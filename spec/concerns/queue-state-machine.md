@@ -77,7 +77,7 @@
                    │              └───────────────────────────────┘│  │
                    │                                               │  │
                    │  evaluate cron                                │  │
-                   │  (LLM이 autodev queue done/hitl CLI 호출)     │  │
+                   │  (LLM이 belt queue done/hitl CLI 호출)     │  │
                    │                                               │  │
               ┌────┴────┐                                          │  │
               │         │                                          │  │
@@ -149,7 +149,7 @@ failure_count는 append-only history에서 계산한다: `history | filter(state
 
 2. **"충분한가?"만 판단** — "이 handler의 결과물이 다음 단계로 넘어가기에 충분한가?"만 본다. 품질 판단(좋은 코드인가?)은 Cron 품질 루프가 담당한다.
 
-3. **state별 구체 기준은 claw-workspace rules에 위임** — `~/.autodev/claw-workspace/.claude/rules/classify-policy.md`에 state별 Done 조건을 정의한다 (Claw 워크스페이스의 rules 파일, [Claw 워크스페이스](./claw-workspace.md) 참조). 코어는 rules를 모르고, `autodev agent`가 rules를 참조하여 판단한다.
+3. **state별 구체 기준은 claw-workspace rules에 위임** — `~/.belt/claw-workspace/.claude/rules/classify-policy.md`에 state별 Done 조건을 정의한다 (Claw 워크스페이스의 rules 파일, [Claw 워크스페이스](./claw-workspace.md) 참조). 코어는 rules를 모르고, `belt agent`가 rules를 참조하여 판단한다.
 
 ### 실패 원칙
 
@@ -159,7 +159,7 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 |-----------|------|------|
 | evaluate LLM 오류/timeout | Completed 유지, 다음 cron tick에서 재시도 | Completed |
 | evaluate 반복 실패 (N회) | HITL로 에스컬레이션 | → HITL |
-| CLI 호출 실패 (`autodev queue done/hitl`) | Completed 유지 + 에러 로그, 다음 tick 재시도 | Completed |
+| CLI 호출 실패 (`belt queue done/hitl`) | Completed 유지 + 에러 로그, 다음 tick 재시도 | Completed |
 | on_done script 실패 | Failed 상태 (on_fail은 실행하지 않음 — handler 실패가 아니므로) | → Failed |
 
 ---

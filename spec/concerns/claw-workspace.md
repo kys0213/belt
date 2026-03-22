@@ -15,22 +15,22 @@ handler 전부 성공 → Completed
     │
     ▼
 evaluate cron (force_trigger로 즉시 실행 가능):
-  autodev agent -p "Completed 아이템의 완료 여부를 판단해줘"
+  belt agent -p "Completed 아이템의 완료 여부를 판단해줘"
     │
-    │  LLM이 autodev context로 컨텍스트 조회 후 CLI 도구로 결정:
+    │  LLM이 belt context로 컨텍스트 조회 후 CLI 도구로 결정:
     │
-    ├── autodev queue done $WORK_ID
+    ├── belt queue done $WORK_ID
     │     → Daemon이 on_done script 실행 (CLI 명령이 상태 전이를 트리거하고, Daemon이 script를 실행)
     │       ├── script 성공 → Done (worktree 정리)
     │       └── script 실패 → Failed (worktree 보존, 로그 기록)
     │
-    └── autodev queue hitl $WORK_ID --reason "..."
+    └── belt queue hitl $WORK_ID --reason "..."
           → HITL 이벤트 생성 → 사람 대기 (worktree 보존)
 ```
 
-evaluate cron: `interval 60s + force_trigger on Completed 전이`. LLM이 JSON을 파싱하는 게 아니라, 직접 `autodev queue done/hitl` CLI를 호출하여 상태를 전이한다.
+evaluate cron: `interval 60s + force_trigger on Completed 전이`. LLM이 JSON을 파싱하는 게 아니라, 직접 `belt queue done/hitl` CLI를 호출하여 상태를 전이한다.
 
-evaluate의 판단 입력: `autodev context $WORK_ID --json` (queue 메타데이터 + 외부 시스템 컨텍스트 + append-only history).
+evaluate의 판단 입력: `belt context $WORK_ID --json` (queue 메타데이터 + 외부 시스템 컨텍스트 + append-only history).
 
 ---
 
@@ -44,9 +44,9 @@ evaluate의 판단 입력: `autodev context $WORK_ID --json` (queue 메타데이
 /claw 실행 →
 
 Step 1: 상태 수집
-  autodev status --json
-  autodev hitl list --json
-  autodev queue list --phase failed --json
+  belt status --json
+  belt hitl list --json
+  belt queue list --phase failed --json
 
 Step 2: 요약 표시
 
@@ -64,17 +64,17 @@ Step 2: 요약 표시
   무엇을 도와드릴까요?
 
 Step 3: 자연어 대화
-  → Bash tool로 autodev CLI 호출
+  → Bash tool로 belt CLI 호출
 ```
 
 ### 자연어 → CLI 매핑 예시
 
 ```
-"지금 상황 어때?"      → autodev status --format rich
-"큐 막힌 거 있어?"     → autodev queue list --json → 분석
-"HITL 대기 목록"       → autodev hitl list --json
-"실패한 거 있어?"      → autodev queue list --phase failed --json
-"cron 일시정지"        → autodev cron pause gap-detection
+"지금 상황 어때?"      → belt status --format rich
+"큐 막힌 거 있어?"     → belt queue list --json → 분석
+"HITL 대기 목록"       → belt hitl list --json
+"실패한 거 있어?"      → belt queue list --phase failed --json
+"cron 일시정지"        → belt cron pause gap-detection
 "뭐 하면 좋을까?"     → status + hitl + queue(failed) 종합 → 추천
 ```
 
@@ -83,7 +83,7 @@ Step 3: 자연어 대화
 ## 워크스페이스 구조
 
 ```
-~/.autodev/claw-workspace/
+~/.belt/claw-workspace/
 ├── CLAUDE.md                         # 판단 원칙
 ├── .claude/rules/
 │   ├── classify-policy.md            # Done vs HITL 분류 기준
@@ -95,7 +95,7 @@ Step 3: 자연어 대화
     └── prioritize/
 ```
 
-Per-workspace 오버라이드: `~/.autodev/workspaces/<name>/claw/`
+Per-workspace 오버라이드: `~/.belt/workspaces/<name>/claw/`
 
 ---
 
