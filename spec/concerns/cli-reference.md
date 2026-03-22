@@ -1,6 +1,6 @@
 # CLI 레퍼런스 — 3-layer 아키텍처 + 전체 커맨드 트리
 
-> autodev CLI는 모든 레이어의 SSOT(Single Source of Truth)이다.
+> belt CLI는 모든 레이어의 SSOT(Single Source of Truth)이다.
 
 ---
 
@@ -13,7 +13,7 @@ Layer 1: Slash Command (3개, thin wrapper)
 Layer 2: DataSource + AgentRuntime (OCP 확장점)
   → 외부 시스템 워크플로우 + LLM 실행 추상화
 
-Layer 3: autodev CLI (SSOT)
+Layer 3: belt CLI (SSOT)
   → DB 조작, 상태 전이, 코어 로직
   → 모든 레이어가 CLI를 호출
 ```
@@ -30,14 +30,14 @@ Layer 3: autodev CLI (SSOT)
 
 ---
 
-## autodev CLI 전체 참조
+## belt CLI 전체 참조
 
 ### Phase 1: 코어 CLI (v5 초기 구현)
 
 상태 변경, 데몬 제어, CRUD — 직접 CLI로 노출.
 
 ```
-autodev
+belt
 ├── start / stop / restart
 ├── status [--format text|json|rich]
 ├── dashboard
@@ -85,25 +85,25 @@ autodev
 ├── logs / usage / report
 ```
 
-> `/claw`는 `autodev status --json`, `autodev queue list --json` 등 Phase 1 CLI의 JSON 출력을 파싱하여 자연어로 표시한다. Phase 2 커맨드도 동일한 패턴으로, `/claw`가 먼저 커버하고 독립 CLI는 수요가 확인되면 추가.
+> `/claw`는 `belt status --json`, `belt queue list --json` 등 Phase 1 CLI의 JSON 출력을 파싱하여 자연어로 표시한다. Phase 2 커맨드도 동일한 패턴으로, `/claw`가 먼저 커버하고 독립 CLI는 수요가 확인되면 추가.
 
 모든 서브커맨드는 `--json` 또는 `--format json` 출력 지원.
 
 ---
 
-## `autodev context` 상세
+## `belt context` 상세
 
 script가 아이템 정보를 조회하는 유일한 방법.
 
 ```bash
 # 기본 사용 (on_done/on_fail script 내에서)
-CTX=$(autodev context $WORK_ID --json)
+CTX=$(belt context $WORK_ID --json)
 ISSUE=$(echo $CTX | jq -r '.issue.number')
 REPO=$(echo $CTX | jq -r '.source.url')
 
 # 특정 필드만 조회 (jq 없이)
-autodev context $WORK_ID --field issue.number    # → 42
-autodev context $WORK_ID --field source.url      # → https://github.com/org/repo
+belt context $WORK_ID --field issue.number    # → 42
+belt context $WORK_ID --field source.url      # → https://github.com/org/repo
 ```
 
 context 스키마는 DataSource별로 다르다. 상세는 [DataSource](./datasource.md) 참조.

@@ -11,8 +11,8 @@
 - **workspace = 1 repo**: 다른 DataSource 지원을 위한 추상화
 - **QueuePhase 8개**: Pending/Ready/Running/Completed/Done/HITL/Failed/Skipped
 - **worktree는 인프라**: 항상 worktree에서 작업, Done 시 정리
-- **환경변수 최소화**: `WORK_ID` + `WORKTREE`만, 나머지는 `autodev context` CLI
-- **evaluate = CLI 도구 호출**: LLM이 `autodev queue done/hitl` 실행
+- **환경변수 최소화**: `WORK_ID` + `WORKTREE`만, 나머지는 `belt context` CLI
+- **evaluate = CLI 도구 호출**: LLM이 `belt queue done/hitl` 실행
 
 ## 설계 문서
 
@@ -30,7 +30,7 @@
 | [AgentRuntime](./concerns/agent-runtime.md) | LLM 실행 추상화 trait + Registry |
 | [Claw 워크스페이스](./concerns/claw-workspace.md) | 대화형 에이전트 + evaluate + slash command |
 | [Cron 엔진](./concerns/cron-engine.md) | 주기 실행 + 품질 루프 + force trigger |
-| [CLI 레퍼런스](./concerns/cli-reference.md) | 3-layer SSOT + `autodev context` + 전체 커맨드 트리 |
+| [CLI 레퍼런스](./concerns/cli-reference.md) | 3-layer SSOT + `belt context` + 전체 커맨드 트리 |
 
 ## 사용자 플로우 (flows/)
 

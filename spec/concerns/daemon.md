@@ -94,12 +94,12 @@ loop {
 // evaluate cron (force_trigger 가능):
 // LLM이 직접 CLI를 호출하여 상태 전이 (JSON 파싱 불필요)
 for item in queue.get(Completed):
-    autodev_agent_p(workspace, "Completed 아이템 $WORK_ID 의 완료 여부를 판단하고,
-        autodev queue done $WORK_ID 또는 autodev queue hitl $WORK_ID 를 실행해줘")
+    belt_agent_p(workspace, "Completed 아이템 $WORK_ID 의 완료 여부를 판단하고,
+        belt queue done $WORK_ID 또는 belt queue hitl $WORK_ID 를 실행해줘")
     // → LLM이 context를 조회하고 판단 후 CLI 실행
-    //   autodev queue done $WORK_ID  → on_done script 실행 → Done (worktree 정리)
+    //   belt queue done $WORK_ID  → on_done script 실행 → Done (worktree 정리)
     //                                  └── script 실패 → Failed (worktree 보존)
-    //   autodev queue hitl $WORK_ID  → HITL 이벤트 생성 (worktree 보존)
+    //   belt queue hitl $WORK_ID  → HITL 이벤트 생성 (worktree 보존)
 ```
 
 ---
@@ -113,7 +113,7 @@ handler, on_done, on_fail, on_enter 전부 같은 두 가지 타입:
 - script: "..."    # → bash 실행 (결정적, WORK_ID + WORKTREE 주입)
 ```
 
-script 안에서 `autodev context $WORK_ID --json`을 호출하여 필요한 정보를 조회한다.
+script 안에서 `belt context $WORK_ID --json`을 호출하여 필요한 정보를 조회한다.
 
 ---
 
@@ -126,7 +126,7 @@ Daemon이 prompt/script 실행 시 주입하는 환경변수는 **2개만**:
 | `WORK_ID` | 큐 아이템 식별자 |
 | `WORKTREE` | worktree 경로 |
 
-나머지는 `autodev context $WORK_ID --json`으로 조회. 상세는 [DataSource](./datasource.md) 참조.
+나머지는 `belt context $WORK_ID --json`으로 조회. 상세는 [DataSource](./datasource.md) 참조.
 
 ---
 

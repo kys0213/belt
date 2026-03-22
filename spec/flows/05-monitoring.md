@@ -8,8 +8,8 @@
 
 | 레이어 | 진입 | 특징 |
 |--------|------|------|
-| TUI Dashboard | `autodev dashboard` | ratatui, 실시간 갱신, 키보드 네비게이션 |
-| CLI 출력 | `autodev status --format rich` | 정적 스냅샷, 코어 CLI |
+| TUI Dashboard | `belt dashboard` | ratatui, 실시간 갱신, 키보드 네비게이션 |
+| CLI 출력 | `belt status --format rich` | 정적 스냅샷, 코어 CLI |
 | Claw 세션 | `/claw` → "보드 보여줘" | 자연어, 읽기 전용 조회의 주 인터페이스 |
 
 > **Phase 구분**: `status`, `spec status` 등 코어 CLI는 Phase 1로 직접 구현. `board`, `decisions`, `logs` 등 읽기 전용 조회는 `/claw`가 흡수 (Phase 2, 필요 시 독립 CLI 추가).
@@ -63,7 +63,7 @@
 │  14:00 ○ Pending  ← github.collect()         │
 │  14:00 ○ Ready    ← auto                     │
 │  14:01 ○ Running                              │
-│         ├ worktree: /tmp/autodev/auth-42      │
+│         ├ worktree: /tmp/belt/auth-42      │
 │         └ handler: claude/sonnet (1.2K, 6m)  │
 │  14:07 ○ Completed ← handlers 성공           │
 │  14:07 ○ evaluate  → Done                    │
@@ -88,7 +88,7 @@
 │  13:08 ✗ on_done script (exit 1, 0.5s)       │
 │         └ error: gh pr create rate limited    │
 │  13:08 ● Failed                              │
-│         └ worktree 보존: /tmp/autodev/auth-39 │
+│         └ worktree 보존: /tmp/belt/auth-39 │
 │                                               │
 │ Actions: [r] retry-script  [s] skip          │
 └───────────────────────────────────────────────┘
@@ -121,10 +121,10 @@
 
 모든 CLI 서브커맨드(status, board, spec list, spec status, queue list 등)에 적용.
 
-### `autodev status --format rich`
+### `belt status --format rich`
 
 ```
-● autodev daemon (uptime 2h 15m)
+● belt daemon (uptime 2h 15m)
 
 Workspaces:
   auth-project  ● active   queue: 1P 1R 1C 2D 1F   specs: 2/3
@@ -136,7 +136,7 @@ Failed: 1 ⚠
 Next evaluate: 25s
 ```
 
-### `autodev spec status <id> --format rich`
+### `belt spec status <id> --format rich`
 
 ```
 auth-v2  Auth Module v2
@@ -191,7 +191,7 @@ HITL 이벤트가 생성되면 사용자에게 다음 경로로 알린다:
 | 경로 | 방법 |
 |------|------|
 | TUI Dashboard | HITL 카운터 실시간 갱신 (`HITL: 1 pending ⚠`) |
-| CLI | `autodev status`에 경고 표시, `autodev hitl list`로 조회 |
+| CLI | `belt status`에 경고 표시, `belt hitl list`로 조회 |
 | /claw 세션 | 진입 시 HITL 대기 목록 자동 표시 |
 | on_fail script | escalation=hitl 시 실행 — GitHub 코멘트 등으로 외부 알림 가능 |
 

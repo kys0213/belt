@@ -38,7 +38,7 @@ handler의 prompt 타입 액션이 실행될 때 AgentRuntime.invoke()를 경유
 
 ### Token usage 기록
 
-RuntimeResponse의 `token_usage`는 Daemon이 `token_usage` 테이블에 자동 저장한다 (work_id, workspace, runtime, model, input/output tokens, duration). `autodev status`와 TUI Dashboard의 Runtime 패널에서 집계하여 표시한다.
+RuntimeResponse의 `token_usage`는 Daemon이 `token_usage` 테이블에 자동 저장한다 (work_id, workspace, runtime, model, input/output tokens, duration). `belt status`와 TUI Dashboard의 Runtime 패널에서 집계하여 표시한다.
 
 ---
 

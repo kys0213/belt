@@ -37,7 +37,7 @@ Archived ──resume──→ Active (복구)
   → 필수 섹션 검증 (개요, 요구사항, 아키텍처, 테스트, 수용 기준)
   → DB에 저장 (status: Active)
   → 스펙 분해 → 이슈 자동 생성
-  → 각 이슈에 trigger 라벨 (예: autodev:analyze) 부착
+  → 각 이슈에 trigger 라벨 (예: belt:analyze) 부착
   → DataSource.collect()가 감지 → 파이프라인 진입
 ```
 
@@ -51,7 +51,7 @@ Archived ──resume──→ Active (복구)
   → 이슈 간 의존성 자동 추론 (공유 파일/모듈 기반)
 
 커스텀 분해: per-workspace 또는 per-user skill 오버라이드
-  → ~/.autodev/workspaces/<name>/skills/decompose/ 에 커스텀 skill 배치
+  → ~/.belt/workspaces/<name>/skills/decompose/ 에 커스텀 skill 배치
   → 기본 skill 대신 커스텀 skill 실행
 ```
 
@@ -94,7 +94,7 @@ on_spec_completing:
 
 판단 기준: 스펙의 대상 모듈/파일 경로, acceptance criteria의 겹침 여부.
 
-> **DependencyGuard**: 스펙 간 의존 관계를 추적하는 메커니즘. 의존 스펙의 이슈가 선행 스펙 완료 전에 실행되지 않도록 큐 스케줄링에서 제어한다. 충돌이 감지되면 (같은 파일/모듈에 영향) HITL 이벤트를 생성하여 사용자에게 판단을 요청한다. 내부적으로는 `autodev queue dependency add/remove` CLI로 관리한다.
+> **DependencyGuard**: 스펙 간 의존 관계를 추적하는 메커니즘. 의존 스펙의 이슈가 선행 스펙 완료 전에 실행되지 않도록 큐 스케줄링에서 제어한다. 충돌이 감지되면 (같은 파일/모듈에 영향) HITL 이벤트를 생성하여 사용자에게 판단을 요청한다. 내부적으로는 `belt queue dependency add/remove` CLI로 관리한다.
 
 ---
 

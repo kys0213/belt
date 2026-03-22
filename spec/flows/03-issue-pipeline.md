@@ -7,11 +7,11 @@
 ## 컨베이어 벨트 흐름
 
 ```
-autodev:analyze 감지 → [analyze handlers] → evaluate → on_done script → autodev:implement 부착
+belt:analyze 감지 → [analyze handlers] → evaluate → on_done script → belt:implement 부착
                                                                               │
-autodev:implement 감지 → [implement handlers] → evaluate → on_done script → autodev:review 부착
+belt:implement 감지 → [implement handlers] → evaluate → on_done script → belt:review 부착
                                                                               │
-autodev:review 감지 → [review handlers] → evaluate → on_done script → autodev:done 부착
+belt:review 감지 → [review handlers] → evaluate → on_done script → belt:done 부착
 ```
 
 각 구간은 독립적인 QueueItem. 되돌아가지 않고, 항상 새 아이템으로 다음 구간에 진입.
@@ -21,7 +21,7 @@ autodev:review 감지 → [review handlers] → evaluate → on_done script → 
 ## 단일 구간 상세
 
 ```
-DataSource.collect(): trigger 조건 매칭 (예: autodev:analyze 라벨)
+DataSource.collect(): trigger 조건 매칭 (예: belt:analyze 라벨)
     │
     ▼
   Pending → Ready → Running (자동 전이, concurrency 제한)
@@ -53,21 +53,21 @@ DataSource.collect(): trigger 조건 매칭 (예: autodev:analyze 라벨)
 
 ## on_done script 예시
 
-on_done script는 `autodev context`로 필요한 정보를 조회하여 외부 시스템에 결과를 반영한다.
+on_done script는 `belt context`로 필요한 정보를 조회하여 외부 시스템에 결과를 반영한다.
 
 ```yaml
 on_done:
   - script: |
-      CTX=$(autodev context $WORK_ID --json)
+      CTX=$(belt context $WORK_ID --json)
       ISSUE=$(echo $CTX | jq -r '.issue.number')
       REPO=$(echo $CTX | jq -r '.source.url')
       TITLE=$(echo $CTX | jq -r '.issue.title')
       gh pr create --title "$TITLE" --body "Closes #$ISSUE" -R $REPO
-      gh issue edit $ISSUE --remove-label "autodev:implement" -R $REPO
-      gh issue edit $ISSUE --add-label "autodev:review" -R $REPO
+      gh issue edit $ISSUE --remove-label "belt:implement" -R $REPO
+      gh issue edit $ISSUE --add-label "belt:review" -R $REPO
 ```
 
-Daemon이 주입하는 환경변수는 `WORK_ID`와 `WORKTREE`뿐. 이슈 번호, 레포 URL 등은 `autodev context`로 직접 조회한다.
+Daemon이 주입하는 환경변수는 `WORK_ID`와 `WORKTREE`뿐. 이슈 번호, 레포 URL 등은 `belt context`로 직접 조회한다.
 
 ---
 

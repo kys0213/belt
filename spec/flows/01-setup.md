@@ -7,7 +7,7 @@
 ## 1. Workspace 등록
 
 ```bash
-autodev workspace add --config workspace.yaml
+belt workspace add --config workspace.yaml
 ```
 
 ### workspace.yaml
@@ -23,42 +23,42 @@ sources:
 
     states:
       analyze:
-        trigger: { label: "autodev:analyze" }
+        trigger: { label: "belt:analyze" }
         handlers:
           - prompt: "이슈를 분석하고 구현 가능 여부를 판단해줘"
         on_done:
           - script: |
-              CTX=$(autodev context $WORK_ID --json)
+              CTX=$(belt context $WORK_ID --json)
               ISSUE=$(echo $CTX | jq -r '.issue.number')
               REPO=$(echo $CTX | jq -r '.source.url')
-              gh issue edit $ISSUE --remove-label "autodev:analyze" -R $REPO
-              gh issue edit $ISSUE --add-label "autodev:implement" -R $REPO
+              gh issue edit $ISSUE --remove-label "belt:analyze" -R $REPO
+              gh issue edit $ISSUE --add-label "belt:implement" -R $REPO
 
       implement:
-        trigger: { label: "autodev:implement" }
+        trigger: { label: "belt:implement" }
         handlers:
           - prompt: "이슈를 구현해줘"
         on_done:
           - script: |
-              CTX=$(autodev context $WORK_ID --json)
+              CTX=$(belt context $WORK_ID --json)
               ISSUE=$(echo $CTX | jq -r '.issue.number')
               REPO=$(echo $CTX | jq -r '.source.url')
               TITLE=$(echo $CTX | jq -r '.issue.title')
               gh pr create --title "$TITLE" --body "Closes #$ISSUE" -R $REPO
-              gh issue edit $ISSUE --remove-label "autodev:implement" -R $REPO
-              gh issue edit $ISSUE --add-label "autodev:review" -R $REPO
+              gh issue edit $ISSUE --remove-label "belt:implement" -R $REPO
+              gh issue edit $ISSUE --add-label "belt:review" -R $REPO
 
       review:
-        trigger: { label: "autodev:review" }
+        trigger: { label: "belt:review" }
         handlers:
           - prompt: "PR을 리뷰하고 품질을 평가해줘"
         on_done:
           - script: |
-              CTX=$(autodev context $WORK_ID --json)
+              CTX=$(belt context $WORK_ID --json)
               ISSUE=$(echo $CTX | jq -r '.issue.number')
               REPO=$(echo $CTX | jq -r '.source.url')
-              gh issue edit $ISSUE --remove-label "autodev:review" -R $REPO
-              gh issue edit $ISSUE --add-label "autodev:done" -R $REPO
+              gh issue edit $ISSUE --remove-label "belt:review" -R $REPO
+              gh issue edit $ISSUE --add-label "belt:done" -R $REPO
 
     escalation:
       1: retry
@@ -80,7 +80,7 @@ workspace는 하나의 외부 레포와 1:1로 대응한다. GitHub 기준으로
 
 ```
 1. DB에 workspace 등록
-2. workspace 디렉토리 생성 (~/.autodev/workspaces/auth-project/)
+2. workspace 디렉토리 생성 (~/.belt/workspaces/auth-project/)
 3. DataSource 인스턴스 생성 + Daemon에 등록
 4. AgentRuntime 바인딩 (RuntimeRegistry 구성)
 5. per-workspace cron seed (evaluate, gap-detection, knowledge-extract)
@@ -104,9 +104,9 @@ workspace는 하나의 외부 레포와 1:1로 대응한다. GitHub 기준으로
 ## 3. Workspace 관리
 
 ```bash
-autodev workspace update <name> --config '<JSON>'
-autodev workspace config <name>    # 유효 설정 조회
-autodev workspace remove <name>    # cascade 삭제 (외부 시스템 데이터는 유지)
+belt workspace update <name> --config '<JSON>'
+belt workspace config <name>    # 유효 설정 조회
+belt workspace remove <name>    # cascade 삭제 (외부 시스템 데이터는 유지)
 ```
 
 ---

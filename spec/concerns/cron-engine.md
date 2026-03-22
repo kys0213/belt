@@ -57,7 +57,7 @@ gap 발견 → DataSource에서 open 아이템 조회 (Pending/Ready/Running)
 
 | Job | 주기 | 동작 |
 |-----|------|------|
-| evaluate | 60초 | 완료 아이템 분류 (Done or HITL) — `autodev agent -p` |
+| evaluate | 60초 | 완료 아이템 분류 (Done or HITL) — `belt agent -p` |
 | gap-detection | 1시간 | 스펙-코드 대조, gap 발견 시 이슈 생성 |
 | knowledge-extract | 1시간 | merged PR 지식 추출 |
 
@@ -90,18 +90,18 @@ evaluate는 **cron 주기 폴링 + force_trigger 즉시 실행**의 하이브리
 
 ## 스크립트 구조
 
-Cron job의 스크립트도 `autodev context`를 활용하여 필요한 정보를 조회한다.
+Cron job의 스크립트도 `belt context`를 활용하여 필요한 정보를 조회한다.
 
 ```bash
 #!/bin/bash
 # Guard: Completed 상태 아이템 있을 때만
-COMPLETED=$(autodev queue list --workspace "$WORKSPACE" --phase completed --json | jq 'length')
+COMPLETED=$(belt queue list --workspace "$WORKSPACE" --phase completed --json | jq 'length')
 if [ "$COMPLETED" = "0" ]; then exit 0; fi
 
 # 실행: evaluate
-# LLM이 context를 조회하고 autodev queue done/hitl CLI를 직접 호출
-autodev agent --workspace "$WORKSPACE" -p \
-  "Completed 아이템의 완료 여부를 판단하고, autodev queue done 또는 autodev queue hitl 을 실행해줘"
+# LLM이 context를 조회하고 belt queue done/hitl CLI를 직접 호출
+belt agent --workspace "$WORKSPACE" -p \
+  "Completed 아이템의 완료 여부를 판단하고, belt queue done 또는 belt queue hitl 을 실행해줘"
 ```
 
 ---
@@ -113,8 +113,8 @@ Cron 스크립트에는 workspace 정보가 필요하므로 추가 변수를 주
 | 변수 | 예시 |
 |------|------|
 | `WORKSPACE` | `auth-project` |
-| `AUTODEV_HOME` | `~/.autodev` |
-| `AUTODEV_DB` | `~/.autodev/autodev.db` |
+| `BELT_HOME` | `~/.belt` |
+| `BELT_DB` | `~/.belt/belt.db` |
 
 > **참고**: handler/on_done/on_fail script에는 `WORK_ID` + `WORKTREE`만 주입된다. Cron은 아이템 단위가 아니라 workspace 단위로 실행되므로 다른 환경변수 세트를 사용한다.
 
@@ -124,7 +124,7 @@ Cron 스크립트에는 workspace 정보가 필요하므로 추가 변수를 주
 
 | | Built-in | Custom |
 |---|---|---|
-| 생성 | workspace 등록 시 자동 | `autodev cron add` |
+| 생성 | workspace 등록 시 자동 | `belt cron add` |
 | 제거 | 불가 (pause/resume) | 자유 |
 | Guard | 내장 | 사용자 정의 |
 
@@ -133,5 +133,5 @@ Cron 스크립트에는 workspace 정보가 필요하므로 추가 변수를 주
 ### 관련 문서
 
 - [DESIGN-v5](../DESIGN-v5.md) — evaluate 아키텍처
-- [DataSource](./datasource.md) — autodev context 스키마
+- [DataSource](./datasource.md) — belt context 스키마
 - [Claw](./claw-workspace.md) — evaluate와 Claw의 관계
