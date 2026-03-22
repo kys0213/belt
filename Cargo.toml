@@ -18,6 +18,9 @@ repository = "https://github.com/kys0213/belt"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+
+# Testing
+tempfile = "3"
 thiserror = "2"
 anyhow = "1"
 

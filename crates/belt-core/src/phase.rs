@@ -1,68 +1,69 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
-/// Queue item phase — the 8-state machine from spec v5.
+/// Queue item phase lifecycle (8 phases).
 ///
 /// ```text
 /// Pending → Ready → Running → Completed → Done | HITL | Failed | Skipped
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "lowercase")]
 pub enum QueuePhase {
-    /// DataSource.collect() detected, waiting in queue.
     Pending,
-    /// Ready to run (auto-transition from Pending).
     Ready,
-    /// Worktree created, handlers executing.
     Running,
-    /// All handlers succeeded, awaiting evaluate.
     Completed,
-    /// Evaluate judged done + on_done script succeeded.
     Done,
-    /// Evaluate or escalation determined human review needed.
     Hitl,
-    /// on_done script failed or infrastructure error.
     Failed,
-    /// Escalation skip or preflight failure.
     Skipped,
 }
 
 impl QueuePhase {
-    /// Returns whether this phase is terminal (no further transitions).
-    pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done | Self::Skipped)
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            QueuePhase::Pending => "pending",
+            QueuePhase::Ready => "ready",
+            QueuePhase::Running => "running",
+            QueuePhase::Completed => "completed",
+            QueuePhase::Done => "done",
+            QueuePhase::Hitl => "hitl",
+            QueuePhase::Failed => "failed",
+            QueuePhase::Skipped => "skipped",
+        }
     }
 
-    /// Validate whether a transition from `self` to `to` is allowed.
-    pub fn can_transition_to(&self, to: &QueuePhase) -> bool {
-        matches!(
-            (self, to),
-            (Self::Pending, Self::Ready)
-                | (Self::Ready, Self::Running)
-                | (Self::Running, Self::Completed)
-                | (Self::Running, Self::Failed)
-                | (Self::Completed, Self::Done)
-                | (Self::Completed, Self::Hitl)
-                | (Self::Done, Self::Done) // idempotent
-                | (Self::Hitl, Self::Done)
-                | (Self::Hitl, Self::Skipped)
-                | (Self::Hitl, Self::Pending) // retry from HITL
-        )
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, QueuePhase::Done | QueuePhase::Skipped)
+    }
+
+    pub fn needs_human(&self) -> bool {
+        matches!(self, QueuePhase::Hitl | QueuePhase::Failed)
     }
 }
 
-impl std::fmt::Display for QueuePhase {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Self::Pending => "Pending",
-            Self::Ready => "Ready",
-            Self::Running => "Running",
-            Self::Completed => "Completed",
-            Self::Done => "Done",
-            Self::Hitl => "HITL",
-            Self::Failed => "Failed",
-            Self::Skipped => "Skipped",
-        };
-        write!(f, "{s}")
+impl std::str::FromStr for QueuePhase {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(QueuePhase::Pending),
+            "ready" => Ok(QueuePhase::Ready),
+            "running" => Ok(QueuePhase::Running),
+            "completed" => Ok(QueuePhase::Completed),
+            "done" => Ok(QueuePhase::Done),
+            "hitl" => Ok(QueuePhase::Hitl),
+            "failed" => Ok(QueuePhase::Failed),
+            "skipped" => Ok(QueuePhase::Skipped),
+            _ => Err(format!("invalid queue phase: {s}")),
+        }
+    }
+}
+
+impl fmt::Display for QueuePhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -71,28 +72,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn happy_path_transitions() {
-        let path = [
+    fn all_phases_roundtrip() {
+        let phases = [
             QueuePhase::Pending,
             QueuePhase::Ready,
             QueuePhase::Running,
             QueuePhase::Completed,
             QueuePhase::Done,
+            QueuePhase::Hitl,
+            QueuePhase::Failed,
+            QueuePhase::Skipped,
         ];
-        for window in path.windows(2) {
-            assert!(
-                window[0].can_transition_to(&window[1]),
-                "{:?} -> {:?} should be valid",
-                window[0],
-                window[1]
-            );
+        for phase in phases {
+            let s = phase.to_string();
+            let parsed: QueuePhase = s.parse().unwrap();
+            assert_eq!(phase, parsed);
         }
-    }
-
-    #[test]
-    fn invalid_backward_transition() {
-        assert!(!QueuePhase::Completed.can_transition_to(&QueuePhase::Running));
-        assert!(!QueuePhase::Done.can_transition_to(&QueuePhase::Pending));
     }
 
     #[test]
@@ -101,5 +96,36 @@ mod tests {
         assert!(QueuePhase::Skipped.is_terminal());
         assert!(!QueuePhase::Failed.is_terminal());
         assert!(!QueuePhase::Hitl.is_terminal());
+    }
+
+    #[test]
+    fn needs_human_phases() {
+        assert!(QueuePhase::Hitl.needs_human());
+        assert!(QueuePhase::Failed.needs_human());
+        assert!(!QueuePhase::Done.needs_human());
+    }
+
+    #[test]
+    fn serde_json_roundtrip() {
+        let phase = QueuePhase::Completed;
+        let json = serde_json::to_string(&phase).unwrap();
+        assert_eq!(json, "\"completed\"");
+        let parsed: QueuePhase = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, phase);
+    }
+
+    #[test]
+    fn phase_count_is_eight() {
+        let all = [
+            QueuePhase::Pending,
+            QueuePhase::Ready,
+            QueuePhase::Running,
+            QueuePhase::Completed,
+            QueuePhase::Done,
+            QueuePhase::Hitl,
+            QueuePhase::Failed,
+            QueuePhase::Skipped,
+        ];
+        assert_eq!(all.len(), 8);
     }
 }

@@ -16,3 +16,6 @@ tokio = { workspace = true }
 rusqlite = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
