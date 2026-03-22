@@ -76,14 +76,14 @@ impl Database {
             .execute_batch(
                 "
             CREATE TABLE IF NOT EXISTS queue_items (
-                work_id    TEXT PRIMARY KEY,
-                source_id  TEXT NOT NULL,
-                workspace  TEXT NOT NULL,
-                state      TEXT NOT NULL,
-                phase      TEXT NOT NULL,
-                worktree   TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                work_id      TEXT PRIMARY KEY,
+                source_id    TEXT NOT NULL,
+                workspace_id TEXT NOT NULL,
+                state        TEXT NOT NULL,
+                phase        TEXT NOT NULL,
+                title        TEXT,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS history (
@@ -139,7 +139,7 @@ impl Database {
     pub fn insert_item(&self, item: &QueueItem) -> Result<(), BeltError> {
         self.conn
             .execute(
-                "INSERT INTO queue_items (work_id, source_id, workspace, state, phase, worktree, created_at, updated_at)
+                "INSERT INTO queue_items (work_id, source_id, workspace_id, state, phase, title, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     item.work_id,
@@ -184,7 +184,7 @@ impl Database {
     pub fn get_item(&self, work_id: &str) -> Result<QueueItem, BeltError> {
         self.conn
             .query_row(
-                "SELECT work_id, source_id, workspace, state, phase, worktree, created_at, updated_at
+                "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at
                  FROM queue_items WHERE work_id = ?1",
                 params![work_id],
                 |row| Ok(row_to_queue_item(row)),
@@ -206,7 +206,7 @@ impl Database {
         workspace: Option<&str>,
     ) -> Result<Vec<QueueItem>, BeltError> {
         let mut sql = String::from(
-            "SELECT work_id, source_id, workspace, state, phase, worktree, created_at, updated_at FROM queue_items WHERE 1=1",
+            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at FROM queue_items WHERE 1=1",
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -215,7 +215,7 @@ impl Database {
             param_values.push(Box::new(phase_to_str(p).to_string()));
         }
         if let Some(ws) = workspace {
-            sql.push_str(" AND workspace = ?");
+            sql.push_str(" AND workspace_id = ?");
             param_values.push(Box::new(ws.to_string()));
         }
 
@@ -547,7 +547,7 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
 /// Extract a `QueueItem` from a rusqlite `Row`.
 ///
 /// Column order must match:
-/// `work_id, source_id, workspace, state, phase, worktree, created_at, updated_at`
+/// `work_id, source_id, workspace_id, state, phase, title, created_at, updated_at`
 fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
     let phase_str: String = row.get(4).map_err(|e| BeltError::Database(e.to_string()))?;
 
@@ -572,17 +572,12 @@ mod tests {
     }
 
     fn sample_item() -> QueueItem {
-        let now = Utc::now().to_rfc3339();
-        QueueItem {
-            work_id: "gh:org/repo#1:implement".to_string(),
-            source_id: "gh:org/repo#1".to_string(),
-            workspace_id: "my-ws".to_string(),
-            state: "implement".to_string(),
-            phase: QueuePhase::Pending,
-            title: None,
-            created_at: now.clone(),
-            updated_at: now,
-        }
+        QueueItem::new(
+            "gh:org/repo#1:implement".to_string(),
+            "gh:org/repo#1".to_string(),
+            "my-ws".to_string(),
+            "implement".to_string(),
+        )
     }
 
     // ---- Queue CRUD --------------------------------------------------------
