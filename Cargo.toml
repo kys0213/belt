@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/belt-core",
+    "crates/belt-infra",
+    "crates/belt-daemon",
+    "crates/belt-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/kys0213/belt"
+
+[workspace.dependencies]
+# Core
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+thiserror = "2"
+anyhow = "1"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Internal crates
+belt-core = { path = "crates/belt-core" }
+belt-infra = { path = "crates/belt-infra" }
+belt-daemon = { path = "crates/belt-daemon" }

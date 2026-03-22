@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"$TOOL_INPUT\" | grep -q '\"file_path\".*\\.env'; then echo 'BLOCK: .env 파일 수정 금지' >&2; exit 1; fi"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if echo \"$TOOL_INPUT\" | grep -qE '\"file_path\".*\\.rs\"'; then cd /Users/irene/Documents/belt && cargo check 2>&1 | tail -20; fi"
+          }
+        ]
+      }
+    ]
+  }
+}

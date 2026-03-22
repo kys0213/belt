@@ -1,0 +1,17 @@
+[package]
+name = "belt-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Daemon: execution loop, cron engine, concurrency control"
+
+[dependencies]
+belt-core = { workspace = true }
+belt-infra = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
