@@ -1,0 +1,13 @@
+[package]
+name = "belt-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core traits, state machine, and queue logic for Belt"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }

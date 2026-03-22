@@ -1,0 +1,18 @@
+[package]
+name = "belt-infra"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Infrastructure: DataSource impls, AgentRuntime impls, DB, worktree management"
+
+[dependencies]
+belt-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+rusqlite = { workspace = true }
+tracing = { workspace = true }
+chrono = { workspace = true }
