@@ -12,7 +12,7 @@ use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::runtime::TokenUsage;
 
-/// History event for database persistence.
+/// An immutable history event recording a state execution result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEvent {
     pub work_id: String,

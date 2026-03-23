@@ -5,6 +5,7 @@ use anyhow::Result;
 
 use belt_core::action::Action;
 use belt_core::context::HistoryEntry;
+use belt_core::error::BeltError;
 use belt_core::escalation::EscalationAction;
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
@@ -17,6 +18,22 @@ use belt_infra::worktree::WorktreeManager;
 
 use crate::concurrency::ConcurrencyTracker;
 use crate::executor::{ActionEnv, ActionExecutor};
+
+/// Safely transition a [`QueueItem`] to a new phase.
+///
+/// All phase mutations **must** go through this function so that
+/// [`QueuePhase::can_transition_to`] is always checked (Issue #12 prevention).
+fn transit(item: &mut QueueItem, to: QueuePhase) -> Result<(), BeltError> {
+    if !item.phase.can_transition_to(&to) {
+        return Err(BeltError::InvalidTransition {
+            from: item.phase,
+            to,
+        });
+    }
+    item.phase = to;
+    item.updated_at = chrono::Utc::now().to_rfc3339();
+    Ok(())
+}
 
 /// Daemon — 상태 머신 + yaml prompt/script 실행기.
 pub struct Daemon {
@@ -340,6 +357,104 @@ impl Daemon {
         Ok(())
     }
 
+    /// Mark a [`QueuePhase::Running`] item as [`QueuePhase::Completed`].
+    pub fn complete_item(&mut self, work_id: &str) -> Result<(), BeltError> {
+        let item = self
+            .queue
+            .iter_mut()
+            .find(|it| it.work_id == work_id)
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+        transit(item, QueuePhase::Completed)
+    }
+
+    /// Mark a [`QueuePhase::Completed`] item as [`QueuePhase::Done`].
+    pub fn mark_done(&mut self, work_id: &str) -> Result<(), BeltError> {
+        let item = self
+            .queue
+            .iter_mut()
+            .find(|it| it.work_id == work_id)
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+        transit(item, QueuePhase::Done)
+    }
+
+    /// Mark a [`QueuePhase::Completed`] item as [`QueuePhase::Hitl`] (human-in-the-loop).
+    pub fn mark_hitl(&mut self, work_id: &str, _reason: Option<String>) -> Result<(), BeltError> {
+        let item = self
+            .queue
+            .iter_mut()
+            .find(|it| it.work_id == work_id)
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+        transit(item, QueuePhase::Hitl)
+    }
+
+    /// Mark a [`QueuePhase::Hitl`] item as [`QueuePhase::Skipped`].
+    pub fn mark_skipped(&mut self, work_id: &str) -> Result<(), BeltError> {
+        let item = self
+            .queue
+            .iter_mut()
+            .find(|it| it.work_id == work_id)
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+        transit(item, QueuePhase::Skipped)
+    }
+
+    /// Retry a [`QueuePhase::Hitl`] item by sending it back to [`QueuePhase::Pending`].
+    pub fn retry_from_hitl(&mut self, work_id: &str) -> Result<(), BeltError> {
+        let item = self
+            .queue
+            .iter_mut()
+            .find(|it| it.work_id == work_id)
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+        transit(item, QueuePhase::Pending)
+    }
+
+    /// Mark a [`QueuePhase::Running`] item as [`QueuePhase::Failed`] and record a
+    /// history entry.
+    pub fn mark_failed(&mut self, work_id: &str, error: String) -> Result<(), BeltError> {
+        let item = self
+            .queue
+            .iter_mut()
+            .find(|it| it.work_id == work_id)
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+
+        let state = item.state.clone();
+
+        transit(item, QueuePhase::Failed)?;
+
+        self.record_history_with_error(work_id, &state, &error);
+
+        Ok(())
+    }
+
+    /// Apply escalation logic based on accumulated failure count.
+    ///
+    /// - 1st failure: log only
+    /// - 2nd failure: log warning
+    /// - 3rd+ failure: escalate to HITL (if current item is in Completed phase)
+    pub fn apply_escalation(&mut self, work_id: &str, source_id: &str, state: &str) {
+        let failure_count = self.count_failures(source_id, state);
+
+        match failure_count {
+            0 => {}
+            1 => {
+                tracing::info!(work_id, source_id, state, "first failure recorded");
+            }
+            2 => {
+                tracing::warn!(work_id, source_id, state, "second failure recorded");
+            }
+            _ => {
+                tracing::error!(
+                    work_id,
+                    source_id,
+                    state,
+                    failure_count,
+                    "escalating to HITL after repeated failures"
+                );
+                // Attempt HITL transition — only succeeds when item is in Completed.
+                let _ = self.mark_hitl(work_id, Some("escalation: repeated failures".to_string()));
+            }
+        }
+    }
+
     /// tokio::select! 기반 async event loop.
     pub async fn run(&mut self, tick_interval_secs: u64) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs));
@@ -373,6 +488,10 @@ impl Daemon {
         None
     }
 
+    /// Count the number of failed history events for a given `source_id` **and** `state`.
+    ///
+    /// Issue #13 prevention: filtering by `source_id` alone is insufficient because
+    /// different states within the same source must be counted independently.
     fn count_failures(&self, _source_id: &str, state: &str) -> u32 {
         self.history
             .iter()
@@ -454,7 +573,24 @@ impl Daemon {
         });
     }
 
+    fn record_history_with_error(&mut self, _work_id: &str, state: &str, error: &str) {
+        let attempt = self.history.iter().filter(|h| h.state == state).count() as u32 + 1;
+        self.history.push(HistoryEntry {
+            state: state.to_string(),
+            status: belt_core::context::HistoryStatus::Failed,
+            attempt,
+            summary: None,
+            error: Some(error.to_string()),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        });
+    }
+
     // --- queries ---
+
+    /// Look up a queue item by `work_id`.
+    pub fn get_item(&self, work_id: &str) -> Option<&QueueItem> {
+        self.queue.iter().find(|it| it.work_id == work_id)
+    }
 
     pub fn queue_items(&self) -> &VecDeque<QueueItem> {
         &self.queue
@@ -462,6 +598,14 @@ impl Daemon {
 
     pub fn items_in_phase(&self, phase: QueuePhase) -> Vec<&QueueItem> {
         self.queue.iter().filter(|i| i.phase == phase).collect()
+    }
+
+    /// Return the number of items currently in [`QueuePhase::Running`].
+    pub fn running_count(&self) -> usize {
+        self.queue
+            .iter()
+            .filter(|it| it.phase == QueuePhase::Running)
+            .count()
     }
 
     pub fn history(&self) -> &[HistoryEntry] {
@@ -636,5 +780,88 @@ sources:
         let success = daemon.execute_on_done(&mut item).await.unwrap();
         assert!(success);
         assert_eq!(item.phase, QueuePhase::Done);
+    }
+
+    #[tokio::test]
+    async fn complete_item_and_mark_done() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("github:org/repo#1", "analyze");
+        item.phase = QueuePhase::Running;
+        daemon.push_item(item);
+
+        assert!(daemon.complete_item("github:org/repo#1:analyze").is_ok());
+        assert_eq!(
+            daemon.get_item("github:org/repo#1:analyze").unwrap().phase,
+            QueuePhase::Completed
+        );
+
+        assert!(daemon.mark_done("github:org/repo#1:analyze").is_ok());
+        assert_eq!(
+            daemon.get_item("github:org/repo#1:analyze").unwrap().phase,
+            QueuePhase::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_to_hitl_and_retry() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("github:org/repo#1", "analyze");
+        item.phase = QueuePhase::Running;
+        daemon.push_item(item);
+
+        daemon.complete_item("github:org/repo#1:analyze").unwrap();
+        assert!(daemon.mark_hitl("github:org/repo#1:analyze", Some("needs review".into())).is_ok());
+        assert_eq!(
+            daemon.get_item("github:org/repo#1:analyze").unwrap().phase,
+            QueuePhase::Hitl
+        );
+
+        assert!(daemon.retry_from_hitl("github:org/repo#1:analyze").is_ok());
+        assert_eq!(
+            daemon.get_item("github:org/repo#1:analyze").unwrap().phase,
+            QueuePhase::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_failed_records_history() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("github:org/repo#1", "analyze");
+        item.phase = QueuePhase::Running;
+        daemon.push_item(item);
+
+        assert!(daemon.mark_failed("github:org/repo#1:analyze", "timeout".into()).is_ok());
+        assert_eq!(
+            daemon.get_item("github:org/repo#1:analyze").unwrap().phase,
+            QueuePhase::Failed
+        );
+        assert_eq!(daemon.history().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_transition_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let item = test_item("github:org/repo#1", "analyze");
+        daemon.push_item(item);
+
+        // Pending → Done is not a valid transition.
+        let result = daemon.mark_done("github:org/repo#1:analyze");
+        assert!(result.is_err());
+        assert_eq!(
+            daemon.get_item("github:org/repo#1:analyze").unwrap().phase,
+            QueuePhase::Pending
+        );
     }
 }
