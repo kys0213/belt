@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use belt_core::context::{IssueContext, ItemContext, QueueContext, SourceContext};
+use belt_core::context::{IssueContext, ItemContext, PrContext, QueueContext, SourceContext};
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::source::DataSource;
@@ -14,6 +14,7 @@ pub struct GitHubDataSource {
 }
 
 impl GitHubDataSource {
+    /// 새 `GitHubDataSource`를 생성한다.
     pub fn new(source_url: &str) -> Self {
         Self {
             source_url: source_url.to_string(),
@@ -21,14 +22,107 @@ impl GitHubDataSource {
         }
     }
 
+    /// URL에서 `owner/repo` 형태의 레포 이름을 추출한다.
     fn extract_repo_name(url: &str) -> Option<String> {
         let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
         let parts: Vec<&str> = trimmed.split('/').collect();
         if parts.len() >= 2 {
-            Some(format!("{}/{}", parts[parts.len() - 2], parts[parts.len() - 1]))
+            Some(format!(
+                "{}/{}",
+                parts[parts.len() - 2],
+                parts[parts.len() - 1]
+            ))
         } else {
             None
         }
+    }
+
+    /// `gh` CLI로 이슈 상세 정보를 조회한다.
+    async fn fetch_issue(
+        repo: &str,
+        number: i64,
+    ) -> Option<(String, Option<String>, Vec<String>, String)> {
+        let output = tokio::process::Command::new("gh")
+            .args([
+                "issue",
+                "view",
+                &number.to_string(),
+                "--repo",
+                repo,
+                "--json",
+                "title,body,labels,author,state",
+            ])
+            .output()
+            .await;
+
+        let output = output.ok().filter(|o| o.status.success())?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let val: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+
+        let title = val["title"].as_str().unwrap_or("").to_string();
+        let body = val["body"].as_str().map(|s| s.to_string());
+        let labels = val["labels"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|l| l["name"].as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let author = val["author"]["login"].as_str().unwrap_or("").to_string();
+
+        Some((title, body, labels, author))
+    }
+
+    /// `gh` CLI로 해당 이슈에 연결된 PR을 조회한다.
+    ///
+    /// `gh pr list`에서 현재 이슈 번호와 연결된 PR을 찾는다.
+    async fn fetch_linked_pr(repo: &str, issue_number: i64) -> Option<PrContext> {
+        let output = tokio::process::Command::new("gh")
+            .args([
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--search",
+                &format!("linked:issue:{issue_number}"),
+                "--json",
+                "number,title,state,url,headRefName",
+                "--limit",
+                "1",
+            ])
+            .output()
+            .await;
+
+        let output = output.ok().filter(|o| o.status.success())?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let prs: Vec<serde_json::Value> = serde_json::from_str(&stdout).ok()?;
+        let pr = prs.first()?;
+
+        let number = pr["number"].as_i64()?;
+        let head_branch = pr["headRefName"].as_str().map(|s| s.to_string());
+
+        Some(PrContext {
+            number,
+            head_branch,
+            review_comments: vec![],
+        })
+    }
+
+    /// `gh repo view`로 기본 브랜치를 조회한다.
+    async fn fetch_default_branch(repo: &str) -> Option<String> {
+        let output = tokio::process::Command::new("gh")
+            .args(["repo", "view", repo, "--json", "defaultBranchRef"])
+            .output()
+            .await;
+
+        let output = output.ok().filter(|o| o.status.success())?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let val: serde_json::Value = serde_json::from_str(&stdout).ok()?;
+
+        val["defaultBranchRef"]["name"]
+            .as_str()
+            .map(|s| s.to_string())
     }
 }
 
@@ -57,31 +151,41 @@ impl DataSource for GitHubDataSource {
 
             // gh issue list로 라벨 매칭 이슈 조회
             let output = tokio::process::Command::new("gh")
-                .args(["issue", "list", "--label", label, "--json", "number,title", "-R", &repo_name])
+                .args([
+                    "issue",
+                    "list",
+                    "--label",
+                    label,
+                    "--json",
+                    "number,title",
+                    "-R",
+                    &repo_name,
+                ])
                 .output()
                 .await;
 
-            if let Ok(output) = output {
-                if output.status.success() {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    if let Ok(issues) = serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {
-                        for issue in issues {
-                            let number = issue["number"].as_i64().unwrap_or(0);
-                            let title = issue["title"].as_str().unwrap_or("").to_string();
-                            let source_id = format!("github:{repo_name}#{number}");
-                            let work_id = QueueItem::make_work_id(&source_id, state_name);
+            // Issue #21: collapsible_if — let-chain으로 병합
+            if let Ok(output) = output
+                && output.status.success()
+            {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if let Ok(issues) = serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {
+                    for issue in issues {
+                        let number = issue["number"].as_i64().unwrap_or(0);
+                        let title = issue["title"].as_str().unwrap_or("").to_string();
+                        let source_id = format!("github:{repo_name}#{number}");
+                        let work_id = QueueItem::make_work_id(&source_id, state_name);
 
-                            items.push(QueueItem {
-                                work_id,
-                                source_id,
-                                workspace_id: workspace.name.clone(),
-                                state: state_name.clone(),
-                                phase: QueuePhase::Pending,
-                                title: Some(title),
-                                created_at: chrono::Utc::now().to_rfc3339(),
-                                updated_at: chrono::Utc::now().to_rfc3339(),
-                            });
-                        }
+                        items.push(QueueItem {
+                            work_id,
+                            source_id,
+                            workspace_id: workspace.name.clone(),
+                            state: state_name.clone(),
+                            phase: QueuePhase::Pending,
+                            title: Some(title),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                            updated_at: chrono::Utc::now().to_rfc3339(),
+                        });
                     }
                 }
             }
@@ -91,6 +195,7 @@ impl DataSource for GitHubDataSource {
         Ok(items)
     }
 
+    /// `gh` CLI를 사용하여 이슈/PR의 실제 데이터를 조회하고 `ItemContext`를 구성한다.
     async fn get_context(&self, item: &QueueItem) -> Result<ItemContext> {
         let issue_number = item
             .source_id
@@ -98,6 +203,25 @@ impl DataSource for GitHubDataSource {
             .next()
             .and_then(|s| s.parse::<i64>().ok())
             .unwrap_or(0);
+
+        let repo_name =
+            Self::extract_repo_name(&self.source_url).unwrap_or_else(|| "unknown/repo".to_string());
+
+        // 이슈 상세, PR, 기본 브랜치를 병렬로 조회
+        let (issue_data, pr_data, default_branch) = tokio::join!(
+            Self::fetch_issue(&repo_name, issue_number),
+            Self::fetch_linked_pr(&repo_name, issue_number),
+            Self::fetch_default_branch(&repo_name),
+        );
+
+        let (title, body, labels, author) = issue_data.unwrap_or_else(|| {
+            (
+                item.title.clone().unwrap_or_default(),
+                None,
+                vec![],
+                String::new(),
+            )
+        });
 
         Ok(ItemContext {
             work_id: item.work_id.clone(),
@@ -110,16 +234,16 @@ impl DataSource for GitHubDataSource {
             source: SourceContext {
                 source_type: "github".to_string(),
                 url: self.source_url.clone(),
-                default_branch: Some("main".to_string()),
+                default_branch: default_branch.or(Some("main".to_string())),
             },
             issue: Some(IssueContext {
                 number: issue_number,
-                title: item.title.clone().unwrap_or_default(),
-                body: None,
-                labels: vec![],
-                author: String::new(),
+                title,
+                body,
+                labels,
+                author,
             }),
-            pr: None,
+            pr: pr_data,
             history: vec![],
             worktree: None,
         })
