@@ -21,4 +21,7 @@ pub enum BeltError {
 
     #[error("database error: {0}")]
     Database(String),
+
+    #[error("worktree error: {0}")]
+    Worktree(String),
 }
