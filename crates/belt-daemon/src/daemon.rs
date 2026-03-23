@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -18,7 +19,8 @@ use belt_infra::db::Database;
 use belt_infra::worktree::WorktreeManager;
 
 use crate::concurrency::ConcurrencyTracker;
-use crate::executor::{ActionEnv, ActionExecutor};
+use crate::evaluator::Evaluator;
+use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
 
 /// Safely transition a [`QueueItem`] to a new phase.
 ///
@@ -40,14 +42,19 @@ fn transit(item: &mut QueueItem, to: QueuePhase) -> Result<(), BeltError> {
 pub struct Daemon {
     config: WorkspaceConfig,
     sources: Vec<Box<dyn DataSource>>,
-    executor: ActionExecutor,
-    worktree_mgr: Box<dyn WorktreeManager>,
+    executor: Arc<ActionExecutor>,
+    worktree_mgr: Arc<dyn WorktreeManager>,
     tracker: ConcurrencyTracker,
     queue: VecDeque<QueueItem>,
     history: Vec<HistoryEntry>,
     db: Option<Database>,
     /// History events with full lineage information for failure tracking.
     history_events: Vec<HistoryEvent>,
+    evaluator: Evaluator,
+    /// Graceful shutdown 플래그. true이면 새 아이템 수집을 중단한다.
+    shutdown_requested: bool,
+    /// Evaluator 스크립트 실행을 위한 Belt home 디렉토리.
+    belt_home: PathBuf,
 }
 
 #[derive(Debug)]
@@ -61,6 +68,27 @@ pub enum ItemOutcome {
     Skipped(QueueItem),
 }
 
+/// 병렬 실행 태스크의 결과. daemon 상태 업데이트에 필요한 데이터를 담는다.
+struct ExecutionResult {
+    item: QueueItem,
+    outcome: ExecutionOutcome,
+    ws_name: String,
+}
+
+enum ExecutionOutcome {
+    Completed {
+        result: Option<ActionResult>,
+    },
+    Failed {
+        error: String,
+        result: Option<ActionResult>,
+    },
+    Skipped,
+    WorktreeError {
+        error: String,
+    },
+}
+
 impl Daemon {
     pub fn new(
         config: WorkspaceConfig,
@@ -69,22 +97,34 @@ impl Daemon {
         worktree_mgr: Box<dyn WorktreeManager>,
         max_concurrent: u32,
     ) -> Self {
+        let evaluator = Evaluator::new(&config.name);
         Self {
             config,
             sources,
-            executor: ActionExecutor::new(registry),
-            worktree_mgr,
+            executor: Arc::new(ActionExecutor::new(registry)),
+            worktree_mgr: Arc::from(worktree_mgr),
             tracker: ConcurrencyTracker::new(max_concurrent),
             queue: VecDeque::new(),
             history: Vec::new(),
             db: None,
             history_events: Vec::new(),
+            evaluator,
+            shutdown_requested: false,
+            belt_home: PathBuf::from(
+                std::env::var("BELT_HOME").unwrap_or_else(|_| ".belt".to_string()),
+            ),
         }
     }
 
     /// Set the database for persisting token usage records.
     pub fn with_db(mut self, db: Database) -> Self {
         self.db = Some(db);
+        self
+    }
+
+    /// Set the belt home directory for evaluator scripts.
+    pub fn with_belt_home(mut self, belt_home: PathBuf) -> Self {
+        self.belt_home = belt_home;
         self
     }
 
@@ -194,13 +234,15 @@ impl Daemon {
     }
 
     // ---------------------------------------------------------------
-    // Phase 3: Execute running items
+    // Phase 3: Execute running items (parallel)
     // ---------------------------------------------------------------
 
-    /// Execute handlers for all Running items.
+    /// Execute handlers for all Running items in parallel using `tokio::spawn`.
+    ///
+    /// Running 상태의 아이템들을 `tokio::spawn`으로 동시에 실행하고
+    /// 결과를 수집한다. concurrency 제한은 `advance()`에서 이미 적용되었으므로
+    /// Running 상태인 아이템은 모두 실행 가능하다.
     pub async fn execute_running(&mut self) -> Vec<ItemOutcome> {
-        let mut outcomes = Vec::new();
-
         let running_indices: Vec<usize> = self
             .queue
             .iter()
@@ -209,38 +251,82 @@ impl Daemon {
             .map(|(i, _)| i)
             .collect();
 
+        if running_indices.is_empty() {
+            return Vec::new();
+        }
+
+        // Remove running items from queue (reverse order to preserve indices).
+        let mut running_items: Vec<QueueItem> = Vec::with_capacity(running_indices.len());
         for &idx in running_indices.iter().rev() {
-            let mut item = self.queue.remove(idx).unwrap();
-            let outcome = self.execute_item(&mut item).await;
-            outcomes.push(outcome);
+            running_items.push(self.queue.remove(idx).unwrap());
+        }
+        running_items.reverse();
+
+        // Spawn parallel tasks.
+        let mut join_set = tokio::task::JoinSet::new();
+        for item in running_items {
+            let executor = Arc::clone(&self.executor);
+            let worktree_mgr = Arc::clone(&self.worktree_mgr);
+            let ws_name = self.config.name.clone();
+            let state_config = self.find_state_config(&item.state).cloned();
+
+            join_set.spawn(async move {
+                Self::execute_item_parallel(item, state_config, executor, worktree_mgr, ws_name)
+                    .await
+            });
+        }
+
+        // Collect results and apply state updates.
+        let mut outcomes = Vec::new();
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok(exec_result) => {
+                    let outcome = self.apply_execution_result(exec_result);
+                    outcomes.push(outcome);
+                }
+                Err(e) => {
+                    tracing::error!("spawned task panicked: {e}");
+                }
+            }
         }
 
         outcomes
     }
 
-    async fn execute_item(&mut self, item: &mut QueueItem) -> ItemOutcome {
-        let state_config = self.find_state_config(&item.state);
-
+    /// 단일 아이템의 handler를 실행하는 순수 async 함수.
+    /// `&mut self` 의존 없이 `tokio::spawn`으로 실행 가능하다.
+    async fn execute_item_parallel(
+        mut item: QueueItem,
+        state_config: Option<StateConfig>,
+        executor: Arc<ActionExecutor>,
+        worktree_mgr: Arc<dyn WorktreeManager>,
+        ws_name: String,
+    ) -> ExecutionResult {
         let state_config = match state_config {
-            Some(cfg) => cfg.clone(),
+            Some(cfg) => cfg,
             None => {
                 item.phase = QueuePhase::Skipped;
-                return ItemOutcome::Skipped(item.clone());
+                return ExecutionResult {
+                    item,
+                    outcome: ExecutionOutcome::Skipped,
+                    ws_name,
+                };
             }
         };
 
-        let worktree = match self
-            .worktree_mgr
-            .create_or_reuse(&self.config.name, &item.source_id)
+        let worktree = match worktree_mgr
+            .create_or_reuse(&ws_name, &item.source_id)
             .await
         {
             Ok(path) => path,
             Err(e) => {
                 item.phase = QueuePhase::Failed;
-                return ItemOutcome::Failed {
-                    item: item.clone(),
-                    error: format!("worktree creation failed: {e}"),
-                    escalation: EscalationAction::Retry,
+                return ExecutionResult {
+                    item,
+                    outcome: ExecutionOutcome::WorktreeError {
+                        error: format!("worktree creation failed: {e}"),
+                    },
+                    ws_name,
                 };
             }
         };
@@ -249,43 +335,37 @@ impl Daemon {
 
         // on_enter
         let on_enter: Vec<Action> = state_config.on_enter.iter().map(Action::from).collect();
-        match self.executor.execute_all(&on_enter, &env).await {
+        match executor.execute_all(&on_enter, &env).await {
             Ok(Some(r)) if !r.success() => {
-                // 비정상 exit code → escalation 적용
-                self.record_history(item, "failed", Some(&r.stderr));
-                let failure_count = self.count_failures(&item.source_id, &item.state);
-                let escalation = self.resolve_escalation(&item.state, failure_count);
-                if escalation.should_run_on_fail() {
-                    let on_fail: Vec<Action> =
-                        state_config.on_fail.iter().map(Action::from).collect();
-                    let _ = self.executor.execute_all(&on_fail, &env).await;
-                }
-                self.handle_escalation(item, escalation);
-                self.tracker.release(&self.config.name.clone());
+                // on_fail 스크립트 실행 시도 (best-effort).
+                let on_fail: Vec<Action> =
+                    state_config.on_fail.iter().map(Action::from).collect();
+                let _ = executor.execute_all(&on_fail, &env).await;
 
-                return ItemOutcome::Failed {
-                    item: item.clone(),
-                    error: format!("on_enter failed with exit code {}", r.exit_code),
-                    escalation,
+                item.phase = QueuePhase::Failed;
+                return ExecutionResult {
+                    item,
+                    outcome: ExecutionOutcome::Failed {
+                        error: format!("on_enter failed with exit code {}", r.exit_code),
+                        result: None,
+                    },
+                    ws_name,
                 };
             }
             Err(e) => {
-                // 실행 자체가 실패한 경우
-                self.record_history(item, "failed", Some(&e.to_string()));
-                let failure_count = self.count_failures(&item.source_id, &item.state);
-                let escalation = self.resolve_escalation(&item.state, failure_count);
-                if escalation.should_run_on_fail() {
-                    let on_fail: Vec<Action> =
-                        state_config.on_fail.iter().map(Action::from).collect();
-                    let _ = self.executor.execute_all(&on_fail, &env).await;
-                }
-                self.handle_escalation(item, escalation);
-                self.tracker.release(&self.config.name.clone());
+                tracing::warn!("on_enter failed for {}: {e}", item.work_id);
+                let on_fail: Vec<Action> =
+                    state_config.on_fail.iter().map(Action::from).collect();
+                let _ = executor.execute_all(&on_fail, &env).await;
 
-                return ItemOutcome::Failed {
-                    item: item.clone(),
-                    error: format!("on_enter failed: {e}"),
-                    escalation,
+                item.phase = QueuePhase::Failed;
+                return ExecutionResult {
+                    item,
+                    outcome: ExecutionOutcome::Failed {
+                        error: format!("on_enter failed: {e}"),
+                        result: None,
+                    },
+                    ws_name,
                 };
             }
             _ => {
@@ -295,59 +375,84 @@ impl Daemon {
 
         // handler chain
         let handlers: Vec<Action> = state_config.handlers.iter().map(Action::from).collect();
-        let result = self.executor.execute_all(&handlers, &env).await;
+        let result = executor.execute_all(&handlers, &env).await;
 
         match result {
-            Ok(Some(r)) if !r.success() => {
-                self.try_record_token_usage(item, &r);
+            Ok(Some(r)) if !r.success() => ExecutionResult {
+                item,
+                outcome: ExecutionOutcome::Failed {
+                    error: r.stderr.clone(),
+                    result: Some(r),
+                },
+                ws_name,
+            },
+            Ok(r) => {
+                item.phase = QueuePhase::Completed;
+                ExecutionResult {
+                    item,
+                    outcome: ExecutionOutcome::Completed { result: r },
+                    ws_name,
+                }
+            }
+            Err(e) => {
+                item.phase = QueuePhase::Failed;
+                ExecutionResult {
+                    item,
+                    outcome: ExecutionOutcome::Failed {
+                        error: e.to_string(),
+                        result: None,
+                    },
+                    ws_name,
+                }
+            }
+        }
+    }
+
+    /// 병렬 실행 결과를 daemon 상태에 반영한다.
+    fn apply_execution_result(&mut self, exec_result: ExecutionResult) -> ItemOutcome {
+        let ExecutionResult {
+            mut item,
+            outcome,
+            ws_name,
+        } = exec_result;
+
+        match outcome {
+            ExecutionOutcome::Skipped => ItemOutcome::Skipped(item),
+            ExecutionOutcome::WorktreeError { error } => {
+                self.tracker.release(&ws_name);
+                ItemOutcome::Failed {
+                    item,
+                    error,
+                    escalation: EscalationAction::Retry,
+                }
+            }
+            ExecutionOutcome::Completed { result } => {
+                if let Some(ref r) = result {
+                    self.try_record_token_usage(&item, r);
+                }
+                self.record_history(&item, "completed", None);
+                self.record_history_event(&item, "completed", None);
+                self.tracker.release(&ws_name);
+                self.queue.push_back(item.clone());
+                ItemOutcome::Completed(item)
+            }
+            ExecutionOutcome::Failed { error, result } => {
+                if let Some(ref r) = result {
+                    self.try_record_token_usage(&item, r);
+                }
 
                 let failure_count = self.count_failures(&item.source_id, &item.state);
                 let escalation = self.resolve_escalation(&item.state, failure_count + 1);
 
-                self.record_history(item, "failed", Some(&r.stderr));
-                self.record_history_event(item, "failed", Some(r.stderr.clone()));
-
-                if escalation.should_run_on_fail() {
-                    let on_fail: Vec<Action> =
-                        state_config.on_fail.iter().map(Action::from).collect();
-                    let _ = self.executor.execute_all(&on_fail, &env).await;
-                }
-
-                self.handle_escalation(item, escalation);
-                self.tracker.release(&self.config.name.clone());
+                self.record_history(&item, "failed", Some(&error));
+                self.record_history_event(&item, "failed", Some(error.clone()));
+                self.handle_escalation(&mut item, escalation);
+                self.tracker.release(&ws_name);
 
                 ItemOutcome::Failed {
-                    item: item.clone(),
-                    error: r.stderr.clone(),
+                    item,
+                    error,
                     escalation,
-                }
-            }
-            Ok(Some(r)) => {
-                self.try_record_token_usage(item, &r);
-
-                let _ = transit(item, QueuePhase::Completed);
-                self.record_history(item, "completed", None);
-                self.tracker.release(&self.config.name.clone());
-                self.queue.push_back(item.clone());
-                ItemOutcome::Completed(item.clone())
-            }
-            Ok(None) => {
-                let _ = transit(item, QueuePhase::Completed);
-                self.record_history(item, "completed", None);
-                self.tracker.release(&self.config.name.clone());
-                self.queue.push_back(item.clone());
-                ItemOutcome::Completed(item.clone())
-            }
-            Err(e) => {
-                item.phase = QueuePhase::Failed;
-                self.record_history(item, "failed", Some(&e.to_string()));
-                self.record_history_event(item, "failed", Some(e.to_string()));
-                self.tracker.release(&self.config.name.clone());
-
-                ItemOutcome::Failed {
-                    item: item.clone(),
-                    error: e.to_string(),
-                    escalation: EscalationAction::Retry,
                 }
             }
         }
@@ -512,16 +617,92 @@ impl Daemon {
         }
     }
 
-    /// Daemon tick: collect -> advance -> execute -> on_done.
-    pub async fn tick(&mut self) -> Result<()> {
-        let collected = self.collect().await?;
-        if collected > 0 {
-            tracing::info!("collected {collected} items");
+    /// 4단계: Completed 아이템을 evaluator로 평가하여 Done 또는 HITL로 분류.
+    ///
+    /// handler 성공 → Completed 전이 후 evaluator가 Done/HITL을 결정한다.
+    /// evaluator 실행 실패 시 Completed 유지, 다음 tick에서 재시도.
+    async fn evaluate_completed(&mut self) {
+        let completed: Vec<String> = self
+            .items_in_phase(QueuePhase::Completed)
+            .iter()
+            .map(|i| i.work_id.clone())
+            .collect();
+
+        if completed.is_empty() {
+            return;
         }
 
-        let advanced = self.advance();
-        if advanced > 0 {
-            tracing::debug!("advanced {advanced} items");
+        // Evaluator 스크립트 실행으로 Done vs HITL 판정.
+        let eval_result = self.evaluator.run_evaluate(&self.belt_home).await;
+
+        match eval_result {
+            Ok(result) if result.success() => {
+                // Evaluator 성공 — on_done을 거쳐 Done으로 전이.
+                for work_id in completed {
+                    if let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id) {
+                        let mut item = self.queue.remove(idx).unwrap();
+                        match self.execute_on_done(&mut item).await {
+                            Ok(true) => tracing::info!("done: {}", item.work_id),
+                            Ok(false) => tracing::warn!("on_done failed: {}", item.work_id),
+                            Err(e) => tracing::error!("on_done error for {}: {e}", item.work_id),
+                        }
+                    }
+                }
+            }
+            Ok(result) => {
+                // Evaluator 비정상 종료 — HITL로 라우팅.
+                tracing::info!(
+                    "evaluator returned non-zero ({}), routing {} items to HITL",
+                    result.exit_code,
+                    completed.len()
+                );
+                for work_id in completed {
+                    if let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id)
+                        && let Some(item) = self.queue.get_mut(idx)
+                    {
+                        item.phase = QueuePhase::Hitl;
+                        self.history.push(HistoryEntry {
+                            source_id: item.source_id.clone(),
+                            work_id: item.work_id.clone(),
+                            state: item.state.clone(),
+                            status: belt_core::context::HistoryStatus::Hitl,
+                            attempt: 0,
+                            summary: None,
+                            error: Some(format!(
+                                "evaluator exit_code={}: {}",
+                                result.exit_code,
+                                result.stderr.trim()
+                            )),
+                            created_at: chrono::Utc::now().to_rfc3339(),
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                // Evaluator 실행 자체가 실패 — Completed 유지, 다음 tick에서 재시도.
+                tracing::warn!(
+                    "evaluator failed for {} completed items, will retry next tick: {e}",
+                    completed.len()
+                );
+            }
+        }
+    }
+
+    /// Daemon tick: collect -> advance -> execute -> evaluate.
+    ///
+    /// shutdown이 요청되면 collect/advance를 건너뛰고 실행 중인
+    /// 아이템의 완료 처리만 수행한다.
+    pub async fn tick(&mut self) -> Result<()> {
+        if !self.shutdown_requested {
+            let collected = self.collect().await?;
+            if collected > 0 {
+                tracing::info!("collected {collected} items");
+            }
+
+            let advanced = self.advance();
+            if advanced > 0 {
+                tracing::debug!("advanced {advanced} items");
+            }
         }
 
         let outcomes = self.execute_running().await;
@@ -544,27 +725,19 @@ impl Daemon {
             }
         }
 
-        let completed: Vec<String> = self
-            .items_in_phase(QueuePhase::Completed)
-            .iter()
-            .map(|i| i.work_id.clone())
-            .collect();
-
-        for work_id in completed {
-            if let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id) {
-                let mut item = self.queue.remove(idx).unwrap();
-                match self.execute_on_done(&mut item).await {
-                    Ok(true) => tracing::info!("done: {}", item.work_id),
-                    Ok(false) => tracing::warn!("on_done failed: {}", item.work_id),
-                    Err(e) => tracing::error!("on_done error for {}: {e}", item.work_id),
-                }
-            }
-        }
+        // Evaluator로 Completed 아이템 평가 (Done vs HITL).
+        self.evaluate_completed().await;
 
         Ok(())
     }
 
-    /// tokio::select! based async event loop.
+    /// tokio::select! 기반 async event loop with graceful shutdown.
+    ///
+    /// SIGINT 수신 시:
+    /// 1. `shutdown_requested = true` — 새 아이템 수집 중단.
+    /// 2. Running 아이템 완료 대기 (timeout: 30초).
+    /// 3. timeout 초과 시 Running → Pending 롤백 (worktree 보존).
+    /// 4. 두 번째 SIGINT 시 즉시 종료 (Running → Pending 롤백).
     pub async fn run(&mut self, tick_interval_secs: u64) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs));
         tracing::info!("belt daemon started (tick={}s)", tick_interval_secs);
@@ -575,15 +748,109 @@ impl Daemon {
                     if let Err(e) = self.tick().await {
                         tracing::error!("tick error: {e}");
                     }
+
+                    if self.shutdown_requested {
+                        let running_count = self.items_in_phase(QueuePhase::Running).len();
+                        if running_count == 0 {
+                            tracing::info!("all running items completed, shutting down");
+                            break;
+                        }
+                        tracing::info!(
+                            "shutdown requested, waiting for {} running items...",
+                            running_count
+                        );
+                    }
                 }
                 _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("received SIGINT, shutting down...");
-                    break;
+                    if self.shutdown_requested {
+                        tracing::warn!("received second SIGINT, forcing shutdown");
+                        self.rollback_running_to_pending();
+                        break;
+                    }
+                    tracing::info!("received SIGINT, initiating graceful shutdown...");
+                    self.shutdown_requested = true;
                 }
             }
         }
 
+        // Shutdown 요청 후 잔여 Running 아이템 drain (30초 timeout).
+        if self.shutdown_requested {
+            self.drain_with_timeout(std::time::Duration::from_secs(30))
+                .await;
+        }
+
         tracing::info!("belt daemon stopped");
+    }
+
+    /// Running 아이템 완료 대기. timeout 초과 시 Pending으로 롤백.
+    async fn drain_with_timeout(&mut self, timeout: std::time::Duration) {
+        let running_count = self.items_in_phase(QueuePhase::Running).len();
+        if running_count == 0 {
+            return;
+        }
+
+        tracing::info!(
+            "draining {} running items (timeout={}s)...",
+            running_count,
+            timeout.as_secs()
+        );
+
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let outcomes = self.execute_running().await;
+                    for outcome in &outcomes {
+                        if let ItemOutcome::Completed(item) = outcome {
+                            tracing::info!("drain: completed {}", item.work_id);
+                        }
+                    }
+
+                    let remaining = self.items_in_phase(QueuePhase::Running).len();
+                    if remaining == 0 {
+                        tracing::info!("all running items drained successfully");
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let remaining = self.items_in_phase(QueuePhase::Running).len();
+                    tracing::warn!(
+                        "drain timeout reached, rolling back {} running items to Pending",
+                        remaining
+                    );
+                    self.rollback_running_to_pending();
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Running → Pending 롤백. worktree는 보존한다.
+    fn rollback_running_to_pending(&mut self) {
+        let ws_name = self.config.name.clone();
+        for item in self.queue.iter_mut() {
+            if item.phase == QueuePhase::Running {
+                item.phase = QueuePhase::Pending;
+                item.updated_at = chrono::Utc::now().to_rfc3339();
+                self.tracker.release(&ws_name);
+                tracing::info!(
+                    "rolled back {} to Pending (worktree preserved)",
+                    item.work_id
+                );
+            }
+        }
+    }
+
+    /// Shutdown이 요청되었는지 확인.
+    pub fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_requested
+    }
+
+    /// 프로그래밍 방식으로 graceful shutdown을 요청.
+    pub fn request_shutdown(&mut self) {
+        self.shutdown_requested = true;
     }
 
     // ---------------------------------------------------------------
@@ -647,7 +914,7 @@ impl Daemon {
     }
 
     /// Token usage가 있으면 DB에 기록한다. DB가 없거나 기록 실패 시 경고만 출력.
-    fn try_record_token_usage(&self, item: &QueueItem, result: &crate::executor::ActionResult) {
+    fn try_record_token_usage(&self, item: &QueueItem, result: &ActionResult) {
         let (Some(usage), Some(runtime_name)) = (&result.token_usage, &result.runtime_name) else {
             return;
         };
@@ -1025,5 +1292,57 @@ sources:
         let success = daemon.execute_on_done(&mut item).await.unwrap();
         assert!(success);
         assert_eq!(item.phase, QueuePhase::Done);
+    }
+
+    #[tokio::test]
+    async fn parallel_execution_runs_multiple_items() {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+        source.add_item(test_item("github:org/repo#2", "analyze"));
+
+        let mut daemon = setup_daemon(&tmp, source, vec![0, 0]);
+        daemon.collect().await.unwrap();
+        daemon.advance();
+
+        let outcomes = daemon.execute_running().await;
+        assert_eq!(outcomes.len(), 2);
+        let completed_count = outcomes
+            .iter()
+            .filter(|o| matches!(o, ItemOutcome::Completed(_)))
+            .count();
+        assert_eq!(completed_count, 2);
+    }
+
+    #[tokio::test]
+    async fn shutdown_skips_collect_and_advance() {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+        daemon.request_shutdown();
+
+        daemon.tick().await.unwrap();
+        assert_eq!(daemon.queue_items().len(), 0);
+        assert!(daemon.is_shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn rollback_running_to_pending_preserves_items() {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+        daemon.collect().await.unwrap();
+        daemon.advance();
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 1);
+
+        daemon.rollback_running_to_pending();
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
+        assert_eq!(daemon.items_in_phase(QueuePhase::Pending).len(), 1);
     }
 }
