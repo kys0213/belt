@@ -39,19 +39,44 @@ impl ActionExecutor {
         Self { registry }
     }
 
+    /// Execute all actions sequentially, accumulating token usage across the chain.
+    ///
+    /// If any action fails (non-zero exit code), execution stops and the failed
+    /// result is returned with accumulated token usage up to that point.
     pub async fn execute_all(
         &self,
         actions: &[Action],
         env: &ActionEnv,
     ) -> Result<Option<ActionResult>> {
+        let mut total_usage = TokenUsage::default();
+        let mut has_usage = false;
         let mut last_result = None;
+
         for action in actions {
             let result = self.execute_one(action, env).await?;
-            if !result.success() {
-                return Ok(Some(result));
+            if let Some(usage) = &result.token_usage {
+                total_usage.input_tokens += usage.input_tokens;
+                total_usage.output_tokens += usage.output_tokens;
+                if let Some(v) = usage.cache_read_tokens {
+                    *total_usage.cache_read_tokens.get_or_insert(0) += v;
+                }
+                if let Some(v) = usage.cache_write_tokens {
+                    *total_usage.cache_write_tokens.get_or_insert(0) += v;
+                }
+                has_usage = true;
             }
+            let failed = !result.success();
             last_result = Some(result);
+            if failed {
+                break;
+            }
         }
+
+        // Attach accumulated token usage to the final result.
+        if let Some(ref mut result) = last_result {
+            result.token_usage = if has_usage { Some(total_usage) } else { None };
+        }
+
         Ok(last_result)
     }
 
@@ -210,5 +235,95 @@ mod tests {
         let executor = ActionExecutor::new(setup_registry());
         let result = executor.execute_all(&[], &test_env()).await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_all_accumulates_token_usage() {
+        use belt_core::runtime::TokenUsage;
+
+        let mock = MockRuntime::new("mock", vec![0, 0, 0]).with_token_usages(vec![
+            TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: Some(10),
+                cache_write_tokens: Some(5),
+            },
+            TokenUsage {
+                input_tokens: 200,
+                output_tokens: 80,
+                cache_read_tokens: Some(20),
+                cache_write_tokens: Some(10),
+            },
+            TokenUsage {
+                input_tokens: 150,
+                output_tokens: 60,
+                cache_read_tokens: Some(15),
+                cache_write_tokens: Some(8),
+            },
+        ]);
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(mock));
+        let executor = ActionExecutor::new(Arc::new(registry));
+
+        let actions = vec![
+            Action::prompt("first"),
+            Action::prompt("second"),
+            Action::prompt("third"),
+        ];
+        let result = executor
+            .execute_all(&actions, &test_env())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let usage = result
+            .token_usage
+            .expect("should have accumulated token usage");
+        assert_eq!(usage.input_tokens, 450);
+        assert_eq!(usage.output_tokens, 190);
+        assert_eq!(usage.cache_read_tokens, Some(45));
+        assert_eq!(usage.cache_write_tokens, Some(23));
+    }
+
+    #[tokio::test]
+    async fn execute_all_accumulates_usage_on_failure() {
+        use belt_core::runtime::TokenUsage;
+
+        let mock = MockRuntime::new("mock", vec![0, 1]).with_token_usages(vec![
+            TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            },
+            TokenUsage {
+                input_tokens: 200,
+                output_tokens: 80,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            },
+        ]);
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(mock));
+        let executor = ActionExecutor::new(Arc::new(registry));
+
+        let actions = vec![
+            Action::prompt("first"),
+            Action::prompt("second"),
+            Action::prompt("third"),
+        ];
+        let result = executor
+            .execute_all(&actions, &test_env())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Should stop at second action (failure) but still accumulate both usages.
+        assert!(!result.success());
+        let usage = result
+            .token_usage
+            .expect("should have accumulated token usage");
+        assert_eq!(usage.input_tokens, 300);
+        assert_eq!(usage.output_tokens, 130);
     }
 }
