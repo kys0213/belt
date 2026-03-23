@@ -42,6 +42,21 @@ pub struct CronJob {
     pub created_at: DateTime<Utc>,
 }
 
+/// A persisted token usage record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenUsageRow {
+    pub id: i64,
+    pub work_id: String,
+    pub workspace: String,
+    pub runtime: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub created_at: DateTime<Utc>,
+}
+
 /// SQLite-backed persistence for Belt state.
 pub struct Database {
     conn: Connection,
@@ -115,14 +130,16 @@ impl Database {
             );
 
             CREATE TABLE IF NOT EXISTS token_usage (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                work_id       TEXT NOT NULL,
-                workspace     TEXT NOT NULL,
-                runtime       TEXT NOT NULL,
-                model         TEXT NOT NULL,
-                input_tokens  INTEGER NOT NULL,
-                output_tokens INTEGER NOT NULL,
-                created_at    TEXT NOT NULL
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                work_id            TEXT NOT NULL,
+                workspace          TEXT NOT NULL,
+                runtime            TEXT NOT NULL,
+                model              TEXT NOT NULL,
+                input_tokens       INTEGER NOT NULL,
+                output_tokens      INTEGER NOT NULL,
+                cache_read_tokens  INTEGER,
+                cache_write_tokens INTEGER,
+                created_at         TEXT NOT NULL
             );
             ",
             )
@@ -483,8 +500,8 @@ impl Database {
         let now = Utc::now().to_rfc3339();
         self.conn
             .execute(
-                "INSERT INTO token_usage (work_id, workspace, runtime, model, input_tokens, output_tokens, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO token_usage (work_id, workspace, runtime, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     work_id,
                     workspace,
@@ -492,11 +509,45 @@ impl Database {
                     model,
                     usage.input_tokens as i64,
                     usage.output_tokens as i64,
+                    usage.cache_read_tokens.map(|v| v as i64),
+                    usage.cache_write_tokens.map(|v| v as i64),
                     now,
                 ],
             )
             .map_err(|e| BeltError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    /// Retrieve all token usage records for a given `work_id`.
+    pub fn get_token_usage(&self, work_id: &str) -> Result<Vec<TokenUsageRow>, BeltError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, work_id, workspace, runtime, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at
+                 FROM token_usage WHERE work_id = ?1 ORDER BY created_at ASC",
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![work_id], |row| {
+                let created: String = row.get(9)?;
+                Ok(TokenUsageRow {
+                    id: row.get(0)?,
+                    work_id: row.get(1)?,
+                    workspace: row.get(2)?,
+                    runtime: row.get(3)?,
+                    model: row.get(4)?,
+                    input_tokens: row.get(5)?,
+                    output_tokens: row.get(6)?,
+                    cache_read_tokens: row.get(7)?,
+                    cache_write_tokens: row.get(8)?,
+                    created_at: parse_datetime(&created),
+                })
+            })
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(rows)
     }
 }
 
@@ -788,23 +839,43 @@ mod tests {
     // ---- Token Usage -------------------------------------------------------
 
     #[test]
-    fn record_token_usage() {
+    fn record_and_get_token_usage() {
         let db = test_db();
         let usage = TokenUsage {
             input_tokens: 1000,
             output_tokens: 500,
-            cache_read_tokens: 0,
-            cache_write_tokens: 0,
+            cache_read_tokens: Some(200),
+            cache_write_tokens: Some(100),
         };
         db.record_token_usage("w1", "ws1", "claude", "opus-4", &usage)
             .unwrap();
 
-        // Verify by raw query — no public read API for token_usage yet.
-        let count: i64 = db
-            .conn
-            .query_row("SELECT COUNT(*) FROM token_usage", [], |row| row.get(0))
+        let rows = db.get_token_usage("w1").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].input_tokens, 1000);
+        assert_eq!(rows[0].output_tokens, 500);
+        assert_eq!(rows[0].cache_read_tokens, Some(200));
+        assert_eq!(rows[0].cache_write_tokens, Some(100));
+        assert_eq!(rows[0].runtime, "claude");
+        assert_eq!(rows[0].model, "opus-4");
+    }
+
+    #[test]
+    fn record_token_usage_without_cache() {
+        let db = test_db();
+        let usage = TokenUsage {
+            input_tokens: 500,
+            output_tokens: 250,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        };
+        db.record_token_usage("w2", "ws1", "claude", "sonnet-4", &usage)
             .unwrap();
-        assert_eq!(count, 1);
+
+        let rows = db.get_token_usage("w2").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cache_read_tokens, None);
+        assert_eq!(rows[0].cache_write_tokens, None);
     }
 
     // ---- Helpers -----------------------------------------------------------

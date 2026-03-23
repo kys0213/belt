@@ -53,8 +53,8 @@ impl RuntimeResponse {
 pub struct TokenUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
-    pub cache_read_tokens: u64,
-    pub cache_write_tokens: u64,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default)]
