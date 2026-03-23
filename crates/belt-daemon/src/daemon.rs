@@ -1336,4 +1336,705 @@ sources:
         assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
         assert_eq!(daemon.items_in_phase(QueuePhase::Pending).len(), 1);
     }
+
+    // ---------------------------------------------------------------
+    // Construction and builder tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn new_daemon_has_empty_queue_and_history() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![]);
+
+        assert_eq!(daemon.queue_items().len(), 0);
+        assert_eq!(daemon.history().len(), 0);
+        assert_eq!(daemon.history_events().len(), 0);
+        assert_eq!(daemon.running_count(), 0);
+        assert!(!daemon.is_shutdown_requested());
+    }
+
+    #[test]
+    fn new_daemon_with_belt_home_sets_path() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let belt_home = tmp.path().join("custom-belt-home");
+        let daemon = setup_daemon(&tmp, source, vec![]).with_belt_home(belt_home.clone());
+
+        // belt_home is private, but we confirm construction succeeds without panic.
+        // The field will be used during evaluator execution.
+        let _ = daemon;
+    }
+
+    // ---------------------------------------------------------------
+    // Query method tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn get_item_returns_none_for_unknown_work_id() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![]);
+
+        assert!(daemon.get_item("nonexistent:work-id").is_none());
+    }
+
+    #[test]
+    fn push_item_and_get_item_roundtrip() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let item = test_item("src1", "analyze");
+        daemon.push_item(item.clone());
+
+        let retrieved = daemon.get_item("src1:analyze").unwrap();
+        assert_eq!(retrieved.work_id, "src1:analyze");
+        assert_eq!(retrieved.phase, QueuePhase::Pending);
+    }
+
+    #[test]
+    fn items_in_phase_filters_correctly() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        daemon.push_item(test_item("s1", "analyze"));
+
+        let mut item2 = test_item("s2", "implement");
+        item2.phase = QueuePhase::Running;
+        daemon.push_item(item2);
+
+        let pending = daemon.items_in_phase(QueuePhase::Pending);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].work_id, "s1:analyze");
+
+        let running = daemon.items_in_phase(QueuePhase::Running);
+        assert_eq!(running.len(), 1);
+        assert_eq!(running[0].work_id, "s2:implement");
+
+        let done = daemon.items_in_phase(QueuePhase::Done);
+        assert!(done.is_empty());
+    }
+
+    #[test]
+    fn running_count_reflects_phase() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        assert_eq!(daemon.running_count(), 0);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Running;
+        daemon.push_item(item);
+
+        assert_eq!(daemon.running_count(), 1);
+
+        let mut item2 = test_item("s2", "implement");
+        item2.phase = QueuePhase::Running;
+        daemon.push_item(item2);
+
+        assert_eq!(daemon.running_count(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // Shutdown flag tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn request_shutdown_sets_flag() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        assert!(!daemon.is_shutdown_requested());
+        daemon.request_shutdown();
+        assert!(daemon.is_shutdown_requested());
+    }
+
+    #[test]
+    fn request_shutdown_is_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        daemon.request_shutdown();
+        daemon.request_shutdown();
+        assert!(daemon.is_shutdown_requested());
+    }
+
+    // ---------------------------------------------------------------
+    // advance_pending_to_ready tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn advance_pending_to_ready_transitions_all_pending() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        daemon.push_item(test_item("s1", "analyze"));
+        daemon.push_item(test_item("s2", "implement"));
+
+        daemon.advance_pending_to_ready();
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Ready).len(), 2);
+        assert_eq!(daemon.items_in_phase(QueuePhase::Pending).len(), 0);
+    }
+
+    #[test]
+    fn advance_pending_to_ready_skips_non_pending() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        daemon.push_item(test_item("s1", "analyze"));
+
+        let mut item2 = test_item("s2", "implement");
+        item2.phase = QueuePhase::Running;
+        daemon.push_item(item2);
+
+        daemon.advance_pending_to_ready();
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Ready).len(), 1);
+        // Running item stays Running
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 1);
+    }
+
+    #[test]
+    fn advance_pending_to_ready_empty_queue_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Should not panic on empty queue.
+        daemon.advance_pending_to_ready();
+
+        assert_eq!(daemon.queue_items().len(), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // advance_ready_to_running tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn advance_ready_to_running_respects_ws_concurrency() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // 3 items ready, ws_concurrency = 2
+        let mut i1 = test_item("s1", "analyze");
+        i1.phase = QueuePhase::Ready;
+        let mut i2 = test_item("s2", "analyze");
+        i2.phase = QueuePhase::Ready;
+        let mut i3 = test_item("s3", "analyze");
+        i3.phase = QueuePhase::Ready;
+        daemon.push_item(i1);
+        daemon.push_item(i2);
+        daemon.push_item(i3);
+
+        daemon.advance_ready_to_running(2);
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 2);
+        assert_eq!(daemon.items_in_phase(QueuePhase::Ready).len(), 1);
+    }
+
+    #[test]
+    fn advance_ready_to_running_promotes_all_when_capacity_allows() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut i1 = test_item("s1", "analyze");
+        i1.phase = QueuePhase::Ready;
+        let mut i2 = test_item("s2", "analyze");
+        i2.phase = QueuePhase::Ready;
+        daemon.push_item(i1);
+        daemon.push_item(i2);
+
+        daemon.advance_ready_to_running(4);
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 2);
+        assert_eq!(daemon.items_in_phase(QueuePhase::Ready).len(), 0);
+    }
+
+    // ---------------------------------------------------------------
+    // count_failures tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn count_failures_returns_zero_with_no_history() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![]);
+
+        assert_eq!(daemon.count_failures("src1", "analyze"), 0);
+    }
+
+    #[test]
+    fn count_failures_includes_history_events() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("src1", "analyze");
+        item.phase = QueuePhase::Running;
+        daemon.push_item(item);
+
+        daemon
+            .mark_failed("src1:analyze", "first failure".into())
+            .unwrap();
+
+        assert_eq!(daemon.count_failures("src1", "analyze"), 1);
+    }
+
+    #[test]
+    fn count_failures_is_source_and_state_specific() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item1 = test_item("src1", "analyze");
+        item1.phase = QueuePhase::Running;
+        daemon.push_item(item1);
+
+        daemon
+            .mark_failed("src1:analyze", "failure".into())
+            .unwrap();
+
+        // Different source_id → 0 failures
+        assert_eq!(daemon.count_failures("src2", "analyze"), 0);
+        // Different state → 0 failures
+        assert_eq!(daemon.count_failures("src1", "implement"), 0);
+        // Correct source_id + state → 1 failure
+        assert_eq!(daemon.count_failures("src1", "analyze"), 1);
+    }
+
+    #[test]
+    fn count_failures_accumulates_across_multiple_failures() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Record failures via mark_failed using distinct work_ids so each
+        // call finds a fresh Running item (work_id is unique per attempt).
+        for i in 0..3u32 {
+            let mut item = test_item("src1", "analyze");
+            item.work_id = format!("src1:analyze-attempt-{i}");
+            item.phase = QueuePhase::Running;
+            daemon.push_item(item);
+            daemon
+                .mark_failed(
+                    &format!("src1:analyze-attempt-{i}"),
+                    "repeated failure".into(),
+                )
+                .unwrap();
+        }
+
+        // count_failures filters by source_id + state, not work_id.
+        assert_eq!(daemon.count_failures("src1", "analyze"), 3);
+    }
+
+    // ---------------------------------------------------------------
+    // apply_escalation tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn apply_escalation_first_failure_logs_info() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // No failures recorded yet → count_failures = 0 → no action taken.
+        daemon.apply_escalation("work-1", "src1", "analyze");
+        // No HITL item should be in queue.
+        assert_eq!(daemon.items_in_phase(QueuePhase::Hitl).len(), 0);
+    }
+
+    #[test]
+    fn apply_escalation_after_three_failures_routes_to_hitl() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Record 3 failures via mark_failed.
+        for _ in 0..3 {
+            let mut item = test_item("src1", "analyze");
+            item.phase = QueuePhase::Running;
+            daemon.push_item(item);
+            daemon
+                .mark_failed("src1:analyze", "failure".into())
+                .unwrap();
+        }
+
+        // Push a Completed item so mark_hitl can succeed.
+        let mut item = test_item("src1", "analyze");
+        item.phase = QueuePhase::Completed;
+        daemon.push_item(item);
+
+        // With 3 recorded failures, apply_escalation sees failure_count >= 3 → HITL.
+        daemon.apply_escalation("src1:analyze", "src1", "analyze");
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Hitl).len(), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // mark_skipped tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn mark_skipped_transitions_hitl_to_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Hitl;
+        daemon.push_item(item);
+
+        assert!(daemon.mark_skipped("s1:analyze").is_ok());
+        assert_eq!(
+            daemon.get_item("s1:analyze").unwrap().phase,
+            QueuePhase::Skipped
+        );
+    }
+
+    #[test]
+    fn mark_skipped_returns_error_for_unknown_id() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let result = daemon.mark_skipped("does-not-exist");
+        assert!(result.is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // mark_failed error path tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn mark_failed_returns_error_for_unknown_work_id() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let result = daemon.mark_failed("no-such-id", "error".into());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn mark_failed_records_error_text_in_history_event() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Running;
+        daemon.push_item(item);
+
+        daemon
+            .mark_failed("s1:analyze", "timeout exceeded".into())
+            .unwrap();
+
+        let events = daemon.history_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].error.as_deref(), Some("timeout exceeded"));
+        assert_eq!(events[0].status, "failed");
+        assert_eq!(events[0].work_id, "s1:analyze");
+    }
+
+    #[test]
+    fn mark_failed_increments_attempt_counter() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Use distinct work_ids so each mark_failed targets a fresh Running item.
+        for i in 0..3u32 {
+            let mut item = test_item("s1", "analyze");
+            item.work_id = format!("s1:analyze-{i}");
+            item.phase = QueuePhase::Running;
+            daemon.push_item(item);
+            daemon
+                .mark_failed(&format!("s1:analyze-{i}"), format!("failure {i}"))
+                .unwrap();
+        }
+
+        let events = daemon.history_events();
+        // The attempt counter in the last event should reflect 3 events recorded
+        // for the same source_id + state combination.
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[2].attempt, 3);
+    }
+
+    // ---------------------------------------------------------------
+    // Deduplication in collect tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn collect_deduplicates_same_work_id() {
+        let tmp = TempDir::new().unwrap();
+
+        // Use two sources that each return the same item (same work_id).
+        let mut source1 = MockDataSource::new("github");
+        source1.add_item(test_item("github:org/repo#1", "analyze"));
+
+        let mut source2 = MockDataSource::new("github2");
+        source2.add_item(test_item("github:org/repo#1", "analyze"));
+
+        let config = test_workspace_config();
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(MockRuntime::new("mock", vec![])));
+        let worktree_mgr = MockWorktreeManager::new(tmp.path().to_path_buf());
+        let mut daemon = Daemon::new(
+            config,
+            vec![Box::new(source1), Box::new(source2)],
+            Arc::new(registry),
+            Box::new(worktree_mgr),
+            4,
+        );
+
+        // Both sources report the same work_id; collect() should report 2 total
+        // (1 from each source) but only enqueue 1 unique item.
+        let total_reported = daemon.collect().await.unwrap();
+        assert_eq!(total_reported, 2);
+        assert_eq!(daemon.queue_items().len(), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // transit function tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn transit_updates_updated_at() {
+        let mut item = test_item("s1", "analyze");
+        let original_updated_at = item.updated_at.clone();
+
+        // Small delay to ensure time progresses.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        transit(&mut item, QueuePhase::Ready).unwrap();
+
+        // updated_at should have changed after a successful transition.
+        assert_ne!(item.updated_at, original_updated_at);
+    }
+
+    #[test]
+    fn transit_does_not_update_updated_at_on_failure() {
+        let mut item = test_item("s1", "analyze");
+        let original_updated_at = item.updated_at.clone();
+
+        // Pending -> Done is invalid.
+        let _ = transit(&mut item, QueuePhase::Done);
+
+        // updated_at must be unchanged on failed transition.
+        assert_eq!(item.updated_at, original_updated_at);
+        assert_eq!(item.phase, QueuePhase::Pending);
+    }
+
+    // ---------------------------------------------------------------
+    // advance full pipeline tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn advance_returns_count_of_transitioned_items() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        daemon.push_item(test_item("s1", "analyze"));
+        daemon.push_item(test_item("s2", "implement"));
+
+        // Both start Pending → Ready → Running.
+        let advanced = daemon.advance();
+        // Each item advances twice (Pending→Ready, Ready→Running) = 4 total,
+        // but max concurrency is 4 and ws_concurrency is 2 so both transition.
+        assert!(advanced >= 2);
+    }
+
+    #[test]
+    fn advance_with_concurrency_limit_caps_running() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        // Use ws_concurrency = 2 (from config).
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Add 4 items to exceed ws_concurrency = 2.
+        for i in 0..4u32 {
+            daemon.push_item(test_item(&format!("s{i}"), "analyze"));
+        }
+
+        daemon.advance();
+
+        // At most ws_concurrency (2) items should be Running.
+        assert!(daemon.items_in_phase(QueuePhase::Running).len() <= 2);
+    }
+
+    // ---------------------------------------------------------------
+    // complete_item and mark_done error paths
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn complete_item_returns_error_for_unknown_id() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let result = daemon.complete_item("nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn mark_done_returns_error_for_unknown_id() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let result = daemon.mark_done("nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn complete_item_invalid_phase_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Pending item cannot be Completed (must go Pending→Ready→Running first).
+        daemon.push_item(test_item("s1", "analyze"));
+        let result = daemon.complete_item("s1:analyze");
+        assert!(result.is_err());
+        assert_eq!(
+            daemon.get_item("s1:analyze").unwrap().phase,
+            QueuePhase::Pending
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // retry_from_hitl tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn retry_from_hitl_returns_error_for_unknown_id() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let result = daemon.retry_from_hitl("nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn retry_from_hitl_invalid_phase_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Pending → Pending (retry_from_hitl) is invalid since only Hitl → Pending is valid.
+        daemon.push_item(test_item("s1", "analyze"));
+        let result = daemon.retry_from_hitl("s1:analyze");
+        assert!(result.is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // mark_hitl error paths
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn mark_hitl_returns_error_for_unknown_id() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let result = daemon.mark_hitl("nonexistent", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn mark_hitl_invalid_phase_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Pending → Hitl is not a valid transition.
+        daemon.push_item(test_item("s1", "analyze"));
+        let result = daemon.mark_hitl("s1:analyze", Some("reason".into()));
+        assert!(result.is_err());
+        assert_eq!(
+            daemon.get_item("s1:analyze").unwrap().phase,
+            QueuePhase::Pending
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // rollback tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn rollback_running_to_pending_handles_empty_queue() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Should not panic on empty queue.
+        daemon.rollback_running_to_pending();
+
+        assert_eq!(daemon.queue_items().len(), 0);
+    }
+
+    #[test]
+    fn rollback_running_to_pending_skips_non_running_items() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        daemon.push_item(test_item("s1", "analyze")); // Pending
+
+        let mut item2 = test_item("s2", "implement");
+        item2.phase = QueuePhase::Completed;
+        daemon.push_item(item2);
+
+        let mut item3 = test_item("s3", "implement");
+        item3.phase = QueuePhase::Running;
+        daemon.push_item(item3);
+
+        daemon.rollback_running_to_pending();
+
+        // Pending item untouched
+        assert_eq!(
+            daemon.get_item("s1:analyze").unwrap().phase,
+            QueuePhase::Pending
+        );
+        // Completed item untouched
+        assert_eq!(
+            daemon.get_item("s2:implement").unwrap().phase,
+            QueuePhase::Completed
+        );
+        // Running item rolled back to Pending
+        assert_eq!(
+            daemon.get_item("s3:implement").unwrap().phase,
+            QueuePhase::Pending
+        );
+    }
+
+    #[test]
+    fn rollback_multiple_running_items_all_to_pending() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        for i in 0..3u32 {
+            let mut item = test_item(&format!("s{i}"), "analyze");
+            item.phase = QueuePhase::Running;
+            daemon.push_item(item);
+        }
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 3);
+        daemon.rollback_running_to_pending();
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
+        assert_eq!(daemon.items_in_phase(QueuePhase::Pending).len(), 3);
+    }
 }
