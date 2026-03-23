@@ -1,7 +1,13 @@
 use clap::{Parser, Subcommand};
 
+mod claw;
+
 #[derive(Parser)]
-#[command(name = "belt", version, about = "Conveyor belt for autonomous development")]
+#[command(
+    name = "belt",
+    version,
+    about = "Conveyor belt for autonomous development"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -37,6 +43,30 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Run an LLM agent session.
+    Agent {
+        /// Target workspace name.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Non-interactive prompt (for cron/evaluate calls).
+        #[arg(short, long)]
+        prompt: Option<String>,
+    },
+    /// Claw interactive management session.
+    Claw {
+        #[command(subcommand)]
+        command: ClawCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClawCommands {
+    /// Initialize Claw workspace.
+    Init,
+    /// Show/edit classification rules.
+    Rules,
+    /// Open interactive session.
+    Session,
 }
 
 #[derive(Subcommand)]
@@ -83,8 +113,7 @@ enum QueueCommands {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("belt=info".parse()?),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("belt=info".parse()?),
         )
         .init();
 
@@ -135,6 +164,39 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(work_id, "fetching context...");
             // TODO: context retrieval
         }
+        Commands::Agent { workspace, prompt } => {
+            if let Some(name) = &workspace {
+                tracing::info!(name, "running agent for workspace...");
+            }
+            if let Some(p) = &prompt {
+                tracing::info!(p, "executing prompt...");
+            }
+            // TODO: AgentRuntime implementation
+        }
+        Commands::Claw { command } => match command {
+            ClawCommands::Init => {
+                let belt_home = dirs::home_dir()
+                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
+                    .join(".belt");
+                let ws = claw::ClawWorkspace::init(&belt_home)?;
+                tracing::info!(path = %ws.path.display(), "claw workspace initialized");
+            }
+            ClawCommands::Rules => {
+                let belt_home = dirs::home_dir()
+                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
+                    .join(".belt");
+                let ws = claw::ClawWorkspace {
+                    path: belt_home.join("claw-workspace"),
+                };
+                let rules = ws.list_rules()?;
+                for rule in &rules {
+                    println!("{}", rule.display());
+                }
+            }
+            ClawCommands::Session => {
+                tracing::info!("interactive session not yet implemented");
+            }
+        },
     }
 
     Ok(())
