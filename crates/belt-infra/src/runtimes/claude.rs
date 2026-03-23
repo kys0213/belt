@@ -53,17 +53,15 @@ struct ClaudeUsage {
 
 /// stdout JSON에서 token usage를 파싱한다.
 /// 파싱 실패 시 `(None, None, None, raw_stdout)` 반환 (graceful degradation).
-fn parse_claude_json(
-    stdout: &str,
-) -> (Option<TokenUsage>, Option<String>, Option<String>, String) {
+fn parse_claude_json(stdout: &str) -> (Option<TokenUsage>, Option<String>, Option<String>, String) {
     let parsed: Option<ClaudeJsonOutput> = serde_json::from_str(stdout).ok();
     match parsed {
         Some(output) => {
             let token_usage = output.usage.map(|u| TokenUsage {
                 input_tokens: u.input_tokens,
                 output_tokens: u.output_tokens,
-                cache_read_tokens: u.cache_read_input_tokens,
-                cache_write_tokens: u.cache_creation_input_tokens,
+                cache_read_tokens: Some(u.cache_read_input_tokens),
+                cache_write_tokens: Some(u.cache_creation_input_tokens),
             });
             let result_text = output.result.unwrap_or_default();
             (token_usage, output.model, output.session_id, result_text)
@@ -99,8 +97,7 @@ impl AgentRuntime for ClaudeRuntime {
             Ok(output) => {
                 let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                let (token_usage, _model, session_id, result_text) =
-                    parse_claude_json(&raw_stdout);
+                let (token_usage, _model, session_id, result_text) = parse_claude_json(&raw_stdout);
 
                 RuntimeResponse {
                     exit_code: output.status.code().unwrap_or(-1),
@@ -150,8 +147,8 @@ mod tests {
         let usage = usage.unwrap();
         assert_eq!(usage.input_tokens, 100);
         assert_eq!(usage.output_tokens, 50);
-        assert_eq!(usage.cache_read_tokens, 10);
-        assert_eq!(usage.cache_write_tokens, 5);
+        assert_eq!(usage.cache_read_tokens, Some(10));
+        assert_eq!(usage.cache_write_tokens, Some(5));
     }
 
     #[test]
@@ -184,7 +181,7 @@ mod tests {
         let usage = usage.unwrap();
         assert_eq!(usage.input_tokens, 200);
         assert_eq!(usage.output_tokens, 100);
-        assert_eq!(usage.cache_read_tokens, 0);
-        assert_eq!(usage.cache_write_tokens, 0);
+        assert_eq!(usage.cache_read_tokens, Some(0));
+        assert_eq!(usage.cache_write_tokens, Some(0));
     }
 }
