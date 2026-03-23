@@ -8,6 +8,8 @@ use crate::escalation::EscalationPolicy;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     pub name: String,
+    #[serde(default = "default_concurrency")]
+    pub concurrency: u32,
     #[serde(default)]
     pub sources: HashMap<String, SourceConfig>,
     #[serde(default)]
@@ -20,8 +22,6 @@ pub struct SourceConfig {
     pub url: String,
     #[serde(default = "default_scan_interval")]
     pub scan_interval_secs: u64,
-    #[serde(default = "default_concurrency")]
-    pub concurrency: u32,
     #[serde(default)]
     pub states: HashMap<String, StateConfig>,
     #[serde(default)]
@@ -120,7 +120,7 @@ impl WorkspaceRef {
             id: id.to_string(),
             name: config.name.clone(),
             url: source.url.clone(),
-            concurrency: source.concurrency,
+            concurrency: config.concurrency,
         })
     }
 }
@@ -131,11 +131,11 @@ mod tests {
 
     const WORKSPACE_YAML: &str = r#"
 name: auth-project
+concurrency: 2
 sources:
   github:
     url: https://github.com/org/repo
     scan_interval_secs: 300
-    concurrency: 2
     states:
       analyze:
         trigger:
@@ -171,9 +171,9 @@ runtime:
     fn parse_full_workspace_yaml() {
         let config: WorkspaceConfig = serde_yaml::from_str(WORKSPACE_YAML).unwrap();
         assert_eq!(config.name, "auth-project");
+        assert_eq!(config.concurrency, 2);
         let github = config.sources.get("github").unwrap();
         assert_eq!(github.url, "https://github.com/org/repo");
-        assert_eq!(github.concurrency, 2);
     }
 
     #[test]
@@ -193,7 +193,11 @@ runtime:
         let github = config.sources.get("github").unwrap();
         let implement = github.states.get("implement").unwrap();
         match &implement.handlers[0] {
-            HandlerConfig::Prompt { prompt, runtime, model } => {
+            HandlerConfig::Prompt {
+                prompt,
+                runtime,
+                model,
+            } => {
                 assert!(prompt.contains("구현"));
                 assert_eq!(runtime.as_deref(), Some("claude"));
                 assert_eq!(model.as_deref(), Some("sonnet"));
@@ -206,9 +210,9 @@ runtime:
     fn defaults() {
         let yaml = "name: minimal\nsources:\n  github:\n    url: https://github.com/org/repo\n";
         let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(config.concurrency, 1);
         let github = config.sources.get("github").unwrap();
         assert_eq!(github.scan_interval_secs, 300);
-        assert_eq!(github.concurrency, 1);
         assert_eq!(config.runtime.default, "claude");
     }
 

@@ -87,13 +87,7 @@ impl Daemon {
         }
 
         let ws_id = &self.config.name;
-        let ws_concurrency = self
-            .config
-            .sources
-            .values()
-            .next()
-            .map(|s| s.concurrency)
-            .unwrap_or(1);
+        let ws_concurrency = self.config.concurrency;
 
         for item in self.queue.iter_mut() {
             if item.phase == QueuePhase::Ready
@@ -161,7 +155,25 @@ impl Daemon {
         // on_enter
         let on_enter: Vec<Action> = state_config.on_enter.iter().map(Action::from).collect();
         if let Err(e) = self.executor.execute_all(&on_enter, &env).await {
-            tracing::warn!("on_enter failed for {}: {e}", item.work_id);
+            // 1. Record failure
+            self.record_history(item, "failed", Some(&e.to_string()));
+            // 2. Count failures and resolve escalation
+            let failure_count = self.count_failures(&item.source_id, &item.state);
+            let escalation = self.resolve_escalation(&item.state, failure_count);
+            // 3. Run on_fail if needed
+            if escalation.should_run_on_fail() {
+                let on_fail: Vec<Action> = state_config.on_fail.iter().map(Action::from).collect();
+                let _ = self.executor.execute_all(&on_fail, &env).await;
+            }
+            // 4. Apply escalation (retry/hitl/skip)
+            self.handle_escalation(item, escalation);
+            self.tracker.release(&self.config.name.clone());
+
+            return ItemOutcome::Failed {
+                item: item.clone(),
+                error: format!("on_enter failed: {e}"),
+                escalation,
+            };
         }
 
         // handler chain
@@ -176,7 +188,8 @@ impl Daemon {
                 self.record_history(item, "failed", Some(&r.stderr));
 
                 if escalation.should_run_on_fail() {
-                    let on_fail: Vec<Action> = state_config.on_fail.iter().map(Action::from).collect();
+                    let on_fail: Vec<Action> =
+                        state_config.on_fail.iter().map(Action::from).collect();
                     let _ = self.executor.execute_all(&on_fail, &env).await;
                 }
 
@@ -224,12 +237,18 @@ impl Daemon {
         if state_config.on_done.is_empty() {
             item.phase = QueuePhase::Done;
             self.record_history(item, "done", None);
-            let worktree = self.worktree_mgr.create_or_reuse(&self.config.name, &item.source_id).await?;
+            let worktree = self
+                .worktree_mgr
+                .create_or_reuse(&self.config.name, &item.source_id)
+                .await?;
             let _ = self.worktree_mgr.cleanup(&worktree).await;
             return Ok(true);
         }
 
-        let worktree = self.worktree_mgr.create_or_reuse(&self.config.name, &item.source_id).await?;
+        let worktree = self
+            .worktree_mgr
+            .create_or_reuse(&self.config.name, &item.source_id)
+            .await?;
         let env = ActionEnv::new(&item.work_id, &worktree);
         let on_done: Vec<Action> = state_config.on_done.iter().map(Action::from).collect();
         let result = self.executor.execute_all(&on_done, &env).await?;
@@ -265,8 +284,17 @@ impl Daemon {
         for outcome in &outcomes {
             match outcome {
                 ItemOutcome::Completed(item) => tracing::info!("completed: {}", item.work_id),
-                ItemOutcome::Failed { item, error, escalation } => {
-                    tracing::warn!("failed: {} (escalation={:?}, error={})", item.work_id, escalation, error);
+                ItemOutcome::Failed {
+                    item,
+                    error,
+                    escalation,
+                } => {
+                    tracing::warn!(
+                        "failed: {} (escalation={:?}, error={})",
+                        item.work_id,
+                        escalation,
+                        error
+                    );
                 }
                 ItemOutcome::Skipped(item) => tracing::info!("skipped: {}", item.work_id),
             }
@@ -363,10 +391,17 @@ impl Daemon {
     }
 
     fn record_history(&mut self, item: &QueueItem, status: &str, error: Option<&str>) {
-        let attempt = self.history.iter().filter(|h| h.state == item.state).count() as u32 + 1;
+        let attempt = self
+            .history
+            .iter()
+            .filter(|h| h.state == item.state)
+            .count() as u32
+            + 1;
         self.history.push(HistoryEntry {
             state: item.state.clone(),
-            status: status.parse().unwrap_or(belt_core::context::HistoryStatus::Failed),
+            status: status
+                .parse()
+                .unwrap_or(belt_core::context::HistoryStatus::Failed),
             attempt,
             summary: None,
             error: error.map(|s| s.to_string()),
@@ -405,10 +440,10 @@ mod tests {
     fn test_workspace_config() -> WorkspaceConfig {
         let yaml = r#"
 name: test-ws
+concurrency: 2
 sources:
   github:
     url: https://github.com/org/repo
-    concurrency: 2
     states:
       analyze:
         trigger:
