@@ -249,26 +249,48 @@ impl Daemon {
 
         // on_enter
         let on_enter: Vec<Action> = state_config.on_enter.iter().map(Action::from).collect();
-        if let Err(e) = self.executor.execute_all(&on_enter, &env).await {
-            // 1. Record failure
-            self.record_history(item, "failed", Some(&e.to_string()));
-            // 2. Count failures and resolve escalation
-            let failure_count = self.count_failures(&item.source_id, &item.state);
-            let escalation = self.resolve_escalation(&item.state, failure_count);
-            // 3. Run on_fail if needed
-            if escalation.should_run_on_fail() {
-                let on_fail: Vec<Action> = state_config.on_fail.iter().map(Action::from).collect();
-                let _ = self.executor.execute_all(&on_fail, &env).await;
-            }
-            // 4. Apply escalation (retry/hitl/skip)
-            self.handle_escalation(item, escalation);
-            self.tracker.release(&self.config.name.clone());
+        match self.executor.execute_all(&on_enter, &env).await {
+            Ok(Some(r)) if !r.success() => {
+                // 비정상 exit code → escalation 적용
+                self.record_history(item, "failed", Some(&r.stderr));
+                let failure_count = self.count_failures(&item.source_id, &item.state);
+                let escalation = self.resolve_escalation(&item.state, failure_count);
+                if escalation.should_run_on_fail() {
+                    let on_fail: Vec<Action> =
+                        state_config.on_fail.iter().map(Action::from).collect();
+                    let _ = self.executor.execute_all(&on_fail, &env).await;
+                }
+                self.handle_escalation(item, escalation);
+                self.tracker.release(&self.config.name.clone());
 
-            return ItemOutcome::Failed {
-                item: item.clone(),
-                error: format!("on_enter failed: {e}"),
-                escalation,
-            };
+                return ItemOutcome::Failed {
+                    item: item.clone(),
+                    error: format!("on_enter failed with exit code {}", r.exit_code),
+                    escalation,
+                };
+            }
+            Err(e) => {
+                // 실행 자체가 실패한 경우
+                self.record_history(item, "failed", Some(&e.to_string()));
+                let failure_count = self.count_failures(&item.source_id, &item.state);
+                let escalation = self.resolve_escalation(&item.state, failure_count);
+                if escalation.should_run_on_fail() {
+                    let on_fail: Vec<Action> =
+                        state_config.on_fail.iter().map(Action::from).collect();
+                    let _ = self.executor.execute_all(&on_fail, &env).await;
+                }
+                self.handle_escalation(item, escalation);
+                self.tracker.release(&self.config.name.clone());
+
+                return ItemOutcome::Failed {
+                    item: item.clone(),
+                    error: format!("on_enter failed: {e}"),
+                    escalation,
+                };
+            }
+            _ => {
+                // 성공 → handler 진행
+            }
         }
 
         // handler chain
