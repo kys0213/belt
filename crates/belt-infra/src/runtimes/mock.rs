@@ -3,13 +3,17 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use belt_core::runtime::{AgentRuntime, RuntimeCapabilities, RuntimeRequest, RuntimeResponse};
+use belt_core::runtime::{
+    AgentRuntime, RuntimeCapabilities, RuntimeRequest, RuntimeResponse, TokenUsage,
+};
 
 /// 테스트용 MockRuntime.
 pub struct MockRuntime {
     rt_name: String,
     exit_codes: Mutex<Vec<i32>>,
     calls: Mutex<Vec<String>>,
+    /// Per-invocation token usage. If empty, no token usage is reported.
+    token_usages: Mutex<Vec<TokenUsage>>,
 }
 
 impl MockRuntime {
@@ -18,11 +22,18 @@ impl MockRuntime {
             rt_name: name.to_string(),
             exit_codes: Mutex::new(exit_codes),
             calls: Mutex::new(Vec::new()),
+            token_usages: Mutex::new(Vec::new()),
         }
     }
 
     pub fn always_ok(name: &str) -> Self {
         Self::new(name, vec![])
+    }
+
+    /// Configure per-invocation token usage responses.
+    pub fn with_token_usages(self, usages: Vec<TokenUsage>) -> Self {
+        *self.token_usages.lock().unwrap() = usages;
+        self
     }
 
     pub fn calls(&self) -> Vec<String> {
@@ -44,12 +55,21 @@ impl AgentRuntime for MockRuntime {
             if codes.is_empty() { 0 } else { codes.remove(0) }
         };
 
+        let token_usage = {
+            let mut usages = self.token_usages.lock().unwrap();
+            if usages.is_empty() {
+                None
+            } else {
+                Some(usages.remove(0))
+            }
+        };
+
         RuntimeResponse {
             exit_code,
             stdout: format!("mock response for: {}", request.prompt),
             stderr: String::new(),
             duration: Duration::from_millis(100),
-            token_usage: None,
+            token_usage,
             session_id: None,
         }
     }
