@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use belt_core::action::Action;
-use belt_core::runtime::{RuntimeRegistry, RuntimeRequest};
+use belt_core::runtime::{RuntimeRegistry, RuntimeRequest, TokenUsage};
 
 /// Action 실행 결과.
 #[derive(Debug, Clone)]
@@ -15,6 +15,12 @@ pub struct ActionResult {
     pub stdout: String,
     pub stderr: String,
     pub duration: std::time::Duration,
+    /// Token usage reported by the runtime, if available.
+    pub token_usage: Option<TokenUsage>,
+    /// Name of the runtime that produced this result, if it was a prompt action.
+    pub runtime_name: Option<String>,
+    /// Model used for the prompt action, if available.
+    pub model: Option<String>,
 }
 
 impl ActionResult {
@@ -51,8 +57,13 @@ impl ActionExecutor {
 
     pub async fn execute_one(&self, action: &Action, env: &ActionEnv) -> Result<ActionResult> {
         match action {
-            Action::Prompt { text, runtime, model } => {
-                self.execute_prompt(text, runtime.as_deref(), model.clone(), env).await
+            Action::Prompt {
+                text,
+                runtime,
+                model,
+            } => {
+                self.execute_prompt(text, runtime.as_deref(), model.clone(), env)
+                    .await
             }
             Action::Script { command } => self.execute_script(command, env).await,
         }
@@ -74,7 +85,7 @@ impl ActionExecutor {
         let request = RuntimeRequest {
             working_dir: env.worktree.clone(),
             prompt: text.to_string(),
-            model,
+            model: model.clone(),
             system_prompt: None,
             session_id: None,
         };
@@ -85,6 +96,9 @@ impl ActionExecutor {
             stdout: response.stdout,
             stderr: response.stderr,
             duration: response.duration,
+            token_usage: response.token_usage,
+            runtime_name: Some(name.to_string()),
+            model,
         })
     }
 
@@ -108,6 +122,9 @@ impl ActionExecutor {
                 stdout: String::from_utf8_lossy(&output.stdout).to_string(),
                 stderr: String::from_utf8_lossy(&output.stderr).to_string(),
                 duration,
+                token_usage: None,
+                runtime_name: None,
+                model: None,
             }),
             Err(e) => bail!("script execution failed: {e}"),
         }
