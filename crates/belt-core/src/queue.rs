@@ -1,6 +1,30 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::phase::QueuePhase;
+
+/// A history event recorded whenever a noteworthy phase transition or failure occurs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEvent {
+    /// The work_id of the queue item.
+    pub work_id: String,
+    /// The source_id of the queue item.
+    pub source_id: String,
+    /// The workflow state.
+    pub state: String,
+    /// Status string (e.g. "failed", "completed").
+    pub status: String,
+    /// Attempt number.
+    pub attempt: u32,
+    /// Optional summary.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// Optional error message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// When this event was recorded.
+    pub created_at: DateTime<Utc>,
+}
 
 /// 큐 아이템 — 컨베이어 벨트 위의 단일 작업 단위.
 #[derive(Debug, Clone, Serialize, Deserialize)]

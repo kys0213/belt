@@ -2,12 +2,14 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use anyhow::Result;
+use chrono::Utc;
 
 use belt_core::action::Action;
 use belt_core::context::HistoryEntry;
+use belt_core::error::BeltError;
 use belt_core::escalation::EscalationAction;
 use belt_core::phase::QueuePhase;
-use belt_core::queue::QueueItem;
+use belt_core::queue::{HistoryEvent, QueueItem};
 use belt_core::runtime::RuntimeRegistry;
 use belt_core::source::DataSource;
 use belt_core::state_machine;
@@ -18,7 +20,23 @@ use belt_infra::worktree::WorktreeManager;
 use crate::concurrency::ConcurrencyTracker;
 use crate::executor::{ActionEnv, ActionExecutor};
 
-/// Daemon — 상태 머신 + yaml prompt/script 실행기.
+/// Safely transition a [`QueueItem`] to a new phase.
+///
+/// All phase mutations **must** go through this function so that
+/// [`QueuePhase::can_transition_to`] is always checked.
+fn transit(item: &mut QueueItem, to: QueuePhase) -> Result<(), BeltError> {
+    if !item.phase.can_transition_to(&to) {
+        return Err(BeltError::InvalidTransition {
+            from: item.phase,
+            to,
+        });
+    }
+    item.phase = to;
+    item.updated_at = Utc::now().to_rfc3339();
+    Ok(())
+}
+
+/// Daemon -- state machine + yaml prompt/script executor.
 pub struct Daemon {
     config: WorkspaceConfig,
     sources: Vec<Box<dyn DataSource>>,
@@ -28,6 +46,8 @@ pub struct Daemon {
     queue: VecDeque<QueueItem>,
     history: Vec<HistoryEntry>,
     db: Option<Database>,
+    /// History events with full lineage information for failure tracking.
+    history_events: Vec<HistoryEvent>,
 }
 
 #[derive(Debug)]
@@ -58,6 +78,7 @@ impl Daemon {
             queue: VecDeque::new(),
             history: Vec::new(),
             db: None,
+            history_events: Vec::new(),
         }
     }
 
@@ -67,7 +88,11 @@ impl Daemon {
         self
     }
 
-    /// 1단계: DataSource에서 새 아이템을 수집하여 Pending 큐에 추가.
+    // ---------------------------------------------------------------
+    // Phase 1: Collect items from DataSources
+    // ---------------------------------------------------------------
+
+    /// Collect new items from all DataSources and add them to the Pending queue.
     pub async fn collect(&mut self) -> Result<usize> {
         let mut total = 0;
         for source in &mut self.sources {
@@ -82,28 +107,34 @@ impl Daemon {
         Ok(total)
     }
 
-    /// 2단계: Pending → Ready → Running 자동 전이.
+    // ---------------------------------------------------------------
+    // Phase 2: Advance queue items through the state machine
+    // ---------------------------------------------------------------
+
+    /// Auto-transition Pending -> Ready -> Running (respecting concurrency).
     pub fn advance(&mut self) -> usize {
         let mut advanced = 0;
 
+        // Pending -> Ready (uses safe transit)
         for item in self.queue.iter_mut() {
             if item.phase == QueuePhase::Pending
                 && state_machine::transit(QueuePhase::Pending, QueuePhase::Ready).is_ok()
+                && transit(item, QueuePhase::Ready).is_ok()
             {
-                item.phase = QueuePhase::Ready;
                 advanced += 1;
             }
         }
 
+        // Ready -> Running (respecting concurrency)
         let ws_id = &self.config.name;
         let ws_concurrency = self.config.concurrency;
 
         for item in self.queue.iter_mut() {
             if item.phase == QueuePhase::Ready
-                && self.tracker.can_spawn_in_workspace(ws_id, ws_concurrency)
+                && self.tracker.can_spawn_in_workspace(&ws_id, ws_concurrency)
+                && transit(item, QueuePhase::Running).is_ok()
             {
-                item.phase = QueuePhase::Running;
-                self.tracker.track(ws_id);
+                self.tracker.track(&ws_id);
                 advanced += 1;
             }
         }
@@ -111,7 +142,62 @@ impl Daemon {
         advanced
     }
 
-    /// 3단계: Running 아이템의 handler를 실행.
+    /// Advance Pending items to Ready.
+    pub fn advance_pending_to_ready(&mut self) {
+        for item in self.queue.iter_mut() {
+            if item.phase == QueuePhase::Pending {
+                let _ = transit(item, QueuePhase::Ready);
+            }
+        }
+    }
+
+    /// Advance Ready items to Running, respecting both per-workspace and global concurrency.
+    pub fn advance_ready_to_running(&mut self, ws_concurrency: usize) {
+        let ws_counts: std::collections::HashMap<String, usize> = {
+            let mut m = std::collections::HashMap::new();
+            for item in self.queue.iter() {
+                if item.phase == QueuePhase::Running {
+                    *m.entry(item.workspace_id.clone()).or_insert(0) += 1;
+                }
+            }
+            m
+        };
+
+        let ready_indices: Vec<usize> = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| it.phase == QueuePhase::Ready)
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut ws_started: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+
+        for idx in ready_indices {
+            let ws = self.queue[idx].workspace_id.clone();
+            let already_running = ws_counts.get(&ws).copied().unwrap_or(0)
+                + ws_started.get(&ws).copied().unwrap_or(0);
+            if already_running >= ws_concurrency {
+                continue;
+            }
+
+            if !self.tracker.can_spawn() {
+                break;
+            }
+
+            if transit(&mut self.queue[idx], QueuePhase::Running).is_ok() {
+                self.tracker.track(&ws);
+                *ws_started.entry(ws).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 3: Execute running items
+    // ---------------------------------------------------------------
+
+    /// Execute handlers for all Running items.
     pub async fn execute_running(&mut self) -> Vec<ItemOutcome> {
         let mut outcomes = Vec::new();
 
@@ -197,6 +283,7 @@ impl Daemon {
                 let escalation = self.resolve_escalation(&item.state, failure_count + 1);
 
                 self.record_history(item, "failed", Some(&r.stderr));
+                self.record_history_event(item, "failed", Some(r.stderr.clone()));
 
                 if escalation.should_run_on_fail() {
                     let on_fail: Vec<Action> =
@@ -216,14 +303,14 @@ impl Daemon {
             Ok(Some(r)) => {
                 self.try_record_token_usage(item, &r);
 
-                item.phase = QueuePhase::Completed;
+                let _ = transit(item, QueuePhase::Completed);
                 self.record_history(item, "completed", None);
                 self.tracker.release(&self.config.name.clone());
                 self.queue.push_back(item.clone());
                 ItemOutcome::Completed(item.clone())
             }
             Ok(None) => {
-                item.phase = QueuePhase::Completed;
+                let _ = transit(item, QueuePhase::Completed);
                 self.record_history(item, "completed", None);
                 self.tracker.release(&self.config.name.clone());
                 self.queue.push_back(item.clone());
@@ -232,6 +319,7 @@ impl Daemon {
             Err(e) => {
                 item.phase = QueuePhase::Failed;
                 self.record_history(item, "failed", Some(&e.to_string()));
+                self.record_history_event(item, "failed", Some(e.to_string()));
                 self.tracker.release(&self.config.name.clone());
 
                 ItemOutcome::Failed {
@@ -243,25 +331,139 @@ impl Daemon {
         }
     }
 
-    /// on_done script 실행. 성공 시 Done, 실패 시 Failed.
+    // ---------------------------------------------------------------
+    // Safe state transition methods
+    // ---------------------------------------------------------------
+
+    /// Mark a Running item as Completed.
+    pub fn complete_item(&mut self, work_id: &str) -> Result<(), BeltError> {
+        let item = self
+            .queue
+            .iter_mut()
+            .find(|it| it.work_id == work_id)
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+        transit(item, QueuePhase::Completed)
+    }
+
+    /// Mark a Completed item as Done.
+    pub fn mark_done(&mut self, work_id: &str) -> Result<(), BeltError> {
+        let item = self
+            .queue
+            .iter_mut()
+            .find(|it| it.work_id == work_id)
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+        transit(item, QueuePhase::Done)
+    }
+
+    /// Mark a Completed item as Hitl (human-in-the-loop).
+    pub fn mark_hitl(&mut self, work_id: &str, _reason: Option<String>) -> Result<(), BeltError> {
+        let item = self
+            .queue
+            .iter_mut()
+            .find(|it| it.work_id == work_id)
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+        transit(item, QueuePhase::Hitl)
+    }
+
+    /// Mark a Hitl item as Skipped.
+    pub fn mark_skipped(&mut self, work_id: &str) -> Result<(), BeltError> {
+        let item = self
+            .queue
+            .iter_mut()
+            .find(|it| it.work_id == work_id)
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+        transit(item, QueuePhase::Skipped)
+    }
+
+    /// Retry a Hitl item by sending it back to Pending.
+    pub fn retry_from_hitl(&mut self, work_id: &str) -> Result<(), BeltError> {
+        let item = self
+            .queue
+            .iter_mut()
+            .find(|it| it.work_id == work_id)
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+        transit(item, QueuePhase::Pending)
+    }
+
+    /// Mark a Running item as Failed and record a HistoryEvent.
+    pub fn mark_failed(&mut self, work_id: &str, error: String) -> Result<(), BeltError> {
+        let item = self
+            .queue
+            .iter_mut()
+            .find(|it| it.work_id == work_id)
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+
+        let source_id = item.source_id.clone();
+        let state = item.state.clone();
+
+        transit(item, QueuePhase::Failed)?;
+
+        let attempt = self.count_failures(&source_id, &state) + 1;
+
+        self.history_events.push(HistoryEvent {
+            work_id: work_id.to_string(),
+            source_id,
+            state,
+            status: "failed".to_string(),
+            attempt,
+            summary: None,
+            error: Some(error),
+            created_at: Utc::now(),
+        });
+
+        Ok(())
+    }
+
+    /// Apply escalation logic based on accumulated failure count.
+    pub fn apply_escalation(&mut self, work_id: &str, source_id: &str, state: &str) {
+        let failure_count = self.count_failures(source_id, state);
+
+        match failure_count {
+            0 => {}
+            1 => {
+                tracing::info!(work_id, source_id, state, "first failure recorded");
+            }
+            2 => {
+                tracing::warn!(work_id, source_id, state, "second failure recorded");
+            }
+            _ => {
+                tracing::error!(
+                    work_id,
+                    source_id,
+                    state,
+                    failure_count,
+                    "escalating to HITL after repeated failures"
+                );
+                let _ = self.mark_hitl(work_id, Some("escalation: repeated failures".to_string()));
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // on_done / tick / run (async execution loop)
+    // ---------------------------------------------------------------
+
+    /// Execute on_done scripts. Transition to Done on success, Failed on failure.
     pub async fn execute_on_done(&mut self, item: &mut QueueItem) -> Result<bool> {
         let state_config = self.find_state_config(&item.state).cloned();
         let state_config = match state_config {
             Some(cfg) => cfg,
             None => {
-                item.phase = QueuePhase::Done;
+                let _ = transit(item, QueuePhase::Done);
                 return Ok(true);
             }
         };
 
         if state_config.on_done.is_empty() {
-            item.phase = QueuePhase::Done;
+            let _ = transit(item, QueuePhase::Done);
             self.record_history(item, "done", None);
             let worktree = self
                 .worktree_mgr
                 .create_or_reuse(&self.config.name, &item.source_id)
-                .await?;
-            let _ = self.worktree_mgr.cleanup(&worktree).await;
+                .await;
+            if let Ok(ref wt) = worktree {
+                let _ = self.worktree_mgr.cleanup(wt).await;
+            }
             return Ok(true);
         }
 
@@ -275,12 +477,12 @@ impl Daemon {
 
         match result {
             Some(r) if !r.success() => {
-                item.phase = QueuePhase::Failed;
+                let _ = transit(item, QueuePhase::Failed);
                 self.record_history(item, "failed", Some("on_done script failed"));
                 Ok(false)
             }
             _ => {
-                item.phase = QueuePhase::Done;
+                let _ = transit(item, QueuePhase::Done);
                 self.record_history(item, "done", None);
                 let _ = self.worktree_mgr.cleanup(&worktree).await;
                 Ok(true)
@@ -288,7 +490,7 @@ impl Daemon {
         }
     }
 
-    /// Daemon tick: collect → advance → execute → on_done.
+    /// Daemon tick: collect -> advance -> execute -> on_done.
     pub async fn tick(&mut self) -> Result<()> {
         let collected = self.collect().await?;
         if collected > 0 {
@@ -340,7 +542,7 @@ impl Daemon {
         Ok(())
     }
 
-    /// tokio::select! 기반 async event loop.
+    /// tokio::select! based async event loop.
     pub async fn run(&mut self, tick_interval_secs: u64) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs));
         tracing::info!("belt daemon started (tick={}s)", tick_interval_secs);
@@ -362,7 +564,9 @@ impl Daemon {
         tracing::info!("belt daemon stopped");
     }
 
-    // --- helpers ---
+    // ---------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------
 
     fn find_state_config(&self, state: &str) -> Option<&StateConfig> {
         for source in self.config.sources.values() {
@@ -373,11 +577,21 @@ impl Daemon {
         None
     }
 
-    fn count_failures(&self, _source_id: &str, state: &str) -> u32 {
-        self.history
+    /// Count failures for a given source_id **and** state.
+    pub fn count_failures(&self, source_id: &str, state: &str) -> u32 {
+        let from_entries = self
+            .history
             .iter()
             .filter(|h| h.state == state && h.status == belt_core::context::HistoryStatus::Failed)
-            .count() as u32
+            .count() as u32;
+
+        let from_events = self
+            .history_events
+            .iter()
+            .filter(|h| h.source_id == source_id && h.state == state && h.status == "failed")
+            .count() as u32;
+
+        from_entries + from_events
     }
 
     fn resolve_escalation(&self, _state: &str, failure_count: u32) -> EscalationAction {
@@ -454,22 +668,65 @@ impl Daemon {
         });
     }
 
-    // --- queries ---
+    fn record_history_event(&mut self, item: &QueueItem, status: &str, error: Option<String>) {
+        let attempt = self
+            .history_events
+            .iter()
+            .filter(|h| h.source_id == item.source_id && h.state == item.state)
+            .count() as u32
+            + 1;
+        self.history_events.push(HistoryEvent {
+            work_id: item.work_id.clone(),
+            source_id: item.source_id.clone(),
+            state: item.state.clone(),
+            status: status.to_string(),
+            attempt,
+            summary: None,
+            error,
+            created_at: Utc::now(),
+        });
+    }
 
+    // ---------------------------------------------------------------
+    // Queries
+    // ---------------------------------------------------------------
+
+    /// Get all queue items.
     pub fn queue_items(&self) -> &VecDeque<QueueItem> {
         &self.queue
     }
 
+    /// Get items in a specific phase.
     pub fn items_in_phase(&self, phase: QueuePhase) -> Vec<&QueueItem> {
         self.queue.iter().filter(|i| i.phase == phase).collect()
     }
 
+    /// Get HistoryEntry records.
     pub fn history(&self) -> &[HistoryEntry] {
         &self.history
     }
 
+    /// Get HistoryEvent records (with full lineage info).
+    pub fn history_events(&self) -> &[HistoryEvent] {
+        &self.history_events
+    }
+
+    /// Push an item onto the queue.
     pub fn push_item(&mut self, item: QueueItem) {
         self.queue.push_back(item);
+    }
+
+    /// Look up a queue item by work_id.
+    pub fn get_item(&self, work_id: &str) -> Option<&QueueItem> {
+        self.queue.iter().find(|it| it.work_id == work_id)
+    }
+
+    /// Return the number of items currently in Running phase.
+    pub fn running_count(&self) -> usize {
+        self.queue
+            .iter()
+            .filter(|it| it.phase == QueuePhase::Running)
+            .count()
     }
 }
 
@@ -529,6 +786,116 @@ sources:
             4,
         )
     }
+
+    // --- Safe state transition tests ---
+
+    #[test]
+    fn transit_success() {
+        let mut item = test_item("s1", "analyze");
+        assert!(transit(&mut item, QueuePhase::Ready).is_ok());
+        assert_eq!(item.phase, QueuePhase::Ready);
+    }
+
+    #[test]
+    fn transit_failure() {
+        let mut item = test_item("s1", "analyze");
+        // Pending -> Completed is not allowed.
+        let err = transit(&mut item, QueuePhase::Completed);
+        assert!(err.is_err());
+        assert_eq!(item.phase, QueuePhase::Pending);
+    }
+
+    #[test]
+    fn complete_and_mark_done_happy_path() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Running;
+        item.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(item);
+
+        assert!(daemon.complete_item("s1:analyze").is_ok());
+        assert_eq!(
+            daemon.get_item("s1:analyze").unwrap().phase,
+            QueuePhase::Completed
+        );
+
+        assert!(daemon.mark_done("s1:analyze").is_ok());
+        assert_eq!(
+            daemon.get_item("s1:analyze").unwrap().phase,
+            QueuePhase::Done
+        );
+    }
+
+    #[test]
+    fn complete_to_hitl_and_retry() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Running;
+        item.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(item);
+
+        daemon.complete_item("s1:analyze").unwrap();
+
+        assert!(
+            daemon
+                .mark_hitl("s1:analyze", Some("needs review".into()))
+                .is_ok()
+        );
+        assert_eq!(
+            daemon.get_item("s1:analyze").unwrap().phase,
+            QueuePhase::Hitl
+        );
+
+        assert!(daemon.retry_from_hitl("s1:analyze").is_ok());
+        assert_eq!(
+            daemon.get_item("s1:analyze").unwrap().phase,
+            QueuePhase::Pending
+        );
+    }
+
+    #[test]
+    fn mark_failed_records_history() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Running;
+        item.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(item);
+
+        assert!(daemon.mark_failed("s1:analyze", "timeout".into()).is_ok());
+        assert_eq!(
+            daemon.get_item("s1:analyze").unwrap().phase,
+            QueuePhase::Failed
+        );
+        assert_eq!(daemon.history_events().len(), 1);
+    }
+
+    #[test]
+    fn invalid_transition_returns_error() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        daemon.push_item(test_item("s1", "analyze"));
+
+        // Pending -> Done is not a valid transition.
+        let result = daemon.mark_done("s1:analyze");
+        assert!(result.is_err());
+        assert_eq!(
+            daemon.get_item("s1:analyze").unwrap().phase,
+            QueuePhase::Pending
+        );
+    }
+
+    // --- Async execution tests ---
 
     #[tokio::test]
     async fn collect_adds_to_queue() {

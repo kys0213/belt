@@ -56,7 +56,10 @@ mod tests {
     async fn create_and_cleanup() {
         let tmp = TempDir::new().unwrap();
         let mgr = MockWorktreeManager::new(tmp.path());
-        let path = mgr.create_or_reuse("auth-project", "github:org/repo#42").await.unwrap();
+        let path = mgr
+            .create_or_reuse("auth-project", "github:org/repo#42")
+            .await
+            .unwrap();
         assert!(path.exists());
         mgr.cleanup(&path).await.unwrap();
         assert!(!path.exists());
@@ -66,9 +69,15 @@ mod tests {
     async fn reuse_existing() {
         let tmp = TempDir::new().unwrap();
         let mgr = MockWorktreeManager::new(tmp.path());
-        let path1 = mgr.create_or_reuse("ws", "github:org/repo#42").await.unwrap();
+        let path1 = mgr
+            .create_or_reuse("ws", "github:org/repo#42")
+            .await
+            .unwrap();
         std::fs::write(path1.join("work.txt"), "previous work").unwrap();
-        let path2 = mgr.create_or_reuse("ws", "github:org/repo#42").await.unwrap();
+        let path2 = mgr
+            .create_or_reuse("ws", "github:org/repo#42")
+            .await
+            .unwrap();
         assert_eq!(path1, path2);
         assert!(path2.join("work.txt").exists());
     }
@@ -77,8 +86,14 @@ mod tests {
     async fn different_source_ids_get_different_paths() {
         let tmp = TempDir::new().unwrap();
         let mgr = MockWorktreeManager::new(tmp.path());
-        let p1 = mgr.create_or_reuse("ws", "github:org/repo#1").await.unwrap();
-        let p2 = mgr.create_or_reuse("ws", "github:org/repo#2").await.unwrap();
+        let p1 = mgr
+            .create_or_reuse("ws", "github:org/repo#1")
+            .await
+            .unwrap();
+        let p2 = mgr
+            .create_or_reuse("ws", "github:org/repo#2")
+            .await
+            .unwrap();
         assert_ne!(p1, p2);
     }
 }

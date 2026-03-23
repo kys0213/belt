@@ -42,7 +42,10 @@ impl ConcurrencyTracker {
     }
 
     pub fn track(&mut self, workspace_id: &str) {
-        *self.per_workspace.entry(workspace_id.to_string()).or_insert(0) += 1;
+        *self
+            .per_workspace
+            .entry(workspace_id.to_string())
+            .or_insert(0) += 1;
         self.total += 1;
     }
 

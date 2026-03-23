@@ -3,9 +3,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use belt_core::runtime::{
-    AgentRuntime, RuntimeCapabilities, RuntimeRequest, RuntimeResponse,
-};
+use belt_core::runtime::{AgentRuntime, RuntimeCapabilities, RuntimeRequest, RuntimeResponse};
 
 /// 테스트용 MockRuntime.
 pub struct MockRuntime {

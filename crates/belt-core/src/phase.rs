@@ -41,6 +41,11 @@ impl QueuePhase {
     pub fn needs_human(&self) -> bool {
         matches!(self, QueuePhase::Hitl | QueuePhase::Failed)
     }
+
+    /// Returns `true` if transitioning from `self` to `to` is valid.
+    pub fn can_transition_to(&self, to: &QueuePhase) -> bool {
+        crate::state_machine::is_valid_transition(*self, *to)
+    }
 }
 
 impl std::str::FromStr for QueuePhase {
