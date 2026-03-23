@@ -9,8 +9,21 @@ use serde::{Deserialize, Serialize};
 
 use belt_core::error::BeltError;
 use belt_core::phase::QueuePhase;
-use belt_core::queue::{HistoryEvent, QueueItem};
+use belt_core::queue::QueueItem;
 use belt_core::runtime::TokenUsage;
+
+/// History event for database persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HistoryEvent {
+    pub work_id: String,
+    pub source_id: String,
+    pub state: String,
+    pub status: String,
+    pub attempt: u32,
+    pub summary: Option<String>,
+    pub error: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
 
 /// A scheduled cron job definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,12 +144,12 @@ impl Database {
                 params![
                     item.work_id,
                     item.source_id,
-                    item.workspace,
+                    item.workspace_id,
                     item.state,
                     phase_to_str(item.phase),
-                    item.worktree,
-                    item.created_at.to_rfc3339(),
-                    item.updated_at.to_rfc3339(),
+                    item.title,
+                    item.created_at,
+                    item.updated_at,
                 ],
             )
             .map_err(|e| BeltError::Database(e.to_string()))?;
@@ -537,18 +550,16 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
 /// `work_id, source_id, workspace, state, phase, worktree, created_at, updated_at`
 fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
     let phase_str: String = row.get(4).map_err(|e| BeltError::Database(e.to_string()))?;
-    let created_str: String = row.get(6).map_err(|e| BeltError::Database(e.to_string()))?;
-    let updated_str: String = row.get(7).map_err(|e| BeltError::Database(e.to_string()))?;
 
     Ok(QueueItem {
         work_id: row.get(0).map_err(|e| BeltError::Database(e.to_string()))?,
         source_id: row.get(1).map_err(|e| BeltError::Database(e.to_string()))?,
-        workspace: row.get(2).map_err(|e| BeltError::Database(e.to_string()))?,
+        workspace_id: row.get(2).map_err(|e| BeltError::Database(e.to_string()))?,
         state: row.get(3).map_err(|e| BeltError::Database(e.to_string()))?,
         phase: str_to_phase(&phase_str),
-        worktree: row.get(5).map_err(|e| BeltError::Database(e.to_string()))?,
-        created_at: parse_datetime(&created_str),
-        updated_at: parse_datetime(&updated_str),
+        title: row.get(5).map_err(|e| BeltError::Database(e.to_string()))?,
+        created_at: row.get(6).map_err(|e| BeltError::Database(e.to_string()))?,
+        updated_at: row.get(7).map_err(|e| BeltError::Database(e.to_string()))?,
     })
 }
 
@@ -561,15 +572,15 @@ mod tests {
     }
 
     fn sample_item() -> QueueItem {
-        let now = Utc::now();
+        let now = Utc::now().to_rfc3339();
         QueueItem {
             work_id: "gh:org/repo#1:implement".to_string(),
             source_id: "gh:org/repo#1".to_string(),
-            workspace: "my-ws".to_string(),
+            workspace_id: "my-ws".to_string(),
             state: "implement".to_string(),
             phase: QueuePhase::Pending,
-            worktree: None,
-            created_at: now,
+            title: None,
+            created_at: now.clone(),
             updated_at: now,
         }
     }
@@ -782,6 +793,8 @@ mod tests {
         let usage = TokenUsage {
             input_tokens: 1000,
             output_tokens: 500,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
         };
         db.record_token_usage("w1", "ws1", "claude", "opus-4", &usage)
             .unwrap();

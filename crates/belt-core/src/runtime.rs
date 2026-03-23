@@ -130,8 +130,12 @@ mod tests {
     #[test]
     fn registry_resolve() {
         let mut registry = RuntimeRegistry::new("claude".to_string());
-        registry.register(Arc::new(DummyRuntime { rt_name: "claude".to_string() }));
-        registry.register(Arc::new(DummyRuntime { rt_name: "gemini".to_string() }));
+        registry.register(Arc::new(DummyRuntime {
+            rt_name: "claude".to_string(),
+        }));
+        registry.register(Arc::new(DummyRuntime {
+            rt_name: "gemini".to_string(),
+        }));
         assert_eq!(registry.resolve("claude").unwrap().name(), "claude");
         assert_eq!(registry.resolve("gemini").unwrap().name(), "gemini");
     }
@@ -139,7 +143,9 @@ mod tests {
     #[test]
     fn registry_fallback_to_default() {
         let mut registry = RuntimeRegistry::new("claude".to_string());
-        registry.register(Arc::new(DummyRuntime { rt_name: "claude".to_string() }));
+        registry.register(Arc::new(DummyRuntime {
+            rt_name: "claude".to_string(),
+        }));
         let resolved = registry.resolve("nonexistent").unwrap();
         assert_eq!(resolved.name(), "claude");
     }

@@ -12,6 +12,7 @@ use belt_core::runtime::RuntimeRegistry;
 use belt_core::source::DataSource;
 use belt_core::state_machine;
 use belt_core::workspace::{StateConfig, WorkspaceConfig};
+use belt_infra::db::Database;
 use belt_infra::worktree::WorktreeManager;
 
 use crate::concurrency::ConcurrencyTracker;
@@ -26,6 +27,7 @@ pub struct Daemon {
     tracker: ConcurrencyTracker,
     queue: VecDeque<QueueItem>,
     history: Vec<HistoryEntry>,
+    db: Option<Database>,
 }
 
 #[derive(Debug)]
@@ -55,7 +57,14 @@ impl Daemon {
             tracker: ConcurrencyTracker::new(max_concurrent),
             queue: VecDeque::new(),
             history: Vec::new(),
+            db: None,
         }
+    }
+
+    /// Set the database for persisting token usage records.
+    pub fn with_db(mut self, db: Database) -> Self {
+        self.db = Some(db);
+        self
     }
 
     /// 1단계: DataSource에서 새 아이템을 수집하여 Pending 큐에 추가.
@@ -170,13 +179,16 @@ impl Daemon {
 
         match result {
             Ok(Some(r)) if !r.success() => {
+                self.try_record_token_usage(item, &r);
+
                 let failure_count = self.count_failures(&item.source_id, &item.state);
                 let escalation = self.resolve_escalation(&item.state, failure_count + 1);
 
                 self.record_history(item, "failed", Some(&r.stderr));
 
                 if escalation.should_run_on_fail() {
-                    let on_fail: Vec<Action> = state_config.on_fail.iter().map(Action::from).collect();
+                    let on_fail: Vec<Action> =
+                        state_config.on_fail.iter().map(Action::from).collect();
                     let _ = self.executor.execute_all(&on_fail, &env).await;
                 }
 
@@ -189,7 +201,16 @@ impl Daemon {
                     escalation,
                 }
             }
-            Ok(_) => {
+            Ok(Some(r)) => {
+                self.try_record_token_usage(item, &r);
+
+                item.phase = QueuePhase::Completed;
+                self.record_history(item, "completed", None);
+                self.tracker.release(&self.config.name.clone());
+                self.queue.push_back(item.clone());
+                ItemOutcome::Completed(item.clone())
+            }
+            Ok(None) => {
                 item.phase = QueuePhase::Completed;
                 self.record_history(item, "completed", None);
                 self.tracker.release(&self.config.name.clone());
@@ -224,12 +245,18 @@ impl Daemon {
         if state_config.on_done.is_empty() {
             item.phase = QueuePhase::Done;
             self.record_history(item, "done", None);
-            let worktree = self.worktree_mgr.create_or_reuse(&self.config.name, &item.source_id).await?;
+            let worktree = self
+                .worktree_mgr
+                .create_or_reuse(&self.config.name, &item.source_id)
+                .await?;
             let _ = self.worktree_mgr.cleanup(&worktree).await;
             return Ok(true);
         }
 
-        let worktree = self.worktree_mgr.create_or_reuse(&self.config.name, &item.source_id).await?;
+        let worktree = self
+            .worktree_mgr
+            .create_or_reuse(&self.config.name, &item.source_id)
+            .await?;
         let env = ActionEnv::new(&item.work_id, &worktree);
         let on_done: Vec<Action> = state_config.on_done.iter().map(Action::from).collect();
         let result = self.executor.execute_all(&on_done, &env).await?;
@@ -265,8 +292,17 @@ impl Daemon {
         for outcome in &outcomes {
             match outcome {
                 ItemOutcome::Completed(item) => tracing::info!("completed: {}", item.work_id),
-                ItemOutcome::Failed { item, error, escalation } => {
-                    tracing::warn!("failed: {} (escalation={:?}, error={})", item.work_id, escalation, error);
+                ItemOutcome::Failed {
+                    item,
+                    error,
+                    escalation,
+                } => {
+                    tracing::warn!(
+                        "failed: {} (escalation={:?}, error={})",
+                        item.work_id,
+                        escalation,
+                        error
+                    );
                 }
                 ItemOutcome::Skipped(item) => tracing::info!("skipped: {}", item.work_id),
             }
@@ -362,11 +398,41 @@ impl Daemon {
         }
     }
 
+    /// Token usage가 있으면 DB에 기록한다. DB가 없거나 기록 실패 시 경고만 출력.
+    fn try_record_token_usage(&self, item: &QueueItem, result: &crate::executor::ActionResult) {
+        let (Some(usage), Some(runtime_name)) = (&result.token_usage, &result.runtime_name) else {
+            return;
+        };
+
+        if let Some(ref db) = self.db {
+            let model = result.model.as_deref().unwrap_or("unknown");
+            if let Err(e) =
+                db.record_token_usage(&item.work_id, &self.config.name, runtime_name, model, usage)
+            {
+                tracing::warn!("failed to record token usage for {}: {e}", item.work_id);
+            } else {
+                tracing::debug!(
+                    "recorded token usage for {}: input={}, output={}",
+                    item.work_id,
+                    usage.input_tokens,
+                    usage.output_tokens
+                );
+            }
+        }
+    }
+
     fn record_history(&mut self, item: &QueueItem, status: &str, error: Option<&str>) {
-        let attempt = self.history.iter().filter(|h| h.state == item.state).count() as u32 + 1;
+        let attempt = self
+            .history
+            .iter()
+            .filter(|h| h.state == item.state)
+            .count() as u32
+            + 1;
         self.history.push(HistoryEntry {
             state: item.state.clone(),
-            status: status.parse().unwrap_or(belt_core::context::HistoryStatus::Failed),
+            status: status
+                .parse()
+                .unwrap_or(belt_core::context::HistoryStatus::Failed),
             attempt,
             summary: None,
             error: error.map(|s| s.to_string()),
