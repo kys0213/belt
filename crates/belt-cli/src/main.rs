@@ -62,9 +62,18 @@ enum Commands {
 #[derive(Subcommand)]
 enum ClawCommands {
     /// Initialize Claw workspace.
-    Init,
+    Init {
+        /// Overwrite existing files.
+        #[arg(long)]
+        force: bool,
+    },
     /// Show/edit classification rules.
     Rules,
+    /// Edit classification/HITL rules.
+    Edit {
+        /// Rule file to edit (classify-policy, hitl-policy, auto-approve-policy).
+        rule: Option<String>,
+    },
     /// Open interactive session.
     Session,
 }
@@ -174,11 +183,15 @@ async fn main() -> anyhow::Result<()> {
             // TODO: AgentRuntime implementation
         }
         Commands::Claw { command } => match command {
-            ClawCommands::Init => {
+            ClawCommands::Init { force } => {
                 let belt_home = dirs::home_dir()
                     .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
                     .join(".belt");
-                let ws = claw::ClawWorkspace::init(&belt_home)?;
+                let ws = if force {
+                    claw::ClawWorkspace::init_with_options(&belt_home, true)?
+                } else {
+                    claw::ClawWorkspace::init(&belt_home)?
+                };
                 tracing::info!(path = %ws.path.display(), "claw workspace initialized");
             }
             ClawCommands::Rules => {
@@ -192,6 +205,15 @@ async fn main() -> anyhow::Result<()> {
                 for rule in &rules {
                     println!("{}", rule.display());
                 }
+            }
+            ClawCommands::Edit { rule } => {
+                let belt_home = dirs::home_dir()
+                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
+                    .join(".belt");
+                let ws = claw::ClawWorkspace {
+                    path: belt_home.join("claw-workspace"),
+                };
+                ws.edit_rule(rule.as_deref())?;
             }
             ClawCommands::Session => {
                 tracing::info!("interactive session not yet implemented");
