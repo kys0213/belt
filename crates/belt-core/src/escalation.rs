@@ -39,17 +39,23 @@ impl EscalationAction {
 /// yaml 기반 escalation 정책.
 ///
 /// failure_count → EscalationAction 매핑.
+/// `terminal` 키는 HITL timeout 시 적용되는 별도 액션.
 #[derive(Debug, Clone, Default)]
 pub struct EscalationPolicy {
     rules: BTreeMap<u32, EscalationAction>,
+    terminal: Option<EscalationAction>,
 }
 
 impl Serialize for EscalationPolicy {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
-        let mut map = serializer.serialize_map(Some(self.rules.len()))?;
+        let len = self.rules.len() + usize::from(self.terminal.is_some());
+        let mut map = serializer.serialize_map(Some(len))?;
         for (k, v) in &self.rules {
             map.serialize_entry(k, v)?;
+        }
+        if let Some(ref action) = self.terminal {
+            map.serialize_entry("terminal", action)?;
         }
         map.end()
     }
@@ -59,19 +65,39 @@ impl<'de> Deserialize<'de> for EscalationPolicy {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw: BTreeMap<String, EscalationAction> = BTreeMap::deserialize(deserializer)?;
         let mut rules = BTreeMap::new();
+        let mut terminal = None;
         for (k, v) in raw {
-            let key: u32 = k
-                .parse()
-                .map_err(|_| serde::de::Error::custom(format!("invalid escalation key: {k}")))?;
-            rules.insert(key, v);
+            if k == "terminal" {
+                terminal = Some(v);
+            } else {
+                let key: u32 = k.parse().map_err(|_| {
+                    serde::de::Error::custom(format!("invalid escalation key: {k}"))
+                })?;
+                rules.insert(key, v);
+            }
         }
-        Ok(Self { rules })
+        Ok(Self { rules, terminal })
     }
 }
 
 impl EscalationPolicy {
+    /// 숫자 키 규칙만으로 생성한다.
     pub fn new(rules: BTreeMap<u32, EscalationAction>) -> Self {
-        Self { rules }
+        Self {
+            rules,
+            terminal: None,
+        }
+    }
+
+    /// 숫자 키 규칙과 terminal 액션을 함께 지정하여 생성한다.
+    pub fn with_terminal(
+        rules: BTreeMap<u32, EscalationAction>,
+        terminal: EscalationAction,
+    ) -> Self {
+        Self {
+            rules,
+            terminal: Some(terminal),
+        }
     }
 
     /// failure_count에 대응하는 escalation action을 결정한다.
@@ -91,20 +117,30 @@ impl EscalationPolicy {
             .unwrap_or(EscalationAction::Retry)
     }
 
+    /// HITL timeout 시 적용되는 terminal action을 반환한다.
+    pub fn terminal_action(&self) -> Option<&EscalationAction> {
+        self.terminal.as_ref()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
 }
 
-/// 기본 5단계 escalation 정책.
+/// 기본 escalation 정책 (spec 기준).
+///
+/// ```yaml
+/// 1: retry
+/// 2: retry_with_comment
+/// 3: hitl
+/// terminal: skip
+/// ```
 pub fn default_escalation_policy() -> EscalationPolicy {
     let mut rules = BTreeMap::new();
     rules.insert(1, EscalationAction::Retry);
     rules.insert(2, EscalationAction::RetryWithComment);
     rules.insert(3, EscalationAction::Hitl);
-    rules.insert(4, EscalationAction::Skip);
-    rules.insert(5, EscalationAction::Replan);
-    EscalationPolicy::new(rules)
+    EscalationPolicy::with_terminal(rules, EscalationAction::Skip)
 }
 
 #[cfg(test)]
@@ -112,20 +148,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_policy_5_levels() {
+    fn default_policy_3_levels_with_terminal() {
         let policy = default_escalation_policy();
         assert_eq!(policy.resolve(1), EscalationAction::Retry);
         assert_eq!(policy.resolve(2), EscalationAction::RetryWithComment);
         assert_eq!(policy.resolve(3), EscalationAction::Hitl);
-        assert_eq!(policy.resolve(4), EscalationAction::Skip);
-        assert_eq!(policy.resolve(5), EscalationAction::Replan);
+        assert_eq!(policy.terminal_action(), Some(&EscalationAction::Skip),);
     }
 
     #[test]
     fn resolve_beyond_max_uses_highest_rule() {
         let policy = default_escalation_policy();
-        assert_eq!(policy.resolve(6), EscalationAction::Replan);
-        assert_eq!(policy.resolve(100), EscalationAction::Replan);
+        // 가장 높은 숫자 키(3)의 Hitl이 반환된다.
+        assert_eq!(policy.resolve(4), EscalationAction::Hitl);
+        assert_eq!(policy.resolve(100), EscalationAction::Hitl);
     }
 
     #[test]
@@ -133,6 +169,7 @@ mod tests {
         let policy = EscalationPolicy::default();
         assert!(policy.is_empty());
         assert_eq!(policy.resolve(1), EscalationAction::Retry);
+        assert_eq!(policy.terminal_action(), None);
     }
 
     #[test]
@@ -154,9 +191,10 @@ mod tests {
         let policy = default_escalation_policy();
         let json = serde_json::to_string(&policy).unwrap();
         let parsed: EscalationPolicy = serde_json::from_str(&json).unwrap();
-        for i in 0..=6 {
+        for i in 0..=4 {
             assert_eq!(policy.resolve(i), parsed.resolve(i));
         }
+        assert_eq!(policy.terminal_action(), parsed.terminal_action());
     }
 
     #[test]
@@ -167,6 +205,17 @@ mod tests {
         assert_eq!(policy.resolve(2), EscalationAction::RetryWithComment);
         assert_eq!(policy.resolve(3), EscalationAction::Hitl);
         assert_eq!(policy.resolve(4), EscalationAction::Hitl);
+        assert_eq!(policy.terminal_action(), None);
+    }
+
+    #[test]
+    fn yaml_with_terminal() {
+        let yaml = "1: retry\n2: retry_with_comment\n3: hitl\nterminal: skip\n";
+        let policy: EscalationPolicy = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(policy.resolve(1), EscalationAction::Retry);
+        assert_eq!(policy.resolve(2), EscalationAction::RetryWithComment);
+        assert_eq!(policy.resolve(3), EscalationAction::Hitl);
+        assert_eq!(policy.terminal_action(), Some(&EscalationAction::Skip),);
     }
 
     #[test]
@@ -180,5 +229,6 @@ mod tests {
         assert_eq!(policy.resolve(2), EscalationAction::Retry);
         assert_eq!(policy.resolve(5), EscalationAction::Skip);
         assert_eq!(policy.resolve(10), EscalationAction::Skip);
+        assert_eq!(policy.terminal_action(), None);
     }
 }
