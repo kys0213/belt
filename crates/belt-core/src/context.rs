@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 /// 모든 상태 변화를 기록하며, failure_count는 history에서 계산한다.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoryEntry {
+    pub source_id: String,
+    pub work_id: String,
     pub state: String,
     pub status: HistoryStatus,
     pub attempt: u32,
@@ -137,6 +139,8 @@ mod tests {
 
     fn make_history_entry(state: &str, status: HistoryStatus, attempt: u32) -> HistoryEntry {
         HistoryEntry {
+            source_id: "github:org/repo#42".to_string(),
+            work_id: format!("github:org/repo#42:{state}"),
             state: state.to_string(),
             status,
             attempt,
