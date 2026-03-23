@@ -3,6 +3,8 @@
 //! Provides CRUD operations for queue items, history events, workspaces,
 //! cron jobs, and token usage — all backed by a single SQLite database.
 
+use std::sync::Mutex;
+
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
@@ -12,17 +14,25 @@ use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::runtime::TokenUsage;
 
-/// An immutable history event recording a state execution result.
+/// An immutable history event recording an attempt on a work item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEvent {
+    /// The work item this event belongs to.
     pub work_id: String,
+    /// External source entity identifier.
     pub source_id: String,
+    /// Workflow state when the event occurred.
     pub state: String,
+    /// Outcome status (e.g. "success", "failed").
     pub status: String,
-    pub attempt: u32,
+    /// Attempt number.
+    pub attempt: i32,
+    /// Optional summary of the result.
     pub summary: Option<String>,
+    /// Optional error description.
     pub error: Option<String>,
-    pub created_at: DateTime<Utc>,
+    /// Timestamp when this event was created (RFC 3339).
+    pub created_at: String,
 }
 
 /// A scheduled cron job definition.
@@ -37,29 +47,42 @@ pub struct CronJob {
     /// Whether this job is currently enabled.
     pub enabled: bool,
     /// Timestamp of the last successful run, if any.
-    pub last_run_at: Option<DateTime<Utc>>,
-    /// When this job was created.
-    pub created_at: DateTime<Utc>,
+    pub last_run_at: Option<String>,
+    /// When this job was created (RFC 3339).
+    pub created_at: String,
 }
 
-/// A persisted token usage record.
+/// A row from the `token_usage` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsageRow {
-    pub id: i64,
+    /// The work item ID this usage belongs to.
     pub work_id: String,
+    /// The workspace scope.
     pub workspace: String,
+    /// Name of the runtime that was invoked.
     pub runtime: String,
+    /// Model identifier used for the invocation.
     pub model: String,
+    /// Number of input tokens consumed.
     pub input_tokens: u64,
+    /// Number of output tokens produced.
     pub output_tokens: u64,
+    /// Number of cache-read tokens, if applicable.
     pub cache_read_tokens: Option<u64>,
+    /// Number of cache-write tokens, if applicable.
     pub cache_write_tokens: Option<u64>,
+    /// Wall-clock duration of the invocation in milliseconds, if recorded.
+    pub duration_ms: Option<u64>,
+    /// Timestamp when the usage was recorded.
     pub created_at: DateTime<Utc>,
 }
 
 /// SQLite-backed persistence for Belt state.
+///
+/// The inner connection is wrapped in a [`Mutex`] so that `Database` is
+/// `Send + Sync` and can be shared across async tasks.
 pub struct Database {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl Database {
@@ -69,7 +92,9 @@ impl Database {
     /// Returns `BeltError::Database` if the connection or schema creation fails.
     pub fn open(path: &str) -> Result<Self, BeltError> {
         let conn = Connection::open(path).map_err(|e| BeltError::Database(e.to_string()))?;
-        let db = Self { conn };
+        let db = Self {
+            conn: Mutex::new(conn),
+        };
         db.init()?;
         Ok(db)
     }
@@ -80,16 +105,21 @@ impl Database {
     /// Returns `BeltError::Database` if schema creation fails.
     pub fn open_in_memory() -> Result<Self, BeltError> {
         let conn = Connection::open_in_memory().map_err(|e| BeltError::Database(e.to_string()))?;
-        let db = Self { conn };
+        let db = Self {
+            conn: Mutex::new(conn),
+        };
         db.init()?;
         Ok(db)
     }
 
     /// Create all tables if they do not already exist.
     fn init(&self) -> Result<(), BeltError> {
-        self.conn
-            .execute_batch(
-                "
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        conn.execute_batch(
+            "
             CREATE TABLE IF NOT EXISTS queue_items (
                 work_id      TEXT PRIMARY KEY,
                 source_id    TEXT NOT NULL,
@@ -139,11 +169,12 @@ impl Database {
                 output_tokens      INTEGER NOT NULL,
                 cache_read_tokens  INTEGER,
                 cache_write_tokens INTEGER,
+                duration_ms        INTEGER,
                 created_at         TEXT NOT NULL
             );
             ",
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
+        )
+        .map_err(|e| BeltError::Database(e.to_string()))?;
         Ok(())
     }
 
@@ -154,22 +185,25 @@ impl Database {
     /// # Errors
     /// Returns `BeltError::Database` on constraint violation or I/O error.
     pub fn insert_item(&self, item: &QueueItem) -> Result<(), BeltError> {
-        self.conn
-            .execute(
-                "INSERT INTO queue_items (work_id, source_id, workspace_id, state, phase, title, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    item.work_id,
-                    item.source_id,
-                    item.workspace_id,
-                    item.state,
-                    phase_to_str(item.phase),
-                    item.title,
-                    item.created_at,
-                    item.updated_at,
-                ],
-            )
+        let conn = self
+            .conn
+            .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO queue_items (work_id, source_id, workspace_id, state, phase, title, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                item.work_id,
+                item.source_id,
+                item.workspace_id,
+                item.state,
+                phase_to_str(item.phase),
+                item.title,
+                item.created_at,
+                item.updated_at,
+            ],
+        )
+        .map_err(|e| BeltError::Database(e.to_string()))?;
         Ok(())
     }
 
@@ -181,8 +215,11 @@ impl Database {
     /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
     pub fn update_phase(&self, work_id: &str, phase: QueuePhase) -> Result<(), BeltError> {
         let now = Utc::now().to_rfc3339();
-        let rows = self
+        let conn = self
             .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
             .execute(
                 "UPDATE queue_items SET phase = ?1, updated_at = ?2 WHERE work_id = ?3",
                 params![phase_to_str(phase), now, work_id],
@@ -199,19 +236,20 @@ impl Database {
     /// # Errors
     /// Returns `BeltError::ItemNotFound` if no row matches.
     pub fn get_item(&self, work_id: &str) -> Result<QueueItem, BeltError> {
-        self.conn
-            .query_row(
-                "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        conn.query_row(
+            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at
                  FROM queue_items WHERE work_id = ?1",
-                params![work_id],
-                |row| Ok(row_to_queue_item(row)),
-            )
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    BeltError::ItemNotFound(work_id.to_string())
-                }
-                other => BeltError::Database(other.to_string()),
-            })?
+            params![work_id],
+            |row| Ok(row_to_queue_item(row)),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => BeltError::ItemNotFound(work_id.to_string()),
+            other => BeltError::Database(other.to_string()),
+        })?
     }
 
     /// List queue items with optional phase and workspace filters.
@@ -222,6 +260,10 @@ impl Database {
         phase: Option<QueuePhase>,
         workspace: Option<&str>,
     ) -> Result<Vec<QueueItem>, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
         let mut sql = String::from(
             "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at FROM queue_items WHERE 1=1",
         );
@@ -239,8 +281,7 @@ impl Database {
         let params_ref: Vec<&dyn rusqlite::types::ToSql> =
             param_values.iter().map(|p| p.as_ref()).collect();
 
-        let mut stmt = self
-            .conn
+        let mut stmt = conn
             .prepare(&sql)
             .map_err(|e| BeltError::Database(e.to_string()))?;
 
@@ -258,29 +299,35 @@ impl Database {
 
     /// Append an immutable history event.
     pub fn append_history(&self, event: &HistoryEvent) -> Result<(), BeltError> {
-        self.conn
-            .execute(
-                "INSERT INTO history (work_id, source_id, state, status, attempt, summary, error, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    event.work_id,
-                    event.source_id,
-                    event.state,
-                    event.status,
-                    event.attempt,
-                    event.summary,
-                    event.error,
-                    event.created_at.to_rfc3339(),
-                ],
-            )
+        let conn = self
+            .conn
+            .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO history (work_id, source_id, state, status, attempt, summary, error, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                event.work_id,
+                event.source_id,
+                event.state,
+                event.status,
+                event.attempt,
+                event.summary,
+                event.error,
+                event.created_at,
+            ],
+        )
+        .map_err(|e| BeltError::Database(e.to_string()))?;
         Ok(())
     }
 
     /// Get all history events for a given `source_id`, ordered by creation time.
     pub fn get_history(&self, source_id: &str) -> Result<Vec<HistoryEvent>, BeltError> {
-        let mut stmt = self
+        let conn = self
             .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
             .prepare(
                 "SELECT work_id, source_id, state, status, attempt, summary, error, created_at
                  FROM history WHERE source_id = ?1 ORDER BY created_at ASC",
@@ -297,7 +344,7 @@ impl Database {
                     attempt: row.get(4)?,
                     summary: row.get(5)?,
                     error: row.get(6)?,
-                    created_at: parse_datetime(&row.get::<_, String>(7)?),
+                    created_at: row.get(7)?,
                 })
             })
             .map_err(|e| BeltError::Database(e.to_string()))?
@@ -308,8 +355,11 @@ impl Database {
 
     /// Count how many times a `source_id` has failed in a given `state`.
     pub fn count_failures(&self, source_id: &str, state: &str) -> Result<u32, BeltError> {
-        let count: u32 = self
+        let conn = self
             .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let count: u32 = conn
             .query_row(
                 "SELECT COUNT(*) FROM history WHERE source_id = ?1 AND state = ?2 AND status = 'failed'",
                 params![source_id, state],
@@ -324,20 +374,50 @@ impl Database {
     /// Register a new workspace.
     pub fn add_workspace(&self, name: &str, config_path: &str) -> Result<(), BeltError> {
         let now = Utc::now().to_rfc3339();
-        self.conn
-            .execute(
-                "INSERT INTO workspaces (name, config_path, created_at, updated_at)
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO workspaces (name, config_path, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![name, config_path, now, now],
+            params![name, config_path, now, now],
+        )
+        .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Update the `config_path` of an existing workspace.
+    ///
+    /// Also refreshes `updated_at` to the current UTC time.
+    ///
+    /// # Errors
+    /// Returns `BeltError::WorkspaceNotFound` if no workspace matches the given `name`.
+    pub fn update_workspace(&self, name: &str, config_path: &str) -> Result<(), BeltError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "UPDATE workspaces SET config_path = ?1, updated_at = ?2 WHERE name = ?3",
+                params![config_path, now, name],
             )
             .map_err(|e| BeltError::Database(e.to_string()))?;
+        if rows == 0 {
+            return Err(BeltError::WorkspaceNotFound(name.to_string()));
+        }
         Ok(())
     }
 
     /// List all registered workspaces as `(name, config_path, created_at)` tuples.
-    pub fn list_workspaces(&self) -> Result<Vec<(String, String, DateTime<Utc>)>, BeltError> {
-        let mut stmt = self
+    pub fn list_workspaces(&self) -> Result<Vec<(String, String, String)>, BeltError> {
+        let conn = self
             .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
             .prepare("SELECT name, config_path, created_at FROM workspaces ORDER BY name")
             .map_err(|e| BeltError::Database(e.to_string()))?;
 
@@ -346,7 +426,7 @@ impl Database {
                 let name: String = row.get(0)?;
                 let config_path: String = row.get(1)?;
                 let created_at: String = row.get(2)?;
-                Ok((name, config_path, parse_datetime(&created_at)))
+                Ok((name, config_path, created_at))
             })
             .map_err(|e| BeltError::Database(e.to_string()))?
             .collect::<Result<Vec<_>, _>>()
@@ -358,24 +438,25 @@ impl Database {
     ///
     /// # Errors
     /// Returns `BeltError::WorkspaceNotFound` if no such workspace exists.
-    pub fn get_workspace(&self, name: &str) -> Result<(String, String, DateTime<Utc>), BeltError> {
-        self.conn
-            .query_row(
-                "SELECT name, config_path, created_at FROM workspaces WHERE name = ?1",
-                params![name],
-                |row| {
-                    let n: String = row.get(0)?;
-                    let cp: String = row.get(1)?;
-                    let ca: String = row.get(2)?;
-                    Ok((n, cp, parse_datetime(&ca)))
-                },
-            )
-            .map_err(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    BeltError::WorkspaceNotFound(name.to_string())
-                }
-                other => BeltError::Database(other.to_string()),
-            })
+    pub fn get_workspace(&self, name: &str) -> Result<(String, String, String), BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        conn.query_row(
+            "SELECT name, config_path, created_at FROM workspaces WHERE name = ?1",
+            params![name],
+            |row| {
+                let n: String = row.get(0)?;
+                let cp: String = row.get(1)?;
+                let ca: String = row.get(2)?;
+                Ok((n, cp, ca))
+            },
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => BeltError::WorkspaceNotFound(name.to_string()),
+            other => BeltError::Database(other.to_string()),
+        })
     }
 
     /// Remove a workspace by name.
@@ -383,8 +464,11 @@ impl Database {
     /// # Errors
     /// Returns `BeltError::WorkspaceNotFound` if no row was deleted.
     pub fn remove_workspace(&self, name: &str) -> Result<(), BeltError> {
-        let rows = self
+        let conn = self
             .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
             .execute("DELETE FROM workspaces WHERE name = ?1", params![name])
             .map_err(|e| BeltError::Database(e.to_string()))?;
         if rows == 0 {
@@ -403,20 +487,26 @@ impl Database {
         workspace: Option<&str>,
     ) -> Result<(), BeltError> {
         let now = Utc::now().to_rfc3339();
-        self.conn
-            .execute(
-                "INSERT INTO cron_jobs (name, schedule, workspace, enabled, created_at)
-                 VALUES (?1, ?2, ?3, 1, ?4)",
-                params![name, schedule, workspace, now],
-            )
+        let conn = self
+            .conn
+            .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO cron_jobs (name, schedule, workspace, enabled, created_at)
+                 VALUES (?1, ?2, ?3, 1, ?4)",
+            params![name, schedule, workspace, now],
+        )
+        .map_err(|e| BeltError::Database(e.to_string()))?;
         Ok(())
     }
 
     /// List all cron jobs.
     pub fn list_cron_jobs(&self) -> Result<Vec<CronJob>, BeltError> {
-        let mut stmt = self
+        let conn = self
             .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
             .prepare(
                 "SELECT name, schedule, workspace, enabled, last_run_at, created_at
                  FROM cron_jobs ORDER BY name",
@@ -426,15 +516,13 @@ impl Database {
         let jobs = stmt
             .query_map([], |row| {
                 let enabled_int: i32 = row.get(3)?;
-                let last_run: Option<String> = row.get(4)?;
-                let created: String = row.get(5)?;
                 Ok(CronJob {
                     name: row.get(0)?,
                     schedule: row.get(1)?,
                     workspace: row.get(2)?,
                     enabled: enabled_int != 0,
-                    last_run_at: last_run.as_deref().map(parse_datetime),
-                    created_at: parse_datetime(&created),
+                    last_run_at: row.get(4)?,
+                    created_at: row.get(5)?,
                 })
             })
             .map_err(|e| BeltError::Database(e.to_string()))?
@@ -446,8 +534,11 @@ impl Database {
     /// Update the `last_run_at` timestamp of a cron job to now.
     pub fn update_cron_last_run(&self, name: &str) -> Result<(), BeltError> {
         let now = Utc::now().to_rfc3339();
-        let rows = self
+        let conn = self
             .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
             .execute(
                 "UPDATE cron_jobs SET last_run_at = ?1 WHERE name = ?2",
                 params![now, name],
@@ -459,10 +550,34 @@ impl Database {
         Ok(())
     }
 
+    /// Update the schedule expression of an existing cron job.
+    ///
+    /// # Errors
+    /// Returns `BeltError::ItemNotFound` if no cron job matches the given `name`.
+    pub fn update_cron_schedule(&self, name: &str, schedule: &str) -> Result<(), BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "UPDATE cron_jobs SET schedule = ?1 WHERE name = ?2",
+                params![schedule, name],
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        if rows == 0 {
+            return Err(BeltError::ItemNotFound(name.to_string()));
+        }
+        Ok(())
+    }
+
     /// Enable or disable a cron job.
     pub fn toggle_cron_job(&self, name: &str, enabled: bool) -> Result<(), BeltError> {
-        let rows = self
+        let conn = self
             .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
             .execute(
                 "UPDATE cron_jobs SET enabled = ?1 WHERE name = ?2",
                 params![enabled as i32, name],
@@ -476,8 +591,11 @@ impl Database {
 
     /// Remove a cron job by name.
     pub fn remove_cron_job(&self, name: &str) -> Result<(), BeltError> {
-        let rows = self
+        let conn = self
             .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
             .execute("DELETE FROM cron_jobs WHERE name = ?1", params![name])
             .map_err(|e| BeltError::Database(e.to_string()))?;
         if rows == 0 {
@@ -489,6 +607,9 @@ impl Database {
     // ---- Token Usage -------------------------------------------------------
 
     /// Record token usage for a completed runtime invocation.
+    ///
+    /// The optional `duration_ms` parameter captures the wall-clock duration
+    /// of the runtime invocation in milliseconds.
     pub fn record_token_usage(
         &self,
         work_id: &str,
@@ -496,58 +617,143 @@ impl Database {
         runtime: &str,
         model: &str,
         usage: &TokenUsage,
+        duration_ms: Option<u64>,
     ) -> Result<(), BeltError> {
         let now = Utc::now().to_rfc3339();
-        self.conn
-            .execute(
-                "INSERT INTO token_usage (work_id, workspace, runtime, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                params![
-                    work_id,
-                    workspace,
-                    runtime,
-                    model,
-                    usage.input_tokens as i64,
-                    usage.output_tokens as i64,
-                    usage.cache_read_tokens.map(|v| v as i64),
-                    usage.cache_write_tokens.map(|v| v as i64),
-                    now,
-                ],
-            )
+        let conn = self
+            .conn
+            .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO token_usage (work_id, workspace, runtime, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                work_id,
+                workspace,
+                runtime,
+                model,
+                usage.input_tokens as i64,
+                usage.output_tokens as i64,
+                usage.cache_read_tokens.map(|v| v as i64),
+                usage.cache_write_tokens.map(|v| v as i64),
+                duration_ms.map(|d| d as i64),
+                now,
+            ],
+        )
+        .map_err(|e| BeltError::Database(e.to_string()))?;
         Ok(())
     }
 
     /// Retrieve all token usage records for a given `work_id`.
-    pub fn get_token_usage(&self, work_id: &str) -> Result<Vec<TokenUsageRow>, BeltError> {
-        let mut stmt = self
+    ///
+    /// Results are ordered by `created_at` ascending.
+    pub fn get_token_usage_by_work_id(
+        &self,
+        work_id: &str,
+    ) -> Result<Vec<TokenUsageRow>, BeltError> {
+        let conn = self
             .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
             .prepare(
-                "SELECT id, work_id, workspace, runtime, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at
+                "SELECT work_id, workspace, runtime, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms, created_at
                  FROM token_usage WHERE work_id = ?1 ORDER BY created_at ASC",
             )
             .map_err(|e| BeltError::Database(e.to_string()))?;
 
         let rows = stmt
             .query_map(params![work_id], |row| {
-                let created: String = row.get(9)?;
-                Ok(TokenUsageRow {
-                    id: row.get(0)?,
-                    work_id: row.get(1)?,
-                    workspace: row.get(2)?,
-                    runtime: row.get(3)?,
-                    model: row.get(4)?,
-                    input_tokens: row.get(5)?,
-                    output_tokens: row.get(6)?,
-                    cache_read_tokens: row.get(7)?,
-                    cache_write_tokens: row.get(8)?,
-                    created_at: parse_datetime(&created),
-                })
+                let created_str: String = row.get(9)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    created_str,
+                ))
             })
             .map_err(|e| BeltError::Database(e.to_string()))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(rows)
+
+        rows.into_iter()
+            .map(|(wid, ws, rt, model, input, output, cache_read, cache_write, dur, created)| {
+                Ok(TokenUsageRow {
+                    work_id: wid,
+                    workspace: ws,
+                    runtime: rt,
+                    model,
+                    input_tokens: input as u64,
+                    output_tokens: output as u64,
+                    cache_read_tokens: cache_read.map(|v| v as u64),
+                    cache_write_tokens: cache_write.map(|v| v as u64),
+                    duration_ms: dur.map(|d| d as u64),
+                    created_at: parse_datetime(&created)?,
+                })
+            })
+            .collect()
+    }
+
+    /// Retrieve all token usage records for a given workspace.
+    ///
+    /// Results are ordered by `created_at` ascending.
+    pub fn get_token_usage_by_workspace(
+        &self,
+        workspace: &str,
+    ) -> Result<Vec<TokenUsageRow>, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT work_id, workspace, runtime, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, duration_ms, created_at
+                 FROM token_usage WHERE workspace = ?1 ORDER BY created_at ASC",
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![workspace], |row| {
+                let created_str: String = row.get(9)?;
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                    created_str,
+                ))
+            })
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        rows.into_iter()
+            .map(|(wid, ws, rt, model, input, output, cache_read, cache_write, dur, created)| {
+                Ok(TokenUsageRow {
+                    work_id: wid,
+                    workspace: ws,
+                    runtime: rt,
+                    model,
+                    input_tokens: input as u64,
+                    output_tokens: output as u64,
+                    cache_read_tokens: cache_read.map(|v| v as u64),
+                    cache_write_tokens: cache_write.map(|v| v as u64),
+                    duration_ms: dur.map(|d| d as u64),
+                    created_at: parse_datetime(&created)?,
+                })
+            })
+            .collect()
     }
 }
 
@@ -569,30 +775,30 @@ fn phase_to_str(phase: QueuePhase) -> &'static str {
 
 /// Parse a database phase string back into a `QueuePhase`.
 ///
-/// Defaults to `Pending` for unrecognised values (should never happen with
-/// validated data).
-fn str_to_phase(s: &str) -> QueuePhase {
+/// # Errors
+/// Returns `BeltError::Database` for unrecognised phase values.
+fn str_to_phase(s: &str) -> Result<QueuePhase, BeltError> {
     match s {
-        "pending" => QueuePhase::Pending,
-        "ready" => QueuePhase::Ready,
-        "running" => QueuePhase::Running,
-        "completed" => QueuePhase::Completed,
-        "done" => QueuePhase::Done,
-        "hitl" => QueuePhase::Hitl,
-        "failed" => QueuePhase::Failed,
-        "skipped" => QueuePhase::Skipped,
-        _ => QueuePhase::Pending,
+        "pending" => Ok(QueuePhase::Pending),
+        "ready" => Ok(QueuePhase::Ready),
+        "running" => Ok(QueuePhase::Running),
+        "completed" => Ok(QueuePhase::Completed),
+        "done" => Ok(QueuePhase::Done),
+        "hitl" => Ok(QueuePhase::Hitl),
+        "failed" => Ok(QueuePhase::Failed),
+        "skipped" => Ok(QueuePhase::Skipped),
+        _ => Err(BeltError::Database(format!("unknown phase: {s}"))),
     }
 }
 
 /// Parse an RFC 3339 timestamp string into `DateTime<Utc>`.
 ///
-/// Falls back to `Utc::now()` on parse failure (should not happen with
-/// well-formed data).
-fn parse_datetime(s: &str) -> DateTime<Utc> {
+/// # Errors
+/// Returns `BeltError::Database` if the string cannot be parsed.
+fn parse_datetime(s: &str) -> Result<DateTime<Utc>, BeltError> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+        .map_err(|_| BeltError::Database(format!("invalid datetime: {s}")))
 }
 
 /// Extract a `QueueItem` from a rusqlite `Row`.
@@ -607,7 +813,7 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
         source_id: row.get(1).map_err(|e| BeltError::Database(e.to_string()))?,
         workspace_id: row.get(2).map_err(|e| BeltError::Database(e.to_string()))?,
         state: row.get(3).map_err(|e| BeltError::Database(e.to_string()))?,
-        phase: str_to_phase(&phase_str),
+        phase: str_to_phase(&phase_str)?,
         title: row.get(5).map_err(|e| BeltError::Database(e.to_string()))?,
         created_at: row.get(6).map_err(|e| BeltError::Database(e.to_string()))?,
         updated_at: row.get(7).map_err(|e| BeltError::Database(e.to_string()))?,
@@ -623,12 +829,16 @@ mod tests {
     }
 
     fn sample_item() -> QueueItem {
-        QueueItem::new(
-            "gh:org/repo#1:implement".to_string(),
-            "gh:org/repo#1".to_string(),
-            "my-ws".to_string(),
-            "implement".to_string(),
-        )
+        QueueItem {
+            work_id: "gh:org/repo#1:implement".to_string(),
+            source_id: "gh:org/repo#1".to_string(),
+            workspace_id: "my-ws".to_string(),
+            state: "implement".to_string(),
+            phase: QueuePhase::Pending,
+            title: None,
+            created_at: Utc::now().to_rfc3339(),
+            updated_at: Utc::now().to_rfc3339(),
+        }
     }
 
     // ---- Queue CRUD --------------------------------------------------------
@@ -721,7 +931,7 @@ mod tests {
             attempt: 1,
             summary: Some("all good".to_string()),
             error: None,
-            created_at: Utc::now(),
+            created_at: Utc::now().to_rfc3339(),
         };
         db.append_history(&event).unwrap();
 
@@ -743,7 +953,7 @@ mod tests {
                 attempt: i + 1,
                 summary: None,
                 error: Some("boom".to_string()),
-                created_at: Utc::now(),
+                created_at: Utc::now().to_rfc3339(),
             };
             db.append_history(&event).unwrap();
         }
@@ -756,7 +966,7 @@ mod tests {
             attempt: 4,
             summary: None,
             error: None,
-            created_at: Utc::now(),
+            created_at: Utc::now().to_rfc3339(),
         };
         db.append_history(&ok_event).unwrap();
 
@@ -796,6 +1006,23 @@ mod tests {
         assert!(matches!(err, BeltError::WorkspaceNotFound(_)));
     }
 
+    #[test]
+    fn update_workspace_changes_config_path() {
+        let db = test_db();
+        db.add_workspace("ws1", "/old/path.yaml").unwrap();
+        db.update_workspace("ws1", "/new/path.yaml").unwrap();
+
+        let (_, path, _) = db.get_workspace("ws1").unwrap();
+        assert_eq!(path, "/new/path.yaml");
+    }
+
+    #[test]
+    fn update_workspace_not_found() {
+        let db = test_db();
+        let err = db.update_workspace("nope", "/any").unwrap_err();
+        assert!(matches!(err, BeltError::WorkspaceNotFound(_)));
+    }
+
     // ---- Cron Jobs ---------------------------------------------------------
 
     #[test]
@@ -831,46 +1058,85 @@ mod tests {
         assert!(jobs[0].workspace.is_none());
     }
 
+    #[test]
+    fn update_cron_schedule_changes_schedule() {
+        let db = test_db();
+        db.add_cron_job("my-job", "*/5 * * * *", None).unwrap();
+        db.update_cron_schedule("my-job", "0 */2 * * *").unwrap();
+
+        let jobs = db.list_cron_jobs().unwrap();
+        assert_eq!(jobs[0].schedule, "0 */2 * * *");
+    }
+
+    #[test]
+    fn update_cron_schedule_not_found() {
+        let db = test_db();
+        let err = db.update_cron_schedule("nope", "* * * * *").unwrap_err();
+        assert!(matches!(err, BeltError::ItemNotFound(_)));
+    }
+
     // ---- Token Usage -------------------------------------------------------
 
     #[test]
-    fn record_and_get_token_usage() {
+    fn record_token_usage() {
         let db = test_db();
         let usage = TokenUsage {
             input_tokens: 1000,
             output_tokens: 500,
             cache_read_tokens: Some(200),
             cache_write_tokens: Some(100),
+            ..Default::default()
         };
-        db.record_token_usage("w1", "ws1", "claude", "opus-4", &usage)
+        db.record_token_usage("w1", "ws1", "claude", "opus-4", &usage, Some(1234))
             .unwrap();
 
-        let rows = db.get_token_usage("w1").unwrap();
+        let rows = db.get_token_usage_by_work_id("w1").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].input_tokens, 1000);
         assert_eq!(rows[0].output_tokens, 500);
         assert_eq!(rows[0].cache_read_tokens, Some(200));
         assert_eq!(rows[0].cache_write_tokens, Some(100));
-        assert_eq!(rows[0].runtime, "claude");
-        assert_eq!(rows[0].model, "opus-4");
+        assert_eq!(rows[0].duration_ms, Some(1234));
     }
 
     #[test]
-    fn record_token_usage_without_cache() {
+    fn record_token_usage_no_duration() {
         let db = test_db();
         let usage = TokenUsage {
-            input_tokens: 500,
-            output_tokens: 250,
-            cache_read_tokens: None,
-            cache_write_tokens: None,
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
         };
-        db.record_token_usage("w2", "ws1", "claude", "sonnet-4", &usage)
+        db.record_token_usage("w2", "ws1", "claude", "opus-4", &usage, None)
             .unwrap();
 
-        let rows = db.get_token_usage("w2").unwrap();
+        let rows = db.get_token_usage_by_work_id("w2").unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].cache_read_tokens, None);
-        assert_eq!(rows[0].cache_write_tokens, None);
+        assert!(rows[0].duration_ms.is_none());
+        assert!(rows[0].cache_read_tokens.is_none());
+        assert!(rows[0].cache_write_tokens.is_none());
+    }
+
+    #[test]
+    fn get_token_usage_by_workspace() {
+        let db = test_db();
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            ..Default::default()
+        };
+        db.record_token_usage("w1", "ws1", "claude", "opus-4", &usage, None)
+            .unwrap();
+        db.record_token_usage("w2", "ws1", "claude", "opus-4", &usage, Some(500))
+            .unwrap();
+        db.record_token_usage("w3", "ws2", "claude", "opus-4", &usage, None)
+            .unwrap();
+
+        let rows = db.get_token_usage_by_workspace("ws1").unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let rows = db.get_token_usage_by_workspace("ws2").unwrap();
+        assert_eq!(rows.len(), 1);
     }
 
     // ---- Helpers -----------------------------------------------------------
@@ -888,7 +1154,25 @@ mod tests {
             QueuePhase::Skipped,
         ];
         for p in phases {
-            assert_eq!(str_to_phase(phase_to_str(p)), p);
+            assert_eq!(str_to_phase(phase_to_str(p)).unwrap(), p);
         }
+    }
+
+    #[test]
+    fn str_to_phase_unknown_returns_error() {
+        let err = str_to_phase("bogus").unwrap_err();
+        assert!(matches!(err, BeltError::Database(_)));
+    }
+
+    #[test]
+    fn parse_datetime_invalid_returns_error() {
+        let err = parse_datetime("not-a-date").unwrap_err();
+        assert!(matches!(err, BeltError::Database(_)));
+    }
+
+    #[test]
+    fn database_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Database>();
     }
 }
