@@ -1,6 +1,6 @@
 use crate::phase::QueuePhase;
 
-/// 상태 전이 규칙 (12개 유효 전이).
+/// 상태 전이 규칙 (14개 유효 전이).
 pub fn is_valid_transition(from: QueuePhase, to: QueuePhase) -> bool {
     use QueuePhase::*;
     matches!(
@@ -9,12 +9,14 @@ pub fn is_valid_transition(from: QueuePhase, to: QueuePhase) -> bool {
             | (Ready, Running)
             | (Running, Completed)
             | (Running, Skipped)
+            | (Running, Failed)
             | (Completed, Done)
             | (Completed, Hitl)
             | (Completed, Failed)
             | (Hitl, Done)
             | (Hitl, Skipped)
             | (Hitl, Failed)
+            | (Hitl, Pending)
             | (Failed, Done)
             | (Failed, Skipped)
     )
@@ -93,20 +95,27 @@ mod tests {
 
     #[test]
     fn same_phase_rejected() {
-        let phases = [Pending, Ready, Running, Completed, Done, Hitl, Failed, Skipped];
+        let phases = [
+            Pending, Ready, Running, Completed, Done, Hitl, Failed, Skipped,
+        ];
         for phase in phases {
-            assert_eq!(transit(phase, phase).unwrap_err(), TransitionError::SamePhase(phase));
+            assert_eq!(
+                transit(phase, phase).unwrap_err(),
+                TransitionError::SamePhase(phase)
+            );
         }
     }
 
     #[test]
     fn exhaustive_transition_count() {
-        let phases = [Pending, Ready, Running, Completed, Done, Hitl, Failed, Skipped];
+        let phases = [
+            Pending, Ready, Running, Completed, Done, Hitl, Failed, Skipped,
+        ];
         let valid_count = phases
             .iter()
             .flat_map(|&from| phases.iter().map(move |&to| (from, to)))
             .filter(|&(from, to)| is_valid_transition(from, to))
             .count();
-        assert_eq!(valid_count, 12);
+        assert_eq!(valid_count, 14);
     }
 }

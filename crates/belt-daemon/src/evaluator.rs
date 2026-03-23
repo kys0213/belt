@@ -25,7 +25,10 @@ impl Evaluator {
     }
 
     pub fn filter_completed(items: &[QueueItem]) -> Vec<&QueueItem> {
-        items.iter().filter(|item| item.phase == QueuePhase::Completed).collect()
+        items
+            .iter()
+            .filter(|item| item.phase == QueuePhase::Completed)
+            .collect()
     }
 
     pub fn target_phase(decision: &EvalDecision) -> QueuePhase {
@@ -99,12 +102,17 @@ mod tests {
 
     #[test]
     fn target_phase_done() {
-        assert_eq!(Evaluator::target_phase(&EvalDecision::Done), QueuePhase::Done);
+        assert_eq!(
+            Evaluator::target_phase(&EvalDecision::Done),
+            QueuePhase::Done
+        );
     }
 
     #[test]
     fn target_phase_hitl() {
-        let decision = EvalDecision::Hitl { reason: "needs review".to_string() };
+        let decision = EvalDecision::Hitl {
+            reason: "needs review".to_string(),
+        };
         assert_eq!(Evaluator::target_phase(&decision), QueuePhase::Hitl);
     }
 

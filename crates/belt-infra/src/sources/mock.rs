@@ -89,8 +89,7 @@ mod tests {
         source.add_item(test_item("github:org/repo#1", "analyze"));
         source.add_item(test_item("github:org/repo#2", "implement"));
 
-        let config: WorkspaceConfig =
-            serde_yaml::from_str("name: test\nsources: {}").unwrap();
+        let config: WorkspaceConfig = serde_yaml::from_str("name: test\nsources: {}").unwrap();
         let items = source.collect(&config).await.unwrap();
         assert_eq!(items.len(), 2);
 
