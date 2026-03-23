@@ -441,6 +441,8 @@ impl Daemon {
             .count() as u32
             + 1;
         self.history.push(HistoryEntry {
+            source_id: item.source_id.clone(),
+            work_id: item.work_id.clone(),
             state: item.state.clone(),
             status: status
                 .parse()
