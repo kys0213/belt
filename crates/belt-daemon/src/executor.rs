@@ -326,4 +326,250 @@ mod tests {
         assert_eq!(usage.input_tokens, 300);
         assert_eq!(usage.output_tokens, 130);
     }
+
+    // --- Additional tests covering gaps in the original suite ---
+
+    #[test]
+    fn action_result_success_boundary() {
+        // exit_code == 0 is success
+        let ok = ActionResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration: std::time::Duration::ZERO,
+            token_usage: None,
+            runtime_name: None,
+            model: None,
+        };
+        assert!(ok.success());
+
+        // Any non-zero exit code is a failure
+        for code in [1, -1, 127, 255] {
+            let fail = ActionResult {
+                exit_code: code,
+                ..ok.clone()
+            };
+            assert!(!fail.success(), "exit_code {code} should not be success");
+        }
+    }
+
+    #[test]
+    fn action_env_with_var_builder() {
+        let env = ActionEnv::new("wid", Path::new("/workspace"))
+            .with_var("FOO", "bar")
+            .with_var("BAZ", "qux");
+
+        assert_eq!(env.work_id, "wid");
+        assert_eq!(env.worktree, PathBuf::from("/workspace"));
+        assert_eq!(env.extra_vars.get("FOO").map(|s| s.as_str()), Some("bar"));
+        assert_eq!(env.extra_vars.get("BAZ").map(|s| s.as_str()), Some("qux"));
+    }
+
+    #[tokio::test]
+    async fn execute_script_injects_worktree_env() {
+        let executor = ActionExecutor::new(setup_registry());
+        // The executor must inject WORKTREE as well as WORK_ID.
+        let action = Action::script("echo $WORKTREE");
+        let env = ActionEnv::new("wid", Path::new("/tmp"));
+        let result = executor.execute_one(&action, &env).await.unwrap();
+        assert!(result.success());
+        assert!(
+            result.stdout.contains("/tmp"),
+            "WORKTREE should be injected; got: {}",
+            result.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_script_injects_extra_vars() {
+        let executor = ActionExecutor::new(setup_registry());
+        let action = Action::script("echo $MY_VAR");
+        let env = ActionEnv::new("wid", Path::new("/tmp")).with_var("MY_VAR", "hello-extra");
+        let result = executor.execute_one(&action, &env).await.unwrap();
+        assert!(result.success());
+        assert!(
+            result.stdout.contains("hello-extra"),
+            "extra var should be injected; got: {}",
+            result.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_prompt_sets_runtime_name_field() {
+        let executor = ActionExecutor::new(setup_registry());
+        let action = Action::prompt("check runtime name");
+        let result = executor.execute_one(&action, &test_env()).await.unwrap();
+        assert_eq!(
+            result.runtime_name.as_deref(),
+            Some("mock"),
+            "runtime_name should reflect the resolved runtime"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_prompt_with_runtime_sets_runtime_name_and_model() {
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(MockRuntime::new("named-rt", vec![0])));
+        let executor = ActionExecutor::new(Arc::new(registry));
+
+        let action = Action::prompt_with_runtime("do work", "named-rt", Some("turbo-model"));
+        let result = executor.execute_one(&action, &test_env()).await.unwrap();
+
+        assert!(result.success());
+        assert_eq!(result.runtime_name.as_deref(), Some("named-rt"));
+        assert_eq!(result.model.as_deref(), Some("turbo-model"));
+    }
+
+    #[tokio::test]
+    async fn execute_prompt_unknown_runtime_returns_error() {
+        // A registry with no runtimes registered causes an error when the
+        // prompt action tries to resolve its runtime.
+        let registry = RuntimeRegistry::new("nonexistent".to_string());
+        let executor = ActionExecutor::new(Arc::new(registry));
+        let action = Action::prompt("this will fail");
+        let err = executor.execute_one(&action, &test_env()).await;
+        assert!(err.is_err(), "should error when runtime not found");
+        let msg = err.unwrap_err().to_string();
+        assert!(
+            msg.contains("runtime not found"),
+            "error message should mention runtime not found; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_script_has_no_token_usage() {
+        let executor = ActionExecutor::new(setup_registry());
+        let action = Action::script("echo ok");
+        let result = executor.execute_one(&action, &test_env()).await.unwrap();
+        assert!(result.success());
+        assert!(
+            result.token_usage.is_none(),
+            "script actions should never report token usage"
+        );
+        assert!(
+            result.runtime_name.is_none(),
+            "script actions should not set runtime_name"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_all_single_success_returns_some() {
+        let executor = ActionExecutor::new(setup_registry());
+        let actions = vec![Action::prompt("only action")];
+        let result = executor.execute_all(&actions, &test_env()).await.unwrap();
+        assert!(
+            result.is_some(),
+            "single successful action should return Some"
+        );
+        assert!(result.unwrap().success());
+    }
+
+    #[tokio::test]
+    async fn execute_all_first_action_fails_stops_immediately() {
+        // MockRuntime with [1, 0]: first invocation returns exit_code 1, second would return 0.
+        // Verifies execute_all returns immediately after the first failure.
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(MockRuntime::new("mock", vec![1, 0])));
+        let executor = ActionExecutor::new(Arc::new(registry));
+
+        let actions = vec![
+            Action::prompt("should fail"),
+            Action::prompt("should not run"),
+        ];
+        let result = executor
+            .execute_all(&actions, &test_env())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The result should be a failure from the first action.
+        assert!(!result.success());
+        assert_eq!(result.exit_code, 1);
+    }
+
+    #[tokio::test]
+    async fn execute_all_scripts_produce_no_token_usage() {
+        let executor = ActionExecutor::new(setup_registry());
+        // All script actions — accumulated token usage should be None.
+        let actions = vec![Action::script("echo one"), Action::script("echo two")];
+        let result = executor
+            .execute_all(&actions, &test_env())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(result.success());
+        assert!(
+            result.token_usage.is_none(),
+            "all-script execute_all should report no token usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_all_mixed_prompt_script_accumulates_only_prompt_usage() {
+        use belt_core::runtime::TokenUsage;
+
+        let mock = MockRuntime::new("mock", vec![0, 0]).with_token_usages(vec![TokenUsage {
+            input_tokens: 50,
+            output_tokens: 25,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        }]);
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(mock));
+        let executor = ActionExecutor::new(Arc::new(registry));
+
+        // First: prompt (has token usage), second: script (no token usage).
+        let actions = vec![Action::prompt("summarize"), Action::script("echo done")];
+        let result = executor
+            .execute_all(&actions, &test_env())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(result.success());
+        let usage = result
+            .token_usage
+            .expect("should carry prompt token usage through mixed chain");
+        assert_eq!(usage.input_tokens, 50);
+        assert_eq!(usage.output_tokens, 25);
+    }
+
+    #[tokio::test]
+    async fn execute_all_cache_tokens_accumulate_when_only_some_have_them() {
+        use belt_core::runtime::TokenUsage;
+
+        // First invocation has cache tokens; second does not.
+        let mock = MockRuntime::new("mock", vec![0, 0]).with_token_usages(vec![
+            TokenUsage {
+                input_tokens: 100,
+                output_tokens: 40,
+                cache_read_tokens: Some(8),
+                cache_write_tokens: Some(4),
+            },
+            TokenUsage {
+                input_tokens: 60,
+                output_tokens: 20,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            },
+        ]);
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(mock));
+        let executor = ActionExecutor::new(Arc::new(registry));
+
+        let actions = vec![Action::prompt("first"), Action::prompt("second")];
+        let result = executor
+            .execute_all(&actions, &test_env())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let usage = result.token_usage.expect("should have usage");
+        assert_eq!(usage.input_tokens, 160);
+        assert_eq!(usage.output_tokens, 60);
+        // Cache fields should retain whatever was accumulated from the first prompt.
+        assert_eq!(usage.cache_read_tokens, Some(8));
+        assert_eq!(usage.cache_write_tokens, Some(4));
+    }
 }
