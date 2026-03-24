@@ -2,6 +2,8 @@ use clap::{Parser, Subcommand};
 
 mod agent;
 mod claw;
+mod dashboard;
+mod status;
 
 #[derive(Parser)]
 #[command(
@@ -235,8 +237,7 @@ async fn main() -> anyhow::Result<()> {
             // TODO: daemon stop
         }
         Commands::Status { format } => {
-            tracing::info!(format, "showing status...");
-            // TODO: status display
+            status::show_status(&format)?;
         }
         Commands::Workspace { command } => {
             let belt_home = dirs::home_dir()
