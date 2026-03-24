@@ -1871,8 +1871,13 @@ mod tests {
     #[test]
     fn cron_job_crud() {
         let db = test_db();
-        db.add_cron_job("sync-issues", "*/5 * * * *", "/usr/local/bin/sync.sh", Some("ws1"))
-            .unwrap();
+        db.add_cron_job(
+            "sync-issues",
+            "*/5 * * * *",
+            "/usr/local/bin/sync.sh",
+            Some("ws1"),
+        )
+        .unwrap();
 
         let jobs = db.list_cron_jobs().unwrap();
         assert_eq!(jobs.len(), 1);
