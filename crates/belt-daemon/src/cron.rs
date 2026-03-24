@@ -507,6 +507,45 @@ struct DetectedGap {
 /// If fewer than this fraction of keywords match, a gap is reported.
 const COVERAGE_THRESHOLD: f64 = 0.5;
 
+/// Check whether an open GitHub issue already exists for a given spec's gap.
+///
+/// Queries `gh issue list` for open issues with the `autopilot:gap` label
+/// whose title contains the spec name.  Returns `true` when a matching
+/// issue is found, meaning a new issue should **not** be created.
+fn has_existing_gap_issue(spec_name: &str) -> bool {
+    let search_title = format!("[Gap] Spec '{spec_name}'");
+    let result = std::process::Command::new("gh")
+        .args([
+            "issue",
+            "list",
+            "--label",
+            "autopilot:gap",
+            "--state",
+            "open",
+            "--search",
+            &search_title,
+            "--json",
+            "number",
+            "--limit",
+            "1",
+        ])
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let trimmed = stdout.trim();
+            // gh returns "[]" when no issues match.
+            !trimmed.is_empty() && trimmed != "[]"
+        }
+        _ => {
+            // If gh CLI is unavailable or fails, err on the safe side and
+            // allow issue creation so gaps are not silently swallowed.
+            false
+        }
+    }
+}
+
 impl CronHandler for GapDetectionJob {
     fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
         tracing::info!("GapDetectionJob: scanning active specs for unimplemented gaps");
@@ -579,8 +618,34 @@ impl CronHandler for GapDetectionJob {
             }
         }
 
-        // Step 4: Create GitHub issues for detected gaps.
+        // Step 4: Create GitHub issues for detected gaps (with dedupe guard).
+        let mut skipped_count = 0usize;
         for gap in &gaps {
+            // Dedupe guard: skip if an open queue item already targets this spec.
+            if self
+                .db
+                .has_open_items_for_source(&gap.spec_id)
+                .unwrap_or(false)
+            {
+                tracing::info!(
+                    spec_id = %gap.spec_id,
+                    "GapDetectionJob: skipping issue creation — open queue item exists for spec"
+                );
+                skipped_count += 1;
+                continue;
+            }
+
+            // Dedupe guard: skip if an open GitHub issue already exists for this gap.
+            if has_existing_gap_issue(&gap.spec_name) {
+                tracing::info!(
+                    spec_id = %gap.spec_id,
+                    spec_name = %gap.spec_name,
+                    "GapDetectionJob: skipping issue creation — open GitHub issue already exists"
+                );
+                skipped_count += 1;
+                continue;
+            }
+
             let title = format!("[Gap] Spec '{}' has unimplemented keywords", gap.spec_name);
             let missing_list = gap.missing_keywords.join(", ");
             let body = format!(
@@ -659,6 +724,7 @@ impl CronHandler for GapDetectionJob {
         tracing::info!(
             total_specs = active_specs.len(),
             gaps_found = gaps.len(),
+            gaps_skipped_dedupe = skipped_count,
             completing = completing_count,
             "GapDetectionJob: completed gap detection scan"
         );
@@ -1397,6 +1463,67 @@ mod tests {
         let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
         let ctx = CronContext { now: Utc::now() };
         assert!(job.execute(&ctx).is_ok());
+    }
+
+    #[test]
+    fn gap_detection_skips_when_open_item_exists_for_spec() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a code file that does NOT cover the spec keywords.
+        std::fs::write(tmp.path().join("main.rs"), "fn unrelated_code() {}").unwrap();
+
+        // Insert an active spec with keywords missing from code.
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-dup".into(),
+            "ws".into(),
+            "Duplicate Gap".into(),
+            "implement authorization middleware for secure endpoints".into(),
+        );
+        spec.status = belt_core::spec::SpecStatus::Active;
+        db.insert_spec(&spec).unwrap();
+
+        // Insert an open (non-terminal) queue item with source_id matching the spec_id.
+        let item = belt_core::queue::QueueItem::new(
+            "spec-dup:implement".into(),
+            "spec-dup".into(),
+            "ws".into(),
+            "implement".into(),
+        );
+        db.insert_item(&item).unwrap();
+
+        // The DB-based dedupe guard should detect the open item.
+        assert!(db.has_open_items_for_source("spec-dup").unwrap());
+
+        // Execute gap detection — should succeed without attempting to create
+        // a duplicate issue (the gh CLI call is skipped).
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+        let ctx = CronContext { now: Utc::now() };
+        assert!(job.execute(&ctx).is_ok());
+    }
+
+    #[test]
+    fn has_open_items_for_source_returns_false_for_terminal_items() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+
+        // Insert a Done item.
+        let mut item = belt_core::queue::QueueItem::new(
+            "spec-done:implement".into(),
+            "spec-done".into(),
+            "ws".into(),
+            "implement".into(),
+        );
+        item.phase = QueuePhase::Done;
+        db.insert_item(&item).unwrap();
+
+        // Terminal item should not count as open.
+        assert!(!db.has_open_items_for_source("spec-done").unwrap());
+    }
+
+    #[test]
+    fn has_open_items_for_source_returns_false_for_missing_source() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        assert!(!db.has_open_items_for_source("nonexistent").unwrap());
     }
 
     #[test]

@@ -540,6 +540,27 @@ impl Database {
         items.into_iter().collect::<Result<Vec<_>, _>>()
     }
 
+    /// Check whether any non-terminal queue items exist for the given `source_id`.
+    ///
+    /// Non-terminal phases are those where `is_terminal()` returns `false`
+    /// (i.e. everything except `Done` and `Skipped`).  This is used as a
+    /// deduplication guard — e.g. the gap-detection job skips issue creation
+    /// when an open item for the same spec already exists.
+    pub fn has_open_items_for_source(&self, source_id: &str) -> Result<bool, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let count: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM queue_items WHERE source_id = ?1 AND phase NOT IN ('done', 'skipped')",
+                rusqlite::params![source_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(count > 0)
+    }
+
     /// Count queue items grouped by phase.
     ///
     /// Returns a list of `(phase_string, count)` tuples.
@@ -2821,7 +2842,6 @@ mod tests {
         assert_eq!(pending, Some(2));
         assert_eq!(running, Some(1));
     }
-}
 
     // ---- Queue Dependencies tests ------------------------------------------
 
