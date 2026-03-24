@@ -132,6 +132,7 @@ impl Daemon {
         let deps = BuiltinJobDeps {
             db: Arc::clone(&db),
             worktree_mgr: Arc::clone(&self.worktree_mgr),
+            workspace_root: self.belt_home.clone(),
         };
         let mut cron = self.cron_engine.take().unwrap_or_default();
         for job in builtin_jobs(deps) {
@@ -324,7 +325,6 @@ impl Daemon {
 
         outcomes
     }
-
 
     /// 단일 아이템의 handler를 실행하는 순수 async 함수.
     /// `&mut self` 의존 없이 `tokio::spawn`으로 실행 가능하다.
@@ -941,19 +941,18 @@ impl Daemon {
 
         // handler 성공 → Completed 전이 후 force_trigger("evaluate") (D-10).
         // force_trigger는 cron의 last_run_at을 리셋하여 다음 tick에서 즉시 실행.
-        if has_completed
-            && let Some(ref mut engine) = self.cron_engine
-        {
+        if has_completed && let Some(ref mut engine) = self.cron_engine {
             engine.force_trigger("evaluate");
             tracing::debug!("force_trigger(evaluate) after handler completion");
         }
-
 
         // Evaluator로 Completed 아이템 평가 (Done vs HITL).
         self.evaluate_completed().await;
 
         // Cron jobs: HITL timeout, daily report, log cleanup, evaluate 등.
-        if let Some(ref mut engine) = self.cron_engine { engine.tick(); }
+        if let Some(ref mut engine) = self.cron_engine {
+            engine.tick();
+        }
 
         Ok(())
     }
@@ -2235,7 +2234,11 @@ sources:
 
         // Pending → Hitl is not a valid transition.
         daemon.push_item(test_item("s1", "analyze"));
-        let result = daemon.mark_hitl("s1:analyze", HitlReason::ManualEscalation, Some("reason".into()));
+        let result = daemon.mark_hitl(
+            "s1:analyze",
+            HitlReason::ManualEscalation,
+            Some("reason".into()),
+        );
         assert!(result.is_err());
         assert_eq!(
             daemon.get_item("s1:analyze").unwrap().phase,

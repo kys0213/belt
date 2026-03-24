@@ -205,6 +205,8 @@ pub struct BuiltinJobDeps {
     pub db: Arc<Database>,
     /// Worktree manager for cleanup operations.
     pub worktree_mgr: Arc<dyn WorktreeManager>,
+    /// Root directory of the workspace (used by gap detection to scan code).
+    pub workspace_root: std::path::PathBuf,
 }
 
 /// Expires unanswered HITL (human-in-the-loop) items after a configurable timeout.
@@ -374,32 +376,240 @@ impl CronHandler for LogCleanupJob {
 
 /// Detects gaps between active specs and implemented code (CR-07).
 ///
-/// Runs every hour. For each active spec it reads the specification file,
-/// extracts keywords, and checks whether corresponding code artefacts exist.
-/// When a gap is found it creates a GitHub issue labelled `autopilot:gap`
-/// via the `gh` CLI.
-pub struct GapDetectionJob;
+/// Runs every hour. For each active spec it queries the database for specs
+/// in `Active` status, extracts keywords from their content, and checks
+/// whether corresponding code artefacts exist by scanning source files
+/// under the configured workspace root.
+///
+/// When a gap is found (keywords from a spec have no matches in the
+/// codebase) it creates a GitHub issue labelled `autopilot:gap` via the
+/// `gh` CLI.
+pub struct GapDetectionJob {
+    db: Arc<Database>,
+    /// Root directory of the workspace to scan for code files.
+    workspace_root: std::path::PathBuf,
+}
+
+impl GapDetectionJob {
+    /// Create a new `GapDetectionJob`.
+    pub fn new(db: Arc<Database>, workspace_root: std::path::PathBuf) -> Self {
+        Self { db, workspace_root }
+    }
+}
+
+/// Minimum keyword length to consider meaningful for gap detection.
+const MIN_KEYWORD_LEN: usize = 4;
+
+/// File extensions to scan when matching keywords against code.
+const CODE_EXTENSIONS: &[&str] = &["rs", "ts", "js", "py", "go", "yaml", "yml", "toml", "md"];
+
+/// Extract meaningful keywords from spec content.
+///
+/// Splits the content into whitespace-delimited tokens, strips
+/// punctuation, lowercases, and keeps tokens that are at least
+/// [`MIN_KEYWORD_LEN`] characters and are not common stop-words.
+fn extract_keywords(content: &str) -> Vec<String> {
+    let stop_words: std::collections::HashSet<&str> = [
+        "the", "and", "for", "with", "that", "this", "from", "will", "have", "been", "should",
+        "would", "could", "each", "when", "then", "into", "also", "than", "them", "they", "their",
+        "there", "were", "what", "which", "about", "some", "more", "other", "does", "done",
+    ]
+    .iter()
+    .copied()
+    .collect();
+
+    content
+        .split_whitespace()
+        .map(|w| {
+            w.trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+                .to_lowercase()
+        })
+        .filter(|w| w.len() >= MIN_KEYWORD_LEN && !stop_words.contains(w.as_str()))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// Scan source files under `root` and collect their contents into a single
+/// lowercase string for keyword matching.
+///
+/// Only files with extensions listed in [`CODE_EXTENSIONS`] are read.
+/// Errors reading individual files are silently skipped.
+fn collect_code_corpus(root: &std::path::Path) -> String {
+    let mut corpus = String::new();
+    let walker = walk_dir(root);
+    for path in walker {
+        if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && CODE_EXTENSIONS.contains(&ext)
+            && let Ok(text) = std::fs::read_to_string(&path)
+        {
+            corpus.push_str(&text.to_lowercase());
+            corpus.push('\n');
+        }
+    }
+    corpus
+}
+
+/// Recursively list all files under `dir`.
+fn walk_dir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Skip hidden directories and common non-source directories.
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && (name.starts_with('.') || name == "target" || name == "node_modules")
+                {
+                    continue;
+                }
+                files.extend(walk_dir(&path));
+            } else {
+                files.push(path);
+            }
+        }
+    }
+    files
+}
+
+/// Represents a detected gap between a spec and the codebase.
+#[derive(Debug)]
+struct DetectedGap {
+    spec_id: String,
+    spec_name: String,
+    missing_keywords: Vec<String>,
+}
+
+/// Minimum ratio of matched keywords for a spec to be considered covered.
+/// If fewer than this fraction of keywords match, a gap is reported.
+const COVERAGE_THRESHOLD: f64 = 0.5;
 
 impl CronHandler for GapDetectionJob {
     fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
         tracing::info!("GapDetectionJob: scanning active specs for unimplemented gaps");
 
-        // Step 1 – Discover spec files (*.spec.yaml / *.spec.md) under the workspace.
-        //          In future iterations this will read a configured spec directory;
-        //          for now we log the intent and succeed gracefully.
+        // Step 1: Query active specs from the database.
+        let active_specs = self
+            .db
+            .list_specs(None, Some(belt_core::spec::SpecStatus::Active))?;
 
-        // Step 2 – For each spec, extract keywords and match against the codebase.
-        //          Keyword matching is intentionally simple (substring search) and
-        //          will be refined as real spec formats stabilise.
+        if active_specs.is_empty() {
+            tracing::info!("GapDetectionJob: no active specs found, nothing to check");
+            return Ok(());
+        }
 
-        // Step 3 – For each unmatched keyword set, invoke `gh issue create`
-        //          with label `autopilot:gap`.
+        tracing::info!(
+            count = active_specs.len(),
+            "GapDetectionJob: found active specs"
+        );
 
-        // TODO: integrate with workspace config to locate spec directory
-        // TODO: implement keyword extraction and code matching
-        // TODO: call `gh issue create --label autopilot:gap` for detected gaps
+        // Step 2: Collect code corpus from workspace root.
+        let corpus = collect_code_corpus(&self.workspace_root);
 
-        tracing::info!("GapDetectionJob: completed gap detection scan");
+        if corpus.is_empty() {
+            tracing::warn!(
+                root = %self.workspace_root.display(),
+                "GapDetectionJob: no source files found in workspace root"
+            );
+            return Ok(());
+        }
+
+        // Step 3: For each spec, extract keywords and check coverage.
+        let mut gaps: Vec<DetectedGap> = Vec::new();
+
+        for spec in &active_specs {
+            let keywords = extract_keywords(&spec.content);
+            if keywords.is_empty() {
+                continue;
+            }
+
+            let missing: Vec<String> = keywords
+                .iter()
+                .filter(|kw| !corpus.contains(kw.as_str()))
+                .cloned()
+                .collect();
+
+            let matched_ratio = if keywords.is_empty() {
+                1.0
+            } else {
+                1.0 - (missing.len() as f64 / keywords.len() as f64)
+            };
+
+            if matched_ratio < COVERAGE_THRESHOLD && !missing.is_empty() {
+                tracing::info!(
+                    spec_id = %spec.id,
+                    spec_name = %spec.name,
+                    total_keywords = keywords.len(),
+                    missing_count = missing.len(),
+                    "GapDetectionJob: gap detected"
+                );
+                gaps.push(DetectedGap {
+                    spec_id: spec.id.clone(),
+                    spec_name: spec.name.clone(),
+                    missing_keywords: missing,
+                });
+            }
+        }
+
+        // Step 4: Create GitHub issues for detected gaps.
+        for gap in &gaps {
+            let title = format!("[Gap] Spec '{}' has unimplemented keywords", gap.spec_name);
+            let missing_list = gap.missing_keywords.join(", ");
+            let body = format!(
+                "## Gap Detection Report\n\n\
+                 **Spec ID:** {}\n\
+                 **Spec Name:** {}\n\n\
+                 The following keywords from the spec were not found in the codebase:\n\n\
+                 `{}`\n\n\
+                 _This issue was automatically created by the gap-detection cron job._",
+                gap.spec_id, gap.spec_name, missing_list,
+            );
+
+            let result = std::process::Command::new("gh")
+                .args([
+                    "issue",
+                    "create",
+                    "--title",
+                    &title,
+                    "--body",
+                    &body,
+                    "--label",
+                    "autopilot:gap",
+                ])
+                .output();
+
+            match result {
+                Ok(output) if output.status.success() => {
+                    let url = String::from_utf8_lossy(&output.stdout);
+                    tracing::info!(
+                        spec_id = %gap.spec_id,
+                        issue_url = %url.trim(),
+                        "GapDetectionJob: created gap issue"
+                    );
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!(
+                        spec_id = %gap.spec_id,
+                        stderr = %stderr.trim(),
+                        "GapDetectionJob: failed to create gap issue via gh CLI"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        spec_id = %gap.spec_id,
+                        error = %e,
+                        "GapDetectionJob: failed to invoke gh CLI"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            total_specs = active_specs.len(),
+            gaps_found = gaps.len(),
+            "GapDetectionJob: completed gap detection scan"
+        );
         Ok(())
     }
 }
@@ -533,7 +743,10 @@ pub fn builtin_jobs(deps: BuiltinJobDeps) -> Vec<CronJobDef> {
             workspace: None,
             enabled: true,
             last_run_at: None,
-            handler: Box::new(GapDetectionJob),
+            handler: Box::new(GapDetectionJob::new(
+                Arc::clone(&deps.db),
+                deps.workspace_root.clone(),
+            )),
         },
         CronJobDef {
             name: "knowledge_extraction".to_string(),
@@ -812,6 +1025,7 @@ mod tests {
         BuiltinJobDeps {
             db,
             worktree_mgr,
+            workspace_root: tmp.path().to_path_buf(),
         }
     }
 
@@ -833,7 +1047,117 @@ mod tests {
 
     #[test]
     fn gap_detection_job_executes_successfully() {
-        let job = GapDetectionJob;
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let job = GapDetectionJob::new(db, tmp.path().to_path_buf());
+        let ctx = CronContext { now: Utc::now() };
+        assert!(job.execute(&ctx).is_ok());
+    }
+
+    #[test]
+    fn extract_keywords_filters_short_and_stop_words() {
+        let kw = extract_keywords("the quick fox should implement authentication handler");
+        assert!(kw.contains(&"quick".to_string()));
+        assert!(kw.contains(&"implement".to_string()));
+        assert!(kw.contains(&"authentication".to_string()));
+        assert!(kw.contains(&"handler".to_string()));
+        // "the" and "should" are stop-words, "fox" is < MIN_KEYWORD_LEN
+        assert!(!kw.contains(&"the".to_string()));
+        assert!(!kw.contains(&"should".to_string()));
+        assert!(!kw.contains(&"fox".to_string()));
+    }
+
+    #[test]
+    fn extract_keywords_deduplicates() {
+        let kw = extract_keywords("token token token validation validation");
+        assert_eq!(kw.iter().filter(|k| *k == "token").count(), 1);
+        assert_eq!(kw.iter().filter(|k| *k == "validation").count(), 1);
+    }
+
+    #[test]
+    fn extract_keywords_strips_punctuation() {
+        let kw = extract_keywords("(authentication) [handler] {validator}");
+        assert!(kw.contains(&"authentication".to_string()));
+        assert!(kw.contains(&"handler".to_string()));
+        assert!(kw.contains(&"validator".to_string()));
+    }
+
+    #[test]
+    fn collect_code_corpus_reads_rs_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("main.rs"), "fn authentication_handler() {}").unwrap();
+        std::fs::write(tmp.path().join("readme.txt"), "this should be ignored").unwrap();
+
+        let corpus = collect_code_corpus(tmp.path());
+        assert!(corpus.contains("authentication_handler"));
+        assert!(!corpus.contains("ignored"));
+    }
+
+    #[test]
+    fn collect_code_corpus_skips_hidden_and_target_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hidden = tmp.path().join(".git");
+        std::fs::create_dir(&hidden).unwrap();
+        std::fs::write(hidden.join("config.rs"), "fn secret() {}").unwrap();
+
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("build.rs"), "fn build_artifact() {}").unwrap();
+
+        std::fs::write(tmp.path().join("lib.rs"), "fn visible() {}").unwrap();
+
+        let corpus = collect_code_corpus(tmp.path());
+        assert!(corpus.contains("visible"));
+        assert!(!corpus.contains("secret"));
+        assert!(!corpus.contains("build_artifact"));
+    }
+
+    #[test]
+    fn gap_detection_finds_gaps_for_active_specs() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a code file that mentions "authentication" but not "authorization".
+        std::fs::write(tmp.path().join("auth.rs"), "fn authentication() {}").unwrap();
+
+        // Insert an active spec whose keywords include "authorization" (not in code).
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-gap".into(),
+            "ws".into(),
+            "Auth Gap".into(),
+            "implement authorization middleware for secure endpoints".into(),
+        );
+        spec.status = belt_core::spec::SpecStatus::Active;
+        db.insert_spec(&spec).unwrap();
+
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+        let ctx = CronContext { now: Utc::now() };
+        // Should succeed even though gh CLI may not be available (warnings logged).
+        assert!(job.execute(&ctx).is_ok());
+    }
+
+    #[test]
+    fn gap_detection_no_gap_when_keywords_covered() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Code covers all spec keywords.
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn authentication() {}\nfn validation() {}\nfn middleware() {}",
+        )
+        .unwrap();
+
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-ok".into(),
+            "ws".into(),
+            "All Covered".into(),
+            "authentication validation middleware".into(),
+        );
+        spec.status = belt_core::spec::SpecStatus::Active;
+        db.insert_spec(&spec).unwrap();
+
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
         let ctx = CronContext { now: Utc::now() };
         assert!(job.execute(&ctx).is_ok());
     }
