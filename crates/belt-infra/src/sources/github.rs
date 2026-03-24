@@ -255,6 +255,80 @@ impl GitHubDataSource {
         Ok(items)
     }
 
+    /// Scan open PRs for `CHANGES_REQUESTED` reviews and create queue items
+    /// for each matching PR in the given review-triggered states.
+    ///
+    /// Uses `!` separator in `source_id` (e.g. `github:org/repo!42`) to
+    /// distinguish PR-review items from issue items (`#`).
+    async fn collect_changes_requested_items(
+        &self,
+        repo_name: &str,
+        workspace: &WorkspaceConfig,
+        review_states: &[String],
+    ) -> Vec<QueueItem> {
+        let output = tokio::process::Command::new("gh")
+            .args([
+                "pr",
+                "list",
+                "--repo",
+                repo_name,
+                "--state",
+                "open",
+                "--json",
+                "number,title",
+                "--limit",
+                "50",
+            ])
+            .output()
+            .await;
+
+        let output = match output {
+            Ok(o) if o.status.success() => o,
+            _ => return Vec::new(),
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let prs: Vec<serde_json::Value> = match serde_json::from_str(&stdout) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut items = Vec::new();
+        for pr in prs {
+            let number = match pr["number"].as_i64() {
+                Some(n) => n,
+                None => continue,
+            };
+            let title = pr["title"].as_str().unwrap_or("").to_string();
+
+            let reviews = Self::fetch_pr_reviews(repo_name, number)
+                .await
+                .unwrap_or_default();
+
+            let has_changes_requested = reviews.iter().any(|r| r.state == "CHANGES_REQUESTED");
+            if !has_changes_requested {
+                continue;
+            }
+
+            // Create a queue item for each review-triggered state.
+            for state_name in review_states {
+                let source_id = format!("github:{repo_name}!{number}");
+                let work_id = QueueItem::make_work_id(&source_id, state_name);
+
+                let mut item = QueueItem::new(
+                    work_id,
+                    source_id,
+                    workspace.name.clone(),
+                    state_name.clone(),
+                );
+                item.title = Some(format!("[review] {title}"));
+                items.push(item);
+            }
+        }
+
+        items
+    }
+
     /// `gh repo view`로 기본 브랜치를 조회한다.
     async fn fetch_default_branch(repo: &str) -> Option<String> {
         let output = tokio::process::Command::new("gh")
@@ -289,59 +363,73 @@ impl DataSource for GitHubDataSource {
 
         let mut items = Vec::new();
 
+        // Collect states triggered by changes_requested reviews.
+        let review_states: Vec<String> = github_config
+            .states
+            .iter()
+            .filter(|(_, cfg)| cfg.trigger.changes_requested)
+            .map(|(name, _)| name.clone())
+            .collect();
+
         for (state_name, state_config) in &github_config.states {
-            let label = match &state_config.trigger.label {
-                Some(l) => l,
-                None => continue,
-            };
+            // Label-based trigger: scan issues matching the label.
+            if let Some(label) = &state_config.trigger.label {
+                let output = tokio::process::Command::new("gh")
+                    .args([
+                        "issue",
+                        "list",
+                        "--label",
+                        label,
+                        "--json",
+                        "number,title",
+                        "-R",
+                        &repo_name,
+                    ])
+                    .output()
+                    .await;
 
-            // gh issue list로 라벨 매칭 이슈 조회
-            let output = tokio::process::Command::new("gh")
-                .args([
-                    "issue",
-                    "list",
-                    "--label",
-                    label,
-                    "--json",
-                    "number,title",
-                    "-R",
-                    &repo_name,
-                ])
-                .output()
-                .await;
+                // Issue #21: collapsible_if — let-chain으로 병합
+                if let Ok(output) = output
+                    && output.status.success()
+                {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    if let Ok(issues) = serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {
+                        for issue in issues {
+                            let number = issue["number"].as_i64().unwrap_or(0);
+                            let title = issue["title"].as_str().unwrap_or("").to_string();
+                            let source_id = format!("github:{repo_name}#{number}");
+                            let work_id = QueueItem::make_work_id(&source_id, state_name);
 
-            // Issue #21: collapsible_if — let-chain으로 병합
-            if let Ok(output) = output
-                && output.status.success()
-            {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Ok(issues) = serde_json::from_str::<Vec<serde_json::Value>>(&stdout) {
-                    for issue in issues {
-                        let number = issue["number"].as_i64().unwrap_or(0);
-                        let title = issue["title"].as_str().unwrap_or("").to_string();
-                        let source_id = format!("github:{repo_name}#{number}");
-                        let work_id = QueueItem::make_work_id(&source_id, state_name);
-
-                        items.push(QueueItem {
-                            work_id,
-                            source_id,
-                            workspace_id: workspace.name.clone(),
-                            state: state_name.clone(),
-                            phase: QueuePhase::Pending,
-                            title: Some(title),
-                            created_at: chrono::Utc::now().to_rfc3339(),
-                            updated_at: chrono::Utc::now().to_rfc3339(),
-                            hitl_created_at: None,
-                            hitl_respondent: None,
-                            hitl_notes: None,
-                            hitl_reason: None,
-                            hitl_timeout_at: None,
-                            hitl_terminal_action: None,
-                            worktree_preserved: false,
-                        });
+                            items.push(QueueItem {
+                                work_id,
+                                source_id,
+                                workspace_id: workspace.name.clone(),
+                                state: state_name.clone(),
+                                phase: QueuePhase::Pending,
+                                title: Some(title),
+                                created_at: chrono::Utc::now().to_rfc3339(),
+                                updated_at: chrono::Utc::now().to_rfc3339(),
+                                hitl_created_at: None,
+                                hitl_respondent: None,
+                                hitl_notes: None,
+                                hitl_reason: None,
+                                hitl_timeout_at: None,
+                                hitl_terminal_action: None,
+                                worktree_preserved: false,
+                            });
+                        }
                     }
                 }
             }
+        }
+
+        // Scan open PRs for changes_requested reviews and create items
+        // for each state configured with `changes_requested: true`.
+        if !review_states.is_empty() {
+            let review_items = self
+                .collect_changes_requested_items(&repo_name, workspace, &review_states)
+                .await;
+            items.extend(review_items);
         }
 
         self.last_scan = Some(chrono::Utc::now());
@@ -660,5 +748,95 @@ sources:
         let number: i64 = 42;
         let source_id = format!("github:{repo_name}#{number}");
         assert_eq!(source_id, "github:org/repo#42");
+    }
+
+    // ── changes_requested trigger ───────────────────────────────────────────
+
+    fn make_workspace_with_review_trigger(url: &str, state: &str) -> WorkspaceConfig {
+        let yaml = format!(
+            r#"
+name: test-ws
+sources:
+  github:
+    url: {url}
+    states:
+      {state}:
+        trigger:
+          changes_requested: true
+"#
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    #[test]
+    fn workspace_parses_changes_requested_trigger() {
+        let ws = make_workspace_with_review_trigger("https://github.com/org/repo", "fix_review");
+        let github = ws.sources.get("github").unwrap();
+        let state = github.states.get("fix_review").unwrap();
+        assert!(state.trigger.changes_requested);
+        assert!(state.trigger.label.is_none());
+    }
+
+    #[tokio::test]
+    async fn collect_returns_empty_when_no_review_states() {
+        let mut ds = GitHubDataSource::new("https://github.com/org/repo");
+        // Workspace with label trigger only — no changes_requested states.
+        let workspace = make_workspace_with_github(
+            "https://github.com/org/repo",
+            "analyze",
+            Some("belt:analyze"),
+        );
+        // gh CLI not available in test env, so label-based scan returns nothing.
+        let items = ds.collect(&workspace).await.unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_skips_review_scan_when_no_review_trigger() {
+        let mut ds = GitHubDataSource::new("https://github.com/org/repo");
+        let workspace = make_workspace_without_github();
+        let items = ds.collect(&workspace).await.unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn pr_review_source_id_uses_bang_separator() {
+        // PR review items use '!' instead of '#' to distinguish from issue items.
+        let repo_name = "org/repo";
+        let pr_number: i64 = 10;
+        let source_id = format!("github:{repo_name}!{pr_number}");
+        assert_eq!(source_id, "github:org/repo!10");
+        // Must not collide with issue source_id.
+        let issue_source_id = format!("github:{repo_name}#{pr_number}");
+        assert_ne!(source_id, issue_source_id);
+    }
+
+    #[test]
+    fn pr_review_work_id_format() {
+        let source_id = "github:org/repo!10";
+        let state = "fix_review";
+        let work_id = QueueItem::make_work_id(source_id, state);
+        assert_eq!(work_id, "github:org/repo!10:fix_review");
+    }
+
+    #[test]
+    fn collect_review_items_creates_correct_item_fields() {
+        // Verify the shape of a review-triggered QueueItem.
+        let source_id = "github:org/repo!10".to_string();
+        let state = "fix_review".to_string();
+        let work_id = QueueItem::make_work_id(&source_id, &state);
+        let mut item = QueueItem::new(
+            work_id.clone(),
+            source_id.clone(),
+            "test-ws".to_string(),
+            state.clone(),
+        );
+        item.title = Some("[review] Fix the bug".to_string());
+
+        assert_eq!(item.work_id, "github:org/repo!10:fix_review");
+        assert_eq!(item.source_id, "github:org/repo!10");
+        assert_eq!(item.state, "fix_review");
+        assert_eq!(item.phase, QueuePhase::Pending);
+        assert!(item.title.as_ref().unwrap().starts_with("[review]"));
     }
 }

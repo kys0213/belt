@@ -78,6 +78,9 @@ pub struct StateConfig {
 pub struct TriggerConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// When `true`, this state is triggered by PR `CHANGES_REQUESTED` reviews.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub changes_requested: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,6 +248,42 @@ runtime:
         let ws_ref = WorkspaceRef::from_config("ws-1", &config, "github").unwrap();
         assert_eq!(ws_ref.name, "auth-project");
         assert_eq!(ws_ref.concurrency, 2);
+    }
+
+    #[test]
+    fn trigger_changes_requested_defaults_to_false() {
+        let config: WorkspaceConfig = serde_yaml::from_str(WORKSPACE_YAML).unwrap();
+        let github = config.sources.get("github").unwrap();
+        let analyze = github.states.get("analyze").unwrap();
+        assert!(!analyze.trigger.changes_requested);
+    }
+
+    #[test]
+    fn trigger_changes_requested_parses_true() {
+        let yaml = r#"
+name: review-ws
+sources:
+  github:
+    url: https://github.com/org/repo
+    states:
+      fix_review:
+        trigger:
+          changes_requested: true
+        handlers:
+          - prompt: "Fix the review comments"
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let github = config.sources.get("github").unwrap();
+        let fix_review = github.states.get("fix_review").unwrap();
+        assert!(fix_review.trigger.changes_requested);
+        assert!(fix_review.trigger.label.is_none());
+    }
+
+    #[test]
+    fn trigger_changes_requested_skipped_in_json_when_false() {
+        let trigger = TriggerConfig::default();
+        let json = serde_json::to_string(&trigger).unwrap();
+        assert!(!json.contains("changes_requested"));
     }
 
     #[test]
