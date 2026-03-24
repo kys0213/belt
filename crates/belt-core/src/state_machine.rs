@@ -1,6 +1,6 @@
 use crate::phase::QueuePhase;
 
-/// 상태 전이 규칙 (14개 유효 전이).
+/// 상태 전이 규칙 (15개 유효 전이).
 pub fn is_valid_transition(from: QueuePhase, to: QueuePhase) -> bool {
     use QueuePhase::*;
     matches!(
@@ -10,6 +10,7 @@ pub fn is_valid_transition(from: QueuePhase, to: QueuePhase) -> bool {
             | (Running, Completed)
             | (Running, Skipped)
             | (Running, Failed)
+            | (Running, Pending) // graceful shutdown rollback
             | (Completed, Done)
             | (Completed, Hitl)
             | (Completed, Failed)
@@ -81,6 +82,12 @@ mod tests {
     }
 
     #[test]
+    fn graceful_shutdown_rollback() {
+        // Running -> Pending is allowed for graceful shutdown rollback.
+        assert!(transit(Running, Pending).is_ok());
+    }
+
+    #[test]
     fn backward_transitions_rejected() {
         assert!(transit(Ready, Pending).is_err());
         assert!(transit(Running, Ready).is_err());
@@ -116,6 +123,6 @@ mod tests {
             .flat_map(|&from| phases.iter().map(move |&to| (from, to)))
             .filter(|&(from, to)| is_valid_transition(from, to))
             .count();
-        assert_eq!(valid_count, 14);
+        assert_eq!(valid_count, 15);
     }
 }
