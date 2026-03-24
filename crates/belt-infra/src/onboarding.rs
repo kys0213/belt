@@ -306,18 +306,9 @@ sources:
             job_map.get("test-project:hitl_timeout"),
             Some(&"*/5 * * * *")
         );
-        assert_eq!(
-            job_map.get("test-project:daily_report"),
-            Some(&"0 6 * * *")
-        );
-        assert_eq!(
-            job_map.get("test-project:log_cleanup"),
-            Some(&"0 0 * * *")
-        );
-        assert_eq!(
-            job_map.get("test-project:evaluate"),
-            Some(&"*/1 * * * *")
-        );
+        assert_eq!(job_map.get("test-project:daily_report"), Some(&"0 6 * * *"));
+        assert_eq!(job_map.get("test-project:log_cleanup"), Some(&"0 0 * * *"));
+        assert_eq!(job_map.get("test-project:evaluate"), Some(&"*/1 * * * *"));
     }
 
     #[test]
