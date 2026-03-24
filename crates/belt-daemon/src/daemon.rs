@@ -52,8 +52,8 @@ pub struct Daemon {
     /// History events with full lineage information for failure tracking.
     history_events: Vec<HistoryEvent>,
     evaluator: Evaluator,
-    /// Cron engine for periodic background jobs (HITL timeout, cleanup, etc.).
-    cron_engine: CronEngine,
+    /// Cron engine for scheduling periodic jobs (evaluate, hitl_timeout, etc.).
+    cron_engine: Option<CronEngine>,
     /// Graceful shutdown 플래그. true이면 새 아이템 수집을 중단한다.
     shutdown_requested: bool,
     /// Evaluator 스크립트 실행을 위한 Belt home 디렉토리.
@@ -101,7 +101,6 @@ impl Daemon {
         max_concurrent: u32,
     ) -> Self {
         let evaluator = Evaluator::new(&config.name);
-        let cron_engine = CronEngine::new();
         Self {
             config,
             sources,
@@ -113,7 +112,7 @@ impl Daemon {
             db: None,
             history_events: Vec::new(),
             evaluator,
-            cron_engine,
+            cron_engine: None,
             shutdown_requested: false,
             belt_home: PathBuf::from(
                 std::env::var("BELT_HOME").unwrap_or_else(|_| ".belt".to_string()),
@@ -129,12 +128,12 @@ impl Daemon {
         let deps = BuiltinJobDeps {
             db: Arc::clone(&db),
             worktree_mgr: Arc::clone(&self.worktree_mgr),
-            belt_home: self.belt_home.clone(),
-            workspace: self.config.name.clone(),
         };
+        let mut cron = self.cron_engine.take().unwrap_or_default();
         for job in builtin_jobs(deps) {
-            self.cron_engine.register(job);
+            cron.register(job);
         }
+        self.cron_engine = Some(cron);
         self.db = Some(db);
         self
     }
@@ -142,6 +141,18 @@ impl Daemon {
     /// Set the belt home directory for evaluator scripts.
     pub fn with_belt_home(mut self, belt_home: PathBuf) -> Self {
         self.belt_home = belt_home;
+        self
+    }
+
+    /// Set the cron engine for periodic job scheduling.
+    pub fn with_cron_engine(mut self, engine: CronEngine) -> Self {
+        self.cron_engine = Some(engine);
+        self
+    }
+
+    /// Set the maximum evaluate failure threshold for HITL escalation.
+    pub fn with_max_eval_failures(mut self, max: u32) -> Self {
+        self.evaluator = Evaluator::new(&self.config.name).with_max_eval_failures(max);
         self
     }
 
@@ -480,6 +491,13 @@ impl Daemon {
                 self.record_history_event(&item, "completed", None);
                 self.tracker.release(&ws_name);
                 self.queue.push_back(item.clone());
+
+                // CR-11: Completed 전이 시 자동 force_trigger("evaluate").
+                if let Some(ref mut engine) = self.cron_engine {
+                    engine.force_trigger("evaluate");
+                    tracing::debug!("force_trigger(evaluate) after Completed: {}", item.work_id);
+                }
+
                 ItemOutcome::Completed(item)
             }
             ExecutionOutcome::Failed { error, result } => {
@@ -705,8 +723,9 @@ impl Daemon {
 
     /// 4단계: Completed 아이템을 evaluator로 평가하여 Done 또는 HITL로 분류.
     ///
-    /// handler 성공 → Completed 전이 후 evaluator가 Done/HITL을 결정한다.
-    /// evaluator 실행 실패 시 Completed 유지, 다음 tick에서 재시도.
+    /// handler 성공 -> Completed 전이 후 evaluator가 Done/HITL을 결정한다.
+    /// evaluator 실행 실패 시 per-item failure count를 증가시키고,
+    /// N회(default 3) 이상 실패 시 자동으로 HITL로 에스컬레이션한다.
     async fn evaluate_completed(&mut self) {
         let completed: Vec<String> = self
             .items_in_phase(QueuePhase::Completed)
@@ -733,7 +752,10 @@ impl Daemon {
 
         match eval_result {
             Ok(result) if result.success() => {
-                // Evaluator 성공 — on_done을 거쳐 Done으로 전이.
+                // Evaluator 성공 -- on_done을 거쳐 Done으로 전이.
+                for work_id in &completed {
+                    self.evaluator.clear_eval_failures(work_id);
+                }
                 for work_id in completed {
                     if let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id) {
                         let mut item = self.queue.remove(idx).unwrap();
@@ -746,48 +768,104 @@ impl Daemon {
                 }
             }
             Ok(result) => {
-                // Evaluator 비정상 종료 — HITL로 라우팅.
+                // Q-07 + Q-14: Evaluator 비정상 종료 -- per-item failure tracking.
+                let error_msg = format!(
+                    "evaluator exit_code={}: {}",
+                    result.exit_code,
+                    result.stderr.trim()
+                );
                 tracing::info!(
-                    "evaluator returned non-zero ({}), routing {} items to HITL",
+                    "evaluator returned non-zero ({}), evaluating {} items for escalation",
                     result.exit_code,
                     completed.len()
                 );
+
+                // Collect decisions first to avoid borrow conflict with self.evaluator.
+                let decisions: Vec<(String, crate::evaluator::EvalDecision)> = completed
+                    .iter()
+                    .map(|work_id| {
+                        let decision = self.evaluator.record_eval_failure(work_id, &error_msg);
+                        (work_id.clone(), decision)
+                    })
+                    .collect();
+
                 let now = chrono::Utc::now().to_rfc3339();
-                for work_id in completed {
-                    if let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id)
+                for (work_id, decision) in decisions {
+                    match decision {
+                        crate::evaluator::EvalDecision::Hitl { reason } => {
+                            // N회 실패 -> HITL 에스컬레이션.
+                            if let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id)
+                                && let Some(item) = self.queue.get_mut(idx)
+                            {
+                                let _ = transit(item, QueuePhase::Hitl);
+                                item.hitl_created_at = Some(now.clone());
+                                item.hitl_reason = Some(HitlReason::EvaluateFailure);
+                                item.hitl_notes = Some(reason.clone());
+                                self.history.push(HistoryEntry {
+                                    source_id: item.source_id.clone(),
+                                    work_id: item.work_id.clone(),
+                                    state: item.state.clone(),
+                                    status: belt_core::context::HistoryStatus::Hitl,
+                                    attempt: self.evaluator.eval_failure_count(&work_id),
+                                    summary: None,
+                                    error: Some(reason),
+                                    created_at: now.clone(),
+                                });
+                            }
+                        }
+                        crate::evaluator::EvalDecision::Retry => {
+                            // Completed 유지, 다음 tick에서 재시도.
+                            tracing::debug!(
+                                "evaluate retry for {} (failure_count={})",
+                                work_id,
+                                self.evaluator.eval_failure_count(&work_id)
+                            );
+                        }
+                        crate::evaluator::EvalDecision::Done => {
+                            // Should not occur from record_eval_failure, but handle gracefully.
+                            self.evaluator.clear_eval_failures(&work_id);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                // Evaluator 실행 자체가 실패 -- per-item failure tracking with escalation.
+                let error_msg = format!("evaluator execution error: {e}");
+                tracing::warn!(
+                    "evaluator failed for {} completed items: {e}",
+                    completed.len()
+                );
+
+                let decisions: Vec<(String, crate::evaluator::EvalDecision)> = completed
+                    .iter()
+                    .map(|work_id| {
+                        let decision = self.evaluator.record_eval_failure(work_id, &error_msg);
+                        (work_id.clone(), decision)
+                    })
+                    .collect();
+
+                let now = chrono::Utc::now().to_rfc3339();
+                for (work_id, decision) in decisions {
+                    if let crate::evaluator::EvalDecision::Hitl { reason } = decision
+                        && let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id)
                         && let Some(item) = self.queue.get_mut(idx)
                     {
-                        item.phase = QueuePhase::Hitl;
+                        let _ = transit(item, QueuePhase::Hitl);
                         item.hitl_created_at = Some(now.clone());
                         item.hitl_reason = Some(HitlReason::EvaluateFailure);
-                        item.hitl_notes = Some(format!(
-                            "evaluator exit_code={}: {}",
-                            result.exit_code,
-                            result.stderr.trim()
-                        ));
+                        item.hitl_notes = Some(reason.clone());
                         self.history.push(HistoryEntry {
                             source_id: item.source_id.clone(),
                             work_id: item.work_id.clone(),
                             state: item.state.clone(),
                             status: belt_core::context::HistoryStatus::Hitl,
-                            attempt: 0,
+                            attempt: self.evaluator.eval_failure_count(&work_id),
                             summary: None,
-                            error: Some(format!(
-                                "evaluator exit_code={}: {}",
-                                result.exit_code,
-                                result.stderr.trim()
-                            )),
+                            error: Some(reason),
                             created_at: now.clone(),
                         });
                     }
                 }
-            }
-            Err(e) => {
-                // Evaluator 실행 자체가 실패 — Completed 유지, 다음 tick에서 재시도.
-                tracing::warn!(
-                    "evaluator failed for {} completed items, will retry next tick: {e}",
-                    completed.len()
-                );
             }
         }
 
@@ -838,19 +916,18 @@ impl Daemon {
 
         // handler 성공 → Completed 전이 후 force_trigger("evaluate") (D-10).
         // force_trigger는 cron의 last_run_at을 리셋하여 다음 tick에서 즉시 실행.
-        if has_completed {
-            self.cron_engine.force_trigger("evaluate");
+        if has_completed
+            && let Some(ref mut engine) = self.cron_engine
+        {
+            engine.force_trigger("evaluate");
             tracing::debug!("force_trigger(evaluate) after handler completion");
         }
-
-        // Cron engine tick (evaluate, HITL timeout, etc.).
-        self.cron_engine.tick();
 
         // Evaluator로 Completed 아이템 평가 (Done vs HITL).
         self.evaluate_completed().await;
 
         // Cron jobs: HITL timeout, daily report, log cleanup, evaluate 등.
-        self.cron_engine.tick();
+        if let Some(ref mut engine) = self.cron_engine { engine.tick(); }
 
         Ok(())
     }
@@ -2120,7 +2197,7 @@ sources:
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
-        let result = daemon.mark_hitl("nonexistent", None);
+        let result = daemon.mark_hitl("nonexistent", HitlReason::ManualEscalation, None);
         assert!(result.is_err());
     }
 
@@ -2132,7 +2209,7 @@ sources:
 
         // Pending → Hitl is not a valid transition.
         daemon.push_item(test_item("s1", "analyze"));
-        let result = daemon.mark_hitl("s1:analyze", Some("reason".into()));
+        let result = daemon.mark_hitl("s1:analyze", HitlReason::ManualEscalation, Some("reason".into()));
         assert!(result.is_err());
         assert_eq!(
             daemon.get_item("s1:analyze").unwrap().phase,

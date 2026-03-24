@@ -448,6 +448,10 @@ sources:
             title: Some("Test issue title".to_string()),
             created_at: "2026-03-24T00:00:00Z".to_string(),
             updated_at: "2026-03-24T00:00:00Z".to_string(),
+            hitl_created_at: None,
+            hitl_respondent: None,
+            hitl_notes: None,
+            hitl_reason: None,
         }
     }
 
