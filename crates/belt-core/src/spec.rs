@@ -244,7 +244,11 @@ impl Spec {
     /// Parse the comma-separated `entry_point` field into individual paths.
     pub fn entry_points(&self) -> Vec<&str> {
         match &self.entry_point {
-            Some(ep) => ep.split(',').map(str::trim).filter(|s| !s.is_empty()).collect(),
+            Some(ep) => ep
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -267,6 +271,56 @@ impl fmt::Display for OverlapType {
             OverlapType::Module => f.write_str("module"),
         }
     }
+}
+
+/// Extract acceptance criteria from markdown content.
+///
+/// Looks for a section headed by `## Acceptance Criteria` or `## AC`
+/// and collects the list items (lines starting with `- ` or `* `) that follow
+/// until the next heading or end of content.
+///
+/// Returns a list of acceptance criteria strings (without the leading bullet).
+pub fn extract_acceptance_criteria(content: &str) -> Vec<String> {
+    let mut in_ac_section = false;
+    let mut criteria = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // Detect AC section header
+        if trimmed.starts_with("## ") {
+            let header = trimmed.trim_start_matches("## ").trim();
+            if header.eq_ignore_ascii_case("acceptance criteria")
+                || header.eq_ignore_ascii_case("ac")
+            {
+                in_ac_section = true;
+                continue;
+            } else if in_ac_section {
+                // Another heading encountered, stop collecting
+                break;
+            }
+        }
+
+        // Also stop on higher-level headings
+        if in_ac_section && trimmed.starts_with("# ") && !trimmed.starts_with("## ") {
+            break;
+        }
+
+        if in_ac_section {
+            // Collect bullet items (- or *)
+            if let Some(rest) = trimmed
+                .strip_prefix("- ")
+                .or_else(|| trimmed.strip_prefix("* "))
+            {
+                let text = rest.trim().to_string();
+                if !text.is_empty() {
+                    criteria.push(text);
+                }
+            }
+        }
+    }
+
+    criteria
 }
 
 /// A detected conflict between two specs.
@@ -579,7 +633,10 @@ mod tests {
             "content".to_string(),
         );
         spec.entry_point = Some("src/a.rs, src/b.rs,src/c.rs".to_string());
-        assert_eq!(spec.entry_points(), vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
+        assert_eq!(
+            spec.entry_points(),
+            vec!["src/a.rs", "src/b.rs", "src/c.rs"]
+        );
     }
 
     #[test]
@@ -696,5 +753,61 @@ mod tests {
         let json = serde_json::to_string(&conflict).unwrap();
         let parsed: SpecConflict = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed, conflict);
+    }
+
+    #[test]
+    fn extract_ac_basic() {
+        let content = "# Overview\nSome description.\n\n## Acceptance Criteria\n- Login endpoint works\n- Token refresh works\n- Logout endpoint works\n\n## Notes\nExtra info.";
+        let ac = extract_acceptance_criteria(content);
+        assert_eq!(
+            ac,
+            vec![
+                "Login endpoint works",
+                "Token refresh works",
+                "Logout endpoint works",
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_ac_short_header() {
+        let content = "## AC\n* First criterion\n* Second criterion\n";
+        let ac = extract_acceptance_criteria(content);
+        assert_eq!(ac, vec!["First criterion", "Second criterion"]);
+    }
+
+    #[test]
+    fn extract_ac_no_section() {
+        let content = "# Overview\nSome description.\n## Design\n- Item 1\n";
+        let ac = extract_acceptance_criteria(content);
+        assert!(ac.is_empty());
+    }
+
+    #[test]
+    fn extract_ac_empty_bullets_skipped() {
+        let content = "## Acceptance Criteria\n-  \n- Valid item\n- \n";
+        let ac = extract_acceptance_criteria(content);
+        assert_eq!(ac, vec!["Valid item"]);
+    }
+
+    #[test]
+    fn extract_ac_case_insensitive_header() {
+        let content = "## acceptance criteria\n- Item A\n- Item B\n";
+        let ac = extract_acceptance_criteria(content);
+        assert_eq!(ac, vec!["Item A", "Item B"]);
+    }
+
+    #[test]
+    fn extract_ac_stops_at_next_heading() {
+        let content = "## AC\n- AC item\n## Other Section\n- Not AC\n";
+        let ac = extract_acceptance_criteria(content);
+        assert_eq!(ac, vec!["AC item"]);
+    }
+
+    #[test]
+    fn extract_ac_mixed_bullets() {
+        let content = "## Acceptance Criteria\n- Dash item\n* Star item\n";
+        let ac = extract_acceptance_criteria(content);
+        assert_eq!(ac, vec!["Dash item", "Star item"]);
     }
 }

@@ -334,6 +334,9 @@ enum SpecCommands {
         /// Optional comma-separated file/module paths this spec touches.
         #[arg(long)]
         entry_point: Option<String>,
+        /// Decompose spec into child issues based on acceptance criteria.
+        #[arg(long)]
+        decompose: bool,
     },
     /// List specs.
     List {
@@ -1259,6 +1262,66 @@ fn parse_github_issue_ref(target: &str) -> Option<(String, String)> {
     None
 }
 
+/// Create a GitHub issue via the `gh` CLI and return the issue URL on success.
+fn create_github_issue(title: &str, body: &str) -> Option<String> {
+    let mut gh_cmd = std::process::Command::new("gh");
+    gh_cmd.args(["issue", "create"]);
+    gh_cmd.args(["--title", title]);
+    gh_cmd.args(["--body", body]);
+    gh_cmd.args(["--label", "autopilot:ready"]);
+    match gh_cmd.output() {
+        Ok(output) => {
+            if output.status.success() {
+                let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                println!("GitHub issue created: {url}");
+                Some(url)
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!("warning: failed to create GitHub issue: {}", stderr.trim());
+                None
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: could not run `gh` CLI: {e}");
+            None
+        }
+    }
+}
+
+/// Extract the issue number from a GitHub issue URL.
+///
+/// For example, `https://github.com/owner/repo/issues/42` returns `Some("42")`.
+fn extract_issue_number(url: &str) -> Option<String> {
+    url.rsplit('/').next().and_then(|s| {
+        if s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty() {
+            Some(s.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+/// Update the body of an existing GitHub issue via the `gh` CLI.
+fn update_github_issue_body(issue_number: &str, body: &str) {
+    let mut gh_cmd = std::process::Command::new("gh");
+    gh_cmd.args(["issue", "edit", issue_number]);
+    gh_cmd.args(["--body", body]);
+    match gh_cmd.output() {
+        Ok(output) => {
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!(
+                    "warning: failed to update parent issue body: {}",
+                    stderr.trim()
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("warning: could not run `gh` for issue update: {e}");
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1647,14 +1710,11 @@ async fn main() -> anyhow::Result<()> {
                     labels,
                     depends_on,
                     entry_point,
+                    decompose,
                 } => {
                     let id = format!("spec-{}", chrono::Utc::now().timestamp_millis());
-                    let mut spec = belt_core::spec::Spec::new(
-                        id.clone(),
-                        workspace.clone(),
-                        name,
-                        content,
-                    );
+                    let mut spec =
+                        belt_core::spec::Spec::new(id.clone(), workspace.clone(), name, content);
                     spec.priority = priority;
                     spec.labels = labels;
                     spec.depends_on = depends_on;
@@ -1662,8 +1722,7 @@ async fn main() -> anyhow::Result<()> {
 
                     // Detect conflicts with existing specs in the same workspace
                     if spec.entry_point.is_some() {
-                        let existing_specs =
-                            db.list_specs(Some(&workspace), None)?;
+                        let existing_specs = db.list_specs(Some(&workspace), None)?;
                         let conflicts =
                             belt_core::spec::ConflictDetector::detect(&spec, &existing_specs);
                         if !conflicts.is_empty() {
@@ -1671,7 +1730,10 @@ async fn main() -> anyhow::Result<()> {
                             for c in &conflicts {
                                 eprintln!(
                                     "  - {} overlap with spec '{}' ({}) at path: {}",
-                                    c.overlap_type, c.existing_spec_name, c.existing_spec_id, c.path
+                                    c.overlap_type,
+                                    c.existing_spec_name,
+                                    c.existing_spec_id,
+                                    c.path
                                 );
                             }
                             let conflicts_json = serde_json::to_string(&conflicts)?;
@@ -1682,27 +1744,58 @@ async fn main() -> anyhow::Result<()> {
                     db.insert_spec(&spec)?;
                     println!("spec created: {id}");
 
-                    // Auto-create GitHub issue with autopilot:ready label.
-                    let mut gh_cmd = std::process::Command::new("gh");
-                    gh_cmd.args(["issue", "create"]);
-                    gh_cmd.args(["--title", &spec.name]);
-                    gh_cmd.args(["--body", &spec.content]);
-                    gh_cmd.args(["--label", "autopilot:ready"]);
-                    match gh_cmd.output() {
-                        Ok(output) => {
-                            if output.status.success() {
-                                let url = String::from_utf8_lossy(&output.stdout);
-                                println!("GitHub issue created: {}", url.trim());
-                            } else {
-                                let stderr = String::from_utf8_lossy(&output.stderr);
-                                eprintln!(
-                                    "warning: failed to create GitHub issue: {}",
-                                    stderr.trim()
-                                );
+                    // Extract acceptance criteria for decomposition.
+                    let criteria = belt_core::spec::extract_acceptance_criteria(&spec.content);
+
+                    // Auto-create GitHub parent issue with autopilot:ready label.
+                    let parent_body = if decompose && !criteria.is_empty() {
+                        // Append a placeholder for child issue links that will be
+                        // filled in after child issues are created.
+                        format!(
+                            "{}\n\n## Sub-issues\n_Creating child issues..._",
+                            spec.content
+                        )
+                    } else {
+                        spec.content.clone()
+                    };
+
+                    let parent_url = create_github_issue(&spec.name, &parent_body);
+
+                    if decompose
+                        && !criteria.is_empty()
+                        && let Some(ref parent) = parent_url
+                    {
+                        let parent_number = extract_issue_number(parent);
+                        let mut child_urls: Vec<String> = Vec::new();
+
+                        for (i, ac) in criteria.iter().enumerate() {
+                            let child_title = format!(
+                                "[sub] #{} AC{}: {}",
+                                parent_number.as_deref().unwrap_or("?"),
+                                i + 1,
+                                ac
+                            );
+                            let child_body =
+                                format!("Parent: {}\n\n## Acceptance Criterion\n\n{}", parent, ac);
+                            if let Some(url) = create_github_issue(&child_title, &child_body) {
+                                println!("  child issue created: {url}");
+                                child_urls.push(url);
                             }
                         }
-                        Err(e) => {
-                            eprintln!("warning: could not run `gh` CLI: {e}");
+
+                        // Update parent issue body with child issue links.
+                        if !child_urls.is_empty()
+                            && let Some(ref num) = parent_number
+                        {
+                            let links = child_urls
+                                .iter()
+                                .enumerate()
+                                .map(|(i, url)| format!("- [ ] AC{}: {}", i + 1, url))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            let updated_body =
+                                format!("{}\n\n## Sub-issues\n{}", spec.content, links);
+                            update_github_issue_body(num, &updated_body);
                         }
                     }
                 }
@@ -2133,5 +2226,29 @@ mod tests {
     #[test]
     fn parse_github_issue_ref_empty_number() {
         assert_eq!(parse_github_issue_ref("owner/repo#"), None);
+    }
+
+    #[test]
+    fn extract_issue_number_from_url() {
+        assert_eq!(
+            extract_issue_number("https://github.com/owner/repo/issues/42"),
+            Some("42".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_issue_number_no_number() {
+        assert_eq!(
+            extract_issue_number("https://github.com/owner/repo/issues/"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_issue_number_non_numeric() {
+        assert_eq!(
+            extract_issue_number("https://github.com/owner/repo/issues/abc"),
+            None
+        );
     }
 }
