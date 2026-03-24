@@ -988,6 +988,9 @@ impl Database {
     }
 
     /// List all specs, optionally filtered by workspace and/or status.
+    ///
+    /// By default, archived specs are excluded unless explicitly requested
+    /// via `status = Some(SpecStatus::Archived)`.
     pub fn list_specs(
         &self,
         workspace: Option<&str>,
@@ -1009,6 +1012,12 @@ impl Database {
         if let Some(s) = status {
             sql.push_str(" AND status = ?");
             param_values.push(Box::new(s.as_str().to_string()));
+        } else {
+            // Exclude archived specs by default
+            sql.push_str(" AND status != ?");
+            param_values.push(Box::new(
+                SpecStatus::Archived.as_str().to_string(),
+            ));
         }
 
         sql.push_str(" ORDER BY created_at ASC");
@@ -1086,22 +1095,12 @@ impl Database {
         Ok(())
     }
 
-    /// Remove a spec by ID.
+    /// Soft-delete a spec by transitioning it to Archived status.
     ///
     /// # Errors
-    /// Returns `BeltError::SpecNotFound` if no row was deleted.
+    /// Returns `BeltError::SpecNotFound` if no spec matches the given ID.
     pub fn remove_spec(&self, id: &str) -> Result<(), BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute("DELETE FROM specs WHERE id = ?1", params![id])
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        if rows == 0 {
-            return Err(BeltError::SpecNotFound(id.to_string()));
-        }
-        Ok(())
+        self.update_spec_status(id, SpecStatus::Archived)
     }
 
     // ---- Spec Links ---------------------------------------------------------
@@ -2494,7 +2493,15 @@ mod tests {
         db.insert_spec(&spec).unwrap();
 
         db.remove_spec(&spec.id).unwrap();
-        assert!(db.get_spec(&spec.id).is_err());
+        // Soft delete: spec still exists but is archived
+        let fetched = db.get_spec(&spec.id).unwrap();
+        assert_eq!(fetched.status, SpecStatus::Archived);
+        // Archived specs are excluded from default listing
+        let listed = db.list_specs(None, None).unwrap();
+        assert!(listed.is_empty());
+        // But can be listed explicitly
+        let archived = db.list_specs(None, Some(SpecStatus::Archived)).unwrap();
+        assert_eq!(archived.len(), 1);
     }
 
     #[test]
@@ -2821,7 +2828,6 @@ mod tests {
         assert_eq!(pending, Some(2));
         assert_eq!(running, Some(1));
     }
-}
 
     // ---- Queue Dependencies tests ------------------------------------------
 
