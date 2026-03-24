@@ -24,4 +24,10 @@ pub enum BeltError {
 
     #[error("worktree error: {0}")]
     Worktree(String),
+
+    #[error("spec not found: {0}")]
+    SpecNotFound(String),
+
+    #[error("invalid spec transition: {from} -> {to}")]
+    InvalidSpecTransition { from: String, to: String },
 }

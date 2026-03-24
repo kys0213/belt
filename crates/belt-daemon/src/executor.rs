@@ -107,12 +107,14 @@ impl ActionExecutor {
             .resolve(name)
             .ok_or_else(|| anyhow::anyhow!("runtime not found: {name}"))?;
 
+        let resolved_model = self.registry.resolve_model(model.clone());
         let request = RuntimeRequest {
             working_dir: env.worktree.clone(),
             prompt: text.to_string(),
-            model: model.clone(),
+            model: resolved_model.clone(),
             system_prompt: None,
             session_id: None,
+            structured_output: None,
         };
 
         let response = runtime.invoke(request).await;
@@ -123,7 +125,7 @@ impl ActionExecutor {
             duration: response.duration,
             token_usage: response.token_usage,
             runtime_name: Some(name.to_string()),
-            model,
+            model: resolved_model,
         })
     }
 
