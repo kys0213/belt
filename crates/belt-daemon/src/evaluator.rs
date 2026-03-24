@@ -53,11 +53,13 @@ belt agent --workspace "{ws}" -p \
 
     pub async fn run_evaluate(&self, belt_home: &Path) -> Result<EvaluateResult> {
         let script = self.build_evaluate_script();
+        let belt_db = belt_home.join("belt.db");
         let output = tokio::process::Command::new("bash")
             .arg("-c")
             .arg(&script)
             .env("WORKSPACE", &self.workspace_name)
             .env("BELT_HOME", belt_home.to_string_lossy().as_ref())
+            .env("BELT_DB", belt_db.to_string_lossy().as_ref())
             .output()
             .await?;
 

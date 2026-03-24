@@ -136,6 +136,16 @@ impl ActionExecutor {
         cmd.current_dir(&env.worktree);
         cmd.env("WORK_ID", &env.work_id);
         cmd.env("WORKTREE", env.worktree.to_string_lossy().as_ref());
+        // Inject BELT_DB path derived from BELT_HOME (or extra_vars override).
+        if let Some(belt_db) = env.extra_vars.get("BELT_DB") {
+            cmd.env("BELT_DB", belt_db);
+        } else if let Some(belt_home) = env.extra_vars.get("BELT_HOME") {
+            let db_path = Path::new(belt_home).join("belt.db");
+            cmd.env("BELT_DB", db_path.to_string_lossy().as_ref());
+        } else if let Ok(belt_home) = std::env::var("BELT_HOME") {
+            let db_path = Path::new(&belt_home).join("belt.db");
+            cmd.env("BELT_DB", db_path.to_string_lossy().as_ref());
+        }
         for (k, v) in &env.extra_vars {
             cmd.env(k, v);
         }
