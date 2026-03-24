@@ -223,4 +223,148 @@ sources:
         assert!(job_names.contains(&"project-a:hitl_timeout"));
         assert!(job_names.contains(&"project-b:hitl_timeout"));
     }
+
+    #[test]
+    fn onboard_invalid_yaml_content_errors() {
+        // File exists but contains invalid YAML — distinct from missing file.
+        let db = test_db();
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp, b"not: [valid: yaml: {{").unwrap();
+
+        let result = onboard_workspace(&db, tmp.path());
+        assert!(result.is_err());
+        // No workspace or cron jobs should have been created.
+        assert_eq!(db.list_cron_jobs().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn onboard_yaml_missing_name_field_errors() {
+        let db = test_db();
+        let yaml = r#"
+concurrency: 2
+sources:
+  github:
+    url: https://github.com/org/repo
+"#;
+        let tmp = write_workspace_yaml(yaml);
+        let result = onboard_workspace(&db, tmp.path());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn onboard_source_count_reflects_config() {
+        let db = test_db();
+        let yaml = r#"
+name: three-source-project
+sources:
+  github:
+    url: https://github.com/org/repo
+  slack:
+    url: https://slack.com/workspace
+  jira:
+    url: https://jira.example.com
+"#;
+        let tmp = write_workspace_yaml(yaml);
+        let result = onboard_workspace(&db, tmp.path()).unwrap();
+        assert_eq!(result.source_count, 3);
+    }
+
+    #[test]
+    fn onboard_zero_sources_succeeds() {
+        let db = test_db();
+        let yaml = "name: no-sources\nsources: {}\n";
+        let tmp = write_workspace_yaml(yaml);
+        let result = onboard_workspace(&db, tmp.path()).unwrap();
+        assert_eq!(result.workspace_name, "no-sources");
+        assert_eq!(result.source_count, 0);
+        assert!(result.created);
+        // Cron jobs are still seeded regardless of source count.
+        assert_eq!(result.cron_jobs_seeded, 4);
+    }
+
+    #[test]
+    fn onboard_result_config_path_is_nonempty() {
+        let db = test_db();
+        let tmp = write_workspace_yaml(VALID_YAML);
+        let result = onboard_workspace(&db, tmp.path()).unwrap();
+        assert!(!result.config_path.is_empty());
+    }
+
+    #[test]
+    fn onboard_cron_jobs_have_correct_schedules() {
+        let db = test_db();
+        let tmp = write_workspace_yaml(VALID_YAML);
+        onboard_workspace(&db, tmp.path()).unwrap();
+
+        let jobs = db.list_cron_jobs().unwrap();
+        let job_map: std::collections::HashMap<&str, &str> = jobs
+            .iter()
+            .map(|j| (j.name.as_str(), j.schedule.as_str()))
+            .collect();
+
+        assert_eq!(
+            job_map.get("test-project:hitl_timeout"),
+            Some(&"*/5 * * * *")
+        );
+        assert_eq!(
+            job_map.get("test-project:daily_report"),
+            Some(&"0 6 * * *")
+        );
+        assert_eq!(
+            job_map.get("test-project:log_cleanup"),
+            Some(&"0 0 * * *")
+        );
+        assert_eq!(
+            job_map.get("test-project:evaluate"),
+            Some(&"*/1 * * * *")
+        );
+    }
+
+    #[test]
+    fn onboard_triple_call_is_idempotent() {
+        // Running onboard three times should not accumulate cron jobs.
+        let db = test_db();
+        let tmp = write_workspace_yaml(VALID_YAML);
+
+        onboard_workspace(&db, tmp.path()).unwrap();
+        onboard_workspace(&db, tmp.path()).unwrap();
+        let result3 = onboard_workspace(&db, tmp.path()).unwrap();
+
+        assert!(!result3.created);
+        assert_eq!(result3.cron_jobs_seeded, 0);
+        assert_eq!(db.list_cron_jobs().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn onboard_all_seeded_cron_jobs_are_enabled() {
+        let db = test_db();
+        let tmp = write_workspace_yaml(VALID_YAML);
+        onboard_workspace(&db, tmp.path()).unwrap();
+
+        let jobs = db.list_cron_jobs().unwrap();
+        for job in &jobs {
+            assert!(
+                job.enabled,
+                "cron job '{}' should be enabled after seeding",
+                job.name
+            );
+        }
+    }
+
+    #[test]
+    fn onboard_cron_jobs_have_correct_workspace_scope() {
+        let db = test_db();
+        let tmp = write_workspace_yaml(VALID_YAML);
+        onboard_workspace(&db, tmp.path()).unwrap();
+
+        let jobs = db.list_cron_jobs().unwrap();
+        for job in &jobs {
+            assert_eq!(
+                job.workspace.as_deref(),
+                Some("test-project"),
+                "cron job '{}' should be scoped to 'test-project'",
+                job.name
+            );
+        }
+    }
 }
