@@ -129,6 +129,12 @@ pub struct QueueItem {
     /// HITL 생성 경로.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hitl_reason: Option<HitlReason>,
+    /// Worktree가 보존되었는지 여부.
+    ///
+    /// HITL 또는 Failed 전이 시 `true`로 설정되어 worktree가
+    /// cleanup 없이 보존되었음을 명시적으로 기록한다.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub worktree_preserved: bool,
 }
 
 impl QueueItem {
@@ -147,6 +153,7 @@ impl QueueItem {
             hitl_respondent: None,
             hitl_notes: None,
             hitl_reason: None,
+            worktree_preserved: false,
         }
     }
 
@@ -172,6 +179,7 @@ pub struct QueueItemRow {
     pub hitl_respondent: Option<String>,
     pub hitl_notes: Option<String>,
     pub hitl_reason: Option<String>,
+    pub worktree_preserved: bool,
 }
 
 impl QueueItem {
@@ -189,6 +197,7 @@ impl QueueItem {
             hitl_respondent: self.hitl_respondent.clone(),
             hitl_notes: self.hitl_notes.clone(),
             hitl_reason: self.hitl_reason.map(|r| r.to_string()),
+            worktree_preserved: self.worktree_preserved,
         }
     }
 
@@ -218,7 +227,16 @@ impl QueueItem {
             hitl_respondent: row.hitl_respondent.clone(),
             hitl_notes: row.hitl_notes.clone(),
             hitl_reason,
+            worktree_preserved: row.worktree_preserved,
         })
+    }
+
+    /// Mark that the worktree is preserved (not cleaned up).
+    ///
+    /// Called when transitioning to HITL or Failed to record that the
+    /// worktree remains on disk for debugging or human review.
+    pub fn mark_worktree_preserved(&mut self) {
+        self.worktree_preserved = true;
     }
 }
 
@@ -241,6 +259,7 @@ pub mod testing {
             hitl_respondent: None,
             hitl_notes: None,
             hitl_reason: None,
+            worktree_preserved: false,
         }
     }
 }
@@ -336,5 +355,42 @@ mod tests {
             HitlReason::ManualEscalation.to_string(),
             "manual_escalation"
         );
+    }
+
+    fn worktree_preserved_default_false() {
+        let item = test_item("s1", "analyze");
+        assert!(!item.worktree_preserved);
+    }
+
+    #[test]
+    fn mark_worktree_preserved_sets_flag() {
+        let mut item = test_item("s1", "analyze");
+        item.mark_worktree_preserved();
+        assert!(item.worktree_preserved);
+    }
+
+    #[test]
+    fn worktree_preserved_skipped_in_json_when_false() {
+        let item = test_item("s1", "analyze");
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(!json.contains("worktree_preserved"));
+    }
+
+    #[test]
+    fn worktree_preserved_present_in_json_when_true() {
+        let mut item = test_item("s1", "analyze");
+        item.mark_worktree_preserved();
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"worktree_preserved\":true"));
+    }
+
+    #[test]
+    fn worktree_preserved_row_roundtrip() {
+        let mut item = test_item("s1", "analyze");
+        item.mark_worktree_preserved();
+        let row = item.to_row();
+        assert!(row.worktree_preserved);
+        let restored = QueueItem::from_row(&row).unwrap();
+        assert!(restored.worktree_preserved);
     }
 }

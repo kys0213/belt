@@ -76,6 +76,10 @@ struct ExecutionResult {
     item: QueueItem,
     outcome: ExecutionOutcome,
     ws_name: String,
+    /// on_fail actions from the state config, deferred for escalation-aware execution.
+    on_fail_actions: Vec<Action>,
+    /// worktree path for on_fail script execution.
+    worktree: Option<PathBuf>,
 }
 
 enum ExecutionOutcome {
@@ -309,19 +313,7 @@ impl Daemon {
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok(exec_result) => {
-                    let outcome = self.apply_execution_result(exec_result);
-
-                    // Execute on_fail scripts based on escalation policy.
-                    if let ItemOutcome::Failed {
-                        ref item,
-                        escalation,
-                        ..
-                    } = outcome
-                        && escalation.should_run_on_fail()
-                    {
-                        self.execute_on_fail_for_item(item).await;
-                    }
-
+                    let outcome = self.apply_execution_result(exec_result).await;
                     outcomes.push(outcome);
                 }
                 Err(e) => {
@@ -333,34 +325,6 @@ impl Daemon {
         outcomes
     }
 
-    /// Execute on_fail scripts for a failed item (best-effort).
-    ///
-    /// Escalation policy의 `should_run_on_fail()`이 true일 때만 호출된다.
-    /// silent retry는 on_fail을 실행하지 않는다.
-    async fn execute_on_fail_for_item(&self, item: &QueueItem) {
-        let state_config = match self.find_state_config(&item.state).cloned() {
-            Some(cfg) => cfg,
-            None => return,
-        };
-
-        if state_config.on_fail.is_empty() {
-            return;
-        }
-
-        let worktree = match self.worktree_mgr.create_or_reuse(&item.work_id) {
-            Ok(path) => path,
-            Err(e) => {
-                tracing::warn!("on_fail worktree error for {}: {e}", item.work_id);
-                return;
-            }
-        };
-
-        let env = ActionEnv::new(&item.work_id, &worktree);
-        let on_fail: Vec<Action> = state_config.on_fail.iter().map(Action::from).collect();
-        if let Err(e) = self.executor.execute_all(&on_fail, &env).await {
-            tracing::warn!("on_fail execution error for {}: {e}", item.work_id);
-        }
-    }
 
     /// 단일 아이템의 handler를 실행하는 순수 async 함수.
     /// `&mut self` 의존 없이 `tokio::spawn`으로 실행 가능하다.
@@ -379,9 +343,14 @@ impl Daemon {
                     item,
                     outcome: ExecutionOutcome::Skipped,
                     ws_name,
+                    on_fail_actions: Vec::new(),
+                    worktree: None,
                 };
             }
         };
+
+        // Collect on_fail actions for deferred, escalation-aware execution.
+        let on_fail_actions: Vec<Action> = state_config.on_fail.iter().map(Action::from).collect();
 
         let worktree = match worktree_mgr.create_or_reuse(&ws_name) {
             Ok(path) => path,
@@ -393,6 +362,8 @@ impl Daemon {
                         error: format!("worktree creation failed: {e}"),
                     },
                     ws_name,
+                    on_fail_actions: Vec::new(),
+                    worktree: None,
                 };
             }
         };
@@ -411,6 +382,8 @@ impl Daemon {
                         result: None,
                     },
                     ws_name,
+                    on_fail_actions,
+                    worktree: Some(worktree),
                 };
             }
             Err(e) => {
@@ -423,6 +396,8 @@ impl Daemon {
                         result: None,
                     },
                     ws_name,
+                    on_fail_actions,
+                    worktree: Some(worktree),
                 };
             }
             _ => {
@@ -442,6 +417,8 @@ impl Daemon {
                     result: Some(r),
                 },
                 ws_name,
+                on_fail_actions,
+                worktree: Some(worktree),
             },
             Ok(r) => {
                 item.phase = QueuePhase::Completed;
@@ -449,6 +426,8 @@ impl Daemon {
                     item,
                     outcome: ExecutionOutcome::Completed { result: r },
                     ws_name,
+                    on_fail_actions: Vec::new(),
+                    worktree: Some(worktree),
                 }
             }
             Err(e) => {
@@ -460,17 +439,24 @@ impl Daemon {
                         result: None,
                     },
                     ws_name,
+                    on_fail_actions,
+                    worktree: Some(worktree),
                 }
             }
         }
     }
 
     /// 병렬 실행 결과를 daemon 상태에 반영한다.
-    fn apply_execution_result(&mut self, exec_result: ExecutionResult) -> ItemOutcome {
+    ///
+    /// Q-12: on_fail scripts are only executed when the escalation action
+    /// is not a silent retry (`EscalationAction::Retry`).
+    async fn apply_execution_result(&mut self, exec_result: ExecutionResult) -> ItemOutcome {
         let ExecutionResult {
             mut item,
             outcome,
             ws_name,
+            on_fail_actions,
+            worktree,
         } = exec_result;
 
         match outcome {
@@ -508,8 +494,36 @@ impl Daemon {
                 let failure_count = self.count_failures(&item.source_id, &item.state);
                 let escalation = self.resolve_escalation(&item.state, failure_count + 1);
 
+                // Q-12: Execute on_fail scripts only when escalation is not a silent retry.
+                if escalation.should_run_on_fail() {
+                    if let Some(ref wt) = worktree {
+                        let env = ActionEnv::new(&item.work_id, wt);
+                        if let Err(e) = self.executor.execute_all(&on_fail_actions, &env).await {
+                            tracing::warn!(
+                                work_id = %item.work_id,
+                                "on_fail script execution error: {e}"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::debug!(
+                        work_id = %item.work_id,
+                        escalation = ?escalation,
+                        "skipping on_fail execution for silent retry"
+                    );
+                }
+
                 self.record_history(&item, "failed", Some(&error));
                 self.record_history_event(&item, "failed", Some(error.clone()));
+
+                // Q-10: Mark worktree as preserved for Failed items.
+                item.mark_worktree_preserved();
+                tracing::info!(
+                    work_id = %item.work_id,
+                    phase = "failed",
+                    "worktree preserved for failed item"
+                );
+
                 self.handle_escalation(&mut item, escalation);
                 self.tracker.release(&ws_name);
 
@@ -622,6 +636,8 @@ impl Daemon {
     }
 
     /// Mark a Running item as Failed and record a HistoryEvent.
+    ///
+    /// Also marks the worktree as preserved so it remains available for debugging.
     pub fn mark_failed(&mut self, work_id: &str, error: String) -> Result<(), BeltError> {
         let item = self
             .queue
@@ -633,6 +649,8 @@ impl Daemon {
         let state = item.state.clone();
 
         transit(item, QueuePhase::Failed)?;
+        item.mark_worktree_preserved();
+        tracing::info!(work_id, "worktree preserved for failed item");
 
         let attempt = self.count_failures(&source_id, &state) + 1;
 
@@ -851,6 +869,13 @@ impl Daemon {
                         && let Some(item) = self.queue.get_mut(idx)
                     {
                         let _ = transit(item, QueuePhase::Hitl);
+                        // Q-10: Mark worktree as preserved for HITL items.
+                        item.mark_worktree_preserved();
+                        tracing::info!(
+                            work_id = %item.work_id,
+                            phase = "hitl",
+                            "worktree preserved for HITL item"
+                        );
                         item.hitl_created_at = Some(now.clone());
                         item.hitl_reason = Some(HitlReason::EvaluateFailure);
                         item.hitl_notes = Some(reason.clone());
@@ -922,6 +947,7 @@ impl Daemon {
             engine.force_trigger("evaluate");
             tracing::debug!("force_trigger(evaluate) after handler completion");
         }
+
 
         // Evaluator로 Completed 아이템 평가 (Done vs HITL).
         self.evaluate_completed().await;
