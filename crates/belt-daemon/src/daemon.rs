@@ -106,7 +106,7 @@ impl Daemon {
             config,
             sources,
             executor: Arc::new(ActionExecutor::new(registry)),
-            worktree_mgr: Arc::from(worktree_mgr),
+            worktree_mgr: worktree_mgr.into(),
             tracker: ConcurrencyTracker::new(max_concurrent),
             queue: VecDeque::new(),
             history: Vec::new(),
