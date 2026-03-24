@@ -54,6 +54,26 @@ pub struct CronJob {
     pub created_at: String,
 }
 
+/// A row from the `knowledge_base` table.
+///
+/// Stores extracted knowledge from merged PRs — decisions, patterns,
+/// domain knowledge, and review feedback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KnowledgeEntry {
+    /// Auto-incremented row ID (populated on read, ignored on insert).
+    pub id: Option<i64>,
+    /// The workspace this knowledge belongs to.
+    pub workspace: String,
+    /// Source reference (e.g. "PR #42", "gh:org/repo#42").
+    pub source_ref: String,
+    /// Category of knowledge: "decision", "pattern", "domain", "review_feedback".
+    pub category: String,
+    /// The extracted knowledge content.
+    pub content: String,
+    /// When this entry was created (RFC 3339).
+    pub created_at: String,
+}
+
 /// A row from the `token_usage` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsageRow {
@@ -197,6 +217,15 @@ impl Database {
                 enabled     INTEGER NOT NULL DEFAULT 1,
                 last_run_at TEXT,
                 created_at  TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS knowledge_base (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                workspace  TEXT NOT NULL,
+                source_ref TEXT NOT NULL,
+                category   TEXT NOT NULL,
+                content    TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS token_usage (
@@ -882,6 +911,115 @@ impl Database {
         Ok(())
     }
 
+    // ---- Knowledge Base ----------------------------------------------------
+
+    /// Insert a new knowledge entry extracted from a merged PR.
+    ///
+    /// # Errors
+    /// Returns `BeltError::Database` on constraint violation or I/O error.
+    pub fn insert_knowledge(&self, entry: &KnowledgeEntry) -> Result<(), BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO knowledge_base (workspace, source_ref, category, content, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                entry.workspace,
+                entry.source_ref,
+                entry.category,
+                entry.content,
+                entry.created_at,
+            ],
+        )
+        .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// List knowledge entries, optionally filtered by workspace and/or category.
+    pub fn list_knowledge(
+        &self,
+        workspace: Option<&str>,
+        category: Option<&str>,
+    ) -> Result<Vec<KnowledgeEntry>, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let mut sql = String::from(
+            "SELECT id, workspace, source_ref, category, content, created_at FROM knowledge_base WHERE 1=1",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(ws) = workspace {
+            sql.push_str(" AND workspace = ?");
+            param_values.push(Box::new(ws.to_string()));
+        }
+        if let Some(cat) = category {
+            sql.push_str(" AND category = ?");
+            param_values.push(Box::new(cat.to_string()));
+        }
+        sql.push_str(" ORDER BY created_at DESC");
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let entries = stmt
+            .query_map(params_ref.as_slice(), |row| {
+                Ok(KnowledgeEntry {
+                    id: row.get(0)?,
+                    workspace: row.get(1)?,
+                    source_ref: row.get(2)?,
+                    category: row.get(3)?,
+                    content: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(entries)
+    }
+
+    /// Get knowledge entries for a specific source reference (e.g. a PR).
+    pub fn get_knowledge_by_source(
+        &self,
+        source_ref: &str,
+    ) -> Result<Vec<KnowledgeEntry>, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, workspace, source_ref, category, content, created_at
+                 FROM knowledge_base WHERE source_ref = ?1 ORDER BY created_at DESC",
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let entries = stmt
+            .query_map(params![source_ref], |row| {
+                Ok(KnowledgeEntry {
+                    id: row.get(0)?,
+                    workspace: row.get(1)?,
+                    source_ref: row.get(2)?,
+                    category: row.get(3)?,
+                    content: row.get(4)?,
+                    created_at: row.get(5)?,
+                })
+            })
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(entries)
+    }
+
     // ---- Token Usage -------------------------------------------------------
 
     /// Record token usage for a completed runtime invocation.
@@ -1499,6 +1637,96 @@ mod tests {
         let db = test_db();
         let err = db.update_cron_schedule("nope", "* * * * *").unwrap_err();
         assert!(matches!(err, BeltError::ItemNotFound(_)));
+    }
+
+    // ---- Knowledge Base ----------------------------------------------------
+
+    #[test]
+    fn insert_and_list_knowledge() {
+        let db = test_db();
+        let entry = KnowledgeEntry {
+            id: None,
+            workspace: "ws1".to_string(),
+            source_ref: "PR #42".to_string(),
+            category: "decision".to_string(),
+            content: "Chose SQLite over Postgres for simplicity".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+        };
+        db.insert_knowledge(&entry).unwrap();
+
+        let entries = db.list_knowledge(None, None).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].source_ref, "PR #42");
+        assert_eq!(entries[0].category, "decision");
+        assert!(entries[0].id.is_some());
+    }
+
+    #[test]
+    fn list_knowledge_filter_by_workspace() {
+        let db = test_db();
+        for (ws, cat) in &[("ws1", "decision"), ("ws1", "pattern"), ("ws2", "domain")] {
+            db.insert_knowledge(&KnowledgeEntry {
+                id: None,
+                workspace: ws.to_string(),
+                source_ref: "PR #1".to_string(),
+                category: cat.to_string(),
+                content: "some knowledge".to_string(),
+                created_at: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        }
+
+        let ws1 = db.list_knowledge(Some("ws1"), None).unwrap();
+        assert_eq!(ws1.len(), 2);
+
+        let ws2 = db.list_knowledge(Some("ws2"), None).unwrap();
+        assert_eq!(ws2.len(), 1);
+    }
+
+    #[test]
+    fn list_knowledge_filter_by_category() {
+        let db = test_db();
+        for cat in &["decision", "pattern", "decision"] {
+            db.insert_knowledge(&KnowledgeEntry {
+                id: None,
+                workspace: "ws1".to_string(),
+                source_ref: "PR #1".to_string(),
+                category: cat.to_string(),
+                content: "content".to_string(),
+                created_at: Utc::now().to_rfc3339(),
+            })
+            .unwrap();
+        }
+
+        let decisions = db.list_knowledge(None, Some("decision")).unwrap();
+        assert_eq!(decisions.len(), 2);
+    }
+
+    #[test]
+    fn get_knowledge_by_source() {
+        let db = test_db();
+        db.insert_knowledge(&KnowledgeEntry {
+            id: None,
+            workspace: "ws1".to_string(),
+            source_ref: "PR #42".to_string(),
+            category: "pattern".to_string(),
+            content: "use builder pattern".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+        })
+        .unwrap();
+        db.insert_knowledge(&KnowledgeEntry {
+            id: None,
+            workspace: "ws1".to_string(),
+            source_ref: "PR #99".to_string(),
+            category: "domain".to_string(),
+            content: "other PR".to_string(),
+            created_at: Utc::now().to_rfc3339(),
+        })
+        .unwrap();
+
+        let entries = db.get_knowledge_by_source("PR #42").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "use builder pattern");
     }
 
     // ---- Token Usage -------------------------------------------------------
