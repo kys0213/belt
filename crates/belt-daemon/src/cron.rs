@@ -418,6 +418,22 @@ impl CronHandler for EvaluateJob {
     }
 }
 
+/// Periodically scans open PRs for `changes_requested` reviews.
+///
+/// When a PR has a `CHANGES_REQUESTED` review, this job creates a new
+/// queue item so the feedback loop can process the review comments and
+/// push updated changes.
+pub struct PrReviewScanJob;
+
+impl CronHandler for PrReviewScanJob {
+    fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
+        // TODO: iterate workspaces, call GitHubDataSource::collect_review_items,
+        // enqueue new items for PRs with changes_requested reviews.
+        tracing::info!("PrReviewScanJob: scanning PRs for changes_requested reviews");
+        Ok(())
+    }
+}
+
 /// Create all built-in jobs with their default schedules.
 ///
 /// Requires shared dependencies (database, worktree manager, etc.)
@@ -467,6 +483,14 @@ pub fn builtin_jobs(deps: BuiltinJobDeps) -> Vec<CronJobDef> {
                 belt_home: deps.belt_home,
                 workspace: deps.workspace,
             }),
+        },
+        CronJobDef {
+            name: "pr_review_scan".to_string(),
+            schedule: CronSchedule::Interval(Duration::from_secs(5 * 60)),
+            workspace: None,
+            enabled: true,
+            last_run_at: None,
+            handler: Box::new(PrReviewScanJob),
         },
     ]
 }
@@ -751,13 +775,14 @@ mod tests {
     fn builtin_jobs_are_valid() {
         let deps = make_test_deps();
         let jobs = builtin_jobs(deps);
-        assert_eq!(jobs.len(), 4);
+        assert_eq!(jobs.len(), 5);
 
         let names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
         assert!(names.contains(&"hitl_timeout"));
         assert!(names.contains(&"daily_report"));
         assert!(names.contains(&"log_cleanup"));
         assert!(names.contains(&"evaluate"));
+        assert!(names.contains(&"pr_review_scan"));
     }
 
     // -- Built-in job logic tests --

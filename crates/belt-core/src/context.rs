@@ -104,23 +104,32 @@ pub struct IssueContext {
     pub author: String,
 }
 
+/// PR context including review information, branch details, and labels.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrContext {
     pub number: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub head_branch: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub state: Option<String>,
+    pub body: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub author: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub draft: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub merge_status: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub labels: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub reviews: Vec<ReviewContext>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub review_comments: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub commits: Vec<CommitContext>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub files: Vec<FileChangeContext>,
 }
 
 /// PR에 포함된 커밋 요약.
@@ -139,6 +148,24 @@ pub struct FileChangeContext {
     pub additions: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deletions: Option<u64>,
+}
+
+/// Individual review on a PR.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewContext {
+    pub reviewer: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submitted_at: Option<String>,
+}
+
+impl PrContext {
+    /// Returns `true` if any review has `CHANGES_REQUESTED` state.
+    pub fn has_changes_requested(&self) -> bool {
+        self.reviews.iter().any(|r| r.state == "CHANGES_REQUESTED")
+    }
 }
 
 impl ItemContext {
@@ -270,5 +297,91 @@ mod tests {
         let json = serde_json::to_string(&source).unwrap();
         assert!(json.contains("\"type\":\"github\""));
         assert!(!json.contains("source_type"));
+    }
+
+    #[test]
+    fn pr_context_has_changes_requested() {
+        let pr = PrContext {
+            number: 10,
+            title: Some("Fix bug".to_string()),
+            body: None,
+            author: Some("dev".to_string()),
+            state: Some("OPEN".to_string()),
+            draft: false,
+            head_branch: Some("fix/bug".to_string()),
+            base_branch: Some("main".to_string()),
+            merge_status: None,
+            labels: vec![],
+            reviews: vec![
+                ReviewContext {
+                    reviewer: "reviewer1".to_string(),
+                    state: "APPROVED".to_string(),
+                    body: None,
+                    submitted_at: None,
+                },
+                ReviewContext {
+                    reviewer: "reviewer2".to_string(),
+                    state: "CHANGES_REQUESTED".to_string(),
+                    body: Some("Please fix the tests".to_string()),
+                    submitted_at: Some("2026-03-24T10:00:00Z".to_string()),
+                },
+            ],
+            review_comments: vec![],
+        };
+        assert!(pr.has_changes_requested());
+    }
+
+    #[test]
+    fn pr_context_no_changes_requested() {
+        let pr = PrContext {
+            number: 10,
+            title: None,
+            body: None,
+            author: None,
+            state: None,
+            draft: false,
+            head_branch: None,
+            base_branch: None,
+            merge_status: None,
+            labels: vec![],
+            reviews: vec![ReviewContext {
+                reviewer: "reviewer1".to_string(),
+                state: "APPROVED".to_string(),
+                body: None,
+                submitted_at: None,
+            }],
+            review_comments: vec![],
+        };
+        assert!(!pr.has_changes_requested());
+    }
+
+    #[test]
+    fn pr_context_json_roundtrip() {
+        let pr = PrContext {
+            number: 5,
+            title: Some("Add feature".to_string()),
+            body: Some("Description".to_string()),
+            author: Some("dev".to_string()),
+            state: Some("OPEN".to_string()),
+            draft: true,
+            head_branch: Some("feat/new".to_string()),
+            base_branch: Some("main".to_string()),
+            merge_status: Some("MERGEABLE".to_string()),
+            labels: vec!["enhancement".to_string()],
+            reviews: vec![ReviewContext {
+                reviewer: "lead".to_string(),
+                state: "CHANGES_REQUESTED".to_string(),
+                body: Some("Needs tests".to_string()),
+                submitted_at: Some("2026-03-24T12:00:00Z".to_string()),
+            }],
+            review_comments: vec!["inline comment".to_string()],
+        };
+        let json = serde_json::to_string_pretty(&pr).unwrap();
+        let parsed: PrContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.number, 5);
+        assert!(parsed.draft);
+        assert_eq!(parsed.reviews.len(), 1);
+        assert_eq!(parsed.reviews[0].state, "CHANGES_REQUESTED");
+        assert!(parsed.has_changes_requested());
     }
 }
