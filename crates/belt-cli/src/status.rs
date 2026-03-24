@@ -55,6 +55,14 @@ pub struct SpecStatus {
     pub phase_counts: Vec<PhaseCount>,
 }
 
+/// Lightweight status output for JSON serialization.
+#[derive(Debug, Serialize)]
+pub struct StatusOutput<'a> {
+    pub status: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_stats: Option<RuntimeStats>,
+}
+
 /// Display system status in the requested format.
 ///
 /// Opens the default Belt database automatically.

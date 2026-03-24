@@ -127,6 +127,7 @@ mod tests {
             concurrency: 1,
             sources: HashMap::new(),
             runtime: RuntimeConfig::default(),
+            claw_config: None,
         }
     }
 
@@ -184,6 +185,7 @@ mod tests {
             concurrency: 2,
             sources,
             runtime: RuntimeConfig::default(),
+            claw_config: None,
         }
     }
 
