@@ -3,7 +3,6 @@
 //! Provides a simple interval/daily schedule system and an engine that
 //! ticks through registered jobs, executing those that are due.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -206,10 +205,6 @@ pub struct BuiltinJobDeps {
     pub db: Arc<Database>,
     /// Worktree manager for cleanup operations.
     pub worktree_mgr: Arc<dyn WorktreeManager>,
-    /// Belt home directory for evaluator scripts.
-    pub belt_home: PathBuf,
-    /// Workspace name for evaluate job.
-    pub workspace: String,
 }
 
 /// Expires unanswered HITL (human-in-the-loop) items after a 24-hour timeout.
@@ -356,52 +351,24 @@ impl CronHandler for LogCleanupJob {
     }
 }
 
-/// Evaluates completed queue items by running the evaluate script.
+/// Classifies completed queue items into Done or HITL.
 ///
-/// Scans items in the `Completed` phase, invokes the evaluate script,
-/// and transitions items to `Done` (exit code 0) or `Hitl` (non-zero).
-pub struct EvaluateJob {
-    db: Arc<Database>,
-    belt_home: PathBuf,
-    workspace: String,
-}
+/// This cron job triggers the evaluate cycle via `belt agent -p` invocation
+/// (see [`crate::evaluator::Evaluator::build_evaluate_script`]).
+/// The actual evaluate logic including per-item failure tracking and HITL
+/// escalation is handled by [`crate::daemon::Daemon::evaluate_completed`].
+///
+/// The cron schedule ensures periodic evaluation, while `force_trigger("evaluate")`
+/// is called on every Completed transition for immediate evaluation.
+pub struct EvaluateJob;
 
 impl CronHandler for EvaluateJob {
     fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
-        tracing::info!("EvaluateJob: evaluating completed items");
-
-        let completed_items = self.db.list_items(Some(QueuePhase::Completed), None)?;
-        if completed_items.is_empty() {
-            tracing::debug!("EvaluateJob: no completed items to evaluate");
-            return Ok(());
-        }
-
-        let evaluator = crate::evaluator::Evaluator::new(&self.workspace);
-        let script = evaluator.build_evaluate_script();
-
-        let output = std::process::Command::new("bash")
-            .arg("-c")
-            .arg(&script)
-            .env("WORKSPACE", &self.workspace)
-            .env("BELT_HOME", self.belt_home.to_string_lossy().as_ref())
-            .output()
-            .map_err(|e| BeltError::Runtime(format!("failed to run evaluate script: {e}")))?;
-
-        let exit_code = output.status.code().unwrap_or(-1);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        if exit_code == 0 {
-            tracing::info!(items = completed_items.len(), "evaluate script succeeded");
-        } else {
-            tracing::warn!(
-                exit_code,
-                stderr = %stderr,
-                stdout = %stdout,
-                "evaluate script returned non-zero exit code"
-            );
-        }
-
+        // The actual evaluate_completed() logic runs in the daemon's async tick.
+        // This cron handler serves as the schedule trigger point.
+        // When the cron engine fires this job, the daemon's next tick will
+        // pick up Completed items and run the evaluator.
+        tracing::info!("EvaluateJob: triggering evaluate cycle for completed items");
         Ok(())
     }
 }
@@ -466,11 +433,7 @@ pub fn builtin_jobs(deps: BuiltinJobDeps) -> Vec<CronJobDef> {
             workspace: None,
             enabled: true,
             last_run_at: None,
-            handler: Box::new(EvaluateJob {
-                db: deps.db,
-                belt_home: deps.belt_home,
-                workspace: deps.workspace,
-            }),
+            handler: Box::new(EvaluateJob),
         },
         CronJobDef {
             name: "pr_review_scan".to_string(),
@@ -542,11 +505,7 @@ pub fn seed_workspace_crons(engine: &mut CronEngine, workspace: &str, deps: Buil
         workspace: Some(ws.clone()),
         enabled: true,
         last_run_at: None,
-        handler: Box::new(EvaluateJob {
-            db: deps.db,
-            belt_home: deps.belt_home,
-            workspace: ws,
-        }),
+        handler: Box::new(EvaluateJob),
     });
 }
 
@@ -753,8 +712,6 @@ mod tests {
         BuiltinJobDeps {
             db,
             worktree_mgr,
-            belt_home: tmp.path().to_path_buf(),
-            workspace: "test-ws".to_string(),
         }
     }
 
@@ -900,17 +857,10 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_job_runs_with_no_completed_items() {
-        let db = Arc::new(Database::open_in_memory().unwrap());
-        let tmp = tempfile::tempdir().unwrap();
-
-        let job = EvaluateJob {
-            db,
-            belt_home: tmp.path().to_path_buf(),
-            workspace: "test-ws".to_string(),
-        };
+    fn evaluate_job_runs_without_error() {
+        let job = EvaluateJob;
         let ctx = CronContext { now: Utc::now() };
-        // Should return Ok when there are no completed items (early return).
+        // EvaluateJob is a trigger-only stub; the actual logic is in Daemon::evaluate_completed.
         job.execute(&ctx).unwrap();
     }
 
