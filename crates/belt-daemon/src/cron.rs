@@ -193,8 +193,8 @@ impl Default for CronEngine {
 // Built-in jobs
 // ---------------------------------------------------------------------------
 
-/// HITL timeout threshold (24 hours).
-const HITL_TIMEOUT_HOURS: i64 = 24;
+/// Default HITL timeout duration (24 hours).
+const DEFAULT_HITL_TIMEOUT_SECS: i64 = 24 * 60 * 60;
 
 /// Worktree TTL for log cleanup (7 days).
 const WORKTREE_TTL_DAYS: i64 = 7;
@@ -207,13 +207,34 @@ pub struct BuiltinJobDeps {
     pub worktree_mgr: Arc<dyn WorktreeManager>,
 }
 
-/// Expires unanswered HITL (human-in-the-loop) items after a 24-hour timeout.
+/// Expires unanswered HITL (human-in-the-loop) items after a configurable timeout.
 ///
 /// Queries items in the `Hitl` phase, checks their `updated_at` timestamp,
-/// and transitions those older than 24 hours to `Failed`.
+/// and transitions those older than the configured timeout to `Failed`.
+/// Also cleans up the associated worktree on expiry.
 pub struct HitlTimeoutJob {
     db: Arc<Database>,
     worktree_mgr: Arc<dyn WorktreeManager>,
+    /// Timeout duration in seconds. Items in HITL phase longer than this
+    /// are considered expired. Defaults to 24 hours.
+    pub timeout_secs: i64,
+}
+
+impl HitlTimeoutJob {
+    /// Create a new `HitlTimeoutJob` with the default timeout (24 hours).
+    pub fn new(db: Arc<Database>, worktree_mgr: Arc<dyn WorktreeManager>) -> Self {
+        Self {
+            db,
+            worktree_mgr,
+            timeout_secs: DEFAULT_HITL_TIMEOUT_SECS,
+        }
+    }
+
+    /// Set the timeout duration in seconds.
+    pub fn with_timeout_secs(mut self, secs: i64) -> Self {
+        self.timeout_secs = secs;
+        self
+    }
 }
 
 impl CronHandler for HitlTimeoutJob {
@@ -221,7 +242,7 @@ impl CronHandler for HitlTimeoutJob {
         tracing::info!("HitlTimeoutJob: checking for expired HITL items");
 
         let hitl_items = self.db.list_items(Some(QueuePhase::Hitl), None)?;
-        let threshold = ctx.now - chrono::Duration::hours(HITL_TIMEOUT_HOURS);
+        let threshold = ctx.now - chrono::Duration::seconds(self.timeout_secs);
         let mut expired_count = 0u32;
 
         for item in &hitl_items {
@@ -251,8 +272,8 @@ impl CronHandler for HitlTimeoutJob {
                 expired_count += 1;
                 tracing::info!(
                     work_id = %item.work_id,
-                    "HITL item expired after {} hours",
-                    HITL_TIMEOUT_HOURS
+                    "HITL item expired after {} seconds, transitioned to Failed",
+                    self.timeout_secs
                 );
             }
         }
@@ -401,10 +422,10 @@ pub fn builtin_jobs(deps: BuiltinJobDeps) -> Vec<CronJobDef> {
             workspace: None,
             enabled: true,
             last_run_at: None,
-            handler: Box::new(HitlTimeoutJob {
-                db: Arc::clone(&deps.db),
-                worktree_mgr: Arc::clone(&deps.worktree_mgr),
-            }),
+            handler: Box::new(HitlTimeoutJob::new(
+                Arc::clone(&deps.db),
+                Arc::clone(&deps.worktree_mgr),
+            )),
         },
         CronJobDef {
             name: "daily_report".to_string(),
@@ -470,10 +491,10 @@ pub fn seed_workspace_crons(engine: &mut CronEngine, workspace: &str, deps: Buil
         workspace: Some(ws.clone()),
         enabled: true,
         last_run_at: None,
-        handler: Box::new(HitlTimeoutJob {
-            db: Arc::clone(&deps.db),
-            worktree_mgr: Arc::clone(&deps.worktree_mgr),
-        }),
+        handler: Box::new(HitlTimeoutJob::new(
+            Arc::clone(&deps.db),
+            Arc::clone(&deps.worktree_mgr),
+        )),
     });
 
     engine.register(CronJobDef {
@@ -757,10 +778,7 @@ mod tests {
         // We need to set phase via DB since insert_item sets it from the struct.
         // Items are already in Hitl phase from the struct.
 
-        let job = HitlTimeoutJob {
-            db: Arc::clone(&db),
-            worktree_mgr,
-        };
+        let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr);
         let ctx = CronContext { now: Utc::now() };
         job.execute(&ctx).unwrap();
 

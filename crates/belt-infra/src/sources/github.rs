@@ -255,6 +255,7 @@ impl GitHubDataSource {
                 hitl_respondent: None,
                 hitl_notes: None,
                 hitl_reason: None,
+                worktree_preserved: false,
             });
         }
 
@@ -341,6 +342,7 @@ impl DataSource for GitHubDataSource {
                             hitl_respondent: None,
                             hitl_notes: None,
                             hitl_reason: None,
+                            worktree_preserved: false,
                         });
                     }
                 }
@@ -452,6 +454,7 @@ sources:
             hitl_respondent: None,
             hitl_notes: None,
             hitl_reason: None,
+            worktree_preserved: false,
         }
     }
 

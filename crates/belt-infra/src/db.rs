@@ -1237,6 +1237,7 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
             .get(10)
             .map_err(|e| BeltError::Database(e.to_string()))?,
         hitl_reason,
+        worktree_preserved: false,
     })
 }
 
@@ -1262,6 +1263,7 @@ mod tests {
             hitl_respondent: None,
             hitl_notes: None,
             hitl_reason: None,
+            worktree_preserved: false,
         }
     }
 
