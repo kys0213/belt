@@ -196,7 +196,11 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(actions[0].is_prompt());
         match &actions[0] {
-            Action::Prompt { text, runtime, model } => {
+            Action::Prompt {
+                text,
+                runtime,
+                model,
+            } => {
                 assert_eq!(text, "do something");
                 assert!(runtime.is_none());
                 assert!(model.is_none());

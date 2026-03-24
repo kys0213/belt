@@ -930,6 +930,30 @@ async fn main() -> anyhow::Result<()> {
                     spec.depends_on = depends_on;
                     db.insert_spec(&spec)?;
                     println!("spec created: {id}");
+
+                    // Auto-create GitHub issue with autopilot:ready label.
+                    let mut gh_cmd = std::process::Command::new("gh");
+                    gh_cmd.args(["issue", "create"]);
+                    gh_cmd.args(["--title", &spec.name]);
+                    gh_cmd.args(["--body", &spec.content]);
+                    gh_cmd.args(["--label", "autopilot:ready"]);
+                    match gh_cmd.output() {
+                        Ok(output) => {
+                            if output.status.success() {
+                                let url = String::from_utf8_lossy(&output.stdout);
+                                println!("GitHub issue created: {}", url.trim());
+                            } else {
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                eprintln!(
+                                    "warning: failed to create GitHub issue: {}",
+                                    stderr.trim()
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("warning: could not run `gh` CLI: {e}");
+                        }
+                    }
                 }
                 SpecCommands::List {
                     workspace,
