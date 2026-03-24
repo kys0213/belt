@@ -720,10 +720,10 @@ impl Daemon {
     /// tokio::select! 기반 async event loop with graceful shutdown.
     ///
     /// SIGINT 수신 시:
-    /// 1. `shutdown_requested = true` — 새 아이템 수집 중단.
-    /// 2. Running 아이템 완료 대기 (timeout: 30초).
-    /// 3. timeout 초과 시 Running → Pending 롤백 (worktree 보존).
-    /// 4. 두 번째 SIGINT 시 즉시 종료 (Running → Pending 롤백).
+    /// 1. `shutdown_requested = true` -- 새 아이템 수집 중단.
+    /// 2. Running 아이템 완료를 최대 30초 대기 (`drain_with_timeout`).
+    /// 3. timeout 초과 시 Running -> Pending 롤백 (worktree 보존).
+    /// 4. drain 중 두 번째 SIGINT 시 즉시 종료 (Running -> Pending 롤백).
     pub async fn run(&mut self, tick_interval_secs: u64) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs));
         tracing::info!("belt daemon started (tick={}s)", tick_interval_secs);
@@ -734,41 +734,23 @@ impl Daemon {
                     if let Err(e) = self.tick().await {
                         tracing::error!("tick error: {e}");
                     }
-
-                    if self.shutdown_requested {
-                        let running_count = self.items_in_phase(QueuePhase::Running).len();
-                        if running_count == 0 {
-                            tracing::info!("all running items completed, shutting down");
-                            break;
-                        }
-                        tracing::info!(
-                            "shutdown requested, waiting for {} running items...",
-                            running_count
-                        );
-                    }
                 }
                 _ = tokio::signal::ctrl_c() => {
-                    if self.shutdown_requested {
-                        tracing::warn!("received second SIGINT, forcing shutdown");
-                        self.rollback_running_to_pending();
-                        break;
-                    }
                     tracing::info!("received SIGINT, initiating graceful shutdown...");
                     self.shutdown_requested = true;
+                    break;
                 }
             }
         }
 
-        // Shutdown 요청 후 잔여 Running 아이템 drain (30초 timeout).
-        if self.shutdown_requested {
-            self.drain_with_timeout(std::time::Duration::from_secs(30))
-                .await;
-        }
+        // Running 아이템 완료를 최대 30초 대기. timeout 시 Pending으로 롤백.
+        self.drain_with_timeout(std::time::Duration::from_secs(30))
+            .await;
 
         tracing::info!("belt daemon stopped");
     }
 
-    /// Running 아이템 완료 대기. timeout 초과 시 Pending으로 롤백.
+    /// Running 아이템 완료 대기. timeout 초과 또는 두 번째 SIGINT 시 Pending으로 롤백.
     async fn drain_with_timeout(&mut self, timeout: std::time::Duration) {
         let running_count = self.items_in_phase(QueuePhase::Running).len();
         if running_count == 0 {
@@ -809,6 +791,11 @@ impl Daemon {
                     self.rollback_running_to_pending();
                     return;
                 }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::warn!("received second SIGINT, forcing shutdown");
+                    self.rollback_running_to_pending();
+                    return;
+                }
             }
         }
     }
@@ -818,8 +805,10 @@ impl Daemon {
         let ws_name = self.config.name.clone();
         for item in self.queue.iter_mut() {
             if item.phase == QueuePhase::Running {
-                item.phase = QueuePhase::Pending;
-                item.updated_at = chrono::Utc::now().to_rfc3339();
+                if let Err(e) = transit(item, QueuePhase::Pending) {
+                    tracing::error!("failed to rollback {}: {e}", item.work_id);
+                    continue;
+                }
                 self.tracker.release(&ws_name);
                 tracing::info!(
                     "rolled back {} to Pending (worktree preserved)",
@@ -1317,6 +1306,41 @@ sources:
         daemon.tick().await.unwrap();
         assert_eq!(daemon.queue_items().len(), 0);
         assert!(daemon.is_shutdown_requested());
+    }
+
+    #[tokio::test]
+    async fn drain_with_timeout_returns_immediately_when_no_running() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // No running items -- drain should return immediately without blocking.
+        daemon
+            .drain_with_timeout(std::time::Duration::from_secs(30))
+            .await;
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn rollback_uses_valid_state_transition() {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+        daemon.collect().await.unwrap();
+        daemon.advance();
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 1);
+
+        // Rollback should use proper state transition (Running -> Pending).
+        daemon.rollback_running_to_pending();
+
+        let pending = daemon.items_in_phase(QueuePhase::Pending);
+        assert_eq!(pending.len(), 1);
+        // Verify updated_at was refreshed.
+        assert_ne!(pending[0].updated_at, pending[0].created_at);
     }
 
     #[tokio::test]
