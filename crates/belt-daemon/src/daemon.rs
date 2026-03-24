@@ -171,10 +171,10 @@ impl Daemon {
 
         for item in self.queue.iter_mut() {
             if item.phase == QueuePhase::Ready
-                && self.tracker.can_spawn_in_workspace(&ws_id, ws_concurrency)
+                && self.tracker.can_spawn_in_workspace(ws_id, ws_concurrency)
                 && transit(item, QueuePhase::Running).is_ok()
             {
-                self.tracker.track(&ws_id);
+                self.tracker.track(ws_id);
                 advanced += 1;
             }
         }
@@ -314,10 +314,7 @@ impl Daemon {
             }
         };
 
-        let worktree = match worktree_mgr
-            .create_or_reuse(&ws_name, &item.source_id)
-            .await
-        {
+        let worktree = match worktree_mgr.create_or_reuse(&ws_name) {
             Ok(path) => path,
             Err(e) => {
                 item.phase = QueuePhase::Failed;
@@ -338,8 +335,7 @@ impl Daemon {
         match executor.execute_all(&on_enter, &env).await {
             Ok(Some(r)) if !r.success() => {
                 // on_fail 스크립트 실행 시도 (best-effort).
-                let on_fail: Vec<Action> =
-                    state_config.on_fail.iter().map(Action::from).collect();
+                let on_fail: Vec<Action> = state_config.on_fail.iter().map(Action::from).collect();
                 let _ = executor.execute_all(&on_fail, &env).await;
 
                 item.phase = QueuePhase::Failed;
@@ -354,8 +350,7 @@ impl Daemon {
             }
             Err(e) => {
                 tracing::warn!("on_enter failed for {}: {e}", item.work_id);
-                let on_fail: Vec<Action> =
-                    state_config.on_fail.iter().map(Action::from).collect();
+                let on_fail: Vec<Action> = state_config.on_fail.iter().map(Action::from).collect();
                 let _ = executor.execute_all(&on_fail, &env).await;
 
                 item.phase = QueuePhase::Failed;
@@ -584,20 +579,11 @@ impl Daemon {
         if state_config.on_done.is_empty() {
             let _ = transit(item, QueuePhase::Done);
             self.record_history(item, "done", None);
-            let worktree = self
-                .worktree_mgr
-                .create_or_reuse(&self.config.name, &item.source_id)
-                .await;
-            if let Ok(ref wt) = worktree {
-                let _ = self.worktree_mgr.cleanup(wt).await;
-            }
+            let _ = self.worktree_mgr.cleanup(&item.work_id);
             return Ok(true);
         }
 
-        let worktree = self
-            .worktree_mgr
-            .create_or_reuse(&self.config.name, &item.source_id)
-            .await?;
+        let worktree = self.worktree_mgr.create_or_reuse(&item.work_id)?;
         let env = ActionEnv::new(&item.work_id, &worktree);
         let on_done: Vec<Action> = state_config.on_done.iter().map(Action::from).collect();
         let result = self.executor.execute_all(&on_done, &env).await?;
@@ -611,7 +597,7 @@ impl Daemon {
             _ => {
                 let _ = transit(item, QueuePhase::Done);
                 self.record_history(item, "done", None);
-                let _ = self.worktree_mgr.cleanup(&worktree).await;
+                let _ = self.worktree_mgr.cleanup(&item.work_id);
                 Ok(true)
             }
         }
@@ -921,9 +907,14 @@ impl Daemon {
 
         if let Some(ref db) = self.db {
             let model = result.model.as_deref().unwrap_or("unknown");
-            if let Err(e) =
-                db.record_token_usage(&item.work_id, &self.config.name, runtime_name, model, usage)
-            {
+            if let Err(e) = db.record_token_usage(
+                &item.work_id,
+                &self.config.name,
+                runtime_name,
+                model,
+                usage,
+                Some(result.duration.as_millis() as u64),
+            ) {
                 tracing::warn!("failed to record token usage for {}: {e}", item.work_id);
             } else {
                 tracing::debug!(
@@ -1065,7 +1056,7 @@ sources:
         let config = test_workspace_config();
         let mut registry = RuntimeRegistry::new("mock".to_string());
         registry.register(Arc::new(MockRuntime::new("mock", exit_codes)));
-        let worktree_mgr = MockWorktreeManager::new(tmp.path());
+        let worktree_mgr = MockWorktreeManager::new(tmp.path().to_path_buf());
 
         Daemon::new(
             config,
