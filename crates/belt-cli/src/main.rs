@@ -166,6 +166,28 @@ enum HitlCommands {
         #[arg(long)]
         workspace: Option<String>,
     },
+    /// Set or query HITL timeouts.
+    Timeout {
+        #[command(subcommand)]
+        command: HitlTimeoutCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum HitlTimeoutCommands {
+    /// Set timeout on a HITL item.
+    Set {
+        /// Queue item work_id.
+        item_id: String,
+        /// Timeout duration in seconds.
+        #[arg(long)]
+        duration: u64,
+        /// Terminal action when timeout fires: skip, failed, replan.
+        #[arg(long)]
+        action: Option<String>,
+    },
+    /// List HITL items with active timeouts.
+    Ls,
 }
 
 #[derive(Subcommand)]
@@ -945,6 +967,78 @@ fn cmd_cron_trigger(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `belt hitl timeout set|ls` -- manage HITL timeouts.
+fn cmd_hitl_timeout(command: HitlTimeoutCommands) -> anyhow::Result<()> {
+    let db = open_db()?;
+    match command {
+        HitlTimeoutCommands::Set {
+            item_id,
+            duration,
+            action,
+        } => {
+            // Validate that the item exists and is in HITL phase.
+            let item = db.get_item(&item_id)?;
+            if item.phase != QueuePhase::Hitl {
+                anyhow::bail!(
+                    "item '{}' is in phase '{}', expected 'hitl'",
+                    item_id,
+                    item.phase
+                );
+            }
+
+            // Validate terminal action if provided.
+            let valid_actions = ["skip", "failed", "replan"];
+            if let Some(ref a) = action
+                && !valid_actions.contains(&a.as_str())
+            {
+                anyhow::bail!(
+                    "invalid terminal action '{}': expected one of skip, failed, replan",
+                    a
+                );
+            }
+
+            // Compute absolute timeout timestamp.
+            let timeout_at =
+                (chrono::Utc::now() + chrono::Duration::seconds(duration as i64)).to_rfc3339();
+
+            db.set_hitl_timeout(&item_id, &timeout_at, action.as_deref())?;
+
+            println!("Timeout set for item '{item_id}':");
+            println!("  expires at: {timeout_at}");
+            println!("  duration:   {} seconds", duration);
+            if let Some(a) = &action {
+                println!("  action:     {a}");
+            } else {
+                println!("  action:     skip (default)");
+            }
+        }
+        HitlTimeoutCommands::Ls => {
+            let items = db.list_hitl_items_with_timeout()?;
+            if items.is_empty() {
+                println!("No HITL items with active timeouts.");
+            } else {
+                println!(
+                    "{:<40} {:<28} {:<10} {:<20}",
+                    "WORK_ID", "TIMEOUT_AT", "ACTION", "WORKSPACE"
+                );
+                for item in &items {
+                    let timeout_at = item.hitl_timeout_at.as_deref().unwrap_or("-");
+                    let action = item.hitl_terminal_action.as_deref().unwrap_or("skip");
+                    println!(
+                        "{:<40} {:<28} {:<10} {:<20}",
+                        truncate(&item.work_id, 40),
+                        timeout_at,
+                        action,
+                        &item.workspace_id,
+                    );
+                }
+                println!("\n{} item(s) with timeout", items.len());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Truncate a string to `max` characters, appending "..." if truncated.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -1623,6 +1717,9 @@ async fn main() -> anyhow::Result<()> {
                     }
                     println!("\n{} item(s) awaiting review.", items.len());
                 }
+            }
+            HitlCommands::Timeout { command } => {
+                cmd_hitl_timeout(command)?;
             }
         },
 

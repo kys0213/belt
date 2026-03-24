@@ -335,6 +335,8 @@ impl DataSource for GitHubDataSource {
                             hitl_respondent: None,
                             hitl_notes: None,
                             hitl_reason: None,
+                            hitl_timeout_at: None,
+                            hitl_terminal_action: None,
                             worktree_preserved: false,
                         });
                     }
