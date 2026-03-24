@@ -19,7 +19,7 @@ use belt_infra::db::Database;
 use belt_infra::worktree::WorktreeManager;
 
 use crate::concurrency::ConcurrencyTracker;
-use crate::cron::{CronEngine, builtin_jobs};
+use crate::cron::{BuiltinJobDeps, CronEngine, builtin_jobs};
 use crate::evaluator::Evaluator;
 use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
 
@@ -48,7 +48,7 @@ pub struct Daemon {
     tracker: ConcurrencyTracker,
     queue: VecDeque<QueueItem>,
     history: Vec<HistoryEntry>,
-    db: Option<Database>,
+    db: Option<Arc<Database>>,
     /// History events with full lineage information for failure tracking.
     history_events: Vec<HistoryEvent>,
     evaluator: Evaluator,
@@ -101,10 +101,7 @@ impl Daemon {
         max_concurrent: u32,
     ) -> Self {
         let evaluator = Evaluator::new(&config.name);
-        let mut cron_engine = CronEngine::new();
-        for job in builtin_jobs() {
-            cron_engine.register(job);
-        }
+        let cron_engine = CronEngine::new();
         Self {
             config,
             sources,
@@ -125,7 +122,19 @@ impl Daemon {
     }
 
     /// Set the database for persisting token usage records.
+    ///
+    /// Also initializes the built-in cron jobs which require a database handle.
     pub fn with_db(mut self, db: Database) -> Self {
+        let db = Arc::new(db);
+        let deps = BuiltinJobDeps {
+            db: Arc::clone(&db),
+            worktree_mgr: Arc::clone(&self.worktree_mgr),
+            belt_home: self.belt_home.clone(),
+            workspace: self.config.name.clone(),
+        };
+        for job in builtin_jobs(deps) {
+            self.cron_engine.register(job);
+        }
         self.db = Some(db);
         self
     }

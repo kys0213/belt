@@ -655,7 +655,15 @@ async fn main() -> anyhow::Result<()> {
                 ws.edit_rule(rule.as_deref())?;
             }
             ClawCommands::Session => {
-                tracing::info!("interactive session not yet implemented");
+                let belt_home = dirs::home_dir()
+                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
+                    .join(".belt");
+                let claw_workspace = claw::ClawWorkspace::init(&belt_home)?;
+                let config = claw::session::SessionConfig {
+                    workspace: None,
+                    claw_workspace,
+                };
+                claw::session::run_interactive(config)?;
             }
         },
     }

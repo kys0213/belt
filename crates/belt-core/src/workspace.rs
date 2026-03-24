@@ -14,6 +14,29 @@ pub struct WorkspaceConfig {
     pub sources: HashMap<String, SourceConfig>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    /// Per-workspace Claw configuration overrides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claw_config: Option<ClawConfig>,
+}
+
+/// Per-workspace Claw configuration.
+///
+/// When present on a `WorkspaceConfig`, these values override the global
+/// Claw defaults for this workspace only.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct ClawConfig {
+    /// Whether auto-approve is enabled for this workspace.
+    #[serde(default)]
+    pub auto_approve: bool,
+    /// Custom HITL policy file path (relative to workspace root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hitl_policy: Option<String>,
+    /// Custom classify policy file path (relative to workspace root).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classify_policy: Option<String>,
+    /// Custom slash commands enabled for this workspace.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enabled_commands: Vec<String>,
 }
 
 /// DataSource별 설정.
@@ -222,5 +245,33 @@ runtime:
         let ws_ref = WorkspaceRef::from_config("ws-1", &config, "github").unwrap();
         assert_eq!(ws_ref.name, "auth-project");
         assert_eq!(ws_ref.concurrency, 2);
+    }
+
+    #[test]
+    fn claw_config_defaults_to_none() {
+        let yaml = "name: minimal\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.claw_config.is_none());
+    }
+
+    #[test]
+    fn claw_config_parses_override() {
+        let yaml = r#"
+name: with-claw
+sources:
+  github:
+    url: https://github.com/org/repo
+claw_config:
+  auto_approve: true
+  hitl_policy: custom-hitl.md
+  enabled_commands:
+    - auto
+    - spec
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let claw = config.claw_config.unwrap();
+        assert!(claw.auto_approve);
+        assert_eq!(claw.hitl_policy.as_deref(), Some("custom-hitl.md"));
+        assert_eq!(claw.enabled_commands, vec!["auto", "spec"]);
     }
 }
