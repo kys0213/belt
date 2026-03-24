@@ -52,6 +52,11 @@ enum Commands {
         #[arg(short, long)]
         prompt: Option<String>,
     },
+    /// Spec lifecycle management.
+    Spec {
+        #[command(subcommand)]
+        command: SpecCommands,
+    },
     /// Claw interactive management session.
     Claw {
         #[command(subcommand)]
@@ -118,6 +123,91 @@ enum QueueCommands {
     Skip { work_id: String },
 }
 
+#[derive(Subcommand)]
+enum SpecCommands {
+    /// Add a new spec.
+    Add {
+        /// Workspace ID.
+        #[arg(long)]
+        workspace: String,
+        /// Spec name.
+        #[arg(long)]
+        name: String,
+        /// Spec content / description.
+        #[arg(long)]
+        content: String,
+        /// Optional priority (lower is higher).
+        #[arg(long)]
+        priority: Option<i32>,
+        /// Optional comma-separated labels.
+        #[arg(long)]
+        labels: Option<String>,
+        /// Optional comma-separated spec IDs this depends on.
+        #[arg(long)]
+        depends_on: Option<String>,
+    },
+    /// List specs.
+    List {
+        /// Filter by workspace.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Filter by status.
+        #[arg(long)]
+        status: Option<String>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show spec details.
+    Show {
+        /// Spec ID.
+        id: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Update spec fields.
+    Update {
+        /// Spec ID.
+        id: String,
+        /// New name.
+        #[arg(long)]
+        name: Option<String>,
+        /// New content.
+        #[arg(long)]
+        content: Option<String>,
+        /// New priority.
+        #[arg(long)]
+        priority: Option<i32>,
+        /// New labels.
+        #[arg(long)]
+        labels: Option<String>,
+        /// New depends_on.
+        #[arg(long)]
+        depends_on: Option<String>,
+    },
+    /// Pause an active spec.
+    Pause {
+        /// Spec ID.
+        id: String,
+    },
+    /// Resume a paused spec.
+    Resume {
+        /// Spec ID.
+        id: String,
+    },
+    /// Complete an active spec.
+    Complete {
+        /// Spec ID.
+        id: String,
+    },
+    /// Remove a spec.
+    Remove {
+        /// Spec ID.
+        id: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -181,6 +271,167 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!(p, "executing prompt...");
             }
             // TODO: AgentRuntime implementation
+        }
+        Commands::Spec { command } => {
+            let belt_home = dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
+                .join(".belt");
+            let db_path = belt_home.join("belt.db");
+            let db = belt_infra::db::Database::open(
+                db_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("invalid db path"))?,
+            )?;
+
+            match command {
+                SpecCommands::Add {
+                    workspace,
+                    name,
+                    content,
+                    priority,
+                    labels,
+                    depends_on,
+                } => {
+                    let id = format!("spec-{}", chrono::Utc::now().timestamp_millis());
+                    let mut spec = belt_core::spec::Spec::new(id.clone(), workspace, name, content);
+                    spec.priority = priority;
+                    spec.labels = labels;
+                    spec.depends_on = depends_on;
+                    db.insert_spec(&spec)?;
+                    println!("spec created: {id}");
+                }
+                SpecCommands::List {
+                    workspace,
+                    status,
+                    json,
+                } => {
+                    let status_filter = status
+                        .map(|s| {
+                            s.parse::<belt_core::spec::SpecStatus>()
+                                .map_err(|e| anyhow::anyhow!(e))
+                        })
+                        .transpose()?;
+                    let specs = db.list_specs(workspace.as_deref(), status_filter)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&specs)?);
+                    } else {
+                        if specs.is_empty() {
+                            println!("no specs found");
+                        } else {
+                            for spec in &specs {
+                                println!(
+                                    "{}\t{}\t{}\t{}",
+                                    spec.id, spec.name, spec.status, spec.workspace_id
+                                );
+                            }
+                        }
+                    }
+                }
+                SpecCommands::Show { id, json } => {
+                    let spec = db.get_spec(&id)?;
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&spec)?);
+                    } else {
+                        println!("ID:          {}", spec.id);
+                        println!("Name:        {}", spec.name);
+                        println!("Status:      {}", spec.status);
+                        println!("Workspace:   {}", spec.workspace_id);
+                        println!("Content:     {}", spec.content);
+                        if let Some(p) = spec.priority {
+                            println!("Priority:    {p}");
+                        }
+                        if let Some(l) = &spec.labels {
+                            println!("Labels:      {l}");
+                        }
+                        if let Some(d) = &spec.depends_on {
+                            println!("Depends On:  {d}");
+                        }
+                        println!("Created At:  {}", spec.created_at);
+                        println!("Updated At:  {}", spec.updated_at);
+                    }
+                }
+                SpecCommands::Update {
+                    id,
+                    name,
+                    content,
+                    priority,
+                    labels,
+                    depends_on,
+                } => {
+                    let mut spec = db.get_spec(&id)?;
+                    if let Some(n) = name {
+                        spec.name = n;
+                    }
+                    if let Some(c) = content {
+                        spec.content = c;
+                    }
+                    if priority.is_some() {
+                        spec.priority = priority;
+                    }
+                    if labels.is_some() {
+                        spec.labels = labels;
+                    }
+                    if depends_on.is_some() {
+                        spec.depends_on = depends_on;
+                    }
+                    db.update_spec(&spec)?;
+                    println!("spec updated: {id}");
+                }
+                SpecCommands::Pause { id } => {
+                    let spec = db.get_spec(&id)?;
+                    if !spec
+                        .status
+                        .can_transition_to(&belt_core::spec::SpecStatus::Paused)
+                    {
+                        anyhow::bail!(
+                            "cannot pause spec in status '{}': only active specs can be paused",
+                            spec.status
+                        );
+                    }
+                    db.update_spec_status(&id, belt_core::spec::SpecStatus::Paused)?;
+                    println!("spec paused: {id}");
+                }
+                SpecCommands::Resume { id } => {
+                    let spec = db.get_spec(&id)?;
+                    if !spec
+                        .status
+                        .can_transition_to(&belt_core::spec::SpecStatus::Active)
+                    {
+                        anyhow::bail!(
+                            "cannot resume spec in status '{}': only draft or paused specs can be activated",
+                            spec.status
+                        );
+                    }
+                    let was_draft = spec.status == belt_core::spec::SpecStatus::Draft;
+                    db.update_spec_status(&id, belt_core::spec::SpecStatus::Active)?;
+                    println!("spec activated: {id}");
+                    if was_draft {
+                        // TODO: trigger GitHub issue creation when spec transitions Draft -> Active
+                        tracing::info!(
+                            id,
+                            "spec activated from draft — GitHub issue creation pending"
+                        );
+                    }
+                }
+                SpecCommands::Complete { id } => {
+                    let spec = db.get_spec(&id)?;
+                    if !spec
+                        .status
+                        .can_transition_to(&belt_core::spec::SpecStatus::Completed)
+                    {
+                        anyhow::bail!(
+                            "cannot complete spec in status '{}': only active specs can be completed",
+                            spec.status
+                        );
+                    }
+                    db.update_spec_status(&id, belt_core::spec::SpecStatus::Completed)?;
+                    println!("spec completed: {id}");
+                }
+                SpecCommands::Remove { id } => {
+                    db.remove_spec(&id)?;
+                    println!("spec removed: {id}");
+                }
+            }
         }
         Commands::Claw { command } => match command {
             ClawCommands::Init { force } => {

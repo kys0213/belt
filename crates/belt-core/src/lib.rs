@@ -6,5 +6,6 @@ pub mod phase;
 pub mod queue;
 pub mod runtime;
 pub mod source;
+pub mod spec;
 pub mod state_machine;
 pub mod workspace;
