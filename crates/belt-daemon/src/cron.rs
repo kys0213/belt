@@ -516,10 +516,13 @@ impl CronHandler for GapDetectionJob {
 
         // Step 3: For each spec, extract keywords and check coverage.
         let mut gaps: Vec<DetectedGap> = Vec::new();
+        let mut covered_spec_ids: Vec<String> = Vec::new();
 
         for spec in &active_specs {
             let keywords = extract_keywords(&spec.content);
             if keywords.is_empty() {
+                // Specs with no extractable keywords are considered covered.
+                covered_spec_ids.push(spec.id.clone());
                 continue;
             }
 
@@ -548,6 +551,8 @@ impl CronHandler for GapDetectionJob {
                     spec_name: spec.name.clone(),
                     missing_keywords: missing,
                 });
+            } else {
+                covered_spec_ids.push(spec.id.clone());
             }
         }
 
@@ -605,9 +610,33 @@ impl CronHandler for GapDetectionJob {
             }
         }
 
+        // Step 5: Transition fully-covered specs to Completing.
+        // Per spec lifecycle, Active -> Completing when gap-detection finds
+        // no gaps. The HITL final confirmation flow will then advance to Completed.
+        let mut completing_count = 0usize;
+        for spec_id in &covered_spec_ids {
+            if let Err(e) =
+                self.db
+                    .update_spec_status(spec_id, belt_core::spec::SpecStatus::Completing)
+            {
+                tracing::warn!(
+                    spec_id = %spec_id,
+                    error = %e,
+                    "GapDetectionJob: failed to transition spec to Completing"
+                );
+            } else {
+                tracing::info!(
+                    spec_id = %spec_id,
+                    "GapDetectionJob: spec transitioned to Completing (no gaps found)"
+                );
+                completing_count += 1;
+            }
+        }
+
         tracing::info!(
             total_specs = active_specs.len(),
             gaps_found = gaps.len(),
+            completing = completing_count,
             "GapDetectionJob: completed gap detection scan"
         );
         Ok(())

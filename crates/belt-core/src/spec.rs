@@ -5,7 +5,9 @@ use serde::{Deserialize, Serialize};
 /// Spec lifecycle status.
 ///
 /// ```text
-/// Draft -> Active -> [Paused <-> Active] -> Completed
+/// Draft -> Active -> [Paused <-> Active] -> Completing -> Completed
+///                                               |
+///                                               └-> Active (gap found)
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -13,6 +15,9 @@ pub enum SpecStatus {
     Draft,
     Active,
     Paused,
+    /// Gap-detection found no gaps and all linked issues are Done.
+    /// Awaiting test execution and HITL final confirmation.
+    Completing,
     Completed,
 }
 
@@ -23,6 +28,7 @@ impl SpecStatus {
             SpecStatus::Draft => "draft",
             SpecStatus::Active => "active",
             SpecStatus::Paused => "paused",
+            SpecStatus::Completing => "completing",
             SpecStatus::Completed => "completed",
         }
     }
@@ -46,6 +52,7 @@ impl std::str::FromStr for SpecStatus {
             "draft" => Ok(SpecStatus::Draft),
             "active" => Ok(SpecStatus::Active),
             "paused" => Ok(SpecStatus::Paused),
+            "completing" => Ok(SpecStatus::Completing),
             "completed" => Ok(SpecStatus::Completed),
             _ => Err(format!("invalid spec status: {s}")),
         }
@@ -63,13 +70,20 @@ impl fmt::Display for SpecStatus {
 /// Valid transitions:
 /// - Draft -> Active
 /// - Active -> Paused
-/// - Active -> Completed
+/// - Active -> Completing (gap-detection finds no gaps, all linked issues Done)
 /// - Paused -> Active
+/// - Completing -> Completed (HITL final approval)
+/// - Completing -> Active (gap found during re-check or test failure)
 pub fn is_valid_spec_transition(from: SpecStatus, to: SpecStatus) -> bool {
     use SpecStatus::*;
     matches!(
         (from, to),
-        (Draft, Active) | (Active, Paused) | (Active, Completed) | (Paused, Active)
+        (Draft, Active)
+            | (Active, Paused)
+            | (Active, Completing)
+            | (Paused, Active)
+            | (Completing, Completed)
+            | (Completing, Active)
     )
 }
 
@@ -175,23 +189,31 @@ mod tests {
     fn valid_transitions() {
         assert!(transit_spec(Draft, Active).is_ok());
         assert!(transit_spec(Active, Paused).is_ok());
-        assert!(transit_spec(Active, Completed).is_ok());
+        assert!(transit_spec(Active, Completing).is_ok());
         assert!(transit_spec(Paused, Active).is_ok());
+        assert!(transit_spec(Completing, Completed).is_ok());
+        assert!(transit_spec(Completing, Active).is_ok());
     }
 
     #[test]
     fn invalid_transitions() {
         assert!(transit_spec(Draft, Paused).is_err());
         assert!(transit_spec(Draft, Completed).is_err());
+        assert!(transit_spec(Draft, Completing).is_err());
         assert!(transit_spec(Paused, Completed).is_err());
+        assert!(transit_spec(Paused, Completing).is_err());
         assert!(transit_spec(Paused, Draft).is_err());
+        assert!(transit_spec(Active, Completed).is_err());
         assert!(transit_spec(Completed, Active).is_err());
         assert!(transit_spec(Completed, Draft).is_err());
+        assert!(transit_spec(Completed, Completing).is_err());
+        assert!(transit_spec(Completing, Draft).is_err());
+        assert!(transit_spec(Completing, Paused).is_err());
     }
 
     #[test]
     fn same_status_rejected() {
-        let statuses = [Draft, Active, Paused, Completed];
+        let statuses = [Draft, Active, Paused, Completing, Completed];
         for s in statuses {
             assert_eq!(
                 transit_spec(s, s).unwrap_err(),
@@ -202,18 +224,18 @@ mod tests {
 
     #[test]
     fn exhaustive_transition_count() {
-        let statuses = [Draft, Active, Paused, Completed];
+        let statuses = [Draft, Active, Paused, Completing, Completed];
         let valid_count = statuses
             .iter()
             .flat_map(|&from| statuses.iter().map(move |&to| (from, to)))
             .filter(|&(from, to)| is_valid_spec_transition(from, to))
             .count();
-        assert_eq!(valid_count, 4);
+        assert_eq!(valid_count, 6);
     }
 
     #[test]
     fn status_roundtrip() {
-        let statuses = [Draft, Active, Paused, Completed];
+        let statuses = [Draft, Active, Paused, Completing, Completed];
         for s in statuses {
             let str_val = s.to_string();
             let parsed: SpecStatus = str_val.parse().unwrap();
@@ -236,6 +258,7 @@ mod tests {
         assert!(!Draft.is_terminal());
         assert!(!Active.is_terminal());
         assert!(!Paused.is_terminal());
+        assert!(!Completing.is_terminal());
     }
 
     #[test]
@@ -268,8 +291,12 @@ mod tests {
         let prev = spec.transition_to(Active).unwrap();
         assert_eq!(prev, Paused);
 
-        let prev = spec.transition_to(Completed).unwrap();
+        let prev = spec.transition_to(Completing).unwrap();
         assert_eq!(prev, Active);
+        assert_eq!(spec.status, Completing);
+
+        let prev = spec.transition_to(Completed).unwrap();
+        assert_eq!(prev, Completing);
         assert_eq!(spec.status, Completed);
     }
 

@@ -1091,17 +1091,36 @@ async fn main() -> anyhow::Result<()> {
                 }
                 SpecCommands::Complete { id } => {
                     let spec = db.get_spec(&id)?;
-                    if !spec
-                        .status
-                        .can_transition_to(&belt_core::spec::SpecStatus::Completed)
-                    {
+                    // Determine the target status based on current state:
+                    // Active -> Completing (enter completion flow)
+                    // Completing -> Completed (HITL final approval)
+                    let target = if spec.status == belt_core::spec::SpecStatus::Active {
+                        belt_core::spec::SpecStatus::Completing
+                    } else if spec.status == belt_core::spec::SpecStatus::Completing {
+                        belt_core::spec::SpecStatus::Completed
+                    } else {
                         anyhow::bail!(
-                            "cannot complete spec in status '{}': only active specs can be completed",
+                            "cannot complete spec in status '{}': only active or completing specs can advance toward completion",
                             spec.status
                         );
+                    };
+                    if !spec.status.can_transition_to(&target) {
+                        anyhow::bail!(
+                            "invalid transition: {} -> {}",
+                            spec.status,
+                            target
+                        );
                     }
-                    db.update_spec_status(&id, belt_core::spec::SpecStatus::Completed)?;
-                    println!("spec completed: {id}");
+                    db.update_spec_status(&id, target)?;
+                    match target {
+                        belt_core::spec::SpecStatus::Completing => {
+                            println!("spec entering completion flow: {id}");
+                        }
+                        belt_core::spec::SpecStatus::Completed => {
+                            println!("spec completed: {id}");
+                        }
+                        _ => unreachable!(),
+                    }
                 }
                 SpecCommands::Remove { id } => {
                     db.remove_spec(&id)?;
