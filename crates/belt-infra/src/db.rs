@@ -683,20 +683,22 @@ impl Database {
             .map_err(|e| BeltError::Database(e.to_string()))?;
 
         rows.into_iter()
-            .map(|(wid, ws, rt, model, input, output, cache_read, cache_write, dur, created)| {
-                Ok(TokenUsageRow {
-                    work_id: wid,
-                    workspace: ws,
-                    runtime: rt,
-                    model,
-                    input_tokens: input as u64,
-                    output_tokens: output as u64,
-                    cache_read_tokens: cache_read.map(|v| v as u64),
-                    cache_write_tokens: cache_write.map(|v| v as u64),
-                    duration_ms: dur.map(|d| d as u64),
-                    created_at: parse_datetime(&created)?,
-                })
-            })
+            .map(
+                |(wid, ws, rt, model, input, output, cache_read, cache_write, dur, created)| {
+                    Ok(TokenUsageRow {
+                        work_id: wid,
+                        workspace: ws,
+                        runtime: rt,
+                        model,
+                        input_tokens: input as u64,
+                        output_tokens: output as u64,
+                        cache_read_tokens: cache_read.map(|v| v as u64),
+                        cache_write_tokens: cache_write.map(|v| v as u64),
+                        duration_ms: dur.map(|d| d as u64),
+                        created_at: parse_datetime(&created)?,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -739,20 +741,22 @@ impl Database {
             .map_err(|e| BeltError::Database(e.to_string()))?;
 
         rows.into_iter()
-            .map(|(wid, ws, rt, model, input, output, cache_read, cache_write, dur, created)| {
-                Ok(TokenUsageRow {
-                    work_id: wid,
-                    workspace: ws,
-                    runtime: rt,
-                    model,
-                    input_tokens: input as u64,
-                    output_tokens: output as u64,
-                    cache_read_tokens: cache_read.map(|v| v as u64),
-                    cache_write_tokens: cache_write.map(|v| v as u64),
-                    duration_ms: dur.map(|d| d as u64),
-                    created_at: parse_datetime(&created)?,
-                })
-            })
+            .map(
+                |(wid, ws, rt, model, input, output, cache_read, cache_write, dur, created)| {
+                    Ok(TokenUsageRow {
+                        work_id: wid,
+                        workspace: ws,
+                        runtime: rt,
+                        model,
+                        input_tokens: input as u64,
+                        output_tokens: output as u64,
+                        cache_read_tokens: cache_read.map(|v| v as u64),
+                        cache_write_tokens: cache_write.map(|v| v as u64),
+                        duration_ms: dur.map(|d| d as u64),
+                        created_at: parse_datetime(&created)?,
+                    })
+                },
+            )
             .collect()
     }
 }
