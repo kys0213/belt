@@ -733,6 +733,11 @@ pub struct PrReviewScanJob {
 
 impl CronHandler for PrReviewScanJob {
     fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
+        // PR changes_requested detection is handled in
+        // GitHubDataSource::collect() for states configured with
+        // `trigger.changes_requested: true`.  This cron job triggers
+        // an additional scan cycle to ensure timely detection between
+        // regular collect intervals.
         tracing::info!("PrReviewScanJob: scanning PRs for changes_requested reviews");
 
         // List all registered workspaces from DB.
