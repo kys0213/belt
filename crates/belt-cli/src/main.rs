@@ -331,6 +331,30 @@ enum SpecCommands {
         /// Spec ID.
         id: String,
     },
+    /// Link a spec to an external resource (URL or issue reference).
+    Link {
+        /// Spec ID.
+        id: String,
+        /// Target URL or issue reference (e.g. `https://...` or `owner/repo#123`).
+        #[arg(long)]
+        to: String,
+    },
+    /// Unlink a spec from an external resource.
+    Unlink {
+        /// Spec ID.
+        id: String,
+        /// Target URL or issue reference to remove.
+        #[arg(long)]
+        from: String,
+    },
+    /// Verify all links for a spec (check reachability).
+    Verify {
+        /// Spec ID.
+        id: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Load workspace config and start the daemon loop.
@@ -711,6 +735,84 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// Verify a link target by checking reachability.
+///
+/// For GitHub issue references (e.g. `owner/repo#123`), uses `gh issue view`.
+/// For HTTP(S) URLs, uses `curl --head`.
+/// Returns `(is_valid, detail_message)`.
+fn verify_link_target(target: &str) -> (bool, String) {
+    // Detect GitHub issue reference: owner/repo#number
+    if let Some((repo, number)) = parse_github_issue_ref(target) {
+        let output = std::process::Command::new("gh")
+            .args(["issue", "view", &number, "--repo", &repo, "--json", "state"])
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                (true, format!("issue exists: {}", stdout.trim()))
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                (false, format!("gh issue view failed: {}", stderr.trim()))
+            }
+            Err(e) => (false, format!("could not run gh: {e}")),
+        }
+    } else if target.starts_with("http://") || target.starts_with("https://") {
+        let output = std::process::Command::new("curl")
+            .args([
+                "--head",
+                "--silent",
+                "--output",
+                "/dev/null",
+                "--write-out",
+                "%{http_code}",
+                "--max-time",
+                "10",
+                "--location",
+                target,
+            ])
+            .output();
+        match output {
+            Ok(out) if out.status.success() => {
+                let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let code_num: u16 = code.parse().unwrap_or(0);
+                if (200..400).contains(&code_num) {
+                    (true, format!("HTTP {code}"))
+                } else {
+                    (false, format!("HTTP {code}"))
+                }
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                (false, format!("curl failed: {}", stderr.trim()))
+            }
+            Err(e) => (false, format!("could not run curl: {e}")),
+        }
+    } else {
+        (false, format!("unsupported target format: {target}"))
+    }
+}
+
+/// Parse a GitHub issue reference like `owner/repo#123` into `(owner/repo, 123)`.
+fn parse_github_issue_ref(target: &str) -> Option<(String, String)> {
+    // Match patterns: owner/repo#123
+    let parts: Vec<&str> = target.splitn(2, '#').collect();
+    if parts.len() == 2 {
+        let repo = parts[0];
+        let number = parts[1];
+        // Validate: repo should contain exactly one '/', number should be digits
+        if repo.matches('/').count() == 1
+            && !repo.starts_with('/')
+            && !repo.ends_with('/')
+            && number.chars().all(|c| c.is_ascii_digit())
+            && !number.is_empty()
+        {
+            return Some((repo.to_string(), number.to_string()));
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -830,7 +932,9 @@ async fn main() -> anyhow::Result<()> {
                         println!("Workspace '{}' updated.", name);
                         println!("  Config: {}", abs_path);
                     } else {
-                        println!("No update options provided. Use --config to update the config path.");
+                        println!(
+                            "No update options provided. Use --config to update the config path."
+                        );
                     }
                 }
                 WorkspaceCommands::Remove { name, force } => {
@@ -1220,8 +1324,54 @@ async fn main() -> anyhow::Result<()> {
                     println!("spec completed: {id}");
                 }
                 SpecCommands::Remove { id } => {
+                    db.remove_all_spec_links(&id)?;
                     db.remove_spec(&id)?;
                     println!("spec removed: {id}");
+                }
+                SpecCommands::Link { id, to } => {
+                    // Ensure spec exists.
+                    let _ = db.get_spec(&id)?;
+                    let link_id = format!("link-{}", chrono::Utc::now().timestamp_millis());
+                    let link =
+                        belt_core::spec::SpecLink::new(link_id.clone(), id.clone(), to.clone());
+                    db.insert_spec_link(&link)?;
+                    println!("linked {id} -> {to}");
+                }
+                SpecCommands::Unlink { id, from } => {
+                    db.remove_spec_link(&id, &from)?;
+                    println!("unlinked {id} -x- {from}");
+                }
+                SpecCommands::Verify { id, json } => {
+                    let _ = db.get_spec(&id)?;
+                    let links = db.list_spec_links(&id)?;
+                    if links.is_empty() {
+                        if json {
+                            println!("[]");
+                        } else {
+                            println!("no links found for spec {id}");
+                        }
+                    } else {
+                        let mut results: Vec<belt_core::spec::LinkVerification> = Vec::new();
+                        for link in links {
+                            let (valid, detail) = verify_link_target(&link.target);
+                            results.push(belt_core::spec::LinkVerification {
+                                link,
+                                valid,
+                                detail,
+                            });
+                        }
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&results)?);
+                        } else {
+                            for r in &results {
+                                let status_icon = if r.valid { "OK" } else { "FAIL" };
+                                println!("[{status_icon}] {} - {}", r.link.target, r.detail);
+                            }
+                            let total = results.len();
+                            let passed = results.iter().filter(|r| r.valid).count();
+                            println!("\n{passed}/{total} links verified successfully");
+                        }
+                    }
                 }
             }
         }
@@ -1383,4 +1533,54 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_github_issue_ref_valid() {
+        let result = parse_github_issue_ref("owner/repo#123");
+        assert_eq!(result, Some(("owner/repo".to_string(), "123".to_string())));
+    }
+
+    #[test]
+    fn parse_github_issue_ref_url_not_matched() {
+        // Full URLs are not issue refs.
+        assert_eq!(
+            parse_github_issue_ref("https://github.com/owner/repo/issues/1"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_github_issue_ref_no_hash() {
+        assert_eq!(parse_github_issue_ref("owner/repo"), None);
+    }
+
+    #[test]
+    fn parse_github_issue_ref_no_number() {
+        assert_eq!(parse_github_issue_ref("owner/repo#abc"), None);
+    }
+
+    #[test]
+    fn parse_github_issue_ref_no_slash() {
+        assert_eq!(parse_github_issue_ref("repo#123"), None);
+    }
+
+    #[test]
+    fn parse_github_issue_ref_leading_slash() {
+        assert_eq!(parse_github_issue_ref("/repo#123"), None);
+    }
+
+    #[test]
+    fn parse_github_issue_ref_trailing_slash() {
+        assert_eq!(parse_github_issue_ref("owner/#123"), None);
+    }
+
+    #[test]
+    fn parse_github_issue_ref_empty_number() {
+        assert_eq!(parse_github_issue_ref("owner/repo#"), None);
+    }
 }

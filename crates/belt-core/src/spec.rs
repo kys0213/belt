@@ -107,6 +107,43 @@ impl fmt::Display for SpecTransitionError {
 
 impl std::error::Error for SpecTransitionError {}
 
+/// A link between a spec and an external resource (URL or issue ID).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecLink {
+    /// Unique identifier for this link.
+    pub id: String,
+    /// The spec this link belongs to.
+    pub spec_id: String,
+    /// The target resource (URL or issue reference like `owner/repo#123`).
+    pub target: String,
+    /// Creation timestamp (RFC 3339).
+    pub created_at: String,
+}
+
+impl SpecLink {
+    /// Create a new spec link.
+    pub fn new(id: String, spec_id: String, target: String) -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
+        Self {
+            id,
+            spec_id,
+            target,
+            created_at: now,
+        }
+    }
+}
+
+/// Result of verifying a single spec link.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkVerification {
+    /// The link that was verified.
+    pub link: SpecLink,
+    /// Whether the link target is reachable / valid.
+    pub valid: bool,
+    /// Human-readable detail (e.g. HTTP status or error message).
+    pub detail: String,
+}
+
 /// A spec represents a planned unit of work with lifecycle management.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Spec {
@@ -282,6 +319,51 @@ mod tests {
             "content".to_string(),
         );
         assert!(spec.transition_to(Completed).is_err());
+    }
+
+    #[test]
+    fn spec_link_new() {
+        let link = SpecLink::new(
+            "link-1".to_string(),
+            "spec-1".to_string(),
+            "https://github.com/org/repo/issues/42".to_string(),
+        );
+        assert_eq!(link.id, "link-1");
+        assert_eq!(link.spec_id, "spec-1");
+        assert_eq!(link.target, "https://github.com/org/repo/issues/42");
+        assert!(!link.created_at.is_empty());
+    }
+
+    #[test]
+    fn spec_link_json_roundtrip() {
+        let link = SpecLink::new(
+            "link-1".to_string(),
+            "spec-1".to_string(),
+            "https://example.com".to_string(),
+        );
+        let json = serde_json::to_string(&link).unwrap();
+        let parsed: SpecLink = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, link.id);
+        assert_eq!(parsed.spec_id, link.spec_id);
+        assert_eq!(parsed.target, link.target);
+    }
+
+    #[test]
+    fn link_verification_json_roundtrip() {
+        let link = SpecLink::new(
+            "link-1".to_string(),
+            "spec-1".to_string(),
+            "https://example.com".to_string(),
+        );
+        let verification = LinkVerification {
+            link,
+            valid: true,
+            detail: "200 OK".to_string(),
+        };
+        let json = serde_json::to_string(&verification).unwrap();
+        let parsed: LinkVerification = serde_json::from_str(&json).unwrap();
+        assert!(parsed.valid);
+        assert_eq!(parsed.detail, "200 OK");
     }
 
     #[test]
