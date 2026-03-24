@@ -837,7 +837,12 @@ const DECISION_KEYWORDS: &[&str] = &[
 
 /// Keywords that signal a "pattern" category.
 const PATTERN_KEYWORDS: &[&str] = &[
-    "pattern", "refactor", "abstraction", "convention", "template", "reusable",
+    "pattern",
+    "refactor",
+    "abstraction",
+    "convention",
+    "template",
+    "reusable",
 ];
 
 /// Classify an item into a knowledge category based on its title and state.
@@ -846,10 +851,7 @@ const PATTERN_KEYWORDS: &[&str] = &[
 /// contains pattern keywords, or `"domain"` as the default category.
 fn classify_knowledge_category(title: &str, state: &str) -> &'static str {
     let haystack = format!("{} {}", title.to_lowercase(), state.to_lowercase());
-    if DECISION_KEYWORDS
-        .iter()
-        .any(|kw| haystack.contains(kw))
-    {
+    if DECISION_KEYWORDS.iter().any(|kw| haystack.contains(kw)) {
         return "decision";
     }
     if PATTERN_KEYWORDS.iter().any(|kw| haystack.contains(kw)) {

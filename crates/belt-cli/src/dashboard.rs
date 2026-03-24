@@ -157,8 +157,8 @@ fn run_loop(
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     if active_panel_len > 0 {
-                        state.selected_index = (state.selected_index + 1)
-                            .min(active_panel_len.saturating_sub(1));
+                        state.selected_index =
+                            (state.selected_index + 1).min(active_panel_len.saturating_sub(1));
                     }
                 }
                 KeyCode::Tab => {
@@ -379,11 +379,7 @@ fn render_recent_items_stateful(
 ///
 /// Displays item metadata and a transition timeline showing state changes
 /// with timestamps.
-fn render_item_detail_overlay(
-    frame: &mut ratatui::Frame,
-    db: &Database,
-    work_id: &str,
-) {
+fn render_item_detail_overlay(frame: &mut ratatui::Frame, db: &Database, work_id: &str) {
     let area = centered_rect(60, 70, frame.area());
 
     // Clear the area behind the overlay.
@@ -430,10 +426,7 @@ fn build_detail_lines<'a>(
                 Span::raw(item.state.clone()),
             ]));
             lines.push(Line::from(vec![
-                Span::styled(
-                    "Workspace: ",
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
+                Span::styled("Workspace: ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(item.workspace_id.clone()),
             ]));
             lines.push(Line::from(vec![
@@ -487,10 +480,7 @@ fn build_detail_lines<'a>(
 
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(
-                    event.from_state.clone(),
-                    Style::default().fg(from_color),
-                ),
+                Span::styled(event.from_state.clone(), Style::default().fg(from_color)),
                 Span::styled(" -> ", Style::default().fg(Color::Gray)),
                 Span::styled(event.to_state.clone(), Style::default().fg(to_color)),
                 Span::raw("  "),
@@ -518,9 +508,7 @@ fn format_transition_time(timestamp: &str) -> String {
     if let Some(t_pos) = timestamp.find('T') {
         let time_part = &timestamp[t_pos + 1..];
         // Take up to the timezone offset (+, -, or Z).
-        let end = time_part
-            .find(['+', 'Z'])
-            .unwrap_or(time_part.len());
+        let end = time_part.find(['+', 'Z']).unwrap_or(time_part.len());
         let time_str = &time_part[..end];
         // Include the date for clarity.
         let date_part = &timestamp[..t_pos];

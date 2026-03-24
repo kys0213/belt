@@ -1036,9 +1036,7 @@ impl Database {
         } else {
             // Exclude archived specs by default
             sql.push_str(" AND status != ?");
-            param_values.push(Box::new(
-                SpecStatus::Archived.as_str().to_string(),
-            ));
+            param_values.push(Box::new(SpecStatus::Archived.as_str().to_string()));
         }
 
         sql.push_str(" ORDER BY created_at ASC");
@@ -1799,7 +1797,9 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> Result<Spec, BeltError> {
         depends_on: row.get(7).map_err(|e| BeltError::Database(e.to_string()))?,
         entry_point: row.get(8).map_err(|e| BeltError::Database(e.to_string()))?,
         created_at: row.get(9).map_err(|e| BeltError::Database(e.to_string()))?,
-        updated_at: row.get(10).map_err(|e| BeltError::Database(e.to_string()))?,
+        updated_at: row
+            .get(10)
+            .map_err(|e| BeltError::Database(e.to_string()))?,
     })
 }
 
