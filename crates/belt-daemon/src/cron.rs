@@ -1096,7 +1096,7 @@ mod tests {
         let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
             belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
         );
-BuiltinJobDeps {
+        BuiltinJobDeps {
             db,
             worktree_mgr,
             workspace_root: tmp.path().to_path_buf(),
