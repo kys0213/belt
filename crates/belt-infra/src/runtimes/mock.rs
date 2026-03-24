@@ -97,6 +97,7 @@ mod tests {
             model: None,
             system_prompt: None,
             session_id: None,
+            structured_output: None,
         };
         assert_eq!(mock.invoke(req.clone()).await.exit_code, 0);
         assert_eq!(mock.invoke(req.clone()).await.exit_code, 1);
@@ -113,6 +114,7 @@ mod tests {
             model: None,
             system_prompt: None,
             session_id: None,
+            structured_output: None,
         };
         mock.invoke(req).await;
         let req2 = RuntimeRequest {
@@ -121,6 +123,7 @@ mod tests {
             model: None,
             system_prompt: None,
             session_id: None,
+            structured_output: None,
         };
         mock.invoke(req2).await;
         assert_eq!(mock.calls(), vec!["first", "second"]);

@@ -20,6 +20,17 @@ pub struct RuntimeRequest {
     pub model: Option<String>,
     pub system_prompt: Option<String>,
     pub session_id: Option<String>,
+    /// Optional structured output configuration for the runtime invocation.
+    pub structured_output: Option<StructuredOutputConfig>,
+}
+
+/// Configuration for requesting structured (schema-validated) output from a runtime.
+#[derive(Debug, Clone)]
+pub struct StructuredOutputConfig {
+    /// JSON Schema that the output must conform to.
+    pub schema: serde_json::Value,
+    /// Optional human-readable name for the output format.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -65,9 +76,17 @@ pub struct RuntimeCapabilities {
 }
 
 /// 런타임 레지스트리 — 이름으로 런타임을 resolve.
+///
+/// Holds a map of named runtimes and an optional workspace-level default model.
+/// Model resolution priority:
+///   1. `RuntimeRequest.model` (per-invocation override)
+///   2. `workspace_default_model` (workspace yaml `runtime.<name>.model`)
+///   3. Runtime-specific default (e.g. `ClaudeRuntime.default_model`)
 pub struct RuntimeRegistry {
     runtimes: HashMap<String, Arc<dyn AgentRuntime>>,
     default_name: String,
+    /// Workspace-level default model from workspace yaml `runtime.<default>.model`.
+    workspace_default_model: Option<String>,
 }
 
 impl RuntimeRegistry {
@@ -75,7 +94,16 @@ impl RuntimeRegistry {
         Self {
             runtimes: HashMap::new(),
             default_name,
+            workspace_default_model: None,
         }
+    }
+
+    /// Create a registry with a workspace-level default model.
+    ///
+    /// This model is used as a fallback when `RuntimeRequest.model` is `None`.
+    pub fn with_default_model(mut self, model: Option<String>) -> Self {
+        self.workspace_default_model = model;
+        self
     }
 
     pub fn register(&mut self, runtime: Arc<dyn AgentRuntime>) {
@@ -96,6 +124,19 @@ impl RuntimeRegistry {
 
     pub fn default_name(&self) -> &str {
         &self.default_name
+    }
+
+    /// Return the workspace-level default model, if configured.
+    pub fn workspace_default_model(&self) -> Option<&str> {
+        self.workspace_default_model.as_deref()
+    }
+
+    /// Resolve the model to use for a request.
+    ///
+    /// Priority: `request_model > workspace_default_model`.
+    /// The runtime implementation may apply its own fallback after this.
+    pub fn resolve_model(&self, request_model: Option<String>) -> Option<String> {
+        request_model.or_else(|| self.workspace_default_model.clone())
     }
 }
 
@@ -161,5 +202,38 @@ mod tests {
         let fail = RuntimeResponse::error("boom");
         assert!(!fail.success());
         assert_eq!(fail.exit_code, -1);
+    }
+
+    #[test]
+    fn resolve_model_request_takes_priority() {
+        let registry = RuntimeRegistry::new("claude".to_string())
+            .with_default_model(Some("sonnet".to_string()));
+        let resolved = registry.resolve_model(Some("opus".to_string()));
+        assert_eq!(resolved.as_deref(), Some("opus"));
+    }
+
+    #[test]
+    fn resolve_model_falls_back_to_workspace_default() {
+        let registry = RuntimeRegistry::new("claude".to_string())
+            .with_default_model(Some("sonnet".to_string()));
+        let resolved = registry.resolve_model(None);
+        assert_eq!(resolved.as_deref(), Some("sonnet"));
+    }
+
+    #[test]
+    fn resolve_model_none_when_no_defaults() {
+        let registry = RuntimeRegistry::new("claude".to_string());
+        let resolved = registry.resolve_model(None);
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn workspace_default_model_accessor() {
+        let registry = RuntimeRegistry::new("claude".to_string())
+            .with_default_model(Some("haiku".to_string()));
+        assert_eq!(registry.workspace_default_model(), Some("haiku"));
+
+        let registry_no_model = RuntimeRegistry::new("claude".to_string());
+        assert_eq!(registry_no_model.workspace_default_model(), None);
     }
 }
