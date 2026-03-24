@@ -180,6 +180,30 @@ enum WorkspaceCommands {
     List,
     /// Show workspace details.
     Show { name: String },
+    /// Update workspace configuration.
+    Update {
+        /// Workspace name.
+        name: String,
+        /// New config file path.
+        #[arg(long)]
+        config: Option<String>,
+    },
+    /// Remove a workspace.
+    Remove {
+        /// Workspace name.
+        name: String,
+        /// Skip confirmation warning for active items.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show workspace configuration details.
+    Config {
+        /// Workspace name.
+        name: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -793,6 +817,98 @@ async fn main() -> anyhow::Result<()> {
                             let status = if job.enabled { "enabled" } else { "disabled" };
                             println!("  {} [{}] ({})", job.name, job.schedule, status);
                         }
+                    }
+                }
+                WorkspaceCommands::Update { name, config } => {
+                    if let Some(config_path) = config {
+                        let path = std::path::Path::new(&config_path);
+                        let abs_path = std::fs::canonicalize(path)
+                            .unwrap_or_else(|_| path.to_path_buf())
+                            .to_string_lossy()
+                            .to_string();
+                        db.update_workspace(&name, &abs_path)?;
+                        println!("Workspace '{}' updated.", name);
+                        println!("  Config: {}", abs_path);
+                    } else {
+                        println!("No update options provided. Use --config to update the config path.");
+                    }
+                }
+                WorkspaceCommands::Remove { name, force } => {
+                    // Check for active queue items in this workspace
+                    let items = db.list_items(None, Some(&name))?;
+                    let active_count = items
+                        .iter()
+                        .filter(|i| !matches!(i.phase, QueuePhase::Done | QueuePhase::Skipped))
+                        .count();
+
+                    if active_count > 0 && !force {
+                        eprintln!(
+                            "Warning: workspace '{}' has {} active item(s).",
+                            name, active_count
+                        );
+                        eprintln!("Use --force to remove anyway.");
+                        std::process::exit(1);
+                    }
+
+                    db.remove_workspace(&name)?;
+                    println!("Workspace '{}' removed.", name);
+                    if active_count > 0 {
+                        println!(
+                            "  Note: {} active item(s) remain in the queue.",
+                            active_count
+                        );
+                    }
+                }
+                WorkspaceCommands::Config { name, json } => {
+                    let (_ws_name, config_path, _created_at) = db.get_workspace(&name)?;
+
+                    // Try to load and display the workspace config file
+                    let path = std::path::Path::new(&config_path);
+                    if path.exists() {
+                        let config: belt_core::workspace::WorkspaceConfig =
+                            belt_infra::workspace_loader::load_workspace_config(path)?;
+                        if json {
+                            let output = serde_json::to_string_pretty(&config)?;
+                            println!("{output}");
+                        } else {
+                            println!("Name:        {}", config.name);
+                            println!("Concurrency: {}", config.concurrency);
+                            println!("Runtime:     {}", config.runtime.default);
+                            if !config.sources.is_empty() {
+                                println!("\nSources:");
+                                for (source_name, source_cfg) in &config.sources {
+                                    println!("  {source_name}:");
+                                    println!("    URL:           {}", source_cfg.url);
+                                    println!(
+                                        "    Scan interval: {}s",
+                                        source_cfg.scan_interval_secs
+                                    );
+                                }
+                            }
+                            if let Some(claw) = &config.claw_config {
+                                println!("\nClaw config:");
+                                println!("  Auto-approve: {}", claw.auto_approve);
+                                if let Some(hp) = &claw.hitl_policy {
+                                    println!("  HITL policy:  {hp}");
+                                }
+                                if let Some(cp) = &claw.classify_policy {
+                                    println!("  Classify:     {cp}");
+                                }
+                                if !claw.enabled_commands.is_empty() {
+                                    println!(
+                                        "  Commands:     {}",
+                                        claw.enabled_commands.join(", ")
+                                    );
+                                }
+                            }
+                        }
+                    } else {
+                        anyhow::bail!(
+                            "Config file not found: {}. \
+                             Use 'belt workspace update {} --config <path>' to fix.",
+                            config_path,
+                            name
+                        );
                     }
                 }
             }
