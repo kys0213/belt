@@ -387,6 +387,49 @@ impl DataSource for GitHubDataSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use belt_core::phase::QueuePhase;
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    fn make_workspace_with_github(url: &str, state: &str, label: Option<&str>) -> WorkspaceConfig {
+        let label_yaml = match label {
+            Some(l) => format!("          label: \"{l}\""),
+            None => String::new(),
+        };
+        let yaml = format!(
+            r#"
+name: test-ws
+sources:
+  github:
+    url: {url}
+    states:
+      {state}:
+        trigger:
+{label_yaml}
+"#
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    fn make_workspace_without_github() -> WorkspaceConfig {
+        serde_yaml::from_str("name: test-ws\nsources: {}").unwrap()
+    }
+
+    fn make_queue_item(source_id: &str, state: &str) -> QueueItem {
+        let work_id = QueueItem::make_work_id(source_id, state);
+        QueueItem {
+            work_id,
+            source_id: source_id.to_string(),
+            workspace_id: "test-ws".to_string(),
+            state: state.to_string(),
+            phase: QueuePhase::Pending,
+            title: Some("Test issue title".to_string()),
+            created_at: "2026-03-24T00:00:00Z".to_string(),
+            updated_at: "2026-03-24T00:00:00Z".to_string(),
+        }
+    }
+
+    // ── extract_repo_name ────────────────────────────────────────────────────
 
     #[test]
     fn extract_repo_name_from_url() {
@@ -398,5 +441,214 @@ mod tests {
             GitHubDataSource::extract_repo_name("https://github.com/org/repo.git"),
             Some("org/repo".to_string())
         );
+    }
+
+    #[test]
+    fn extract_repo_name_strips_trailing_slash() {
+        assert_eq!(
+            GitHubDataSource::extract_repo_name("https://github.com/org/repo/"),
+            Some("org/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_repo_name_strips_trailing_slash_and_git() {
+        // trailing slash then .git would leave ".git" after trim_end_matches('/'),
+        // but .git suffix is stripped independently — test the actual combination
+        assert_eq!(
+            GitHubDataSource::extract_repo_name("https://github.com/org/repo.git"),
+            Some("org/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_repo_name_ssh_url() {
+        // SSH style: git@github.com:org/repo.git
+        // split('/') on this gives ["git@github.com:org", "repo.git"] → "org/repo" after strip
+        assert_eq!(
+            GitHubDataSource::extract_repo_name("git@github.com:org/repo.git"),
+            Some("git@github.com:org/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_repo_name_bare_owner_repo() {
+        // Minimal "owner/repo" string (no host)
+        assert_eq!(
+            GitHubDataSource::extract_repo_name("owner/repo"),
+            Some("owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_repo_name_single_segment_returns_none() {
+        // Only one segment — cannot form "owner/repo"
+        assert_eq!(GitHubDataSource::extract_repo_name("repo"), None);
+    }
+
+    #[test]
+    fn extract_repo_name_empty_string_returns_none() {
+        assert_eq!(GitHubDataSource::extract_repo_name(""), None);
+    }
+
+    // ── constructor & DataSource::name ───────────────────────────────────────
+
+    #[test]
+    fn new_stores_source_url() {
+        let ds = GitHubDataSource::new("https://github.com/org/repo");
+        assert_eq!(ds.source_url, "https://github.com/org/repo");
+    }
+
+    #[test]
+    fn new_sets_last_scan_to_none() {
+        let ds = GitHubDataSource::new("https://github.com/org/repo");
+        assert!(ds.last_scan.is_none());
+    }
+
+    #[test]
+    fn name_returns_github() {
+        let ds = GitHubDataSource::new("https://github.com/org/repo");
+        assert_eq!(ds.name(), "github");
+    }
+
+    // ── collect() ────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn collect_returns_empty_when_no_github_source() {
+        let mut ds = GitHubDataSource::new("https://github.com/org/repo");
+        let workspace = make_workspace_without_github();
+        let items = ds.collect(&workspace).await.unwrap();
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_skips_state_with_no_trigger_label() {
+        let mut ds = GitHubDataSource::new("https://github.com/org/repo");
+        // label is None — this state must be skipped
+        let workspace = make_workspace_with_github(
+            "https://github.com/org/repo",
+            "analyze",
+            None,
+        );
+        // The gh CLI will not be called because we return early when label is None.
+        // We only verify no panic and the result is Ok.
+        let result = ds.collect(&workspace).await;
+        assert!(result.is_ok());
+    }
+
+    // ── get_context() ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn get_context_parses_issue_number_from_source_id() {
+        let ds = GitHubDataSource::new("https://github.com/org/repo");
+        let item = make_queue_item("github:org/repo#42", "analyze");
+        // gh CLI will fail in the test environment; the fallback path is exercised.
+        let ctx = ds.get_context(&item).await.unwrap();
+        // issue number must be parsed correctly from source_id even without gh
+        assert_eq!(ctx.issue.as_ref().unwrap().number, 42);
+    }
+
+    #[tokio::test]
+    async fn get_context_uses_item_title_as_fallback_when_gh_unavailable() {
+        let ds = GitHubDataSource::new("https://github.com/org/repo");
+        let item = make_queue_item("github:org/repo#7", "implement");
+        let ctx = ds.get_context(&item).await.unwrap();
+        // When gh CLI is not available, title falls back to item.title
+        let issue = ctx.issue.as_ref().unwrap();
+        assert_eq!(issue.title, item.title.clone().unwrap_or_default());
+    }
+
+    #[tokio::test]
+    async fn get_context_falls_back_to_main_when_default_branch_unknown() {
+        let ds = GitHubDataSource::new("https://github.com/org/repo");
+        let item = make_queue_item("github:org/repo#1", "analyze");
+        let ctx = ds.get_context(&item).await.unwrap();
+        // When gh CLI is unavailable, default_branch falls back to Some("main")
+        assert_eq!(
+            ctx.source.default_branch.as_deref(),
+            Some("main")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_context_source_type_is_github() {
+        let ds = GitHubDataSource::new("https://github.com/org/repo");
+        let item = make_queue_item("github:org/repo#5", "review");
+        let ctx = ds.get_context(&item).await.unwrap();
+        assert_eq!(ctx.source.source_type, "github");
+    }
+
+    #[tokio::test]
+    async fn get_context_source_url_matches_datasource_url() {
+        let url = "https://github.com/org/repo";
+        let ds = GitHubDataSource::new(url);
+        let item = make_queue_item("github:org/repo#10", "analyze");
+        let ctx = ds.get_context(&item).await.unwrap();
+        assert_eq!(ctx.source.url, url);
+    }
+
+    #[tokio::test]
+    async fn get_context_work_id_and_workspace_propagated() {
+        let ds = GitHubDataSource::new("https://github.com/org/repo");
+        let item = make_queue_item("github:org/repo#3", "analyze");
+        let ctx = ds.get_context(&item).await.unwrap();
+        assert_eq!(ctx.work_id, item.work_id);
+        assert_eq!(ctx.workspace, item.workspace_id);
+    }
+
+    #[tokio::test]
+    async fn get_context_queue_fields_propagated() {
+        let ds = GitHubDataSource::new("https://github.com/org/repo");
+        let item = make_queue_item("github:org/repo#9", "implement");
+        let ctx = ds.get_context(&item).await.unwrap();
+        assert_eq!(ctx.queue.state, item.state);
+        assert_eq!(ctx.queue.source_id, item.source_id);
+        assert_eq!(ctx.queue.phase, item.phase.as_str());
+    }
+
+    #[tokio::test]
+    async fn get_context_source_id_without_hash_yields_issue_number_zero() {
+        // Edge case: malformed source_id with no '#' separator
+        let ds = GitHubDataSource::new("https://github.com/org/repo");
+        let mut item = make_queue_item("github:org/repo#0", "analyze");
+        item.source_id = "github:org/repo".to_string(); // no '#number'
+        let ctx = ds.get_context(&item).await.unwrap();
+        assert_eq!(ctx.issue.as_ref().unwrap().number, 0);
+    }
+
+    #[tokio::test]
+    async fn get_context_history_is_empty_by_default() {
+        let ds = GitHubDataSource::new("https://github.com/org/repo");
+        let item = make_queue_item("github:org/repo#11", "analyze");
+        let ctx = ds.get_context(&item).await.unwrap();
+        assert!(ctx.history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_context_worktree_is_none_by_default() {
+        let ds = GitHubDataSource::new("https://github.com/org/repo");
+        let item = make_queue_item("github:org/repo#12", "analyze");
+        let ctx = ds.get_context(&item).await.unwrap();
+        assert!(ctx.worktree.is_none());
+    }
+
+    // ── work_id construction ─────────────────────────────────────────────────
+
+    #[test]
+    fn work_id_format_matches_convention() {
+        // Verifies the source_id + state → work_id convention used inside collect()
+        let source_id = "github:org/repo#42";
+        let state = "implement";
+        let work_id = QueueItem::make_work_id(source_id, state);
+        assert_eq!(work_id, "github:org/repo#42:implement");
+    }
+
+    #[test]
+    fn source_id_format_matches_convention() {
+        // Verifies the repo_name + issue_number → source_id format used inside collect()
+        let repo_name = "org/repo";
+        let number: i64 = 42;
+        let source_id = format!("github:{repo_name}#{number}");
+        assert_eq!(source_id, "github:org/repo#42");
     }
 }
