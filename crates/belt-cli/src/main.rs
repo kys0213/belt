@@ -267,6 +267,28 @@ enum QueueCommands {
         /// Script execution timeout in seconds.
         #[arg(long)]
         timeout: Option<u64>,
+    /// Manage queue item dependencies.
+    #[command(subcommand)]
+    Dependency(DependencyCommands),
+}
+
+#[derive(Subcommand)]
+enum DependencyCommands {
+    /// Add a dependency (item must run after another item).
+    Add {
+        /// Queue item work_id.
+        queue_id: String,
+        /// The work_id that this item depends on (must complete first).
+        #[arg(long)]
+        after: String,
+    },
+    /// Remove a dependency.
+    Remove {
+        /// Queue item work_id.
+        queue_id: String,
+        /// The work_id to remove from dependencies.
+        #[arg(long)]
+        after: String,
     },
 }
 
@@ -830,6 +852,19 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
         }
     }
 
+/// `belt queue dependency add` -- add a dependency between queue items.
+fn cmd_queue_dependency_add(queue_id: &str, after: &str) -> anyhow::Result<()> {
+    let db = open_db()?;
+    db.add_queue_dependency(queue_id, after)?;
+    println!("Added dependency: {queue_id} depends on {after}.");
+    Ok(())
+}
+
+/// `belt queue dependency remove` -- remove a dependency between queue items.
+fn cmd_queue_dependency_remove(queue_id: &str, after: &str) -> anyhow::Result<()> {
+    let db = open_db()?;
+    db.remove_queue_dependency(queue_id, after)?;
+    println!("Removed dependency: {queue_id} no longer depends on {after}.");
     Ok(())
 }
 
@@ -1389,6 +1424,14 @@ async fn main() -> anyhow::Result<()> {
             QueueCommands::RetryScript { work_id, timeout } => {
                 cmd_queue_retry_script(&work_id, timeout).await?;
             }
+            QueueCommands::Dependency(dep_cmd) => match dep_cmd {
+                DependencyCommands::Add { queue_id, after } => {
+                    cmd_queue_dependency_add(&queue_id, &after)?;
+                }
+                DependencyCommands::Remove { queue_id, after } => {
+                    cmd_queue_dependency_remove(&queue_id, &after)?;
+                }
+            },
         },
         Commands::Cron { command } => match command {
             CronCommands::List { format } => {

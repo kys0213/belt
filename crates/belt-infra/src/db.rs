@@ -300,6 +300,13 @@ impl Database {
                 timestamp  TEXT NOT NULL,
                 metadata   TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS queue_dependencies (
+                work_id    TEXT NOT NULL,
+                depends_on TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (work_id, depends_on)
+            );
             ",
         )
         .map_err(|e| BeltError::Database(e.to_string()))?;
@@ -1379,6 +1386,81 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         Ok(events)
+    }
+
+    // ---- Queue Dependencies ------------------------------------------------
+
+    /// Add a dependency between two queue items.
+    ///
+    /// Declares that `work_id` depends on (must run after) `depends_on_id`.
+    ///
+    /// # Errors
+    /// Returns `BeltError::Database` on constraint violation or I/O error.
+    pub fn add_queue_dependency(
+        &self,
+        work_id: &str,
+        depends_on_id: &str,
+    ) -> Result<(), BeltError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        conn.execute(
+            "INSERT OR IGNORE INTO queue_dependencies (work_id, depends_on, created_at)
+                 VALUES (?1, ?2, ?3)",
+            params![work_id, depends_on_id, now],
+        )
+        .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Remove a dependency between two queue items.
+    ///
+    /// # Errors
+    /// Returns `BeltError::ItemNotFound` if the dependency does not exist.
+    pub fn remove_queue_dependency(
+        &self,
+        work_id: &str,
+        depends_on_id: &str,
+    ) -> Result<(), BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "DELETE FROM queue_dependencies WHERE work_id = ?1 AND depends_on = ?2",
+                params![work_id, depends_on_id],
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        if rows == 0 {
+            return Err(BeltError::ItemNotFound(format!(
+                "dependency {work_id} -> {depends_on_id}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// List all dependencies for a given queue item.
+    ///
+    /// Returns the `work_id` values that the given item depends on.
+    pub fn list_queue_dependencies(&self, work_id: &str) -> Result<Vec<String>, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT depends_on FROM queue_dependencies WHERE work_id = ?1 ORDER BY created_at ASC",
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let deps = stmt
+            .query_map(params![work_id], |row| row.get::<_, String>(0))
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(deps)
     }
 
     // ---- Token Usage -------------------------------------------------------
@@ -2738,5 +2820,57 @@ mod tests {
         let running = counts.iter().find(|(p, _)| p == "running").map(|(_, c)| *c);
         assert_eq!(pending, Some(2));
         assert_eq!(running, Some(1));
+    }
+}
+
+    // ---- Queue Dependencies tests ------------------------------------------
+
+    #[test]
+    fn add_and_list_queue_dependency() {
+        let db = test_db();
+        db.add_queue_dependency("item-a", "item-b").unwrap();
+        db.add_queue_dependency("item-a", "item-c").unwrap();
+
+        let deps = db.list_queue_dependencies("item-a").unwrap();
+        assert_eq!(deps.len(), 2);
+        assert!(deps.contains(&"item-b".to_string()));
+        assert!(deps.contains(&"item-c".to_string()));
+    }
+
+    #[test]
+    fn add_duplicate_dependency_is_ignored() {
+        let db = test_db();
+        db.add_queue_dependency("item-a", "item-b").unwrap();
+        db.add_queue_dependency("item-a", "item-b").unwrap();
+
+        let deps = db.list_queue_dependencies("item-a").unwrap();
+        assert_eq!(deps.len(), 1);
+    }
+
+    #[test]
+    fn remove_queue_dependency() {
+        let db = test_db();
+        db.add_queue_dependency("item-a", "item-b").unwrap();
+        db.add_queue_dependency("item-a", "item-c").unwrap();
+
+        db.remove_queue_dependency("item-a", "item-b").unwrap();
+
+        let deps = db.list_queue_dependencies("item-a").unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0], "item-c");
+    }
+
+    #[test]
+    fn remove_nonexistent_dependency_returns_error() {
+        let db = test_db();
+        let result = db.remove_queue_dependency("item-a", "item-b");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn list_queue_dependencies_empty() {
+        let db = test_db();
+        let deps = db.list_queue_dependencies("item-a").unwrap();
+        assert!(deps.is_empty());
     }
 }
