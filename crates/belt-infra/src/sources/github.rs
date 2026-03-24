@@ -251,6 +251,10 @@ impl GitHubDataSource {
                 title: Some(format!("[review] {title}")),
                 created_at: chrono::Utc::now().to_rfc3339(),
                 updated_at: chrono::Utc::now().to_rfc3339(),
+                hitl_created_at: None,
+                hitl_respondent: None,
+                hitl_notes: None,
+                hitl_reason: None,
             });
         }
 
