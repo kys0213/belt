@@ -9,6 +9,8 @@ use belt_infra::db::Database;
 
 mod agent;
 mod bootstrap;
+mod dashboard;
+mod status;
 
 use belt_core::runtime::RuntimeRegistry;
 use belt_daemon::daemon::Daemon;
@@ -47,10 +49,12 @@ enum Commands {
     Stop,
     /// Show system status.
     Status {
-        /// Output format.
+        /// Output format (text, json, rich).
         #[arg(long, default_value = "text")]
         format: String,
     },
+    /// Open the real-time TUI dashboard.
+    Dashboard,
     /// Workspace management.
     Workspace {
         #[command(subcommand)]
@@ -211,6 +215,14 @@ enum QueueCommands {
 
 #[derive(Subcommand)]
 enum SpecCommands {
+    /// Show workspace status (item counts by phase).
+    Status {
+        /// Workspace name.
+        name: String,
+        /// Output format (text, json, rich).
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
     /// Add a new spec.
     Add {
         /// Workspace ID.
@@ -686,6 +698,19 @@ async fn main() -> anyhow::Result<()> {
         Commands::Status { format } => {
             cmd_status(&format)?;
         }
+        Commands::Dashboard => {
+            let belt_home = dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
+                .join(".belt");
+            std::fs::create_dir_all(&belt_home)?;
+            let db_path = belt_home.join("belt.db");
+            let db = std::sync::Arc::new(belt_infra::db::Database::open(
+                db_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("invalid db path"))?,
+            )?);
+            dashboard::run(db)?;
+        }
         Commands::Workspace { command } => {
             let belt_home = dirs::home_dir()
                 .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
@@ -872,6 +897,10 @@ async fn main() -> anyhow::Result<()> {
             )?;
 
             match command {
+                SpecCommands::Status { name, format } => {
+                    let spec_status = status::gather_spec_status(&db, &name)?;
+                    status::print_spec_status(&spec_status, &format)?;
+                }
                 SpecCommands::Add {
                     workspace,
                     name,
