@@ -300,6 +300,9 @@ enum SpecCommands {
         /// Optional comma-separated spec IDs this depends on.
         #[arg(long)]
         depends_on: Option<String>,
+        /// Optional comma-separated file/module paths this spec touches.
+        #[arg(long)]
+        entry_point: Option<String>,
     },
     /// List specs.
     List {
@@ -340,6 +343,9 @@ enum SpecCommands {
         /// New depends_on.
         #[arg(long)]
         depends_on: Option<String>,
+        /// New entry_point (comma-separated file/module paths).
+        #[arg(long)]
+        entry_point: Option<String>,
     },
     /// Pause an active spec.
     Pause {
@@ -1425,12 +1431,39 @@ async fn main() -> anyhow::Result<()> {
                     priority,
                     labels,
                     depends_on,
+                    entry_point,
                 } => {
                     let id = format!("spec-{}", chrono::Utc::now().timestamp_millis());
-                    let mut spec = belt_core::spec::Spec::new(id.clone(), workspace, name, content);
+                    let mut spec = belt_core::spec::Spec::new(
+                        id.clone(),
+                        workspace.clone(),
+                        name,
+                        content,
+                    );
                     spec.priority = priority;
                     spec.labels = labels;
                     spec.depends_on = depends_on;
+                    spec.entry_point = entry_point;
+
+                    // Detect conflicts with existing specs in the same workspace
+                    if spec.entry_point.is_some() {
+                        let existing_specs =
+                            db.list_specs(Some(&workspace), None)?;
+                        let conflicts =
+                            belt_core::spec::ConflictDetector::detect(&spec, &existing_specs);
+                        if !conflicts.is_empty() {
+                            eprintln!("warning: spec conflicts detected:");
+                            for c in &conflicts {
+                                eprintln!(
+                                    "  - {} overlap with spec '{}' ({}) at path: {}",
+                                    c.overlap_type, c.existing_spec_name, c.existing_spec_id, c.path
+                                );
+                            }
+                            let conflicts_json = serde_json::to_string(&conflicts)?;
+                            eprintln!("conflicts_json: {conflicts_json}");
+                        }
+                    }
+
                     db.insert_spec(&spec)?;
                     println!("spec created: {id}");
 
@@ -1504,6 +1537,9 @@ async fn main() -> anyhow::Result<()> {
                         if let Some(d) = &spec.depends_on {
                             println!("Depends On:  {d}");
                         }
+                        if let Some(ep) = &spec.entry_point {
+                            println!("Entry Point: {ep}");
+                        }
                         println!("Created At:  {}", spec.created_at);
                         println!("Updated At:  {}", spec.updated_at);
                     }
@@ -1515,6 +1551,7 @@ async fn main() -> anyhow::Result<()> {
                     priority,
                     labels,
                     depends_on,
+                    entry_point,
                 } => {
                     let mut spec = db.get_spec(&id)?;
                     if let Some(n) = name {
@@ -1531,6 +1568,9 @@ async fn main() -> anyhow::Result<()> {
                     }
                     if depends_on.is_some() {
                         spec.depends_on = depends_on;
+                    }
+                    if entry_point.is_some() {
+                        spec.entry_point = entry_point;
                     }
                     db.update_spec(&spec)?;
                     println!("spec updated: {id}");

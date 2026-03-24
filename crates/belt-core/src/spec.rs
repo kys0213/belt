@@ -1,4 +1,6 @@
+use std::collections::HashMap;
 use std::fmt;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
@@ -143,6 +145,9 @@ pub struct Spec {
     /// Optional comma-separated IDs of specs this depends on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub depends_on: Option<String>,
+    /// Optional comma-separated file/module paths this spec touches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_point: Option<String>,
     /// Creation timestamp (RFC 3339).
     pub created_at: String,
     /// Last update timestamp (RFC 3339).
@@ -162,6 +167,7 @@ impl Spec {
             priority: None,
             labels: None,
             depends_on: None,
+            entry_point: None,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -177,6 +183,111 @@ impl Spec {
         self.status = to;
         self.updated_at = chrono::Utc::now().to_rfc3339();
         Ok(previous)
+    }
+
+    /// Parse the comma-separated `entry_point` field into individual paths.
+    pub fn entry_points(&self) -> Vec<&str> {
+        match &self.entry_point {
+            Some(ep) => ep.split(',').map(str::trim).filter(|s| !s.is_empty()).collect(),
+            None => Vec::new(),
+        }
+    }
+}
+
+/// Type of overlap detected between specs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlapType {
+    /// Two specs share the exact same file path.
+    File,
+    /// One spec's path is a parent module of another's.
+    Module,
+}
+
+impl fmt::Display for OverlapType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            OverlapType::File => f.write_str("file"),
+            OverlapType::Module => f.write_str("module"),
+        }
+    }
+}
+
+/// A detected conflict between two specs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecConflict {
+    /// ID of the existing spec that conflicts.
+    pub existing_spec_id: String,
+    /// Name of the existing spec.
+    pub existing_spec_name: String,
+    /// The type of overlap.
+    pub overlap_type: OverlapType,
+    /// The path that caused the overlap.
+    pub path: String,
+}
+
+/// Detects implicit conflicts between specs based on entry_point overlaps.
+///
+/// When a new spec is added, its entry points are compared against existing
+/// specs to find file-level or module-level overlaps that could cause
+/// merge conflicts or unintended interactions.
+pub struct ConflictDetector;
+
+impl ConflictDetector {
+    /// Detect conflicts between a new spec and a list of existing specs.
+    ///
+    /// Returns a list of `SpecConflict` entries for each overlap found.
+    /// An empty list means no conflicts were detected.
+    pub fn detect(new_spec: &Spec, existing_specs: &[Spec]) -> Vec<SpecConflict> {
+        let new_entry_points = new_spec.entry_points();
+        if new_entry_points.is_empty() {
+            return Vec::new();
+        }
+
+        // Build a map: path -> (spec_id, spec_name) for all existing, non-terminal specs
+        let mut path_map: HashMap<&str, (&str, &str)> = HashMap::new();
+        let mut module_entries: Vec<(&str, &str, &str)> = Vec::new(); // (path, spec_id, spec_name)
+
+        for spec in existing_specs {
+            if spec.id == new_spec.id || spec.status.is_terminal() {
+                continue;
+            }
+            for ep in spec.entry_points() {
+                path_map.insert(ep, (&spec.id, &spec.name));
+                module_entries.push((ep, &spec.id, &spec.name));
+            }
+        }
+
+        let mut conflicts = Vec::new();
+
+        for new_ep in &new_entry_points {
+            // Check exact file overlap
+            if let Some(&(spec_id, spec_name)) = path_map.get(new_ep) {
+                conflicts.push(SpecConflict {
+                    existing_spec_id: spec_id.to_string(),
+                    existing_spec_name: spec_name.to_string(),
+                    overlap_type: OverlapType::File,
+                    path: new_ep.to_string(),
+                });
+                continue;
+            }
+
+            // Check module overlap (parent/child directory relationship)
+            let new_path = Path::new(new_ep);
+            for &(existing_ep, spec_id, spec_name) in &module_entries {
+                let existing_path = Path::new(existing_ep);
+                if new_path.starts_with(existing_path) || existing_path.starts_with(new_path) {
+                    conflicts.push(SpecConflict {
+                        existing_spec_id: spec_id.to_string(),
+                        existing_spec_name: spec_name.to_string(),
+                        overlap_type: OverlapType::Module,
+                        path: new_ep.to_string(),
+                    });
+                }
+            }
+        }
+
+        conflicts
     }
 }
 
@@ -322,6 +433,7 @@ mod tests {
         spec.priority = Some(1);
         spec.labels = Some("bug,urgent".to_string());
         spec.depends_on = Some("spec-0".to_string());
+        spec.entry_point = Some("src/auth/mod.rs,src/auth/token.rs".to_string());
 
         let json = serde_json::to_string(&spec).unwrap();
         let parsed: Spec = serde_json::from_str(&json).unwrap();
@@ -329,5 +441,137 @@ mod tests {
         assert_eq!(parsed.priority, Some(1));
         assert_eq!(parsed.labels.as_deref(), Some("bug,urgent"));
         assert_eq!(parsed.depends_on.as_deref(), Some("spec-0"));
+        assert_eq!(
+            parsed.entry_point.as_deref(),
+            Some("src/auth/mod.rs,src/auth/token.rs")
+        );
+    }
+
+    #[test]
+    fn entry_points_parses_comma_separated() {
+        let mut spec = Spec::new(
+            "s1".to_string(),
+            "ws".to_string(),
+            "name".to_string(),
+            "content".to_string(),
+        );
+        spec.entry_point = Some("src/a.rs, src/b.rs,src/c.rs".to_string());
+        assert_eq!(spec.entry_points(), vec!["src/a.rs", "src/b.rs", "src/c.rs"]);
+    }
+
+    #[test]
+    fn entry_points_empty_when_none() {
+        let spec = Spec::new(
+            "s1".to_string(),
+            "ws".to_string(),
+            "name".to_string(),
+            "content".to_string(),
+        );
+        assert!(spec.entry_points().is_empty());
+    }
+
+    fn make_spec_with_entry(id: &str, name: &str, entry_point: Option<&str>) -> Spec {
+        let mut spec = Spec::new(
+            id.to_string(),
+            "ws-1".to_string(),
+            name.to_string(),
+            "content".to_string(),
+        );
+        spec.entry_point = entry_point.map(String::from);
+        spec.status = Active;
+        spec
+    }
+
+    #[test]
+    fn conflict_detector_no_conflicts() {
+        let new_spec = make_spec_with_entry("s2", "new", Some("src/new.rs"));
+        let existing = vec![make_spec_with_entry("s1", "old", Some("src/old.rs"))];
+        let conflicts = ConflictDetector::detect(&new_spec, &existing);
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn conflict_detector_file_overlap() {
+        let new_spec = make_spec_with_entry("s2", "new", Some("src/auth.rs"));
+        let existing = vec![make_spec_with_entry("s1", "old", Some("src/auth.rs"))];
+        let conflicts = ConflictDetector::detect(&new_spec, &existing);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].overlap_type, OverlapType::File);
+        assert_eq!(conflicts[0].existing_spec_id, "s1");
+        assert_eq!(conflicts[0].path, "src/auth.rs");
+    }
+
+    #[test]
+    fn conflict_detector_module_overlap() {
+        let new_spec = make_spec_with_entry("s2", "new", Some("src/auth/token.rs"));
+        let existing = vec![make_spec_with_entry("s1", "old", Some("src/auth"))];
+        let conflicts = ConflictDetector::detect(&new_spec, &existing);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].overlap_type, OverlapType::Module);
+    }
+
+    #[test]
+    fn conflict_detector_reverse_module_overlap() {
+        let new_spec = make_spec_with_entry("s2", "new", Some("src/auth"));
+        let existing = vec![make_spec_with_entry("s1", "old", Some("src/auth/token.rs"))];
+        let conflicts = ConflictDetector::detect(&new_spec, &existing);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].overlap_type, OverlapType::Module);
+    }
+
+    #[test]
+    fn conflict_detector_skips_completed_specs() {
+        let new_spec = make_spec_with_entry("s2", "new", Some("src/auth.rs"));
+        let mut completed = make_spec_with_entry("s1", "old", Some("src/auth.rs"));
+        completed.status = Completed;
+        let conflicts = ConflictDetector::detect(&new_spec, &[completed]);
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn conflict_detector_skips_self() {
+        let spec = make_spec_with_entry("s1", "self", Some("src/auth.rs"));
+        let conflicts = ConflictDetector::detect(&spec, &[spec.clone()]);
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn conflict_detector_no_entry_point_no_conflict() {
+        let new_spec = make_spec_with_entry("s2", "new", None);
+        let existing = vec![make_spec_with_entry("s1", "old", Some("src/auth.rs"))];
+        let conflicts = ConflictDetector::detect(&new_spec, &existing);
+        assert!(conflicts.is_empty());
+    }
+
+    #[test]
+    fn conflict_detector_multiple_entry_points() {
+        let new_spec = make_spec_with_entry("s2", "new", Some("src/auth.rs,src/db.rs"));
+        let existing = vec![
+            make_spec_with_entry("s1", "old-auth", Some("src/auth.rs")),
+            make_spec_with_entry("s3", "old-api", Some("src/api.rs")),
+        ];
+        let conflicts = ConflictDetector::detect(&new_spec, &existing);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].existing_spec_id, "s1");
+        assert_eq!(conflicts[0].path, "src/auth.rs");
+    }
+
+    #[test]
+    fn overlap_type_display() {
+        assert_eq!(OverlapType::File.to_string(), "file");
+        assert_eq!(OverlapType::Module.to_string(), "module");
+    }
+
+    #[test]
+    fn spec_conflict_json_roundtrip() {
+        let conflict = SpecConflict {
+            existing_spec_id: "s1".to_string(),
+            existing_spec_name: "Auth".to_string(),
+            overlap_type: OverlapType::File,
+            path: "src/auth.rs".to_string(),
+        };
+        let json = serde_json::to_string(&conflict).unwrap();
+        let parsed: SpecConflict = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, conflict);
     }
 }
