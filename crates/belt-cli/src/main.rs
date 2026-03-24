@@ -345,6 +345,9 @@ async fn start_daemon(
     let db = belt_infra::db::Database::open(db_path.to_str().unwrap_or("belt.db"))
         .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
 
+    // Capture PID file path before belt_home is moved into the daemon.
+    let pid_path = belt_home.join("daemon.pid");
+
     let mut daemon = Daemon::new(
         config,
         sources,
@@ -355,12 +358,23 @@ async fn start_daemon(
     .with_db(db)
     .with_belt_home(belt_home);
 
+    // Write PID file so `belt stop` can find the daemon process.
+    std::fs::write(&pid_path, std::process::id().to_string())
+        .map_err(|e| anyhow::anyhow!("failed to write PID file: {e}"))?;
+
     tracing::info!(
-        "starting belt daemon (tick={}s, max_concurrent={})",
+        "starting belt daemon (tick={}s, max_concurrent={}, pid={})",
         tick_interval_secs,
-        max_concurrent
+        max_concurrent,
+        std::process::id()
     );
     daemon.run(tick_interval_secs).await;
+
+    // Clean up PID file on graceful shutdown.
+    if let Err(e) = std::fs::remove_file(&pid_path) {
+        tracing::warn!("failed to remove PID file: {e}");
+    }
+
     Ok(())
 }
 
