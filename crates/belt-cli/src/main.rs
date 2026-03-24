@@ -166,6 +166,14 @@ enum HitlCommands {
         #[arg(long)]
         workspace: Option<String>,
     },
+    /// Show HITL item details.
+    Show {
+        /// Queue item work_id.
+        item_id: String,
+        /// Output format.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
     /// Set or query HITL timeouts.
     Timeout {
         #[command(subcommand)]
@@ -1031,6 +1039,58 @@ fn cmd_cron_trigger(name: &str) -> anyhow::Result<()> {
     // force_trigger. Without IPC, the best we can do is inform the user.
     println!("Trigger requested for cron job '{name}'.");
     println!("The job will execute on the next daemon tick.");
+    Ok(())
+}
+
+/// `belt hitl show` -- show HITL item details.
+fn cmd_hitl_show(item_id: &str, format: &str) -> anyhow::Result<()> {
+    let db = open_db()?;
+    let item = db.get_item(item_id)?;
+
+    if item.phase != QueuePhase::Hitl {
+        anyhow::bail!(
+            "item '{}' is in phase '{}', not 'hitl'",
+            item_id,
+            item.phase
+        );
+    }
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&item)?);
+        }
+        _ => {
+            println!("Work ID:      {}", item.work_id);
+            println!("Source ID:    {}", item.source_id);
+            println!("Workspace:    {}", item.workspace_id);
+            println!("State:        {}", item.state);
+            println!("Phase:        {}", item.phase);
+            if let Some(title) = &item.title {
+                println!("Title:        {title}");
+            }
+            println!("Created:      {}", item.created_at);
+            println!("Updated:      {}", item.updated_at);
+            if let Some(hitl_at) = &item.hitl_created_at {
+                println!("HITL Since:   {hitl_at}");
+            }
+            if let Some(reason) = &item.hitl_reason {
+                println!("HITL Reason:  {reason}");
+            }
+            if let Some(respondent) = &item.hitl_respondent {
+                println!("Respondent:   {respondent}");
+            }
+            if let Some(notes) = &item.hitl_notes {
+                println!("Notes:        {notes}");
+            }
+            if let Some(timeout_at) = &item.hitl_timeout_at {
+                println!("Timeout At:   {timeout_at}");
+            }
+            if let Some(action) = &item.hitl_terminal_action {
+                println!("Timeout Act:  {action}");
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1950,6 +2010,9 @@ async fn main() -> anyhow::Result<()> {
                     }
                     println!("\n{} item(s) awaiting review.", items.len());
                 }
+            }
+            HitlCommands::Show { item_id, format } => {
+                cmd_hitl_show(&item_id, &format)?;
             }
             HitlCommands::Timeout { command } => {
                 cmd_hitl_timeout(command)?;
