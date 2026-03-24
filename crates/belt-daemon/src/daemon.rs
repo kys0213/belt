@@ -718,6 +718,16 @@ impl Daemon {
             return;
         }
 
+        // evaluate LLM 호출도 concurrency slot을 소비한다 (D-04).
+        if !self.tracker.can_spawn() {
+            tracing::debug!(
+                "no concurrency slots available for evaluate, deferring {} items",
+                completed.len()
+            );
+            return;
+        }
+        self.tracker.track_evaluate();
+
         // Evaluator 스크립트 실행으로 Done vs HITL 판정.
         let eval_result = self.evaluator.run_evaluate(&self.belt_home).await;
 
@@ -780,6 +790,9 @@ impl Daemon {
                 );
             }
         }
+
+        // evaluate slot 반환.
+        self.tracker.release_evaluate();
     }
 
     /// Daemon tick: collect -> advance -> execute -> evaluate.
@@ -800,9 +813,13 @@ impl Daemon {
         }
 
         let outcomes = self.execute_running().await;
+        let mut has_completed = false;
         for outcome in &outcomes {
             match outcome {
-                ItemOutcome::Completed(item) => tracing::info!("completed: {}", item.work_id),
+                ItemOutcome::Completed(item) => {
+                    tracing::info!("completed: {}", item.work_id);
+                    has_completed = true;
+                }
                 ItemOutcome::Failed {
                     item,
                     error,
@@ -818,6 +835,16 @@ impl Daemon {
                 ItemOutcome::Skipped(item) => tracing::info!("skipped: {}", item.work_id),
             }
         }
+
+        // handler 성공 → Completed 전이 후 force_trigger("evaluate") (D-10).
+        // force_trigger는 cron의 last_run_at을 리셋하여 다음 tick에서 즉시 실행.
+        if has_completed {
+            self.cron_engine.force_trigger("evaluate");
+            tracing::debug!("force_trigger(evaluate) after handler completion");
+        }
+
+        // Cron engine tick (evaluate, HITL timeout, etc.).
+        self.cron_engine.tick();
 
         // Evaluator로 Completed 아이템 평가 (Done vs HITL).
         self.evaluate_completed().await;

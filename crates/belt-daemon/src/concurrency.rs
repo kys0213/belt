@@ -4,10 +4,15 @@ use std::collections::HashMap;
 ///
 /// Level 1: workspace별 제한 (workspace.concurrency)
 /// Level 2: 전역 제한 (daemon.max_concurrent)
+///
+/// evaluate LLM 호출도 concurrency slot을 소비한다.
+/// `active_evaluates` 카운트가 `total`에 포함되어 전역 제한을 공유한다.
 pub struct ConcurrencyTracker {
     per_workspace: HashMap<String, usize>,
     total: usize,
     max_total: usize,
+    /// 현재 실행 중인 evaluate LLM 호출 수. `total`에 포함된다.
+    active_evaluates: usize,
 }
 
 impl ConcurrencyTracker {
@@ -16,6 +21,7 @@ impl ConcurrencyTracker {
             per_workspace: HashMap::new(),
             total: 0,
             max_total: max_total as usize,
+            active_evaluates: 0,
         }
     }
 
@@ -57,6 +63,23 @@ impl ConcurrencyTracker {
             }
         }
         self.total = self.total.saturating_sub(1);
+    }
+
+    /// Track an evaluate LLM call. Consumes a global concurrency slot.
+    pub fn track_evaluate(&mut self) {
+        self.active_evaluates += 1;
+        self.total += 1;
+    }
+
+    /// Release an evaluate LLM call slot.
+    pub fn release_evaluate(&mut self) {
+        self.active_evaluates = self.active_evaluates.saturating_sub(1);
+        self.total = self.total.saturating_sub(1);
+    }
+
+    /// Number of active evaluate LLM calls.
+    pub fn active_evaluate_count(&self) -> usize {
+        self.active_evaluates
     }
 
     pub fn total(&self) -> usize {
@@ -115,6 +138,43 @@ mod tests {
     fn release_saturating() {
         let mut tracker = ConcurrencyTracker::new(4);
         tracker.release("ws1");
+        assert_eq!(tracker.total(), 0);
+    }
+
+    #[test]
+    fn evaluate_consumes_global_slot() {
+        let mut tracker = ConcurrencyTracker::new(2);
+        tracker.track_evaluate();
+        assert_eq!(tracker.total(), 1);
+        assert_eq!(tracker.active_evaluate_count(), 1);
+        assert!(tracker.can_spawn());
+
+        tracker.track_evaluate();
+        assert_eq!(tracker.total(), 2);
+        assert!(!tracker.can_spawn());
+    }
+
+    #[test]
+    fn evaluate_and_handler_share_slots() {
+        let mut tracker = ConcurrencyTracker::new(3);
+        tracker.track("ws1");
+        tracker.track_evaluate();
+        assert_eq!(tracker.total(), 2);
+        assert!(tracker.can_spawn());
+
+        tracker.track("ws2");
+        assert!(!tracker.can_spawn());
+
+        tracker.release_evaluate();
+        assert!(tracker.can_spawn());
+        assert_eq!(tracker.active_evaluate_count(), 0);
+    }
+
+    #[test]
+    fn release_evaluate_saturating() {
+        let mut tracker = ConcurrencyTracker::new(4);
+        tracker.release_evaluate();
+        assert_eq!(tracker.active_evaluate_count(), 0);
         assert_eq!(tracker.total(), 0);
     }
 }

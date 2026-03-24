@@ -1,7 +1,17 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use clap::{Parser, Subcommand};
 
 mod agent;
 mod bootstrap;
+
+use belt_core::runtime::RuntimeRegistry;
+use belt_daemon::daemon::Daemon;
+use belt_infra::runtimes::claude::ClaudeRuntime;
+use belt_infra::sources::github::GitHubDataSource;
+use belt_infra::worktree::GitWorktreeManager;
+
 mod claw;
 mod dashboard;
 mod status;
@@ -20,7 +30,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Start the daemon.
-    Start,
+    Start {
+        /// Path to workspace.yaml config.
+        #[arg(long, default_value = "workspace.yaml")]
+        config: String,
+        /// Tick interval in seconds.
+        #[arg(long, default_value_t = 30)]
+        tick: u64,
+        /// Maximum concurrent tasks.
+        #[arg(long, default_value_t = 4)]
+        max_concurrent: u32,
+    },
     /// Stop the daemon.
     Stop,
     /// Show system status.
@@ -259,6 +279,64 @@ enum SpecCommands {
     },
 }
 
+/// Load workspace config and start the daemon loop.
+async fn start_daemon(
+    config_path: &str,
+    tick_interval_secs: u64,
+    max_concurrent: u32,
+) -> anyhow::Result<()> {
+    let config_content = std::fs::read_to_string(config_path)
+        .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {}", config_path, e))?;
+    let config: belt_core::workspace::WorkspaceConfig = serde_yaml::from_str(&config_content)
+        .map_err(|e| anyhow::anyhow!("failed to parse config file '{}': {}", config_path, e))?;
+
+    let belt_home = dirs::home_dir()
+        .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
+        .join(".belt");
+
+    // Build DataSources from workspace config.
+    let mut sources: Vec<Box<dyn belt_core::source::DataSource>> = Vec::new();
+    for (name, source_config) in &config.sources {
+        if name == "github" || source_config.url.contains("github.com") {
+            sources.push(Box::new(GitHubDataSource::new(&source_config.url)));
+        }
+    }
+
+    // Runtime registry with Claude as default.
+    let mut registry = RuntimeRegistry::new("claude".to_string());
+    registry.register(Arc::new(ClaudeRuntime::new(None)));
+
+    // Worktree manager.
+    let worktree_base = belt_home.join("worktrees");
+    std::fs::create_dir_all(&worktree_base)?;
+    let repo_path = PathBuf::from(".");
+    let worktree_mgr = GitWorktreeManager::new(worktree_base, repo_path);
+
+    // Database for token usage.
+    let db_path = belt_home.join("belt.db");
+    std::fs::create_dir_all(&belt_home)?;
+    let db = belt_infra::db::Database::open(db_path.to_str().unwrap_or("belt.db"))
+        .map_err(|e| anyhow::anyhow!("failed to open database: {e}"))?;
+
+    let mut daemon = Daemon::new(
+        config,
+        sources,
+        Arc::new(registry),
+        Box::new(worktree_mgr),
+        max_concurrent,
+    )
+    .with_db(db)
+    .with_belt_home(belt_home);
+
+    tracing::info!(
+        "starting belt daemon (tick={}s, max_concurrent={})",
+        tick_interval_secs,
+        max_concurrent
+    );
+    daemon.run(tick_interval_secs).await;
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -270,9 +348,12 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start => {
-            tracing::info!("starting belt daemon...");
-            // TODO: daemon start
+        Commands::Start {
+            config,
+            tick,
+            max_concurrent,
+        } => {
+            start_daemon(&config, tick, max_concurrent).await?;
         }
         Commands::Stop => {
             tracing::info!("stopping belt daemon...");
