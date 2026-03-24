@@ -468,4 +468,53 @@ mod tests {
         assert_eq!(models[0].model, "large-model");
         assert_eq!(models[1].model, "small-model");
     }
+
+    // ---- phase_color ----
+
+    #[test]
+    fn phase_color_pending() {
+        assert_eq!(phase_color("pending"), Color::Gray);
+    }
+
+    #[test]
+    fn phase_color_ready() {
+        assert_eq!(phase_color("ready"), Color::Blue);
+    }
+
+    #[test]
+    fn phase_color_running() {
+        assert_eq!(phase_color("running"), Color::Green);
+    }
+
+    #[test]
+    fn phase_color_completed() {
+        assert_eq!(phase_color("completed"), Color::Cyan);
+    }
+
+    #[test]
+    fn phase_color_done() {
+        assert_eq!(phase_color("done"), Color::White);
+    }
+
+    #[test]
+    fn phase_color_hitl() {
+        assert_eq!(phase_color("hitl"), Color::Yellow);
+    }
+
+    #[test]
+    fn phase_color_failed() {
+        assert_eq!(phase_color("failed"), Color::Red);
+    }
+
+    #[test]
+    fn phase_color_skipped() {
+        assert_eq!(phase_color("skipped"), Color::DarkGray);
+    }
+
+    #[test]
+    fn phase_color_unknown_returns_white() {
+        assert_eq!(phase_color("unknown"), Color::White);
+        assert_eq!(phase_color(""), Color::White);
+        assert_eq!(phase_color("PENDING"), Color::White);
+    }
 }

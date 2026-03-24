@@ -357,6 +357,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn worktree_preserved_default_false() {
         let item = test_item("s1", "analyze");
         assert!(!item.worktree_preserved);
