@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod agent;
+mod bootstrap;
 mod claw;
 mod dashboard;
 mod status;
@@ -70,6 +71,18 @@ enum Commands {
     Claw {
         #[command(subcommand)]
         command: ClawCommands,
+    },
+    /// Bootstrap .claude/rules files for a workspace.
+    Bootstrap {
+        /// Workspace root directory (defaults to current directory).
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Custom rules directory path (defaults to <workspace>/.claude/rules).
+        #[arg(long)]
+        rules_dir: Option<String>,
+        /// Overwrite existing rule files.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -561,6 +574,52 @@ async fn main() -> anyhow::Result<()> {
                     println!("spec removed: {id}");
                 }
             }
+        }
+        Commands::Bootstrap {
+            workspace,
+            rules_dir,
+            force,
+        } => {
+            let workspace_root = match (&workspace, &rules_dir) {
+                // If a custom rules_dir is given, create it directly.
+                (_, Some(dir)) => {
+                    let rules_path = std::path::PathBuf::from(dir);
+                    std::fs::create_dir_all(&rules_path)?;
+                    // Use the parent of the rules dir as a synthetic workspace root
+                    // so that bootstrap::run creates files inside the given path.
+                    // We need to strip the `.claude/rules` suffix expectation.
+                    // Instead, write directly using the rules_dir.
+                    let result = bootstrap::run_in_dir(&rules_path, force)?;
+                    for path in &result.written {
+                        println!("  created: {}", path.display());
+                    }
+                    for path in &result.skipped {
+                        println!("  skipped: {}", path.display());
+                    }
+                    tracing::info!(
+                        rules_dir = %rules_path.display(),
+                        written = result.written.len(),
+                        skipped = result.skipped.len(),
+                        "bootstrap complete"
+                    );
+                    return Ok(());
+                }
+                (Some(ws), None) => std::path::PathBuf::from(ws),
+                (None, None) => std::env::current_dir()?,
+            };
+            let result = bootstrap::run(&workspace_root, force)?;
+            for path in &result.written {
+                println!("  created: {}", path.display());
+            }
+            for path in &result.skipped {
+                println!("  skipped: {}", path.display());
+            }
+            tracing::info!(
+                rules_dir = %result.rules_dir.display(),
+                written = result.written.len(),
+                skipped = result.skipped.len(),
+                "bootstrap complete"
+            );
         }
         Commands::Claw { command } => match command {
             ClawCommands::Init { force } => {
