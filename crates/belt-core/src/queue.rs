@@ -1,7 +1,78 @@
+use std::fmt;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::phase::QueuePhase;
+
+/// HITL 생성 경로 — 어떤 원인으로 HITL에 진입했는지 기록한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HitlReason {
+    /// evaluate 실패 (partial result).
+    EvaluateFailure,
+    /// retry 최대 횟수 초과.
+    RetryMaxExceeded,
+    /// 실행 timeout.
+    Timeout,
+    /// 수동 escalation (사용자 요청).
+    ManualEscalation,
+}
+
+impl fmt::Display for HitlReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HitlReason::EvaluateFailure => f.write_str("evaluate_failure"),
+            HitlReason::RetryMaxExceeded => f.write_str("retry_max_exceeded"),
+            HitlReason::Timeout => f.write_str("timeout"),
+            HitlReason::ManualEscalation => f.write_str("manual_escalation"),
+        }
+    }
+}
+
+/// HITL 응답 액션 — 사용자가 HITL 아이템에 대해 취할 수 있는 행동.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HitlRespondAction {
+    /// 완료 처리 (HITL → Done).
+    Done,
+    /// 재시도 (HITL → Pending).
+    Retry,
+    /// 건너뛰기 (HITL → Skipped).
+    Skip,
+    /// 재계획 (HITL → Failed, replan 트리거).
+    Replan,
+}
+
+impl std::str::FromStr for HitlRespondAction {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "done" => Ok(HitlRespondAction::Done),
+            "retry" => Ok(HitlRespondAction::Retry),
+            "skip" => Ok(HitlRespondAction::Skip),
+            "replan" => Ok(HitlRespondAction::Replan),
+            _ => Err(format!(
+                "invalid HITL respond action: {s} (expected: done, retry, skip, replan)"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for HitlRespondAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HitlRespondAction::Done => f.write_str("done"),
+            HitlRespondAction::Retry => f.write_str("retry"),
+            HitlRespondAction::Skip => f.write_str("skip"),
+            HitlRespondAction::Replan => f.write_str("replan"),
+        }
+    }
+}
+
+/// HITL timeout 기본값 (24시간).
+pub const HITL_TIMEOUT_HOURS: u64 = 24;
 
 /// A history event recorded whenever a noteworthy phase transition or failure occurs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +117,18 @@ pub struct QueueItem {
     pub created_at: String,
     /// 마지막 업데이트 시각 (RFC3339)
     pub updated_at: String,
+    /// HITL 진입 시각 (RFC3339). HITL phase 진입 시 설정된다.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hitl_created_at: Option<String>,
+    /// HITL 응답자 (e.g. 사용자 이름).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hitl_respondent: Option<String>,
+    /// HITL 관련 메모 (사유, 응답 내용 등).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hitl_notes: Option<String>,
+    /// HITL 생성 경로.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hitl_reason: Option<HitlReason>,
 }
 
 impl QueueItem {
@@ -60,6 +143,10 @@ impl QueueItem {
             title: None,
             created_at: now.clone(),
             updated_at: now,
+            hitl_created_at: None,
+            hitl_respondent: None,
+            hitl_notes: None,
+            hitl_reason: None,
         }
     }
 
@@ -81,6 +168,10 @@ pub struct QueueItemRow {
     pub title: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    pub hitl_created_at: Option<String>,
+    pub hitl_respondent: Option<String>,
+    pub hitl_notes: Option<String>,
+    pub hitl_reason: Option<String>,
 }
 
 impl QueueItem {
@@ -94,11 +185,26 @@ impl QueueItem {
             title: self.title.clone(),
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
+            hitl_created_at: self.hitl_created_at.clone(),
+            hitl_respondent: self.hitl_respondent.clone(),
+            hitl_notes: self.hitl_notes.clone(),
+            hitl_reason: self.hitl_reason.map(|r| r.to_string()),
         }
     }
 
     pub fn from_row(row: &QueueItemRow) -> Result<Self, String> {
         let phase: QueuePhase = row.phase.parse()?;
+        let hitl_reason = row
+            .hitl_reason
+            .as_deref()
+            .map(|s| match s {
+                "evaluate_failure" => Ok(HitlReason::EvaluateFailure),
+                "retry_max_exceeded" => Ok(HitlReason::RetryMaxExceeded),
+                "timeout" => Ok(HitlReason::Timeout),
+                "manual_escalation" => Ok(HitlReason::ManualEscalation),
+                other => Err(format!("invalid hitl_reason: {other}")),
+            })
+            .transpose()?;
         Ok(Self {
             work_id: row.work_id.clone(),
             source_id: row.source_id.clone(),
@@ -108,6 +214,10 @@ impl QueueItem {
             title: row.title.clone(),
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
+            hitl_created_at: row.hitl_created_at.clone(),
+            hitl_respondent: row.hitl_respondent.clone(),
+            hitl_notes: row.hitl_notes.clone(),
+            hitl_reason,
         })
     }
 }
@@ -127,6 +237,10 @@ pub mod testing {
             title: Some(format!("Test item: {state}")),
             created_at: "2026-03-22T00:00:00Z".to_string(),
             updated_at: "2026-03-22T00:00:00Z".to_string(),
+            hitl_created_at: None,
+            hitl_respondent: None,
+            hitl_notes: None,
+            hitl_reason: None,
         }
     }
 }
@@ -178,5 +292,49 @@ mod tests {
         let parsed: QueueItem = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.work_id, item.work_id);
         assert_eq!(parsed.phase, item.phase);
+    }
+
+    #[test]
+    fn hitl_metadata_json_roundtrip() {
+        let mut item = test_item("github:org/repo#42", "analyze");
+        item.hitl_created_at = Some("2026-03-24T00:00:00Z".to_string());
+        item.hitl_respondent = Some("irene".to_string());
+        item.hitl_notes = Some("needs manual review".to_string());
+        item.hitl_reason = Some(HitlReason::RetryMaxExceeded);
+
+        let json = serde_json::to_string(&item).unwrap();
+        let parsed: QueueItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.hitl_created_at, item.hitl_created_at);
+        assert_eq!(parsed.hitl_respondent, item.hitl_respondent);
+        assert_eq!(parsed.hitl_notes, item.hitl_notes);
+        assert_eq!(parsed.hitl_reason, item.hitl_reason);
+    }
+
+    #[test]
+    fn hitl_respond_action_roundtrip() {
+        let actions = ["done", "retry", "skip", "replan"];
+        for s in actions {
+            let action: HitlRespondAction = s.parse().unwrap();
+            assert_eq!(action.to_string(), s);
+        }
+    }
+
+    #[test]
+    fn hitl_respond_action_invalid() {
+        assert!("invalid".parse::<HitlRespondAction>().is_err());
+    }
+
+    #[test]
+    fn hitl_reason_display() {
+        assert_eq!(HitlReason::EvaluateFailure.to_string(), "evaluate_failure");
+        assert_eq!(
+            HitlReason::RetryMaxExceeded.to_string(),
+            "retry_max_exceeded"
+        );
+        assert_eq!(HitlReason::Timeout.to_string(), "timeout");
+        assert_eq!(
+            HitlReason::ManualEscalation.to_string(),
+            "manual_escalation"
+        );
     }
 }

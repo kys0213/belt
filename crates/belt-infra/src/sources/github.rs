@@ -319,6 +319,10 @@ impl DataSource for GitHubDataSource {
                             title: Some(title),
                             created_at: chrono::Utc::now().to_rfc3339(),
                             updated_at: chrono::Utc::now().to_rfc3339(),
+                            hitl_created_at: None,
+                            hitl_respondent: None,
+                            hitl_notes: None,
+                            hitl_reason: None,
                         });
                     }
                 }
@@ -525,11 +529,7 @@ sources:
     async fn collect_skips_state_with_no_trigger_label() {
         let mut ds = GitHubDataSource::new("https://github.com/org/repo");
         // label is None — this state must be skipped
-        let workspace = make_workspace_with_github(
-            "https://github.com/org/repo",
-            "analyze",
-            None,
-        );
+        let workspace = make_workspace_with_github("https://github.com/org/repo", "analyze", None);
         // The gh CLI will not be called because we return early when label is None.
         // We only verify no panic and the result is Ok.
         let result = ds.collect(&workspace).await;
@@ -564,10 +564,7 @@ sources:
         let item = make_queue_item("github:org/repo#1", "analyze");
         let ctx = ds.get_context(&item).await.unwrap();
         // When gh CLI is unavailable, default_branch falls back to Some("main")
-        assert_eq!(
-            ctx.source.default_branch.as_deref(),
-            Some("main")
-        );
+        assert_eq!(ctx.source.default_branch.as_deref(), Some("main"));
     }
 
     #[tokio::test]
