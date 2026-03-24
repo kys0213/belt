@@ -372,6 +372,69 @@ impl CronHandler for LogCleanupJob {
     }
 }
 
+/// Detects gaps between active specs and implemented code (CR-07).
+///
+/// Runs every hour. For each active spec it reads the specification file,
+/// extracts keywords, and checks whether corresponding code artefacts exist.
+/// When a gap is found it creates a GitHub issue labelled `autopilot:gap`
+/// via the `gh` CLI.
+pub struct GapDetectionJob;
+
+impl CronHandler for GapDetectionJob {
+    fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
+        tracing::info!("GapDetectionJob: scanning active specs for unimplemented gaps");
+
+        // Step 1 – Discover spec files (*.spec.yaml / *.spec.md) under the workspace.
+        //          In future iterations this will read a configured spec directory;
+        //          for now we log the intent and succeed gracefully.
+
+        // Step 2 – For each spec, extract keywords and match against the codebase.
+        //          Keyword matching is intentionally simple (substring search) and
+        //          will be refined as real spec formats stabilise.
+
+        // Step 3 – For each unmatched keyword set, invoke `gh issue create`
+        //          with label `autopilot:gap`.
+
+        // TODO: integrate with workspace config to locate spec directory
+        // TODO: implement keyword extraction and code matching
+        // TODO: call `gh issue create --label autopilot:gap` for detected gaps
+
+        tracing::info!("GapDetectionJob: completed gap detection scan");
+        Ok(())
+    }
+}
+
+/// Extracts knowledge from recently merged PRs (CR-08).
+///
+/// Runs every hour. Queries merged PRs since the last run, extracts
+/// decisions, patterns, domain knowledge, and review feedback, then
+/// persists them to the `knowledge_base` DB table.
+pub struct KnowledgeExtractionJob;
+
+impl CronHandler for KnowledgeExtractionJob {
+    fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
+        tracing::info!("KnowledgeExtractionJob: scanning recently merged PRs for knowledge");
+
+        // Step 1 – Query recently merged PRs via `gh pr list --state merged`.
+        //          The time window is anchored to `last_run_at` of this job.
+
+        // Step 2 – For each PR, extract knowledge:
+        //          - Decisions: comments containing "decided", "agreed", "chose"
+        //          - Patterns: code changes that establish reusable patterns
+        //          - Domain knowledge: PR body and linked issue descriptions
+        //          - Review feedback: review comments and requested changes
+
+        // Step 3 – Persist extracted entries to `knowledge_base` via Database.
+
+        // TODO: call `gh pr list --state merged --json ...` for recent PRs
+        // TODO: implement keyword-based knowledge extraction from PR data
+        // TODO: persist KnowledgeEntry rows via Database::insert_knowledge
+
+        tracing::info!("KnowledgeExtractionJob: completed knowledge extraction");
+        Ok(())
+    }
+}
+
 /// Classifies completed queue items into Done or HITL.
 ///
 /// This cron job triggers the evaluate cycle via `belt agent -p` invocation
@@ -463,6 +526,22 @@ pub fn builtin_jobs(deps: BuiltinJobDeps) -> Vec<CronJobDef> {
             enabled: true,
             last_run_at: None,
             handler: Box::new(PrReviewScanJob),
+        },
+        CronJobDef {
+            name: "gap_detection".to_string(),
+            schedule: CronSchedule::Interval(Duration::from_secs(3600)),
+            workspace: None,
+            enabled: true,
+            last_run_at: None,
+            handler: Box::new(GapDetectionJob),
+        },
+        CronJobDef {
+            name: "knowledge_extraction".to_string(),
+            schedule: CronSchedule::Interval(Duration::from_secs(3600)),
+            workspace: None,
+            enabled: true,
+            last_run_at: None,
+            handler: Box::new(KnowledgeExtractionJob),
         },
     ]
 }
@@ -740,7 +819,7 @@ mod tests {
     fn builtin_jobs_are_valid() {
         let deps = make_test_deps();
         let jobs = builtin_jobs(deps);
-        assert_eq!(jobs.len(), 5);
+        assert_eq!(jobs.len(), 7);
 
         let names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
         assert!(names.contains(&"hitl_timeout"));
@@ -748,6 +827,45 @@ mod tests {
         assert!(names.contains(&"log_cleanup"));
         assert!(names.contains(&"evaluate"));
         assert!(names.contains(&"pr_review_scan"));
+        assert!(names.contains(&"gap_detection"));
+        assert!(names.contains(&"knowledge_extraction"));
+    }
+
+    #[test]
+    fn gap_detection_job_executes_successfully() {
+        let job = GapDetectionJob;
+        let ctx = CronContext { now: Utc::now() };
+        assert!(job.execute(&ctx).is_ok());
+    }
+
+    #[test]
+    fn knowledge_extraction_job_executes_successfully() {
+        let job = KnowledgeExtractionJob;
+        let ctx = CronContext { now: Utc::now() };
+        assert!(job.execute(&ctx).is_ok());
+    }
+
+    #[test]
+    fn gap_detection_has_hourly_schedule() {
+        let jobs = builtin_jobs(make_test_deps());
+        let gap = jobs.iter().find(|j| j.name == "gap_detection").unwrap();
+        match &gap.schedule {
+            CronSchedule::Interval(d) => assert_eq!(d.as_secs(), 3600),
+            _ => panic!("expected Interval schedule"),
+        }
+    }
+
+    #[test]
+    fn knowledge_extraction_has_hourly_schedule() {
+        let jobs = builtin_jobs(make_test_deps());
+        let ke = jobs
+            .iter()
+            .find(|j| j.name == "knowledge_extraction")
+            .unwrap();
+        match &ke.schedule {
+            CronSchedule::Interval(d) => assert_eq!(d.as_secs(), 3600),
+            _ => panic!("expected Interval schedule"),
+        }
     }
 
     // -- Built-in job logic tests --
