@@ -282,6 +282,18 @@ impl Daemon {
             match result {
                 Ok(exec_result) => {
                     let outcome = self.apply_execution_result(exec_result);
+
+                    // Execute on_fail scripts based on escalation policy.
+                    if let ItemOutcome::Failed {
+                        ref item,
+                        escalation,
+                        ..
+                    } = outcome
+                        && escalation.should_run_on_fail()
+                    {
+                        self.execute_on_fail_for_item(item).await;
+                    }
+
                     outcomes.push(outcome);
                 }
                 Err(e) => {
@@ -291,6 +303,35 @@ impl Daemon {
         }
 
         outcomes
+    }
+
+    /// Execute on_fail scripts for a failed item (best-effort).
+    ///
+    /// Escalation policy의 `should_run_on_fail()`이 true일 때만 호출된다.
+    /// silent retry는 on_fail을 실행하지 않는다.
+    async fn execute_on_fail_for_item(&self, item: &QueueItem) {
+        let state_config = match self.find_state_config(&item.state).cloned() {
+            Some(cfg) => cfg,
+            None => return,
+        };
+
+        if state_config.on_fail.is_empty() {
+            return;
+        }
+
+        let worktree = match self.worktree_mgr.create_or_reuse(&item.work_id) {
+            Ok(path) => path,
+            Err(e) => {
+                tracing::warn!("on_fail worktree error for {}: {e}", item.work_id);
+                return;
+            }
+        };
+
+        let env = ActionEnv::new(&item.work_id, &worktree);
+        let on_fail: Vec<Action> = state_config.on_fail.iter().map(Action::from).collect();
+        if let Err(e) = self.executor.execute_all(&on_fail, &env).await {
+            tracing::warn!("on_fail execution error for {}: {e}", item.work_id);
+        }
     }
 
     /// 단일 아이템의 handler를 실행하는 순수 async 함수.
@@ -334,10 +375,6 @@ impl Daemon {
         let on_enter: Vec<Action> = state_config.on_enter.iter().map(Action::from).collect();
         match executor.execute_all(&on_enter, &env).await {
             Ok(Some(r)) if !r.success() => {
-                // on_fail 스크립트 실행 시도 (best-effort).
-                let on_fail: Vec<Action> = state_config.on_fail.iter().map(Action::from).collect();
-                let _ = executor.execute_all(&on_fail, &env).await;
-
                 item.phase = QueuePhase::Failed;
                 return ExecutionResult {
                     item,
@@ -350,9 +387,6 @@ impl Daemon {
             }
             Err(e) => {
                 tracing::warn!("on_enter failed for {}: {e}", item.work_id);
-                let on_fail: Vec<Action> = state_config.on_fail.iter().map(Action::from).collect();
-                let _ = executor.execute_all(&on_fail, &env).await;
-
                 item.phase = QueuePhase::Failed;
                 return ExecutionResult {
                     item,

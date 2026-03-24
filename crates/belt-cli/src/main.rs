@@ -169,9 +169,70 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!(work_id, "skipping item...");
             }
         },
-        Commands::Context { work_id, json: _ } => {
-            tracing::info!(work_id, "fetching context...");
-            // TODO: context retrieval
+        Commands::Context { work_id, json } => {
+            let db_path = dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
+                .join(".belt")
+                .join("belt.db");
+
+            if !db_path.exists() {
+                anyhow::bail!("belt database not found at {}", db_path.display());
+            }
+
+            let db_path_str = db_path.to_string_lossy();
+            let db = belt_infra::db::Database::open(&db_path_str)?;
+            let item = db.get_item(&work_id)?;
+
+            // Convert DB HistoryEvents to context HistoryEntries.
+            let history_events = db.get_history(&item.source_id)?;
+            let history: Vec<belt_core::context::HistoryEntry> = history_events
+                .iter()
+                .map(|e| belt_core::context::HistoryEntry {
+                    source_id: e.source_id.clone(),
+                    work_id: e.work_id.clone(),
+                    state: e.state.clone(),
+                    status: e
+                        .status
+                        .parse()
+                        .unwrap_or(belt_core::context::HistoryStatus::Failed),
+                    attempt: e.attempt as u32,
+                    summary: e.summary.clone(),
+                    error: e.error.clone(),
+                    created_at: e.created_at.clone(),
+                })
+                .collect();
+
+            let ctx = belt_core::context::ItemContext {
+                work_id: item.work_id.clone(),
+                workspace: item.workspace_id.clone(),
+                queue: belt_core::context::QueueContext {
+                    phase: item.phase.as_str().to_string(),
+                    state: item.state.clone(),
+                    source_id: item.source_id.clone(),
+                },
+                source: belt_core::context::SourceContext {
+                    source_type: "github".to_string(),
+                    url: String::new(),
+                    default_branch: None,
+                },
+                issue: None,
+                pr: None,
+                history,
+                worktree: None,
+            };
+
+            if json {
+                println!("{}", serde_json::to_string_pretty(&ctx)?);
+            } else {
+                println!("work_id:   {}", ctx.work_id);
+                println!("workspace: {}", ctx.workspace);
+                println!("phase:     {}", ctx.queue.phase);
+                println!("state:     {}", ctx.queue.state);
+                println!("source_id: {}", ctx.queue.source_id);
+                if !ctx.history.is_empty() {
+                    println!("history:   {} entries", ctx.history.len());
+                }
+            }
         }
         Commands::Agent { workspace, prompt } => {
             if let Some(name) = &workspace {

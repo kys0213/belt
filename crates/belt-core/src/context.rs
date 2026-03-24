@@ -109,8 +109,36 @@ pub struct PrContext {
     pub number: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub head_branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub review_comments: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<CommitContext>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileChangeContext>,
+}
+
+/// PR에 포함된 커밋 요약.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommitContext {
+    pub sha: String,
+    pub message: String,
+    pub author: String,
+}
+
+/// PR에서 변경된 파일 정보.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChangeContext {
+    pub path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additions: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u64>,
 }
 
 impl ItemContext {
