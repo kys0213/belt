@@ -6,8 +6,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::collections::HashMap;
+
 use belt_core::error::BeltError;
+use belt_core::escalation::EscalationAction;
 use belt_core::phase::QueuePhase;
+use belt_core::workspace::WorkspaceConfig;
 use belt_infra::db::Database;
 use belt_infra::worktree::WorktreeManager;
 use chrono::{DateTime, Utc};
@@ -247,6 +251,9 @@ impl CronHandler for HitlTimeoutJob {
         let threshold = ctx.now - chrono::Duration::seconds(self.timeout_secs);
         let mut expired_count = 0u32;
 
+        // Cache loaded workspace configs to avoid repeated file I/O.
+        let mut ws_cache: HashMap<String, Option<WorkspaceConfig>> = HashMap::new();
+
         for item in &hitl_items {
             // Check per-item timeout first (set via `belt hitl timeout set`).
             let is_expired = if let Some(ref timeout_at_str) = item.hitl_timeout_at {
@@ -265,12 +272,19 @@ impl CronHandler for HitlTimeoutJob {
                 continue;
             }
 
-            // Determine target phase from per-item terminal action, or default to Failed.
+            // Determine target phase from per-item terminal action first,
+            // then fall back to workspace escalation_policy terminal action,
+            // and finally default to Failed (safe default).
             let target_phase = match item.hitl_terminal_action.as_deref() {
                 Some("skip") => QueuePhase::Skipped,
                 Some("replan") => QueuePhase::Failed,
                 Some("failed") => QueuePhase::Failed,
-                _ => QueuePhase::Failed,
+                _ => resolve_workspace_terminal_phase(
+                    &self.db,
+                    &item.workspace_id,
+                    &item.source_id,
+                    &mut ws_cache,
+                ),
             };
 
             if let Err(e) = self.db.update_phase(&item.work_id, target_phase) {
@@ -309,6 +323,66 @@ impl CronHandler for HitlTimeoutJob {
             "HitlTimeoutJob completed"
         );
         Ok(())
+    }
+}
+
+/// Resolve the target phase for an expired HITL item by consulting the
+/// workspace's escalation policy `terminal` action.
+///
+/// Extracts the source key from `source_id` (the prefix before the first `:`),
+/// looks up the corresponding `SourceConfig`, and maps its `terminal_action()`
+/// to a `QueuePhase`. Returns `QueuePhase::Failed` as the safe default when
+/// the workspace or source cannot be found, or when no terminal action is set.
+fn resolve_workspace_terminal_phase(
+    db: &Database,
+    workspace_id: &str,
+    source_id: &str,
+    cache: &mut HashMap<String, Option<WorkspaceConfig>>,
+) -> QueuePhase {
+    // Load or retrieve cached workspace config.
+    let ws_config = cache.entry(workspace_id.to_string()).or_insert_with(|| {
+        let (_name, config_path, _created_at) = match db.get_workspace(workspace_id) {
+            Ok(ws) => ws,
+            Err(e) => {
+                tracing::warn!(
+                    workspace_id = %workspace_id,
+                    error = %e,
+                    "failed to look up workspace for terminal action resolution"
+                );
+                return None;
+            }
+        };
+        match belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(
+            &config_path,
+        )) {
+            Ok(cfg) => Some(cfg),
+            Err(e) => {
+                tracing::warn!(
+                    workspace_id = %workspace_id,
+                    error = %e,
+                    "failed to load workspace config for terminal action resolution"
+                );
+                None
+            }
+        }
+    });
+
+    let Some(config) = ws_config else {
+        return QueuePhase::Failed;
+    };
+
+    // Extract source key from source_id (e.g. "github:org/repo#42" -> "github").
+    let source_key = source_id.split(':').next().unwrap_or("github");
+
+    let terminal_action = config
+        .sources
+        .get(source_key)
+        .and_then(|src| src.escalation.terminal_action());
+
+    match terminal_action {
+        Some(EscalationAction::Skip) => QueuePhase::Skipped,
+        Some(EscalationAction::Replan) => QueuePhase::Failed,
+        _ => QueuePhase::Failed,
     }
 }
 
@@ -1635,6 +1709,126 @@ mod tests {
         job.execute(&ctx).unwrap();
 
         let updated = db.get_item("w1").unwrap();
+        assert_eq!(updated.phase, QueuePhase::Failed);
+    }
+
+    #[test]
+    fn hitl_timeout_falls_back_to_workspace_escalation_terminal_action() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
+
+        // Create a workspace config file with terminal: skip.
+        let ws_config_path = tmp.path().join("workspace.yml");
+        std::fs::write(
+            &ws_config_path,
+            "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      2: hitl\n      terminal: skip\n",
+        )
+        .unwrap();
+
+        // Register the workspace in the DB.
+        db.add_workspace("test-ws", ws_config_path.to_str().unwrap())
+            .unwrap();
+
+        // Insert an expired HITL item WITHOUT per-item terminal_action.
+        // The source_id starts with "github:" to match the source key.
+        let mut item = belt_core::queue::QueueItem::new(
+            "w-ws-fallback".into(),
+            "github:org/repo#99".into(),
+            "test-ws".into(),
+            "implement".into(),
+        );
+        item.phase = QueuePhase::Hitl;
+        item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339());
+        // hitl_terminal_action is None — should fall back to workspace policy.
+        db.insert_item(&item).unwrap();
+
+        let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr);
+        let ctx = CronContext { now: Utc::now() };
+        job.execute(&ctx).unwrap();
+
+        // Item should be Skipped (from workspace escalation terminal: skip).
+        let updated = db.get_item("w-ws-fallback").unwrap();
+        assert_eq!(updated.phase, QueuePhase::Skipped);
+    }
+
+    #[test]
+    fn hitl_timeout_defaults_to_failed_when_no_workspace_terminal_action() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
+
+        // Create a workspace config WITHOUT terminal action in escalation.
+        let ws_config_path = tmp.path().join("workspace.yml");
+        std::fs::write(
+            &ws_config_path,
+            "name: no-terminal-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      2: hitl\n",
+        )
+        .unwrap();
+
+        db.add_workspace("no-terminal-ws", ws_config_path.to_str().unwrap())
+            .unwrap();
+
+        let mut item = belt_core::queue::QueueItem::new(
+            "w-no-term".into(),
+            "github:org/repo#10".into(),
+            "no-terminal-ws".into(),
+            "implement".into(),
+        );
+        item.phase = QueuePhase::Hitl;
+        item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
+        db.insert_item(&item).unwrap();
+
+        let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr);
+        let ctx = CronContext { now: Utc::now() };
+        job.execute(&ctx).unwrap();
+
+        // Should default to Failed (safe default).
+        let updated = db.get_item("w-no-term").unwrap();
+        assert_eq!(updated.phase, QueuePhase::Failed);
+    }
+
+    #[test]
+    fn hitl_timeout_per_item_action_overrides_workspace_policy() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
+
+        // Workspace says terminal: skip.
+        let ws_config_path = tmp.path().join("workspace.yml");
+        std::fs::write(
+            &ws_config_path,
+            "name: override-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n",
+        )
+        .unwrap();
+
+        db.add_workspace("override-ws", ws_config_path.to_str().unwrap())
+            .unwrap();
+
+        // But per-item says "failed" — per-item should win.
+        let mut item = belt_core::queue::QueueItem::new(
+            "w-override".into(),
+            "github:org/repo#5".into(),
+            "override-ws".into(),
+            "implement".into(),
+        );
+        item.phase = QueuePhase::Hitl;
+        item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
+        item.hitl_terminal_action = Some("failed".to_string());
+        db.insert_item(&item).unwrap();
+
+        let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr);
+        let ctx = CronContext { now: Utc::now() };
+        job.execute(&ctx).unwrap();
+
+        // Per-item "failed" overrides workspace "skip".
+        let updated = db.get_item("w-override").unwrap();
         assert_eq!(updated.phase, QueuePhase::Failed);
     }
 
