@@ -1,10 +1,14 @@
 //! Claw interactive agent workspace management.
 //!
-//! Provides initialization, policy file management, and workspace structure
-//! for the Claw interactive management session.
+//! Provides initialization, policy file management, workspace structure,
+//! interactive session (REPL), and slash command handling for the Claw
+//! interactive management session.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+
+pub mod session;
+pub mod slash;
 
 /// Represents an initialized Claw workspace directory.
 pub struct ClawWorkspace {
