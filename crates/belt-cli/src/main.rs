@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+mod agent;
 mod claw;
 
 #[derive(Parser)]
@@ -45,12 +46,18 @@ enum Commands {
     },
     /// Run an LLM agent session.
     Agent {
-        /// Target workspace name.
+        /// Path to workspace.yaml config file.
         #[arg(long)]
         workspace: Option<String>,
         /// Non-interactive prompt (for cron/evaluate calls).
         #[arg(short, long)]
         prompt: Option<String>,
+        /// Plan mode: show execution plan without running.
+        #[arg(long)]
+        plan: bool,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Spec lifecycle management.
     Spec {
@@ -382,14 +389,16 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Agent { workspace, prompt } => {
-            if let Some(name) = &workspace {
-                tracing::info!(name, "running agent for workspace...");
+        Commands::Agent {
+            workspace,
+            prompt,
+            plan,
+            json,
+        } => {
+            let exit_code = agent::run_agent(workspace, prompt, plan, json).await?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
             }
-            if let Some(p) = &prompt {
-                tracing::info!(p, "executing prompt...");
-            }
-            // TODO: AgentRuntime implementation
         }
         Commands::Spec { command } => {
             let belt_home = dirs::home_dir()
