@@ -14,7 +14,7 @@ use belt_core::error::BeltError;
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::runtime::TokenUsage;
-use belt_core::spec::{Spec, SpecStatus};
+use belt_core::spec::{Spec, SpecLink, SpecStatus};
 
 /// An immutable history event recording an attempt on a work item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,6 +281,14 @@ impl Database {
                 entry_point  TEXT,
                 created_at   TEXT NOT NULL,
                 updated_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS spec_links (
+                id         TEXT PRIMARY KEY,
+                spec_id    TEXT NOT NULL,
+                target     TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(spec_id, target)
             );
 
             CREATE TABLE IF NOT EXISTS transition_events (
@@ -1087,6 +1095,89 @@ impl Database {
             return Err(BeltError::SpecNotFound(id.to_string()));
         }
         Ok(())
+    }
+
+    // ---- Spec Links ---------------------------------------------------------
+
+    /// Insert a new spec link (association between a spec and an external resource).
+    ///
+    /// # Errors
+    /// Returns `BeltError::Database` on constraint violation.
+    pub fn insert_spec_link(&self, link: &SpecLink) -> Result<(), BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO spec_links (id, spec_id, target, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![link.id, link.spec_id, link.target, link.created_at],
+        )
+        .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// List all links for a given spec.
+    pub fn list_spec_links(&self, spec_id: &str) -> Result<Vec<SpecLink>, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, spec_id, target, created_at FROM spec_links WHERE spec_id = ?1 ORDER BY created_at ASC",
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let links = stmt
+            .query_map(params![spec_id], |row| {
+                Ok(SpecLink {
+                    id: row.get(0)?,
+                    spec_id: row.get(1)?,
+                    target: row.get(2)?,
+                    created_at: row.get(3)?,
+                })
+            })
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(links)
+    }
+
+    /// Remove a spec link by spec_id and target.
+    ///
+    /// # Errors
+    /// Returns `BeltError::Database` with a descriptive message if no matching link exists.
+    pub fn remove_spec_link(&self, spec_id: &str, target: &str) -> Result<(), BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "DELETE FROM spec_links WHERE spec_id = ?1 AND target = ?2",
+                params![spec_id, target],
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        if rows == 0 {
+            return Err(BeltError::Database(format!(
+                "no link found for spec '{spec_id}' with target '{target}'"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Remove all links for a spec (used when removing a spec).
+    pub fn remove_all_spec_links(&self, spec_id: &str) -> Result<usize, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "DELETE FROM spec_links WHERE spec_id = ?1",
+                params![spec_id],
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(rows)
     }
 
     // ---- Knowledge Base ----------------------------------------------------
@@ -2357,6 +2448,102 @@ mod tests {
         for s in statuses {
             assert_eq!(str_to_spec_status(s.as_str()).unwrap(), s);
         }
+    }
+
+    // ---- Spec links -----------------------------------------------------------
+
+    #[test]
+    fn insert_and_list_spec_links() {
+        let db = test_db();
+        let spec = sample_spec();
+        db.insert_spec(&spec).unwrap();
+
+        let link = SpecLink::new(
+            "link-1".to_string(),
+            spec.id.clone(),
+            "https://example.com".to_string(),
+        );
+        db.insert_spec_link(&link).unwrap();
+
+        let links = db.list_spec_links(&spec.id).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, "https://example.com");
+    }
+
+    #[test]
+    fn remove_spec_link() {
+        let db = test_db();
+        let spec = sample_spec();
+        db.insert_spec(&spec).unwrap();
+
+        let link = SpecLink::new(
+            "link-1".to_string(),
+            spec.id.clone(),
+            "https://example.com".to_string(),
+        );
+        db.insert_spec_link(&link).unwrap();
+        db.remove_spec_link(&spec.id, "https://example.com")
+            .unwrap();
+
+        let links = db.list_spec_links(&spec.id).unwrap();
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn remove_spec_link_not_found() {
+        let db = test_db();
+        let err = db
+            .remove_spec_link("nonexistent", "https://example.com")
+            .unwrap_err();
+        assert!(matches!(err, BeltError::Database(_)));
+    }
+
+    #[test]
+    fn remove_all_spec_links() {
+        let db = test_db();
+        let spec = sample_spec();
+        db.insert_spec(&spec).unwrap();
+
+        let link1 = SpecLink::new(
+            "link-1".to_string(),
+            spec.id.clone(),
+            "https://example.com".to_string(),
+        );
+        let link2 = SpecLink::new(
+            "link-2".to_string(),
+            spec.id.clone(),
+            "https://other.com".to_string(),
+        );
+        db.insert_spec_link(&link1).unwrap();
+        db.insert_spec_link(&link2).unwrap();
+
+        let removed = db.remove_all_spec_links(&spec.id).unwrap();
+        assert_eq!(removed, 2);
+
+        let links = db.list_spec_links(&spec.id).unwrap();
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn duplicate_spec_link_rejected() {
+        let db = test_db();
+        let spec = sample_spec();
+        db.insert_spec(&spec).unwrap();
+
+        let link = SpecLink::new(
+            "link-1".to_string(),
+            spec.id.clone(),
+            "https://example.com".to_string(),
+        );
+        db.insert_spec_link(&link).unwrap();
+
+        let link2 = SpecLink::new(
+            "link-2".to_string(),
+            spec.id.clone(),
+            "https://example.com".to_string(),
+        );
+        let err = db.insert_spec_link(&link2).unwrap_err();
+        assert!(matches!(err, BeltError::Database(_)));
     }
 
     // ---- HITL metadata --------------------------------------------------------
