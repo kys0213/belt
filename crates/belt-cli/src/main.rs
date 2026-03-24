@@ -141,17 +141,75 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(format, "showing status...");
             // TODO: status display
         }
-        Commands::Workspace { command } => match command {
-            WorkspaceCommands::Add { config } => {
-                tracing::info!(config, "registering workspace...");
+        Commands::Workspace { command } => {
+            let belt_home = dirs::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
+                .join(".belt");
+            std::fs::create_dir_all(&belt_home)?;
+            let db_path = belt_home.join("belt.db");
+            let db = belt_infra::db::Database::open(
+                db_path
+                    .to_str()
+                    .ok_or_else(|| anyhow::anyhow!("invalid db path"))?,
+            )?;
+
+            match command {
+                WorkspaceCommands::Add { config } => {
+                    let config_path = std::path::Path::new(&config);
+                    let result = belt_infra::onboarding::onboard_workspace(&db, config_path)?;
+
+                    // Initialize claw workspace automatically
+                    let claw_ws = claw::ClawWorkspace::init(&belt_home)?;
+                    tracing::info!(path = %claw_ws.path.display(), "claw workspace initialized");
+
+                    if result.created {
+                        println!(
+                            "Workspace '{}' registered successfully.",
+                            result.workspace_name
+                        );
+                    } else {
+                        println!(
+                            "Workspace '{}' updated successfully.",
+                            result.workspace_name
+                        );
+                    }
+                    println!("  Config: {}", result.config_path);
+                    println!("  Sources: {}", result.source_count);
+                    println!("  Cron jobs seeded: {}", result.cron_jobs_seeded);
+                }
+                WorkspaceCommands::List => {
+                    let workspaces = db.list_workspaces()?;
+                    if workspaces.is_empty() {
+                        println!("No workspaces registered.");
+                    } else {
+                        println!("{:<20} {:<50} CREATED", "NAME", "CONFIG");
+                        for (name, config_path, created_at) in &workspaces {
+                            println!("{:<20} {:<50} {}", name, config_path, created_at);
+                        }
+                    }
+                }
+                WorkspaceCommands::Show { name } => {
+                    let (ws_name, config_path, created_at) = db.get_workspace(&name)?;
+                    println!("Name:       {ws_name}");
+                    println!("Config:     {config_path}");
+                    println!("Created at: {created_at}");
+
+                    // Show associated cron jobs
+                    let jobs = db.list_cron_jobs()?;
+                    let ws_jobs: Vec<_> = jobs
+                        .iter()
+                        .filter(|j| j.workspace.as_deref() == Some(&name))
+                        .collect();
+                    if !ws_jobs.is_empty() {
+                        println!("\nCron jobs:");
+                        for job in &ws_jobs {
+                            let status = if job.enabled { "enabled" } else { "disabled" };
+                            println!("  {} [{}] ({})", job.name, job.schedule, status);
+                        }
+                    }
+                }
             }
-            WorkspaceCommands::List => {
-                tracing::info!("listing workspaces...");
-            }
-            WorkspaceCommands::Show { name } => {
-                tracing::info!(name, "showing workspace...");
-            }
-        },
+        }
         Commands::Queue { command } => match command {
             QueueCommands::List { phase, workspace } => {
                 tracing::info!(?phase, ?workspace, "listing queue items...");
