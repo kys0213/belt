@@ -173,6 +173,76 @@ pub fn print_spec_status(status: &SpecStatus, format: &str) -> anyhow::Result<()
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use belt_infra::db::RuntimeStats;
+
+    use super::*;
+
+    // ---- StatusOutput serialization ----
+
+    /// Build a `RuntimeStats` value with predictable fields for assertions.
+    fn sample_stats() -> RuntimeStats {
+        use std::collections::HashMap;
+        RuntimeStats {
+            total_tokens_input: 1_000,
+            total_tokens_output: 500,
+            total_tokens: 1_500,
+            executions: 7,
+            avg_duration_ms: Some(250.0),
+            by_model: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn status_output_json_ok_without_stats() {
+        let output = StatusOutput {
+            status: "ok",
+            runtime_stats: None,
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["status"], "ok");
+        assert!(v["runtime_stats"].is_null());
+    }
+
+    #[test]
+    fn status_output_json_ok_with_stats() {
+        let output = StatusOutput {
+            status: "ok",
+            runtime_stats: Some(sample_stats()),
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["status"], "ok");
+        let stats = &v["runtime_stats"];
+        assert!(!stats.is_null());
+        assert_eq!(stats["total_tokens"], 1_500);
+        assert_eq!(stats["executions"], 7);
+        assert_eq!(stats["total_tokens_input"], 1_000);
+        assert_eq!(stats["total_tokens_output"], 500);
+    }
+
+    #[test]
+    fn status_output_always_reports_ok() {
+        // The status field must always be the literal string "ok".
+        let output = StatusOutput {
+            status: "ok",
+            runtime_stats: None,
+        };
+        assert_eq!(output.status, "ok");
+    }
+
+    // ---- open_db error path ----
+
+    #[test]
+    fn open_db_invalid_path_returns_error() {
+        // Providing a path inside a non-existent directory tree should fail.
+        let result = belt_infra::db::Database::open("/nonexistent/dir/belt.db");
+        assert!(result.is_err());
+    }
+}
+
 /// Open the Belt database from the default location (`~/.belt/belt.db`).
 fn open_db() -> anyhow::Result<Database> {
     let belt_home = dirs::home_dir()

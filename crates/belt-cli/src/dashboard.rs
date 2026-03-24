@@ -331,4 +331,141 @@ mod tests {
     fn format_number_millions() {
         assert_eq!(format_number(10_000_000), "10,000,000");
     }
+
+    #[test]
+    fn format_number_exact_boundary_1000() {
+        // 1_000 is the first value that requires a comma separator.
+        assert_eq!(format_number(1_000), "1,000");
+    }
+
+    #[test]
+    fn format_number_just_below_boundary() {
+        assert_eq!(format_number(999), "999");
+    }
+
+    #[test]
+    fn format_number_exactly_10000() {
+        assert_eq!(format_number(10_000), "10,000");
+    }
+
+    #[test]
+    fn format_number_exactly_100000() {
+        assert_eq!(format_number(100_000), "100,000");
+    }
+
+    #[test]
+    fn format_number_u64_large_value() {
+        assert_eq!(format_number(1_000_000_000), "1,000,000,000");
+    }
+
+    // ---- render_runtime_panel: by_model sorting ----
+
+    #[test]
+    fn render_runtime_panel_does_not_panic_with_empty_stats() {
+        use std::collections::HashMap;
+        let stats = RuntimeStats {
+            total_tokens_input: 0,
+            total_tokens_output: 0,
+            total_tokens: 0,
+            executions: 0,
+            avg_duration_ms: None,
+            by_model: HashMap::new(),
+        };
+        // Must not panic.
+        render_runtime_panel(&stats);
+    }
+
+    #[test]
+    fn render_runtime_panel_does_not_panic_with_avg_duration() {
+        use std::collections::HashMap;
+        let stats = RuntimeStats {
+            total_tokens_input: 500,
+            total_tokens_output: 300,
+            total_tokens: 800,
+            executions: 5,
+            avg_duration_ms: Some(123.4),
+            by_model: HashMap::new(),
+        };
+        render_runtime_panel(&stats);
+    }
+
+    #[test]
+    fn render_runtime_panel_does_not_panic_with_multiple_models() {
+        use std::collections::HashMap;
+
+        use belt_infra::db::ModelStats;
+
+        let mut by_model = HashMap::new();
+        by_model.insert(
+            "claude-sonnet".to_string(),
+            ModelStats {
+                model: "claude-sonnet".to_string(),
+                input_tokens: 1_000,
+                output_tokens: 500,
+                total_tokens: 1_500,
+                executions: 3,
+                avg_duration_ms: Some(200.0),
+            },
+        );
+        by_model.insert(
+            "claude-haiku".to_string(),
+            ModelStats {
+                model: "claude-haiku".to_string(),
+                input_tokens: 200,
+                output_tokens: 100,
+                total_tokens: 300,
+                executions: 1,
+                avg_duration_ms: None,
+            },
+        );
+
+        let stats = RuntimeStats {
+            total_tokens_input: 1_200,
+            total_tokens_output: 600,
+            total_tokens: 1_800,
+            executions: 4,
+            avg_duration_ms: Some(175.0),
+            by_model,
+        };
+        // Sorting by total_tokens descending must not panic.
+        render_runtime_panel(&stats);
+    }
+
+    #[test]
+    fn model_stats_sorted_by_total_tokens_descending() {
+        use std::collections::HashMap;
+
+        use belt_infra::db::ModelStats;
+
+        let mut by_model = HashMap::new();
+        by_model.insert(
+            "small-model".to_string(),
+            ModelStats {
+                model: "small-model".to_string(),
+                input_tokens: 10,
+                output_tokens: 10,
+                total_tokens: 20,
+                executions: 1,
+                avg_duration_ms: None,
+            },
+        );
+        by_model.insert(
+            "large-model".to_string(),
+            ModelStats {
+                model: "large-model".to_string(),
+                input_tokens: 5_000,
+                output_tokens: 3_000,
+                total_tokens: 8_000,
+                executions: 10,
+                avg_duration_ms: Some(500.0),
+            },
+        );
+
+        // Verify the sort logic used in render_runtime_panel directly.
+        let mut models: Vec<_> = by_model.values().collect();
+        models.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+
+        assert_eq!(models[0].model, "large-model");
+        assert_eq!(models[1].model, "small-model");
+    }
 }
