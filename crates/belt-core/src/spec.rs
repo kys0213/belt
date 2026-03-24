@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 /// Draft -> Active -> [Paused <-> Active] -> Completing -> Completed
 ///                                               |
 ///                                               └-> Active (gap found)
+///
+/// Any non-terminal state -> Archived (soft delete)
+/// Archived -> Active (restore)
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -21,6 +24,8 @@ pub enum SpecStatus {
     /// Awaiting test execution and HITL final confirmation.
     Completing,
     Completed,
+    /// Soft-deleted spec. Can be restored to Active via `spec resume`.
+    Archived,
 }
 
 impl SpecStatus {
@@ -32,12 +37,18 @@ impl SpecStatus {
             SpecStatus::Paused => "paused",
             SpecStatus::Completing => "completing",
             SpecStatus::Completed => "completed",
+            SpecStatus::Archived => "archived",
         }
     }
 
     /// Returns `true` if the status is terminal (no further transitions).
     pub fn is_terminal(&self) -> bool {
         matches!(self, SpecStatus::Completed)
+    }
+
+    /// Returns `true` if this spec is archived (soft-deleted).
+    pub fn is_archived(&self) -> bool {
+        matches!(self, SpecStatus::Archived)
     }
 
     /// Returns `true` if transitioning from `self` to `to` is valid.
@@ -56,6 +67,7 @@ impl std::str::FromStr for SpecStatus {
             "paused" => Ok(SpecStatus::Paused),
             "completing" => Ok(SpecStatus::Completing),
             "completed" => Ok(SpecStatus::Completed),
+            "archived" => Ok(SpecStatus::Archived),
             _ => Err(format!("invalid spec status: {s}")),
         }
     }
@@ -76,6 +88,8 @@ impl fmt::Display for SpecStatus {
 /// - Paused -> Active
 /// - Completing -> Completed (HITL final approval)
 /// - Completing -> Active (gap found during re-check or test failure)
+/// - Draft | Active | Paused | Completing -> Archived (soft delete)
+/// - Archived -> Active (restore)
 pub fn is_valid_spec_transition(from: SpecStatus, to: SpecStatus) -> bool {
     use SpecStatus::*;
     matches!(
@@ -86,6 +100,11 @@ pub fn is_valid_spec_transition(from: SpecStatus, to: SpecStatus) -> bool {
             | (Paused, Active)
             | (Completing, Completed)
             | (Completing, Active)
+            | (Draft, Archived)
+            | (Active, Archived)
+            | (Paused, Archived)
+            | (Completing, Archived)
+            | (Archived, Active)
     )
 }
 
@@ -341,6 +360,12 @@ mod tests {
         assert!(transit_spec(Paused, Active).is_ok());
         assert!(transit_spec(Completing, Completed).is_ok());
         assert!(transit_spec(Completing, Active).is_ok());
+        // Archived transitions
+        assert!(transit_spec(Draft, Archived).is_ok());
+        assert!(transit_spec(Active, Archived).is_ok());
+        assert!(transit_spec(Paused, Archived).is_ok());
+        assert!(transit_spec(Completing, Archived).is_ok());
+        assert!(transit_spec(Archived, Active).is_ok());
     }
 
     #[test]
@@ -357,11 +382,17 @@ mod tests {
         assert!(transit_spec(Completed, Completing).is_err());
         assert!(transit_spec(Completing, Draft).is_err());
         assert!(transit_spec(Completing, Paused).is_err());
+        // Archived invalid transitions
+        assert!(transit_spec(Completed, Archived).is_err());
+        assert!(transit_spec(Archived, Draft).is_err());
+        assert!(transit_spec(Archived, Paused).is_err());
+        assert!(transit_spec(Archived, Completing).is_err());
+        assert!(transit_spec(Archived, Completed).is_err());
     }
 
     #[test]
     fn same_status_rejected() {
-        let statuses = [Draft, Active, Paused, Completing, Completed];
+        let statuses = [Draft, Active, Paused, Completing, Completed, Archived];
         for s in statuses {
             assert_eq!(
                 transit_spec(s, s).unwrap_err(),
@@ -372,18 +403,19 @@ mod tests {
 
     #[test]
     fn exhaustive_transition_count() {
-        let statuses = [Draft, Active, Paused, Completing, Completed];
+        let statuses = [Draft, Active, Paused, Completing, Completed, Archived];
         let valid_count = statuses
             .iter()
             .flat_map(|&from| statuses.iter().map(move |&to| (from, to)))
             .filter(|&(from, to)| is_valid_spec_transition(from, to))
             .count();
-        assert_eq!(valid_count, 6);
+        // 6 original + 5 archived (4 -> Archived, 1 Archived -> Active)
+        assert_eq!(valid_count, 11);
     }
 
     #[test]
     fn status_roundtrip() {
-        let statuses = [Draft, Active, Paused, Completing, Completed];
+        let statuses = [Draft, Active, Paused, Completing, Completed, Archived];
         for s in statuses {
             let str_val = s.to_string();
             let parsed: SpecStatus = str_val.parse().unwrap();
@@ -407,6 +439,15 @@ mod tests {
         assert!(!Active.is_terminal());
         assert!(!Paused.is_terminal());
         assert!(!Completing.is_terminal());
+        assert!(!Archived.is_terminal());
+    }
+
+    #[test]
+    fn archived_status() {
+        assert!(Archived.is_archived());
+        assert!(!Draft.is_archived());
+        assert!(!Active.is_archived());
+        assert!(!Completed.is_archived());
     }
 
     #[test]

@@ -275,6 +275,7 @@ enum QueueCommands {
         /// Script execution timeout in seconds.
         #[arg(long)]
         timeout: Option<u64>,
+    },
     /// Manage queue item dependencies.
     #[command(subcommand)]
     Dependency(DependencyCommands),
@@ -859,6 +860,9 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
             println!("Item '{work_id}' transitioned from failed to done.");
         }
     }
+
+    Ok(())
+}
 
 /// `belt queue dependency add` -- add a dependency between queue items.
 fn cmd_queue_dependency_add(queue_id: &str, after: &str) -> anyhow::Result<()> {
@@ -1807,13 +1811,18 @@ async fn main() -> anyhow::Result<()> {
                         .can_transition_to(&belt_core::spec::SpecStatus::Active)
                     {
                         anyhow::bail!(
-                            "cannot resume spec in status '{}': only draft or paused specs can be activated",
+                            "cannot resume spec in status '{}': only draft, paused, or archived specs can be activated",
                             spec.status
                         );
                     }
                     let was_draft = spec.status == belt_core::spec::SpecStatus::Draft;
+                    let was_archived = spec.status == belt_core::spec::SpecStatus::Archived;
                     db.update_spec_status(&id, belt_core::spec::SpecStatus::Active)?;
-                    println!("spec activated: {id}");
+                    if was_archived {
+                        println!("spec restored from archive: {id}");
+                    } else {
+                        println!("spec activated: {id}");
+                    }
                     if was_draft {
                         // TODO: trigger GitHub issue creation when spec transitions Draft -> Active
                         tracing::info!(
@@ -1852,9 +1861,17 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 SpecCommands::Remove { id } => {
-                    db.remove_all_spec_links(&id)?;
-                    db.remove_spec(&id)?;
-                    println!("spec removed: {id}");
+                    let spec = db.get_spec(&id)?;
+                    if spec.status == belt_core::spec::SpecStatus::Completed {
+                        anyhow::bail!(
+                            "cannot archive spec in status 'completed': completed specs cannot be archived"
+                        );
+                    }
+                    if spec.status == belt_core::spec::SpecStatus::Archived {
+                        anyhow::bail!("spec is already archived");
+                    }
+                    db.update_spec_status(&id, belt_core::spec::SpecStatus::Archived)?;
+                    println!("spec archived: {id}");
                 }
                 SpecCommands::Link { id, to } => {
                     // Ensure spec exists.
