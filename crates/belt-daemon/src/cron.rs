@@ -667,18 +667,90 @@ impl CronHandler for EvaluateJob {
     }
 }
 
+/// Default state name used when enqueuing PR review feedback items.
+const PR_REVIEW_SCAN_STATE: &str = "review_feedback";
+
 /// Periodically scans open PRs for `changes_requested` reviews.
 ///
 /// When a PR has a `CHANGES_REQUESTED` review, this job creates a new
 /// queue item so the feedback loop can process the review comments and
 /// push updated changes.
-pub struct PrReviewScanJob;
+pub struct PrReviewScanJob {
+    db: Arc<Database>,
+}
 
 impl CronHandler for PrReviewScanJob {
     fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
-        // TODO: iterate workspaces, call GitHubDataSource::collect_review_items,
-        // enqueue new items for PRs with changes_requested reviews.
         tracing::info!("PrReviewScanJob: scanning PRs for changes_requested reviews");
+
+        // List all registered workspaces from DB.
+        let workspaces = self.db.list_workspaces()?;
+
+        let mut enqueued_count = 0u32;
+
+        for (name, config_path, _created_at) in &workspaces {
+            // Load workspace config from disk.
+            let workspace_config = match belt_infra::workspace_loader::load_workspace_config(
+                std::path::Path::new(config_path),
+            ) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %name,
+                        error = %e,
+                        "failed to load workspace config, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            // Determine the source URL for GitHub.
+            let source_url = match workspace_config.sources.get("github") {
+                Some(cfg) => cfg.url.clone(),
+                None => continue,
+            };
+
+            let gh = belt_infra::sources::github::GitHubDataSource::new(&source_url);
+
+            // Bridge async collect_review_items into this sync handler.
+            let items = std::thread::scope(|_| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| BeltError::Runtime(e.to_string()))?;
+                rt.block_on(gh.collect_review_items(&workspace_config, PR_REVIEW_SCAN_STATE))
+                    .map_err(|e| BeltError::Runtime(e.to_string()))
+            })?;
+
+            for item in &items {
+                match self.db.insert_item(item) {
+                    Ok(()) => {
+                        enqueued_count += 1;
+                        tracing::info!(
+                            work_id = %item.work_id,
+                            title = ?item.title,
+                            "enqueued PR review feedback item"
+                        );
+                    }
+                    Err(BeltError::Database(ref msg)) if msg.contains("UNIQUE constraint") => {
+                        // Item already exists in the queue — skip silently.
+                        tracing::debug!(
+                            work_id = %item.work_id,
+                            "PR review item already enqueued, skipping"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            work_id = %item.work_id,
+                            error = %e,
+                            "failed to enqueue PR review feedback item"
+                        );
+                    }
+                }
+            }
+        }
+
+        tracing::info!(enqueued = enqueued_count, "PrReviewScanJob completed");
         Ok(())
     }
 }
@@ -735,7 +807,9 @@ pub fn builtin_jobs(deps: BuiltinJobDeps) -> Vec<CronJobDef> {
             workspace: None,
             enabled: true,
             last_run_at: None,
-            handler: Box::new(PrReviewScanJob),
+            handler: Box::new(PrReviewScanJob {
+                db: Arc::clone(&deps.db),
+            }),
         },
         CronJobDef {
             name: "gap_detection".to_string(),
@@ -1022,7 +1096,7 @@ mod tests {
         let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
             belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
         );
-        BuiltinJobDeps {
+BuiltinJobDeps {
             db,
             worktree_mgr,
             workspace_root: tmp.path().to_path_buf(),
