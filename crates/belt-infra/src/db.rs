@@ -270,6 +270,7 @@ impl Database {
                 priority     INTEGER,
                 labels       TEXT,
                 depends_on   TEXT,
+                entry_point  TEXT,
                 created_at   TEXT NOT NULL,
                 updated_at   TEXT NOT NULL
             );
@@ -808,8 +809,8 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.execute(
-            "INSERT INTO specs (id, workspace_id, name, status, content, priority, labels, depends_on, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            "INSERT INTO specs (id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 spec.id,
                 spec.workspace_id,
@@ -819,6 +820,7 @@ impl Database {
                 spec.priority,
                 spec.labels,
                 spec.depends_on,
+                spec.entry_point,
                 spec.created_at,
                 spec.updated_at,
             ],
@@ -837,7 +839,7 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.query_row(
-            "SELECT id, workspace_id, name, status, content, priority, labels, depends_on, created_at, updated_at
+            "SELECT id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, created_at, updated_at
                  FROM specs WHERE id = ?1",
             params![id],
             |row| Ok(row_to_spec(row)),
@@ -859,7 +861,7 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let mut sql = String::from(
-            "SELECT id, workspace_id, name, status, content, priority, labels, depends_on, created_at, updated_at FROM specs WHERE 1=1",
+            "SELECT id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, created_at, updated_at FROM specs WHERE 1=1",
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -902,13 +904,14 @@ impl Database {
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let rows = conn
             .execute(
-                "UPDATE specs SET name = ?1, content = ?2, priority = ?3, labels = ?4, depends_on = ?5, updated_at = ?6 WHERE id = ?7",
+                "UPDATE specs SET name = ?1, content = ?2, priority = ?3, labels = ?4, depends_on = ?5, entry_point = ?6, updated_at = ?7 WHERE id = ?8",
                 params![
                     spec.name,
                     spec.content,
                     spec.priority,
                     spec.labels,
                     spec.depends_on,
+                    spec.entry_point,
                     now,
                     spec.id,
                 ],
@@ -1466,7 +1469,7 @@ fn str_to_spec_status(s: &str) -> Result<SpecStatus, BeltError> {
 /// Extract a `Spec` from a rusqlite `Row`.
 ///
 /// Column order must match:
-/// `id, workspace_id, name, status, content, priority, labels, depends_on, created_at, updated_at`
+/// `id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, created_at, updated_at`
 fn row_to_spec(row: &rusqlite::Row<'_>) -> Result<Spec, BeltError> {
     let status_str: String = row.get(3).map_err(|e| BeltError::Database(e.to_string()))?;
 
@@ -1479,8 +1482,9 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> Result<Spec, BeltError> {
         priority: row.get(5).map_err(|e| BeltError::Database(e.to_string()))?,
         labels: row.get(6).map_err(|e| BeltError::Database(e.to_string()))?,
         depends_on: row.get(7).map_err(|e| BeltError::Database(e.to_string()))?,
-        created_at: row.get(8).map_err(|e| BeltError::Database(e.to_string()))?,
-        updated_at: row.get(9).map_err(|e| BeltError::Database(e.to_string()))?,
+        entry_point: row.get(8).map_err(|e| BeltError::Database(e.to_string()))?,
+        created_at: row.get(9).map_err(|e| BeltError::Database(e.to_string()))?,
+        updated_at: row.get(10).map_err(|e| BeltError::Database(e.to_string()))?,
     })
 }
 
