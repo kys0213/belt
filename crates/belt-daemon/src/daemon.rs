@@ -7,6 +7,7 @@ use chrono::Utc;
 
 use belt_core::action::Action;
 use belt_core::context::HistoryEntry;
+use belt_core::dependency::{DependencyGuard, SpecDependencyGuard};
 use belt_core::error::BeltError;
 use belt_core::escalation::EscalationAction;
 use belt_core::phase::QueuePhase;
@@ -58,6 +59,8 @@ pub struct Daemon {
     shutdown_requested: bool,
     /// Evaluator 스크립트 실행을 위한 Belt home 디렉토리.
     belt_home: PathBuf,
+    /// Dependency guard for spec execution ordering.
+    dependency_guard: SpecDependencyGuard,
 }
 
 #[derive(Debug)]
@@ -121,6 +124,7 @@ impl Daemon {
             belt_home: PathBuf::from(
                 std::env::var("BELT_HOME").unwrap_or_else(|_| ".belt".to_string()),
             ),
+            dependency_guard: SpecDependencyGuard,
         }
     }
 
@@ -188,12 +192,32 @@ impl Daemon {
     pub fn advance(&mut self) -> usize {
         let mut advanced = 0;
 
-        // Pending -> Ready (uses safe transit)
-        for item in self.queue.iter_mut() {
-            if item.phase == QueuePhase::Pending
-                && state_machine::transit(QueuePhase::Pending, QueuePhase::Ready).is_ok()
-                && transit(item, QueuePhase::Ready).is_ok()
-            {
+        // Pending -> Ready (uses safe transit + dependency gate)
+        // Collect indices first to avoid borrow issues with self.
+        let pending_indices: Vec<usize> = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.phase == QueuePhase::Pending)
+            .map(|(i, _)| i)
+            .collect();
+
+        for idx in pending_indices {
+            if state_machine::transit(QueuePhase::Pending, QueuePhase::Ready).is_err() {
+                continue;
+            }
+
+            // Dependency gate: check if the spec's depends_on specs are all completed.
+            if !self.check_dependency_gate(&self.queue[idx].source_id.clone()) {
+                tracing::debug!(
+                    "dependency gate blocked: {} (source={})",
+                    self.queue[idx].work_id,
+                    self.queue[idx].source_id
+                );
+                continue;
+            }
+
+            if transit(&mut self.queue[idx], QueuePhase::Ready).is_ok() {
                 advanced += 1;
             }
         }
@@ -264,6 +288,34 @@ impl Daemon {
                 *ws_started.entry(ws).or_insert(0) += 1;
             }
         }
+    }
+
+    /// Check whether a queue item's associated spec has all dependencies completed.
+    ///
+    /// Uses the database to resolve specs. If no database is configured or no
+    /// matching spec is found, the gate is open (returns `true`) to avoid
+    /// blocking items that are not spec-based.
+    fn check_dependency_gate(&self, source_id: &str) -> bool {
+        let db = match &self.db {
+            Some(db) => db,
+            None => return true,
+        };
+
+        // Try to find a spec whose ID matches the source_id.
+        let spec = match db.get_spec(source_id) {
+            Ok(spec) => spec,
+            Err(_) => return true, // No matching spec — gate open.
+        };
+
+        let result = self
+            .dependency_guard
+            .check_dependencies(&spec, |dep_id| db.get_spec(dep_id).ok());
+
+        if !result.is_ready() {
+            tracing::trace!("spec {} blocked by dependencies: {:?}", spec.id, result);
+        }
+
+        result.is_ready()
     }
 
     // ---------------------------------------------------------------
