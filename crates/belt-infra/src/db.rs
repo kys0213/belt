@@ -13,6 +13,7 @@ use belt_core::error::BeltError;
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::runtime::TokenUsage;
+use belt_core::spec::{Spec, SpecStatus};
 
 /// An immutable history event recording an attempt on a work item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,6 +172,19 @@ impl Database {
                 cache_write_tokens INTEGER,
                 duration_ms        INTEGER,
                 created_at         TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS specs (
+                id           TEXT PRIMARY KEY,
+                workspace_id TEXT NOT NULL,
+                name         TEXT NOT NULL,
+                status       TEXT NOT NULL,
+                content      TEXT NOT NULL,
+                priority     INTEGER,
+                labels       TEXT,
+                depends_on   TEXT,
+                created_at   TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
             );
             ",
         )
@@ -604,6 +618,174 @@ impl Database {
         Ok(())
     }
 
+    // ---- Specs -------------------------------------------------------------
+
+    /// Insert a new spec.
+    ///
+    /// # Errors
+    /// Returns `BeltError::Database` on constraint violation or I/O error.
+    pub fn insert_spec(&self, spec: &Spec) -> Result<(), BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO specs (id, workspace_id, name, status, content, priority, labels, depends_on, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                spec.id,
+                spec.workspace_id,
+                spec.name,
+                spec.status.as_str(),
+                spec.content,
+                spec.priority,
+                spec.labels,
+                spec.depends_on,
+                spec.created_at,
+                spec.updated_at,
+            ],
+        )
+        .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Retrieve a single spec by ID.
+    ///
+    /// # Errors
+    /// Returns `BeltError::SpecNotFound` if no row matches.
+    pub fn get_spec(&self, id: &str) -> Result<Spec, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        conn.query_row(
+            "SELECT id, workspace_id, name, status, content, priority, labels, depends_on, created_at, updated_at
+                 FROM specs WHERE id = ?1",
+            params![id],
+            |row| Ok(row_to_spec(row)),
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => BeltError::SpecNotFound(id.to_string()),
+            other => BeltError::Database(other.to_string()),
+        })?
+    }
+
+    /// List all specs, optionally filtered by workspace and/or status.
+    pub fn list_specs(
+        &self,
+        workspace: Option<&str>,
+        status: Option<SpecStatus>,
+    ) -> Result<Vec<Spec>, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut sql = String::from(
+            "SELECT id, workspace_id, name, status, content, priority, labels, depends_on, created_at, updated_at FROM specs WHERE 1=1",
+        );
+        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(ws) = workspace {
+            sql.push_str(" AND workspace_id = ?");
+            param_values.push(Box::new(ws.to_string()));
+        }
+        if let Some(s) = status {
+            sql.push_str(" AND status = ?");
+            param_values.push(Box::new(s.as_str().to_string()));
+        }
+
+        sql.push_str(" ORDER BY created_at ASC");
+
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            param_values.iter().map(|p| p.as_ref()).collect();
+
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let specs = stmt
+            .query_map(params_ref.as_slice(), |row| Ok(row_to_spec(row)))
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        specs.into_iter().collect::<Result<Vec<_>, _>>()
+    }
+
+    /// Update a spec's name, content, priority, labels, and depends_on.
+    ///
+    /// # Errors
+    /// Returns `BeltError::SpecNotFound` if no spec matches the given ID.
+    pub fn update_spec(&self, spec: &Spec) -> Result<(), BeltError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "UPDATE specs SET name = ?1, content = ?2, priority = ?3, labels = ?4, depends_on = ?5, updated_at = ?6 WHERE id = ?7",
+                params![
+                    spec.name,
+                    spec.content,
+                    spec.priority,
+                    spec.labels,
+                    spec.depends_on,
+                    now,
+                    spec.id,
+                ],
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        if rows == 0 {
+            return Err(BeltError::SpecNotFound(spec.id.clone()));
+        }
+        Ok(())
+    }
+
+    /// Update the status of a spec.
+    ///
+    /// This method does NOT validate state machine transitions; the caller
+    /// is responsible for checking `SpecStatus::can_transition_to` before
+    /// calling this.
+    ///
+    /// # Errors
+    /// Returns `BeltError::SpecNotFound` if no spec matches the given ID.
+    pub fn update_spec_status(&self, id: &str, status: SpecStatus) -> Result<(), BeltError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "UPDATE specs SET status = ?1, updated_at = ?2 WHERE id = ?3",
+                params![status.as_str(), now, id],
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        if rows == 0 {
+            return Err(BeltError::SpecNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Remove a spec by ID.
+    ///
+    /// # Errors
+    /// Returns `BeltError::SpecNotFound` if no row was deleted.
+    pub fn remove_spec(&self, id: &str) -> Result<(), BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
+            .execute("DELETE FROM specs WHERE id = ?1", params![id])
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        if rows == 0 {
+            return Err(BeltError::SpecNotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
     // ---- Token Usage -------------------------------------------------------
 
     /// Record token usage for a completed runtime invocation.
@@ -683,20 +865,22 @@ impl Database {
             .map_err(|e| BeltError::Database(e.to_string()))?;
 
         rows.into_iter()
-            .map(|(wid, ws, rt, model, input, output, cache_read, cache_write, dur, created)| {
-                Ok(TokenUsageRow {
-                    work_id: wid,
-                    workspace: ws,
-                    runtime: rt,
-                    model,
-                    input_tokens: input as u64,
-                    output_tokens: output as u64,
-                    cache_read_tokens: cache_read.map(|v| v as u64),
-                    cache_write_tokens: cache_write.map(|v| v as u64),
-                    duration_ms: dur.map(|d| d as u64),
-                    created_at: parse_datetime(&created)?,
-                })
-            })
+            .map(
+                |(wid, ws, rt, model, input, output, cache_read, cache_write, dur, created)| {
+                    Ok(TokenUsageRow {
+                        work_id: wid,
+                        workspace: ws,
+                        runtime: rt,
+                        model,
+                        input_tokens: input as u64,
+                        output_tokens: output as u64,
+                        cache_read_tokens: cache_read.map(|v| v as u64),
+                        cache_write_tokens: cache_write.map(|v| v as u64),
+                        duration_ms: dur.map(|d| d as u64),
+                        created_at: parse_datetime(&created)?,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -739,20 +923,22 @@ impl Database {
             .map_err(|e| BeltError::Database(e.to_string()))?;
 
         rows.into_iter()
-            .map(|(wid, ws, rt, model, input, output, cache_read, cache_write, dur, created)| {
-                Ok(TokenUsageRow {
-                    work_id: wid,
-                    workspace: ws,
-                    runtime: rt,
-                    model,
-                    input_tokens: input as u64,
-                    output_tokens: output as u64,
-                    cache_read_tokens: cache_read.map(|v| v as u64),
-                    cache_write_tokens: cache_write.map(|v| v as u64),
-                    duration_ms: dur.map(|d| d as u64),
-                    created_at: parse_datetime(&created)?,
-                })
-            })
+            .map(
+                |(wid, ws, rt, model, input, output, cache_read, cache_write, dur, created)| {
+                    Ok(TokenUsageRow {
+                        work_id: wid,
+                        workspace: ws,
+                        runtime: rt,
+                        model,
+                        input_tokens: input as u64,
+                        output_tokens: output as u64,
+                        cache_read_tokens: cache_read.map(|v| v as u64),
+                        cache_write_tokens: cache_write.map(|v| v as u64),
+                        duration_ms: dur.map(|d| d as u64),
+                        created_at: parse_datetime(&created)?,
+                    })
+                },
+            )
             .collect()
     }
 }
@@ -799,6 +985,36 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>, BeltError> {
     DateTime::parse_from_rfc3339(s)
         .map(|dt| dt.with_timezone(&Utc))
         .map_err(|_| BeltError::Database(format!("invalid datetime: {s}")))
+}
+
+/// Parse a database status string back into a `SpecStatus`.
+///
+/// # Errors
+/// Returns `BeltError::Database` for unrecognised status values.
+fn str_to_spec_status(s: &str) -> Result<SpecStatus, BeltError> {
+    s.parse::<SpecStatus>()
+        .map_err(|_| BeltError::Database(format!("unknown spec status: {s}")))
+}
+
+/// Extract a `Spec` from a rusqlite `Row`.
+///
+/// Column order must match:
+/// `id, workspace_id, name, status, content, priority, labels, depends_on, created_at, updated_at`
+fn row_to_spec(row: &rusqlite::Row<'_>) -> Result<Spec, BeltError> {
+    let status_str: String = row.get(3).map_err(|e| BeltError::Database(e.to_string()))?;
+
+    Ok(Spec {
+        id: row.get(0).map_err(|e| BeltError::Database(e.to_string()))?,
+        workspace_id: row.get(1).map_err(|e| BeltError::Database(e.to_string()))?,
+        name: row.get(2).map_err(|e| BeltError::Database(e.to_string()))?,
+        status: str_to_spec_status(&status_str)?,
+        content: row.get(4).map_err(|e| BeltError::Database(e.to_string()))?,
+        priority: row.get(5).map_err(|e| BeltError::Database(e.to_string()))?,
+        labels: row.get(6).map_err(|e| BeltError::Database(e.to_string()))?,
+        depends_on: row.get(7).map_err(|e| BeltError::Database(e.to_string()))?,
+        created_at: row.get(8).map_err(|e| BeltError::Database(e.to_string()))?,
+        updated_at: row.get(9).map_err(|e| BeltError::Database(e.to_string()))?,
+    })
 }
 
 /// Extract a `QueueItem` from a rusqlite `Row`.
@@ -1174,5 +1390,161 @@ mod tests {
     fn database_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Database>();
+    }
+
+    // ---- Specs -------------------------------------------------------------
+
+    fn sample_spec() -> Spec {
+        Spec::new(
+            "spec-1".to_string(),
+            "ws-1".to_string(),
+            "Test Spec".to_string(),
+            "Some content".to_string(),
+        )
+    }
+
+    #[test]
+    fn insert_and_get_spec() {
+        let db = test_db();
+        let spec = sample_spec();
+        db.insert_spec(&spec).unwrap();
+
+        let fetched = db.get_spec(&spec.id).unwrap();
+        assert_eq!(fetched.id, spec.id);
+        assert_eq!(fetched.name, "Test Spec");
+        assert_eq!(fetched.status, SpecStatus::Draft);
+        assert_eq!(fetched.content, "Some content");
+    }
+
+    #[test]
+    fn get_spec_not_found() {
+        let db = test_db();
+        let err = db.get_spec("nonexistent").unwrap_err();
+        assert!(matches!(err, BeltError::SpecNotFound(_)));
+    }
+
+    #[test]
+    fn list_specs_no_filter() {
+        let db = test_db();
+        db.insert_spec(&sample_spec()).unwrap();
+
+        let specs = db.list_specs(None, None).unwrap();
+        assert_eq!(specs.len(), 1);
+    }
+
+    #[test]
+    fn list_specs_filter_by_workspace() {
+        let db = test_db();
+        db.insert_spec(&sample_spec()).unwrap();
+
+        let specs = db.list_specs(Some("ws-1"), None).unwrap();
+        assert_eq!(specs.len(), 1);
+
+        let specs = db.list_specs(Some("other"), None).unwrap();
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn list_specs_filter_by_status() {
+        let db = test_db();
+        db.insert_spec(&sample_spec()).unwrap();
+
+        let specs = db.list_specs(None, Some(SpecStatus::Draft)).unwrap();
+        assert_eq!(specs.len(), 1);
+
+        let specs = db.list_specs(None, Some(SpecStatus::Active)).unwrap();
+        assert!(specs.is_empty());
+    }
+
+    #[test]
+    fn update_spec_fields() {
+        let db = test_db();
+        let mut spec = sample_spec();
+        db.insert_spec(&spec).unwrap();
+
+        spec.name = "Updated Name".to_string();
+        spec.content = "Updated content".to_string();
+        spec.priority = Some(1);
+        spec.labels = Some("urgent".to_string());
+        db.update_spec(&spec).unwrap();
+
+        let fetched = db.get_spec(&spec.id).unwrap();
+        assert_eq!(fetched.name, "Updated Name");
+        assert_eq!(fetched.content, "Updated content");
+        assert_eq!(fetched.priority, Some(1));
+        assert_eq!(fetched.labels.as_deref(), Some("urgent"));
+    }
+
+    #[test]
+    fn update_spec_not_found() {
+        let db = test_db();
+        let spec = sample_spec();
+        let err = db.update_spec(&spec).unwrap_err();
+        assert!(matches!(err, BeltError::SpecNotFound(_)));
+    }
+
+    #[test]
+    fn update_spec_status() {
+        let db = test_db();
+        let spec = sample_spec();
+        db.insert_spec(&spec).unwrap();
+
+        db.update_spec_status(&spec.id, SpecStatus::Active).unwrap();
+        let fetched = db.get_spec(&spec.id).unwrap();
+        assert_eq!(fetched.status, SpecStatus::Active);
+    }
+
+    #[test]
+    fn update_spec_status_not_found() {
+        let db = test_db();
+        let err = db
+            .update_spec_status("nonexistent", SpecStatus::Active)
+            .unwrap_err();
+        assert!(matches!(err, BeltError::SpecNotFound(_)));
+    }
+
+    #[test]
+    fn remove_spec() {
+        let db = test_db();
+        let spec = sample_spec();
+        db.insert_spec(&spec).unwrap();
+
+        db.remove_spec(&spec.id).unwrap();
+        assert!(db.get_spec(&spec.id).is_err());
+    }
+
+    #[test]
+    fn remove_spec_not_found() {
+        let db = test_db();
+        let err = db.remove_spec("nonexistent").unwrap_err();
+        assert!(matches!(err, BeltError::SpecNotFound(_)));
+    }
+
+    #[test]
+    fn spec_with_optional_fields() {
+        let db = test_db();
+        let mut spec = sample_spec();
+        spec.priority = Some(5);
+        spec.labels = Some("bug,feature".to_string());
+        spec.depends_on = Some("spec-0".to_string());
+        db.insert_spec(&spec).unwrap();
+
+        let fetched = db.get_spec(&spec.id).unwrap();
+        assert_eq!(fetched.priority, Some(5));
+        assert_eq!(fetched.labels.as_deref(), Some("bug,feature"));
+        assert_eq!(fetched.depends_on.as_deref(), Some("spec-0"));
+    }
+
+    #[test]
+    fn spec_status_roundtrip() {
+        let statuses = [
+            SpecStatus::Draft,
+            SpecStatus::Active,
+            SpecStatus::Paused,
+            SpecStatus::Completed,
+        ];
+        for s in statuses {
+            assert_eq!(str_to_spec_status(s.as_str()).unwrap(), s);
+        }
     }
 }

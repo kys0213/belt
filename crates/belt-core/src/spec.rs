@@ -1,0 +1,306 @@
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+/// Spec lifecycle status.
+///
+/// ```text
+/// Draft -> Active -> [Paused <-> Active] -> Completed
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpecStatus {
+    Draft,
+    Active,
+    Paused,
+    Completed,
+}
+
+impl SpecStatus {
+    /// Returns the string representation of this status.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SpecStatus::Draft => "draft",
+            SpecStatus::Active => "active",
+            SpecStatus::Paused => "paused",
+            SpecStatus::Completed => "completed",
+        }
+    }
+
+    /// Returns `true` if the status is terminal (no further transitions).
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, SpecStatus::Completed)
+    }
+
+    /// Returns `true` if transitioning from `self` to `to` is valid.
+    pub fn can_transition_to(&self, to: &SpecStatus) -> bool {
+        is_valid_spec_transition(*self, *to)
+    }
+}
+
+impl std::str::FromStr for SpecStatus {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "draft" => Ok(SpecStatus::Draft),
+            "active" => Ok(SpecStatus::Active),
+            "paused" => Ok(SpecStatus::Paused),
+            "completed" => Ok(SpecStatus::Completed),
+            _ => Err(format!("invalid spec status: {s}")),
+        }
+    }
+}
+
+impl fmt::Display for SpecStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Validate a spec status transition.
+///
+/// Valid transitions:
+/// - Draft -> Active
+/// - Active -> Paused
+/// - Active -> Completed
+/// - Paused -> Active
+pub fn is_valid_spec_transition(from: SpecStatus, to: SpecStatus) -> bool {
+    use SpecStatus::*;
+    matches!(
+        (from, to),
+        (Draft, Active) | (Active, Paused) | (Active, Completed) | (Paused, Active)
+    )
+}
+
+/// Attempt a spec status transition, returning an error if invalid.
+pub fn transit_spec(from: SpecStatus, to: SpecStatus) -> Result<(), SpecTransitionError> {
+    if from == to {
+        return Err(SpecTransitionError::SameStatus(from));
+    }
+    if is_valid_spec_transition(from, to) {
+        Ok(())
+    } else {
+        Err(SpecTransitionError::Invalid { from, to })
+    }
+}
+
+/// Error type for invalid spec status transitions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecTransitionError {
+    SameStatus(SpecStatus),
+    Invalid { from: SpecStatus, to: SpecStatus },
+}
+
+impl fmt::Display for SpecTransitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SpecTransitionError::SameStatus(s) => {
+                write!(f, "cannot transit to same status: {s}")
+            }
+            SpecTransitionError::Invalid { from, to } => {
+                write!(f, "invalid spec transition: {from} -> {to}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SpecTransitionError {}
+
+/// A spec represents a planned unit of work with lifecycle management.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Spec {
+    /// Unique identifier.
+    pub id: String,
+    /// Associated workspace identifier.
+    pub workspace_id: String,
+    /// Human-readable name.
+    pub name: String,
+    /// Current lifecycle status.
+    pub status: SpecStatus,
+    /// Spec content / description.
+    pub content: String,
+    /// Optional priority (lower is higher priority).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+    /// Optional comma-separated labels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<String>,
+    /// Optional comma-separated IDs of specs this depends on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub depends_on: Option<String>,
+    /// Creation timestamp (RFC 3339).
+    pub created_at: String,
+    /// Last update timestamp (RFC 3339).
+    pub updated_at: String,
+}
+
+impl Spec {
+    /// Create a new spec in Draft status.
+    pub fn new(id: String, workspace_id: String, name: String, content: String) -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
+        Self {
+            id,
+            workspace_id,
+            name,
+            status: SpecStatus::Draft,
+            content,
+            priority: None,
+            labels: None,
+            depends_on: None,
+            created_at: now.clone(),
+            updated_at: now,
+        }
+    }
+
+    /// Attempt to transition this spec to a new status.
+    ///
+    /// Returns the previous status on success, or an error if the transition
+    /// is invalid.
+    pub fn transition_to(&mut self, to: SpecStatus) -> Result<SpecStatus, SpecTransitionError> {
+        transit_spec(self.status, to)?;
+        let previous = self.status;
+        self.status = to;
+        self.updated_at = chrono::Utc::now().to_rfc3339();
+        Ok(previous)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use SpecStatus::*;
+
+    #[test]
+    fn valid_transitions() {
+        assert!(transit_spec(Draft, Active).is_ok());
+        assert!(transit_spec(Active, Paused).is_ok());
+        assert!(transit_spec(Active, Completed).is_ok());
+        assert!(transit_spec(Paused, Active).is_ok());
+    }
+
+    #[test]
+    fn invalid_transitions() {
+        assert!(transit_spec(Draft, Paused).is_err());
+        assert!(transit_spec(Draft, Completed).is_err());
+        assert!(transit_spec(Paused, Completed).is_err());
+        assert!(transit_spec(Paused, Draft).is_err());
+        assert!(transit_spec(Completed, Active).is_err());
+        assert!(transit_spec(Completed, Draft).is_err());
+    }
+
+    #[test]
+    fn same_status_rejected() {
+        let statuses = [Draft, Active, Paused, Completed];
+        for s in statuses {
+            assert_eq!(
+                transit_spec(s, s).unwrap_err(),
+                SpecTransitionError::SameStatus(s)
+            );
+        }
+    }
+
+    #[test]
+    fn exhaustive_transition_count() {
+        let statuses = [Draft, Active, Paused, Completed];
+        let valid_count = statuses
+            .iter()
+            .flat_map(|&from| statuses.iter().map(move |&to| (from, to)))
+            .filter(|&(from, to)| is_valid_spec_transition(from, to))
+            .count();
+        assert_eq!(valid_count, 4);
+    }
+
+    #[test]
+    fn status_roundtrip() {
+        let statuses = [Draft, Active, Paused, Completed];
+        for s in statuses {
+            let str_val = s.to_string();
+            let parsed: SpecStatus = str_val.parse().unwrap();
+            assert_eq!(s, parsed);
+        }
+    }
+
+    #[test]
+    fn serde_json_roundtrip() {
+        let status = SpecStatus::Active;
+        let json = serde_json::to_string(&status).unwrap();
+        assert_eq!(json, "\"active\"");
+        let parsed: SpecStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, status);
+    }
+
+    #[test]
+    fn terminal_status() {
+        assert!(Completed.is_terminal());
+        assert!(!Draft.is_terminal());
+        assert!(!Active.is_terminal());
+        assert!(!Paused.is_terminal());
+    }
+
+    #[test]
+    fn new_spec_is_draft() {
+        let spec = Spec::new(
+            "spec-1".to_string(),
+            "ws-1".to_string(),
+            "My Spec".to_string(),
+            "Some content".to_string(),
+        );
+        assert_eq!(spec.status, Draft);
+    }
+
+    #[test]
+    fn spec_transition_method() {
+        let mut spec = Spec::new(
+            "spec-1".to_string(),
+            "ws-1".to_string(),
+            "My Spec".to_string(),
+            "content".to_string(),
+        );
+        let prev = spec.transition_to(Active).unwrap();
+        assert_eq!(prev, Draft);
+        assert_eq!(spec.status, Active);
+
+        let prev = spec.transition_to(Paused).unwrap();
+        assert_eq!(prev, Active);
+        assert_eq!(spec.status, Paused);
+
+        let prev = spec.transition_to(Active).unwrap();
+        assert_eq!(prev, Paused);
+
+        let prev = spec.transition_to(Completed).unwrap();
+        assert_eq!(prev, Active);
+        assert_eq!(spec.status, Completed);
+    }
+
+    #[test]
+    fn spec_transition_invalid() {
+        let mut spec = Spec::new(
+            "spec-1".to_string(),
+            "ws-1".to_string(),
+            "name".to_string(),
+            "content".to_string(),
+        );
+        assert!(spec.transition_to(Completed).is_err());
+    }
+
+    #[test]
+    fn spec_full_json_roundtrip() {
+        let mut spec = Spec::new(
+            "spec-1".to_string(),
+            "ws-1".to_string(),
+            "My Spec".to_string(),
+            "content here".to_string(),
+        );
+        spec.priority = Some(1);
+        spec.labels = Some("bug,urgent".to_string());
+        spec.depends_on = Some("spec-0".to_string());
+
+        let json = serde_json::to_string(&spec).unwrap();
+        let parsed: Spec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, spec.id);
+        assert_eq!(parsed.priority, Some(1));
+        assert_eq!(parsed.labels.as_deref(), Some("bug,urgent"));
+        assert_eq!(parsed.depends_on.as_deref(), Some("spec-0"));
+    }
+}
