@@ -67,6 +67,11 @@ enum Commands {
         #[command(subcommand)]
         command: SpecCommands,
     },
+    /// Human-in-the-loop operations.
+    Hitl {
+        #[command(subcommand)]
+        command: HitlCommands,
+    },
     /// Claw interactive management session.
     Claw {
         #[command(subcommand)]
@@ -103,6 +108,30 @@ enum ClawCommands {
     },
     /// Open interactive session.
     Session,
+}
+
+#[derive(Subcommand)]
+enum HitlCommands {
+    /// Respond to a HITL item.
+    Respond {
+        /// Queue item work_id.
+        item_id: String,
+        /// Action to take: done, retry, skip, replan.
+        #[arg(long)]
+        action: String,
+        /// Respondent name.
+        #[arg(long)]
+        respondent: Option<String>,
+        /// Additional notes.
+        #[arg(long)]
+        notes: Option<String>,
+    },
+    /// List HITL items.
+    List {
+        /// Filter by workspace.
+        #[arg(long)]
+        workspace: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -332,7 +361,8 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!(work_id, "marking as done...");
             }
             QueueCommands::Hitl { work_id, reason } => {
-                tracing::info!(work_id, ?reason, "marking as HITL...");
+                tracing::info!(work_id, ?reason, "marking as HITL (manual escalation)...");
+                // TODO: wire to daemon mark_hitl with HitlReason::ManualEscalation
             }
             QueueCommands::Skip { work_id } => {
                 tracing::info!(work_id, "skipping item...");
@@ -621,6 +651,31 @@ async fn main() -> anyhow::Result<()> {
                 "bootstrap complete"
             );
         }
+        Commands::Hitl { command } => match command {
+            HitlCommands::Respond {
+                item_id,
+                action,
+                respondent,
+                notes,
+            } => {
+                let action: belt_core::queue::HitlRespondAction =
+                    action.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+                tracing::info!(
+                    item_id,
+                    %action,
+                    ?respondent,
+                    ?notes,
+                    "responding to HITL item"
+                );
+                // TODO: wire to daemon/DB to apply the respond action
+                println!("HITL respond: item={item_id} action={action}");
+            }
+            HitlCommands::List { workspace } => {
+                tracing::info!(?workspace, "listing HITL items...");
+                // TODO: wire to DB to list HITL items
+            }
+        },
+
         Commands::Claw { command } => match command {
             ClawCommands::Init { force } => {
                 let belt_home = dirs::home_dir()

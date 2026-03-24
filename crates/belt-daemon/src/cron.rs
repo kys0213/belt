@@ -286,18 +286,9 @@ impl CronHandler for DailyReportJob {
         let done_count = self.db.list_items(Some(QueuePhase::Done), None)?.len();
         let failed_count = self.db.list_items(Some(QueuePhase::Failed), None)?.len();
         let hitl_count = self.db.list_items(Some(QueuePhase::Hitl), None)?.len();
-        let running_count = self
-            .db
-            .list_items(Some(QueuePhase::Running), None)?
-            .len();
-        let pending_count = self
-            .db
-            .list_items(Some(QueuePhase::Pending), None)?
-            .len();
-        let completed_count = self
-            .db
-            .list_items(Some(QueuePhase::Completed), None)?
-            .len();
+        let running_count = self.db.list_items(Some(QueuePhase::Running), None)?.len();
+        let pending_count = self.db.list_items(Some(QueuePhase::Pending), None)?.len();
+        let completed_count = self.db.list_items(Some(QueuePhase::Completed), None)?.len();
 
         tracing::info!(
             done = done_count,
@@ -401,10 +392,7 @@ impl CronHandler for EvaluateJob {
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         if exit_code == 0 {
-            tracing::info!(
-                items = completed_items.len(),
-                "evaluate script succeeded"
-            );
+            tracing::info!(items = completed_items.len(), "evaluate script succeeded");
         } else {
             tracing::warn!(
                 exit_code,
@@ -759,10 +747,9 @@ mod tests {
     fn make_test_deps() -> BuiltinJobDeps {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let tmp = tempfile::tempdir().unwrap();
-        let worktree_mgr: Arc<dyn WorktreeManager> =
-            Arc::new(belt_infra::worktree::MockWorktreeManager::new(
-                tmp.path().to_path_buf(),
-            ));
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
         BuiltinJobDeps {
             db,
             worktree_mgr,
@@ -791,10 +778,9 @@ mod tests {
     fn hitl_timeout_expires_old_items() {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let tmp = tempfile::tempdir().unwrap();
-        let worktree_mgr: Arc<dyn WorktreeManager> =
-            Arc::new(belt_infra::worktree::MockWorktreeManager::new(
-                tmp.path().to_path_buf(),
-            ));
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
 
         // Insert an item in HITL phase with an old timestamp.
         let old_time = (Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
@@ -857,10 +843,9 @@ mod tests {
     fn log_cleanup_removes_old_worktrees() {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let tmp = tempfile::tempdir().unwrap();
-        let worktree_mgr: Arc<dyn WorktreeManager> =
-            Arc::new(belt_infra::worktree::MockWorktreeManager::new(
-                tmp.path().to_path_buf(),
-            ));
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
 
         // Insert a Done item with an old timestamp.
         let old_time = (Utc::now() - chrono::Duration::days(8)).to_rfc3339();
@@ -889,10 +874,9 @@ mod tests {
     fn log_cleanup_preserves_recent_worktrees() {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let tmp = tempfile::tempdir().unwrap();
-        let worktree_mgr: Arc<dyn WorktreeManager> =
-            Arc::new(belt_infra::worktree::MockWorktreeManager::new(
-                tmp.path().to_path_buf(),
-            ));
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
 
         // Insert a Done item with a recent timestamp.
         let mut item =

@@ -10,7 +10,7 @@ use belt_core::context::HistoryEntry;
 use belt_core::error::BeltError;
 use belt_core::escalation::EscalationAction;
 use belt_core::phase::QueuePhase;
-use belt_core::queue::{HistoryEvent, QueueItem};
+use belt_core::queue::{HistoryEvent, HitlReason, HitlRespondAction, QueueItem};
 use belt_core::runtime::RuntimeRegistry;
 use belt_core::source::DataSource;
 use belt_core::state_machine;
@@ -528,14 +528,23 @@ impl Daemon {
         transit(item, QueuePhase::Done)
     }
 
-    /// Mark a Completed item as Hitl (human-in-the-loop).
-    pub fn mark_hitl(&mut self, work_id: &str, _reason: Option<String>) -> Result<(), BeltError> {
+    /// Mark a Completed item as Hitl (human-in-the-loop) with reason and optional notes.
+    pub fn mark_hitl(
+        &mut self,
+        work_id: &str,
+        reason: HitlReason,
+        notes: Option<String>,
+    ) -> Result<(), BeltError> {
         let item = self
             .queue
             .iter_mut()
             .find(|it| it.work_id == work_id)
             .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-        transit(item, QueuePhase::Hitl)
+        transit(item, QueuePhase::Hitl)?;
+        item.hitl_created_at = Some(Utc::now().to_rfc3339());
+        item.hitl_reason = Some(reason);
+        item.hitl_notes = notes;
+        Ok(())
     }
 
     /// Mark a Hitl item as Skipped.
@@ -556,6 +565,42 @@ impl Daemon {
             .find(|it| it.work_id == work_id)
             .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
         transit(item, QueuePhase::Pending)
+    }
+
+    /// Respond to a HITL item with a user action.
+    ///
+    /// Applies the given [`HitlRespondAction`] and records the respondent.
+    pub fn respond_hitl(
+        &mut self,
+        work_id: &str,
+        action: HitlRespondAction,
+        respondent: Option<String>,
+        notes: Option<String>,
+    ) -> Result<(), BeltError> {
+        let item = self
+            .queue
+            .iter_mut()
+            .find(|it| it.work_id == work_id)
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+
+        if item.phase != QueuePhase::Hitl {
+            return Err(BeltError::InvalidTransition {
+                from: item.phase,
+                to: QueuePhase::Done, // placeholder
+            });
+        }
+
+        item.hitl_respondent = respondent;
+        if let Some(n) = notes {
+            item.hitl_notes = Some(n);
+        }
+
+        match action {
+            HitlRespondAction::Done => transit(item, QueuePhase::Done),
+            HitlRespondAction::Retry => transit(item, QueuePhase::Pending),
+            HitlRespondAction::Skip => transit(item, QueuePhase::Skipped),
+            HitlRespondAction::Replan => transit(item, QueuePhase::Failed),
+        }
     }
 
     /// Mark a Running item as Failed and record a HistoryEvent.
@@ -607,7 +652,11 @@ impl Daemon {
                     failure_count,
                     "escalating to HITL after repeated failures"
                 );
-                let _ = self.mark_hitl(work_id, Some("escalation: repeated failures".to_string()));
+                let _ = self.mark_hitl(
+                    work_id,
+                    HitlReason::RetryMaxExceeded,
+                    Some("escalation: repeated failures".to_string()),
+                );
             }
         }
     }
@@ -693,11 +742,19 @@ impl Daemon {
                     result.exit_code,
                     completed.len()
                 );
+                let now = chrono::Utc::now().to_rfc3339();
                 for work_id in completed {
                     if let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id)
                         && let Some(item) = self.queue.get_mut(idx)
                     {
                         item.phase = QueuePhase::Hitl;
+                        item.hitl_created_at = Some(now.clone());
+                        item.hitl_reason = Some(HitlReason::EvaluateFailure);
+                        item.hitl_notes = Some(format!(
+                            "evaluator exit_code={}: {}",
+                            result.exit_code,
+                            result.stderr.trim()
+                        ));
                         self.history.push(HistoryEntry {
                             source_id: item.source_id.clone(),
                             work_id: item.work_id.clone(),
@@ -710,7 +767,7 @@ impl Daemon {
                                 result.exit_code,
                                 result.stderr.trim()
                             )),
-                            created_at: chrono::Utc::now().to_rfc3339(),
+                            created_at: now.clone(),
                         });
                     }
                 }
@@ -925,11 +982,12 @@ impl Daemon {
     }
 
     fn handle_escalation(&mut self, item: &mut QueueItem, action: EscalationAction) {
+        let now = chrono::Utc::now().to_rfc3339();
         match action {
             EscalationAction::Retry | EscalationAction::RetryWithComment => {
                 let mut retry_item = item.clone();
                 retry_item.phase = QueuePhase::Pending;
-                retry_item.updated_at = chrono::Utc::now().to_rfc3339();
+                retry_item.updated_at = now;
                 self.queue.push_back(retry_item);
             }
             EscalationAction::Skip => {
@@ -937,6 +995,8 @@ impl Daemon {
             }
             EscalationAction::Hitl | EscalationAction::Replan => {
                 item.phase = QueuePhase::Hitl;
+                item.hitl_created_at = Some(now);
+                item.hitl_reason = Some(HitlReason::RetryMaxExceeded);
                 self.queue.push_back(item.clone());
             }
         }
@@ -1167,7 +1227,11 @@ sources:
 
         assert!(
             daemon
-                .mark_hitl("s1:analyze", Some("needs review".into()))
+                .mark_hitl(
+                    "s1:analyze",
+                    HitlReason::ManualEscalation,
+                    Some("needs review".into()),
+                )
                 .is_ok()
         );
         assert_eq!(

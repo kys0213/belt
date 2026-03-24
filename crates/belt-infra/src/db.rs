@@ -157,14 +157,18 @@ impl Database {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS queue_items (
-                work_id      TEXT PRIMARY KEY,
-                source_id    TEXT NOT NULL,
-                workspace_id TEXT NOT NULL,
-                state        TEXT NOT NULL,
-                phase        TEXT NOT NULL,
-                title        TEXT,
-                created_at   TEXT NOT NULL,
-                updated_at   TEXT NOT NULL
+                work_id          TEXT PRIMARY KEY,
+                source_id        TEXT NOT NULL,
+                workspace_id     TEXT NOT NULL,
+                state            TEXT NOT NULL,
+                phase            TEXT NOT NULL,
+                title            TEXT,
+                created_at       TEXT NOT NULL,
+                updated_at       TEXT NOT NULL,
+                hitl_created_at  TEXT,
+                hitl_respondent  TEXT,
+                hitl_notes       TEXT,
+                hitl_reason      TEXT
             );
 
             CREATE TABLE IF NOT EXISTS history (
@@ -239,8 +243,8 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.execute(
-            "INSERT INTO queue_items (work_id, source_id, workspace_id, state, phase, title, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO queue_items (work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 item.work_id,
                 item.source_id,
@@ -250,6 +254,10 @@ impl Database {
                 item.title,
                 item.created_at,
                 item.updated_at,
+                item.hitl_created_at,
+                item.hitl_respondent,
+                item.hitl_notes,
+                item.hitl_reason.map(|r| r.to_string()),
             ],
         )
         .map_err(|e| BeltError::Database(e.to_string()))?;
@@ -280,6 +288,59 @@ impl Database {
         Ok(())
     }
 
+    /// Update HITL metadata when responding to a HITL item.
+    ///
+    /// Sets `hitl_respondent`, `hitl_notes`, phase, and refreshes `updated_at`.
+    ///
+    /// # Errors
+    /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
+    pub fn respond_hitl(
+        &self,
+        work_id: &str,
+        phase: QueuePhase,
+        respondent: Option<&str>,
+        notes: Option<&str>,
+    ) -> Result<(), BeltError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "UPDATE queue_items SET phase = ?1, updated_at = ?2, hitl_respondent = ?3, hitl_notes = COALESCE(?4, hitl_notes) WHERE work_id = ?5",
+                params![phase_to_str(phase), now, respondent, notes, work_id],
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        if rows == 0 {
+            return Err(BeltError::ItemNotFound(work_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// List queue items in HITL phase that have exceeded the timeout threshold.
+    ///
+    /// Returns work_ids of HITL items where `hitl_created_at` is older than
+    /// `timeout_hours` from now.
+    pub fn list_expired_hitl_items(&self, timeout_hours: u64) -> Result<Vec<String>, BeltError> {
+        let cutoff = (Utc::now() - chrono::Duration::hours(timeout_hours as i64)).to_rfc3339();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT work_id FROM queue_items WHERE phase = 'hitl' AND hitl_created_at IS NOT NULL AND hitl_created_at < ?1",
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let work_ids = stmt
+            .query_map(params![cutoff], |row| row.get::<_, String>(0))
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(work_ids)
+    }
+
     /// Retrieve a single queue item by `work_id`.
     ///
     /// # Errors
@@ -290,7 +351,7 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.query_row(
-            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at
+            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason
                  FROM queue_items WHERE work_id = ?1",
             params![work_id],
             |row| Ok(row_to_queue_item(row)),
@@ -314,7 +375,7 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let mut sql = String::from(
-            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at FROM queue_items WHERE 1=1",
+            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason FROM queue_items WHERE 1=1",
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -1143,9 +1204,23 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> Result<Spec, BeltError> {
 /// Extract a `QueueItem` from a rusqlite `Row`.
 ///
 /// Column order must match:
-/// `work_id, source_id, workspace_id, state, phase, title, created_at, updated_at`
+/// `work_id, source_id, workspace_id, state, phase, title, created_at, updated_at,
+///  hitl_created_at, hitl_respondent, hitl_notes, hitl_reason`
 fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
     let phase_str: String = row.get(4).map_err(|e| BeltError::Database(e.to_string()))?;
+    let hitl_reason_str: Option<String> = row
+        .get(11)
+        .map_err(|e| BeltError::Database(e.to_string()))?;
+    let hitl_reason = hitl_reason_str
+        .as_deref()
+        .map(|s| match s {
+            "evaluate_failure" => Ok(belt_core::queue::HitlReason::EvaluateFailure),
+            "retry_max_exceeded" => Ok(belt_core::queue::HitlReason::RetryMaxExceeded),
+            "timeout" => Ok(belt_core::queue::HitlReason::Timeout),
+            "manual_escalation" => Ok(belt_core::queue::HitlReason::ManualEscalation),
+            other => Err(BeltError::Database(format!("unknown hitl_reason: {other}"))),
+        })
+        .transpose()?;
 
     Ok(QueueItem {
         work_id: row.get(0).map_err(|e| BeltError::Database(e.to_string()))?,
@@ -1156,6 +1231,12 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
         title: row.get(5).map_err(|e| BeltError::Database(e.to_string()))?,
         created_at: row.get(6).map_err(|e| BeltError::Database(e.to_string()))?,
         updated_at: row.get(7).map_err(|e| BeltError::Database(e.to_string()))?,
+        hitl_created_at: row.get(8).map_err(|e| BeltError::Database(e.to_string()))?,
+        hitl_respondent: row.get(9).map_err(|e| BeltError::Database(e.to_string()))?,
+        hitl_notes: row
+            .get(10)
+            .map_err(|e| BeltError::Database(e.to_string()))?,
+        hitl_reason,
     })
 }
 
@@ -1177,6 +1258,10 @@ mod tests {
             title: None,
             created_at: Utc::now().to_rfc3339(),
             updated_at: Utc::now().to_rfc3339(),
+            hitl_created_at: None,
+            hitl_respondent: None,
+            hitl_notes: None,
+            hitl_reason: None,
         }
     }
 
@@ -1716,5 +1801,76 @@ mod tests {
         for s in statuses {
             assert_eq!(str_to_spec_status(s.as_str()).unwrap(), s);
         }
+    }
+
+    // ---- HITL metadata --------------------------------------------------------
+
+    #[test]
+    fn insert_and_get_item_with_hitl_metadata() {
+        let db = test_db();
+        let mut item = sample_item();
+        item.phase = QueuePhase::Hitl;
+        item.hitl_created_at = Some(Utc::now().to_rfc3339());
+        item.hitl_reason = Some(belt_core::queue::HitlReason::RetryMaxExceeded);
+        item.hitl_notes = Some("max retries".to_string());
+        db.insert_item(&item).unwrap();
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert_eq!(fetched.phase, QueuePhase::Hitl);
+        assert!(fetched.hitl_created_at.is_some());
+        assert_eq!(
+            fetched.hitl_reason,
+            Some(belt_core::queue::HitlReason::RetryMaxExceeded)
+        );
+        assert_eq!(fetched.hitl_notes.as_deref(), Some("max retries"));
+    }
+
+    #[test]
+    fn respond_hitl_updates_metadata() {
+        let db = test_db();
+        let mut item = sample_item();
+        item.phase = QueuePhase::Hitl;
+        item.hitl_created_at = Some(Utc::now().to_rfc3339());
+        db.insert_item(&item).unwrap();
+
+        db.respond_hitl(
+            &item.work_id,
+            QueuePhase::Done,
+            Some("irene"),
+            Some("looks good"),
+        )
+        .unwrap();
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert_eq!(fetched.phase, QueuePhase::Done);
+        assert_eq!(fetched.hitl_respondent.as_deref(), Some("irene"));
+        assert_eq!(fetched.hitl_notes.as_deref(), Some("looks good"));
+    }
+
+    #[test]
+    fn list_expired_hitl_items_returns_old_items() {
+        let db = test_db();
+        // Item with hitl_created_at 25 hours ago
+        let mut old_item = sample_item();
+        old_item.phase = QueuePhase::Hitl;
+        old_item.hitl_created_at = Some((Utc::now() - chrono::Duration::hours(25)).to_rfc3339());
+        db.insert_item(&old_item).unwrap();
+        db.update_phase(&old_item.work_id, QueuePhase::Hitl)
+            .unwrap();
+
+        // Item with hitl_created_at 1 hour ago (not expired)
+        let mut new_item = QueueItem {
+            work_id: "gh:org/repo#2:implement".to_string(),
+            ..sample_item()
+        };
+        new_item.phase = QueuePhase::Hitl;
+        new_item.hitl_created_at = Some((Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
+        db.insert_item(&new_item).unwrap();
+        db.update_phase(&new_item.work_id, QueuePhase::Hitl)
+            .unwrap();
+
+        let expired = db.list_expired_hitl_items(24).unwrap();
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0], old_item.work_id);
     }
 }
