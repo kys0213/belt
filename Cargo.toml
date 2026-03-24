@@ -34,6 +34,10 @@ clap = { version = "4", features = ["derive"] }
 # Database
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -242,21 +242,14 @@ impl GitHubDataSource {
             let source_id = format!("github:{repo_name}!{number}");
             let work_id = QueueItem::make_work_id(&source_id, review_scan_state);
 
-            items.push(QueueItem {
+            let mut item = QueueItem::new(
                 work_id,
                 source_id,
-                workspace_id: workspace.name.clone(),
-                state: review_scan_state.to_string(),
-                phase: QueuePhase::Pending,
-                title: Some(format!("[review] {title}")),
-                created_at: chrono::Utc::now().to_rfc3339(),
-                updated_at: chrono::Utc::now().to_rfc3339(),
-                hitl_created_at: None,
-                hitl_respondent: None,
-                hitl_notes: None,
-                hitl_reason: None,
-                worktree_preserved: false,
-            });
+                workspace.name.clone(),
+                review_scan_state.to_string(),
+            );
+            item.title = Some(format!("[review] {title}"));
+            items.push(item);
         }
 
         Ok(items)
@@ -441,21 +434,14 @@ sources:
 
     fn make_queue_item(source_id: &str, state: &str) -> QueueItem {
         let work_id = QueueItem::make_work_id(source_id, state);
-        QueueItem {
+        let mut item = QueueItem::new(
             work_id,
-            source_id: source_id.to_string(),
-            workspace_id: "test-ws".to_string(),
-            state: state.to_string(),
-            phase: QueuePhase::Pending,
-            title: Some("Test issue title".to_string()),
-            created_at: "2026-03-24T00:00:00Z".to_string(),
-            updated_at: "2026-03-24T00:00:00Z".to_string(),
-            hitl_created_at: None,
-            hitl_respondent: None,
-            hitl_notes: None,
-            hitl_reason: None,
-            worktree_preserved: false,
-        }
+            source_id.to_string(),
+            "test-ws".to_string(),
+            state.to_string(),
+        );
+        item.title = Some("Test issue title".to_string());
+        item
     }
 
     // ── extract_repo_name ────────────────────────────────────────────────────

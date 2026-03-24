@@ -99,6 +99,25 @@ pub struct TokenUsageRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// A transition event recording a state change for a queue item.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransitionEvent {
+    /// Unique event identifier.
+    pub id: String,
+    /// The queue item this transition belongs to.
+    pub item_id: String,
+    /// Phase before the transition.
+    pub from_state: String,
+    /// Phase after the transition.
+    pub to_state: String,
+    /// Type of event (e.g. "phase_change", "manual", "auto").
+    pub event_type: String,
+    /// When this transition occurred (RFC 3339).
+    pub timestamp: String,
+    /// Optional JSON metadata.
+    pub metadata: Option<String>,
+}
+
 /// Per-model aggregated statistics from the `token_usage` table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelStats {
@@ -253,6 +272,16 @@ impl Database {
                 depends_on   TEXT,
                 created_at   TEXT NOT NULL,
                 updated_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS transition_events (
+                id         TEXT PRIMARY KEY,
+                item_id    TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state   TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                timestamp  TEXT NOT NULL,
+                metadata   TEXT
             );
             ",
         )
@@ -432,6 +461,30 @@ impl Database {
 
         // Unwrap the inner Results produced by row_to_queue_item.
         items.into_iter().collect::<Result<Vec<_>, _>>()
+    }
+
+    /// Count queue items grouped by phase.
+    ///
+    /// Returns a list of `(phase_string, count)` tuples.
+    pub fn count_items_by_phase(&self) -> Result<Vec<(String, u32)>, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
+            .prepare("SELECT phase, COUNT(*) FROM queue_items GROUP BY phase ORDER BY phase")
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let phase: String = row.get(0)?;
+                let count: u32 = row.get(1)?;
+                Ok((phase, count))
+            })
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(rows)
     }
 
     // ---- History -----------------------------------------------------------
@@ -1018,6 +1071,98 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         Ok(entries)
+    }
+
+    // ---- Transition Events -------------------------------------------------
+
+    /// Record a transition event.
+    pub fn insert_transition_event(&self, event: &TransitionEvent) -> Result<(), BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        conn.execute(
+            "INSERT INTO transition_events (id, item_id, from_state, to_state, event_type, timestamp, metadata)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                event.id,
+                event.item_id,
+                event.from_state,
+                event.to_state,
+                event.event_type,
+                event.timestamp,
+                event.metadata,
+            ],
+        )
+        .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// List transition events for a given item, ordered by timestamp ascending.
+    pub fn list_transition_events(&self, item_id: &str) -> Result<Vec<TransitionEvent>, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, item_id, from_state, to_state, event_type, timestamp, metadata
+                 FROM transition_events WHERE item_id = ?1 ORDER BY timestamp ASC",
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let events = stmt
+            .query_map(params![item_id], |row| {
+                Ok(TransitionEvent {
+                    id: row.get(0)?,
+                    item_id: row.get(1)?,
+                    from_state: row.get(2)?,
+                    to_state: row.get(3)?,
+                    event_type: row.get(4)?,
+                    timestamp: row.get(5)?,
+                    metadata: row.get(6)?,
+                })
+            })
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(events)
+    }
+
+    /// List the most recent transition events across all items.
+    ///
+    /// Returns up to `limit` events ordered by timestamp descending.
+    pub fn list_recent_transition_events(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<TransitionEvent>, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, item_id, from_state, to_state, event_type, timestamp, metadata
+                 FROM transition_events ORDER BY timestamp DESC LIMIT ?1",
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let events = stmt
+            .query_map(params![limit], |row| {
+                Ok(TransitionEvent {
+                    id: row.get(0)?,
+                    item_id: row.get(1)?,
+                    from_state: row.get(2)?,
+                    to_state: row.get(3)?,
+                    event_type: row.get(4)?,
+                    timestamp: row.get(5)?,
+                    metadata: row.get(6)?,
+                })
+            })
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(events)
     }
 
     // ---- Token Usage -------------------------------------------------------
@@ -2103,4 +2248,79 @@ mod tests {
         assert_eq!(expired.len(), 1);
         assert_eq!(expired[0], old_item.work_id);
     }
+
+    // ---- Transition Events tests -------------------------------------------
+
+    #[test]
+    fn insert_and_list_transition_events() {
+        let db = test_db();
+        let ev = TransitionEvent {
+            id: "ev1".to_string(),
+            item_id: "w1".to_string(),
+            from_state: "pending".to_string(),
+            to_state: "running".to_string(),
+            event_type: "phase_change".to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            metadata: None,
+        };
+        db.insert_transition_event(&ev).unwrap();
+
+        let events = db.list_transition_events("w1").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].id, "ev1");
+        assert_eq!(events[0].from_state, "pending");
+        assert_eq!(events[0].to_state, "running");
+    }
+
+    #[test]
+    fn list_recent_transition_events_respects_limit() {
+        let db = test_db();
+        for i in 0..5 {
+            let ev = TransitionEvent {
+                id: format!("ev{i}"),
+                item_id: format!("w{i}"),
+                from_state: "pending".to_string(),
+                to_state: "running".to_string(),
+                event_type: "phase_change".to_string(),
+                timestamp: Utc::now().to_rfc3339(),
+                metadata: None,
+            };
+            db.insert_transition_event(&ev).unwrap();
+        }
+        let recent = db.list_recent_transition_events(3).unwrap();
+        assert_eq!(recent.len(), 3);
+    }
+
+    #[test]
+    fn count_items_by_phase_empty() {
+        let db = test_db();
+        let counts = db.count_items_by_phase().unwrap();
+        assert!(counts.is_empty());
+    }
+
+    #[test]
+    fn count_items_by_phase_with_items() {
+        let db = test_db();
+        let mut item1 = sample_item();
+        item1.work_id = "w1".to_string();
+        item1.phase = QueuePhase::Pending;
+        db.insert_item(&item1).unwrap();
+
+        let mut item2 = sample_item();
+        item2.work_id = "w2".to_string();
+        item2.phase = QueuePhase::Running;
+        db.insert_item(&item2).unwrap();
+
+        let mut item3 = sample_item();
+        item3.work_id = "w3".to_string();
+        item3.phase = QueuePhase::Pending;
+        db.insert_item(&item3).unwrap();
+
+        let counts = db.count_items_by_phase().unwrap();
+        let pending = counts.iter().find(|(p, _)| p == "pending").map(|(_, c)| *c);
+        let running = counts.iter().find(|(p, _)| p == "running").map(|(_, c)| *c);
+        assert_eq!(pending, Some(2));
+        assert_eq!(running, Some(1));
+    }
+
 }
