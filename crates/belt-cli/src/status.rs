@@ -183,9 +183,33 @@ pub fn print_spec_status(status: &SpecStatus, format: &str) -> anyhow::Result<()
 
 #[cfg(test)]
 mod tests {
-    use belt_infra::db::RuntimeStats;
+    use belt_core::phase::QueuePhase;
+    use belt_core::queue::QueueItem;
+    use belt_infra::db::{Database, RuntimeStats, TransitionEvent};
 
     use super::*;
+
+    // ---- test helpers ----
+
+    fn test_db() -> Database {
+        Database::open_in_memory().expect("in-memory DB should open")
+    }
+
+    fn make_item(
+        work_id: &str,
+        source_id: &str,
+        workspace_id: &str,
+        phase: QueuePhase,
+    ) -> QueueItem {
+        let mut item = QueueItem::new(
+            work_id.to_string(),
+            source_id.to_string(),
+            workspace_id.to_string(),
+            "implement".to_string(),
+        );
+        item.phase = phase;
+        item
+    }
 
     // ---- StatusOutput serialization ----
 
@@ -248,6 +272,212 @@ mod tests {
         // Providing a path inside a non-existent directory tree should fail.
         let result = belt_infra::db::Database::open("/nonexistent/dir/belt.db");
         assert!(result.is_err());
+    }
+
+    // ---- gather_status ----
+
+    #[test]
+    fn gather_status_empty_db_returns_zero_totals() {
+        let db = test_db();
+        let status = gather_status(&db).unwrap();
+
+        assert_eq!(status.total_items, 0);
+        assert!(status.phase_counts.is_empty());
+        assert!(status.running_items.is_empty());
+        assert!(status.recent_events.is_empty());
+    }
+
+    #[test]
+    fn gather_status_counts_items_across_phases() {
+        let db = test_db();
+
+        let pending = make_item("w1:implement", "w1", "ws-a", QueuePhase::Pending);
+        let running1 = make_item("w2:implement", "w2", "ws-a", QueuePhase::Running);
+        let running2 = make_item("w3:implement", "w3", "ws-b", QueuePhase::Running);
+        let done = make_item("w4:implement", "w4", "ws-a", QueuePhase::Done);
+
+        db.insert_item(&pending).unwrap();
+        db.insert_item(&running1).unwrap();
+        db.insert_item(&running2).unwrap();
+        db.insert_item(&done).unwrap();
+
+        let status = gather_status(&db).unwrap();
+
+        assert_eq!(status.total_items, 4);
+
+        let phase_map: std::collections::HashMap<&str, u32> = status
+            .phase_counts
+            .iter()
+            .map(|pc| (pc.phase.as_str(), pc.count))
+            .collect();
+        assert_eq!(phase_map.get("pending").copied(), Some(1));
+        assert_eq!(phase_map.get("running").copied(), Some(2));
+        assert_eq!(phase_map.get("done").copied(), Some(1));
+    }
+
+    #[test]
+    fn gather_status_running_items_populated() {
+        let db = test_db();
+
+        let running = make_item("run1:implement", "run1", "ws-x", QueuePhase::Running);
+        let pending = make_item("pend1:implement", "pend1", "ws-x", QueuePhase::Pending);
+
+        db.insert_item(&running).unwrap();
+        db.insert_item(&pending).unwrap();
+
+        let status = gather_status(&db).unwrap();
+
+        assert_eq!(status.running_items.len(), 1);
+        assert_eq!(status.running_items[0].work_id, "run1:implement");
+        assert_eq!(status.running_items[0].workspace, "ws-x");
+        assert_eq!(status.running_items[0].phase, "running");
+    }
+
+    #[test]
+    fn gather_status_recent_events_populated() {
+        let db = test_db();
+
+        let ev = TransitionEvent {
+            id: "ev-1".to_string(),
+            item_id: "w1:implement".to_string(),
+            from_state: "pending".to_string(),
+            to_state: "running".to_string(),
+            event_type: "phase_change".to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            metadata: None,
+        };
+        db.insert_transition_event(&ev).unwrap();
+
+        let status = gather_status(&db).unwrap();
+
+        assert_eq!(status.recent_events.len(), 1);
+        assert_eq!(status.recent_events[0].item_id, "w1:implement");
+        assert_eq!(status.recent_events[0].from_state, "pending");
+        assert_eq!(status.recent_events[0].to_state, "running");
+        assert_eq!(status.recent_events[0].event_type, "phase_change");
+    }
+
+    #[test]
+    fn gather_status_recent_events_capped_at_ten() {
+        let db = test_db();
+
+        for i in 0..15u32 {
+            let ev = TransitionEvent {
+                id: format!("ev-{i}"),
+                item_id: format!("w{i}:implement"),
+                from_state: "pending".to_string(),
+                to_state: "running".to_string(),
+                event_type: "phase_change".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                metadata: None,
+            };
+            db.insert_transition_event(&ev).unwrap();
+        }
+
+        let status = gather_status(&db).unwrap();
+
+        assert!(
+            status.recent_events.len() <= 10,
+            "expected at most 10 events, got {}",
+            status.recent_events.len()
+        );
+    }
+
+    // ---- gather_spec_status ----
+
+    #[test]
+    fn gather_spec_status_workspace_not_found_returns_error() {
+        let db = test_db();
+        let result = gather_spec_status(&db, "no-such-workspace");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn gather_spec_status_empty_workspace() {
+        let db = test_db();
+        db.add_workspace("ws-empty", "/path/to/workspace.yaml")
+            .unwrap();
+
+        let spec_status = gather_spec_status(&db, "ws-empty").unwrap();
+
+        assert_eq!(spec_status.workspace, "ws-empty");
+        assert_eq!(spec_status.config_path, "/path/to/workspace.yaml");
+        assert_eq!(spec_status.item_count, 0);
+        assert!(spec_status.phase_counts.is_empty());
+    }
+
+    #[test]
+    fn gather_spec_status_counts_items_in_workspace() {
+        let db = test_db();
+        db.add_workspace("ws-main", "/path/to/ws.yaml").unwrap();
+        db.add_workspace("ws-other", "/other/ws.yaml").unwrap();
+
+        let item1 = make_item("a1:implement", "a1", "ws-main", QueuePhase::Pending);
+        let item2 = make_item("a2:implement", "a2", "ws-main", QueuePhase::Running);
+        let item3 = make_item("a3:implement", "a3", "ws-main", QueuePhase::Done);
+        let other = make_item("b1:implement", "b1", "ws-other", QueuePhase::Pending);
+
+        db.insert_item(&item1).unwrap();
+        db.insert_item(&item2).unwrap();
+        db.insert_item(&item3).unwrap();
+        db.insert_item(&other).unwrap();
+
+        let spec_status = gather_spec_status(&db, "ws-main").unwrap();
+
+        assert_eq!(spec_status.item_count, 3);
+
+        let phase_map: std::collections::HashMap<&str, u32> = spec_status
+            .phase_counts
+            .iter()
+            .map(|pc| (pc.phase.as_str(), pc.count))
+            .collect();
+        assert_eq!(phase_map.get("pending").copied(), Some(1));
+        assert_eq!(phase_map.get("running").copied(), Some(1));
+        assert_eq!(phase_map.get("done").copied(), Some(1));
+    }
+
+    #[test]
+    fn gather_spec_status_phase_counts_sorted_alphabetically() {
+        let db = test_db();
+        db.add_workspace("ws-sort", "/sort/ws.yaml").unwrap();
+
+        let items = vec![
+            make_item("s1:impl", "s1", "ws-sort", QueuePhase::Running),
+            make_item("s2:impl", "s2", "ws-sort", QueuePhase::Done),
+            make_item("s3:impl", "s3", "ws-sort", QueuePhase::Failed),
+        ];
+        for item in &items {
+            db.insert_item(item).unwrap();
+        }
+
+        let spec_status = gather_spec_status(&db, "ws-sort").unwrap();
+
+        let phases: Vec<&str> = spec_status
+            .phase_counts
+            .iter()
+            .map(|pc| pc.phase.as_str())
+            .collect();
+        let mut sorted = phases.clone();
+        sorted.sort_unstable();
+        assert_eq!(phases, sorted, "phase_counts must be sorted alphabetically");
+    }
+
+    #[test]
+    fn gather_spec_status_excludes_other_workspace_items() {
+        let db = test_db();
+        db.add_workspace("ws-a", "/a.yaml").unwrap();
+        db.add_workspace("ws-b", "/b.yaml").unwrap();
+
+        let item_a = make_item("ia:impl", "ia", "ws-a", QueuePhase::Pending);
+        let item_b = make_item("ib:impl", "ib", "ws-b", QueuePhase::Running);
+        db.insert_item(&item_a).unwrap();
+        db.insert_item(&item_b).unwrap();
+
+        let spec_status = gather_spec_status(&db, "ws-a").unwrap();
+
+        assert_eq!(spec_status.item_count, 1);
+        assert_eq!(spec_status.phase_counts.len(), 1);
+        assert_eq!(spec_status.phase_counts[0].phase, "pending");
     }
 }
 
