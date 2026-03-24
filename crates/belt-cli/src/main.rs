@@ -16,7 +16,7 @@ use belt_core::runtime::RuntimeRegistry;
 use belt_daemon::daemon::Daemon;
 use belt_infra::runtimes::claude::ClaudeRuntime;
 use belt_infra::sources::github::GitHubDataSource;
-use belt_infra::worktree::GitWorktreeManager;
+use belt_infra::worktree::{GitWorktreeManager, WorktreeManager};
 
 mod claw;
 
@@ -214,6 +214,14 @@ enum QueueCommands {
     },
     /// Skip an item.
     Skip { work_id: String },
+    /// Re-run on_done script for a Failed item.
+    RetryScript {
+        /// Queue item work_id.
+        work_id: String,
+        /// Script execution timeout in seconds.
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -608,6 +616,101 @@ fn cmd_queue_skip(work_id: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `belt queue retry-script` -- re-run on_done script for a Failed item.
+async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::Result<()> {
+    let db = open_db()?;
+    let item = db.get_item(work_id)?;
+
+    if item.phase != QueuePhase::Failed {
+        anyhow::bail!(
+            "item '{}' is in phase '{}', not 'failed'",
+            work_id,
+            item.phase
+        );
+    }
+
+    // Load workspace config to find on_done scripts for this item's state.
+    let (_, config_path, _) = db.get_workspace(&item.workspace_id)?;
+    let config = belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(
+        &config_path,
+    ))?;
+
+    // Find the state config containing on_done scripts.
+    let state_config = config
+        .sources
+        .values()
+        .find_map(|source| source.states.get(&item.state))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no state config found for state '{}' in workspace '{}'",
+                item.state,
+                item.workspace_id
+            )
+        })?;
+
+    if state_config.on_done.is_empty() {
+        println!("No on_done scripts configured for state '{}'. Transitioning to done.", item.state);
+        db.update_phase(work_id, QueuePhase::Done)?;
+        println!("Item '{work_id}' transitioned from failed to done.");
+        return Ok(());
+    }
+
+    let on_done: Vec<belt_core::action::Action> =
+        state_config.on_done.iter().map(belt_core::action::Action::from).collect();
+
+    // Set up execution environment.
+    let belt_home = belt_home()?;
+    let worktree_base = belt_home.join("worktrees");
+    let repo_path = std::path::PathBuf::from(".");
+    let worktree_mgr =
+        belt_infra::worktree::GitWorktreeManager::new(worktree_base, repo_path);
+
+    let worktree_path = worktree_mgr.create_or_reuse(work_id)?;
+    let env = belt_daemon::executor::ActionEnv::new(work_id, &worktree_path);
+
+    // Build a minimal runtime registry for script execution.
+    let mut registry = belt_core::runtime::RuntimeRegistry::new("claude".to_string());
+    registry.register(std::sync::Arc::new(
+        belt_infra::runtimes::claude::ClaudeRuntime::new(None),
+    ));
+    let executor = belt_daemon::executor::ActionExecutor::new(std::sync::Arc::new(registry));
+
+    println!("Re-running on_done scripts for '{work_id}'...");
+
+    let result = if let Some(secs) = timeout {
+        let duration = std::time::Duration::from_secs(secs);
+        match tokio::time::timeout(duration, executor.execute_all(&on_done, &env)).await {
+            Ok(r) => r?,
+            Err(_) => {
+                println!("Script execution timed out after {secs}s. Item remains failed.");
+                return Ok(());
+            }
+        }
+    } else {
+        executor.execute_all(&on_done, &env).await?
+    };
+
+    match result {
+        Some(r) if r.success() => {
+            db.update_phase(work_id, QueuePhase::Done)?;
+            println!("on_done scripts succeeded. Item '{work_id}' transitioned from failed to done.");
+        }
+        Some(r) => {
+            println!(
+                "on_done scripts failed (exit code {}). Item '{work_id}' remains in failed phase.",
+                r.exit_code
+            );
+        }
+        None => {
+            // No scripts produced a result (shouldn't happen since we checked on_done is non-empty).
+            db.update_phase(work_id, QueuePhase::Done)?;
+            println!("Item '{work_id}' transitioned from failed to done.");
+        }
+    }
+
+    Ok(())
+}
+
 /// `belt cron list` -- list registered cron jobs.
 fn cmd_cron_list(format: &str) -> anyhow::Result<()> {
     let db = open_db()?;
@@ -816,6 +919,9 @@ async fn main() -> anyhow::Result<()> {
             }
             QueueCommands::Skip { work_id } => {
                 cmd_queue_skip(&work_id)?;
+            }
+            QueueCommands::RetryScript { work_id, timeout } => {
+                cmd_queue_retry_script(&work_id, timeout).await?;
             }
         },
         Commands::Cron { command } => match command {
