@@ -77,6 +77,9 @@ enum Commands {
         /// Output as JSON.
         #[arg(long)]
         json: bool,
+        /// Extract a specific field using dot notation (e.g. issue.number).
+        #[arg(long)]
+        field: Option<String>,
     },
     /// Run an LLM agent session.
     Agent {
@@ -809,7 +812,11 @@ async fn main() -> anyhow::Result<()> {
                 cmd_cron_trigger(&name)?;
             }
         },
-        Commands::Context { work_id, json } => {
+        Commands::Context {
+            work_id,
+            json,
+            field,
+        } => {
             let db_path = dirs::home_dir()
                 .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
                 .join(".belt")
@@ -861,7 +868,23 @@ async fn main() -> anyhow::Result<()> {
                 worktree: None,
             };
 
-            if json {
+            if let Some(ref field_path) = field {
+                let value = serde_json::to_value(&ctx)?;
+                let extracted = field_path
+                    .split('.')
+                    .try_fold(&value, |v, key| v.get(key));
+                match extracted {
+                    Some(v) if v.is_string() => {
+                        println!("{}", v.as_str().unwrap());
+                    }
+                    Some(v) => {
+                        println!("{}", serde_json::to_string_pretty(v)?);
+                    }
+                    None => {
+                        anyhow::bail!("field '{}' not found in context", field_path);
+                    }
+                }
+            } else if json {
                 println!("{}", serde_json::to_string_pretty(&ctx)?);
             } else {
                 println!("work_id:   {}", ctx.work_id);
