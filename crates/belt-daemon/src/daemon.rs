@@ -1659,17 +1659,19 @@ sources:
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
-        // Record 3 failures via mark_failed.
-        for _ in 0..3 {
+        // Record 3 failures via mark_failed using distinct work_ids so
+        // each call finds a fresh Running item.
+        for i in 0..3u32 {
             let mut item = test_item("src1", "analyze");
+            item.work_id = format!("src1:analyze-attempt-{i}");
             item.phase = QueuePhase::Running;
             daemon.push_item(item);
             daemon
-                .mark_failed("src1:analyze", "failure".into())
+                .mark_failed(&format!("src1:analyze-attempt-{i}"), "failure".into())
                 .unwrap();
         }
 
-        // Push a Completed item so mark_hitl can succeed.
+        // Push a Completed item so mark_hitl (called by apply_escalation) can succeed.
         let mut item = test_item("src1", "analyze");
         item.phase = QueuePhase::Completed;
         daemon.push_item(item);
