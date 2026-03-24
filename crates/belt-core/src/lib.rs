@@ -1,5 +1,6 @@
 pub mod action;
 pub mod context;
+pub mod dependency;
 pub mod error;
 pub mod escalation;
 pub mod phase;
