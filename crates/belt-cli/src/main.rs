@@ -717,9 +717,8 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
 
     // Load workspace config to find on_done scripts for this item's state.
     let (_, config_path, _) = db.get_workspace(&item.workspace_id)?;
-    let config = belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(
-        &config_path,
-    ))?;
+    let config =
+        belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))?;
 
     // Find the state config containing on_done scripts.
     let state_config = config
@@ -735,21 +734,26 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
         })?;
 
     if state_config.on_done.is_empty() {
-        println!("No on_done scripts configured for state '{}'. Transitioning to done.", item.state);
+        println!(
+            "No on_done scripts configured for state '{}'. Transitioning to done.",
+            item.state
+        );
         db.update_phase(work_id, QueuePhase::Done)?;
         println!("Item '{work_id}' transitioned from failed to done.");
         return Ok(());
     }
 
-    let on_done: Vec<belt_core::action::Action> =
-        state_config.on_done.iter().map(belt_core::action::Action::from).collect();
+    let on_done: Vec<belt_core::action::Action> = state_config
+        .on_done
+        .iter()
+        .map(belt_core::action::Action::from)
+        .collect();
 
     // Set up execution environment.
     let belt_home = belt_home()?;
     let worktree_base = belt_home.join("worktrees");
     let repo_path = std::path::PathBuf::from(".");
-    let worktree_mgr =
-        belt_infra::worktree::GitWorktreeManager::new(worktree_base, repo_path);
+    let worktree_mgr = belt_infra::worktree::GitWorktreeManager::new(worktree_base, repo_path);
 
     let worktree_path = worktree_mgr.create_or_reuse(work_id)?;
     let env = belt_daemon::executor::ActionEnv::new(work_id, &worktree_path);
@@ -779,7 +783,9 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
     match result {
         Some(r) if r.success() => {
             db.update_phase(work_id, QueuePhase::Done)?;
-            println!("on_done scripts succeeded. Item '{work_id}' transitioned from failed to done.");
+            println!(
+                "on_done scripts succeeded. Item '{work_id}' transitioned from failed to done."
+            );
         }
         Some(r) => {
             println!(
@@ -852,11 +858,7 @@ fn cmd_cron_add(
 }
 
 /// `belt cron update` -- update schedule and/or script of an existing cron job.
-fn cmd_cron_update(
-    name: &str,
-    schedule: Option<&str>,
-    script: Option<&str>,
-) -> anyhow::Result<()> {
+fn cmd_cron_update(name: &str, schedule: Option<&str>, script: Option<&str>) -> anyhow::Result<()> {
     if schedule.is_none() && script.is_none() {
         anyhow::bail!("at least one of --schedule or --script must be provided");
     }
@@ -1106,9 +1108,10 @@ async fn main() -> anyhow::Result<()> {
             match command {
                 WorkspaceCommands::Add { config } => {
                     let config_path = std::path::Path::new(&config);
-                    let result = belt_infra::onboarding::onboard_workspace(&db, config_path)?;
+                    let result =
+                        belt_infra::onboarding::onboard_workspace(&db, config_path, &belt_home)?;
 
-                    // Initialize claw workspace automatically
+                    // Initialize global claw workspace automatically
                     let claw_ws = claw::ClawWorkspace::init(&belt_home)?;
                     tracing::info!(path = %claw_ws.path.display(), "claw workspace initialized");
 
@@ -1126,6 +1129,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("  Config: {}", result.config_path);
                     println!("  Sources: {}", result.source_count);
                     println!("  Cron jobs seeded: {}", result.cron_jobs_seeded);
+                    println!("  Claw dir: {}", result.claw_dir.display());
                 }
                 WorkspaceCommands::List => {
                     let workspaces = db.list_workspaces()?;
@@ -1169,7 +1173,9 @@ async fn main() -> anyhow::Result<()> {
                         println!("Workspace '{}' updated.", name);
                         println!("  Config: {}", abs_path);
                     } else {
-                        println!("No update options provided. Use --config to update the config path.");
+                        println!(
+                            "No update options provided. Use --config to update the config path."
+                        );
                     }
                 }
                 WorkspaceCommands::Remove { name, force } => {
@@ -1587,11 +1593,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                     };
                     if !spec.status.can_transition_to(&target) {
-                        anyhow::bail!(
-                            "invalid transition: {} -> {}",
-                            spec.status,
-                            target
-                        );
+                        anyhow::bail!("invalid transition: {} -> {}", spec.status, target);
                     }
                     db.update_spec_status(&id, target)?;
                     match target {

@@ -638,9 +638,9 @@ impl CronHandler for GapDetectionJob {
         // no gaps. The HITL final confirmation flow will then advance to Completed.
         let mut completing_count = 0usize;
         for spec_id in &covered_spec_ids {
-            if let Err(e) =
-                self.db
-                    .update_spec_status(spec_id, belt_core::spec::SpecStatus::Completing)
+            if let Err(e) = self
+                .db
+                .update_spec_status(spec_id, belt_core::spec::SpecStatus::Completing)
             {
                 tracing::warn!(
                     spec_id = %spec_id,
