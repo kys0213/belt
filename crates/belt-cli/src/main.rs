@@ -421,6 +421,46 @@ enum CronCommands {
         #[arg(long, default_value = "text")]
         format: String,
     },
+    /// Add a new cron job.
+    Add {
+        /// Unique name for the cron job.
+        name: String,
+        /// Cron schedule expression (e.g. "0 * * * *").
+        #[arg(long)]
+        schedule: String,
+        /// Path to the script to execute.
+        #[arg(long)]
+        script: String,
+        /// Optional workspace scope.
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Update an existing cron job.
+    Update {
+        /// Name of the cron job to update.
+        name: String,
+        /// New cron schedule expression.
+        #[arg(long)]
+        schedule: Option<String>,
+        /// New script path.
+        #[arg(long)]
+        script: Option<String>,
+    },
+    /// Pause (disable) a cron job.
+    Pause {
+        /// Name of the cron job to pause.
+        name: String,
+    },
+    /// Resume (enable) a paused cron job.
+    Resume {
+        /// Name of the cron job to resume.
+        name: String,
+    },
+    /// Remove a cron job.
+    Remove {
+        /// Name of the cron job to remove.
+        name: String,
+    },
     /// Trigger a cron job immediately by resetting its last_run_at.
     Trigger {
         /// Name of the cron job to trigger.
@@ -770,6 +810,108 @@ fn cmd_cron_list(format: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `belt cron add` -- register a new cron job.
+fn cmd_cron_add(
+    name: &str,
+    schedule: &str,
+    script: &str,
+    workspace: Option<&str>,
+) -> anyhow::Result<()> {
+    validate_cron_expression(schedule)?;
+    let script_path = std::path::Path::new(script);
+    if !script_path.exists() {
+        anyhow::bail!("script not found: {script}");
+    }
+
+    let db = open_db()?;
+    db.add_cron_job(name, schedule, script, workspace)?;
+    println!("Cron job '{name}' added.");
+    Ok(())
+}
+
+/// `belt cron update` -- update schedule and/or script of an existing cron job.
+fn cmd_cron_update(
+    name: &str,
+    schedule: Option<&str>,
+    script: Option<&str>,
+) -> anyhow::Result<()> {
+    if schedule.is_none() && script.is_none() {
+        anyhow::bail!("at least one of --schedule or --script must be provided");
+    }
+
+    let db = open_db()?;
+
+    // Verify the job exists.
+    db.get_cron_job(name)?;
+
+    if let Some(sched) = schedule {
+        validate_cron_expression(sched)?;
+        db.update_cron_schedule(name, sched)?;
+    }
+    if let Some(s) = script {
+        let script_path = std::path::Path::new(s);
+        if !script_path.exists() {
+            anyhow::bail!("script not found: {s}");
+        }
+        db.update_cron_script(name, s)?;
+    }
+
+    println!("Cron job '{name}' updated.");
+    Ok(())
+}
+
+/// `belt cron pause` -- disable a cron job.
+fn cmd_cron_pause(name: &str) -> anyhow::Result<()> {
+    let db = open_db()?;
+    db.toggle_cron_job(name, false)?;
+    println!("Cron job '{name}' paused.");
+    Ok(())
+}
+
+/// `belt cron resume` -- enable a paused cron job.
+fn cmd_cron_resume(name: &str) -> anyhow::Result<()> {
+    let db = open_db()?;
+    db.toggle_cron_job(name, true)?;
+    println!("Cron job '{name}' resumed.");
+    Ok(())
+}
+
+/// `belt cron remove` -- delete a cron job.
+fn cmd_cron_remove(name: &str) -> anyhow::Result<()> {
+    let db = open_db()?;
+    db.remove_cron_job(name)?;
+    println!("Cron job '{name}' removed.");
+    Ok(())
+}
+
+/// Validate a cron expression has the correct number of fields (5).
+///
+/// This performs basic structural validation: exactly 5 space-separated fields
+/// where each field contains only valid cron characters (digits, `*`, `/`, `-`, `,`).
+fn validate_cron_expression(expr: &str) -> anyhow::Result<()> {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 5 {
+        anyhow::bail!(
+            "invalid cron expression: expected 5 fields (minute hour day month weekday), got {}",
+            fields.len()
+        );
+    }
+    for (i, field) in fields.iter().enumerate() {
+        let field_names = ["minute", "hour", "day", "month", "weekday"];
+        if !field
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '*' | '/' | '-' | ','))
+        {
+            anyhow::bail!(
+                "invalid cron expression: {} field '{}' contains invalid characters",
+                field_names[i],
+                field
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `belt cron trigger` -- reset last_run_at so the job fires on next tick.
 fn cmd_cron_trigger(name: &str) -> anyhow::Result<()> {
     let db = open_db()?;
@@ -1043,6 +1185,30 @@ async fn main() -> anyhow::Result<()> {
         Commands::Cron { command } => match command {
             CronCommands::List { format } => {
                 cmd_cron_list(&format)?;
+            }
+            CronCommands::Add {
+                name,
+                schedule,
+                script,
+                workspace,
+            } => {
+                cmd_cron_add(&name, &schedule, &script, workspace.as_deref())?;
+            }
+            CronCommands::Update {
+                name,
+                schedule,
+                script,
+            } => {
+                cmd_cron_update(&name, schedule.as_deref(), script.as_deref())?;
+            }
+            CronCommands::Pause { name } => {
+                cmd_cron_pause(&name)?;
+            }
+            CronCommands::Resume { name } => {
+                cmd_cron_resume(&name)?;
+            }
+            CronCommands::Remove { name } => {
+                cmd_cron_remove(&name)?;
             }
             CronCommands::Trigger { name } => {
                 cmd_cron_trigger(&name)?;
