@@ -472,6 +472,73 @@ pub fn builtin_jobs(deps: BuiltinJobDeps) -> Vec<CronJobDef> {
 }
 
 // ---------------------------------------------------------------------------
+// Per-workspace cron seed
+// ---------------------------------------------------------------------------
+
+/// Seed built-in cron jobs for a specific workspace.
+///
+/// Creates workspace-scoped instances of the standard jobs with the
+/// intervals specified in the issue requirements:
+/// - `HitlTimeoutJob` — every 1 hour
+/// - `DailyReportJob` — every 24 hours
+/// - `LogCleanupJob` — every 6 hours
+/// - `EvaluateJob` — every 60 seconds
+///
+/// The `deps` parameter provides the shared dependencies (DB, worktree manager,
+/// belt home, workspace name) used to initialise each job handler.
+pub fn seed_workspace_crons(engine: &mut CronEngine, workspace: &str, deps: BuiltinJobDeps) {
+    let ws = workspace.to_string();
+
+    engine.register(CronJobDef {
+        name: format!("{ws}:hitl_timeout"),
+        schedule: CronSchedule::Interval(Duration::from_secs(3600)),
+        workspace: Some(ws.clone()),
+        enabled: true,
+        last_run_at: None,
+        handler: Box::new(HitlTimeoutJob {
+            db: Arc::clone(&deps.db),
+            worktree_mgr: Arc::clone(&deps.worktree_mgr),
+        }),
+    });
+
+    engine.register(CronJobDef {
+        name: format!("{ws}:daily_report"),
+        schedule: CronSchedule::Interval(Duration::from_secs(86400)),
+        workspace: Some(ws.clone()),
+        enabled: true,
+        last_run_at: None,
+        handler: Box::new(DailyReportJob {
+            db: Arc::clone(&deps.db),
+        }),
+    });
+
+    engine.register(CronJobDef {
+        name: format!("{ws}:log_cleanup"),
+        schedule: CronSchedule::Interval(Duration::from_secs(21600)),
+        workspace: Some(ws.clone()),
+        enabled: true,
+        last_run_at: None,
+        handler: Box::new(LogCleanupJob {
+            db: Arc::clone(&deps.db),
+            worktree_mgr: Arc::clone(&deps.worktree_mgr),
+        }),
+    });
+
+    engine.register(CronJobDef {
+        name: format!("{ws}:evaluate"),
+        schedule: CronSchedule::Interval(Duration::from_secs(60)),
+        workspace: Some(ws.clone()),
+        enabled: true,
+        last_run_at: None,
+        handler: Box::new(EvaluateJob {
+            db: deps.db,
+            belt_home: deps.belt_home,
+            workspace: ws,
+        }),
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -836,5 +903,61 @@ mod tests {
         let ctx = CronContext { now: Utc::now() };
         // Should return Ok when there are no completed items (early return).
         job.execute(&ctx).unwrap();
+    }
+
+    // -- seed_workspace_crons tests --
+
+    #[test]
+    fn seed_workspace_crons_registers_four_jobs() {
+        let mut engine = CronEngine::new();
+        let deps = make_test_deps();
+        seed_workspace_crons(&mut engine, "my-project", deps);
+        assert_eq!(engine.job_count(), 4);
+    }
+
+    #[test]
+    fn seed_workspace_crons_names_are_scoped() {
+        let mut engine = CronEngine::new();
+        let deps = make_test_deps();
+        seed_workspace_crons(&mut engine, "auth", deps);
+
+        // Verify all job names are workspace-scoped.
+        let names: Vec<&str> = engine.jobs.iter().map(|j| j.name.as_str()).collect();
+        assert!(names.contains(&"auth:hitl_timeout"));
+        assert!(names.contains(&"auth:daily_report"));
+        assert!(names.contains(&"auth:log_cleanup"));
+        assert!(names.contains(&"auth:evaluate"));
+    }
+
+    #[test]
+    fn seed_workspace_crons_sets_workspace_field() {
+        let mut engine = CronEngine::new();
+        let deps = make_test_deps();
+        seed_workspace_crons(&mut engine, "billing", deps);
+
+        for job in &engine.jobs {
+            assert_eq!(job.workspace.as_deref(), Some("billing"));
+        }
+    }
+
+    #[test]
+    fn seed_workspace_crons_multiple_workspaces_coexist() {
+        let mut engine = CronEngine::new();
+        let deps1 = make_test_deps();
+        let deps2 = make_test_deps();
+        seed_workspace_crons(&mut engine, "alpha", deps1);
+        seed_workspace_crons(&mut engine, "beta", deps2);
+        assert_eq!(engine.job_count(), 8);
+    }
+
+    #[test]
+    fn seed_workspace_crons_idempotent() {
+        let mut engine = CronEngine::new();
+        let deps1 = make_test_deps();
+        let deps2 = make_test_deps();
+        seed_workspace_crons(&mut engine, "ws", deps1);
+        seed_workspace_crons(&mut engine, "ws", deps2);
+        // register() replaces by name, so should still be 4.
+        assert_eq!(engine.job_count(), 4);
     }
 }
