@@ -1126,12 +1126,51 @@ async fn main() -> anyhow::Result<()> {
                     ?notes,
                     "responding to HITL item"
                 );
-                // TODO: wire to daemon/DB to apply the respond action
-                println!("HITL respond: item={item_id} action={action}");
+                let db = open_db()?;
+                // Verify the item exists and is in HITL phase.
+                let item = db.get_item(&item_id)?;
+                if item.phase != QueuePhase::Hitl {
+                    anyhow::bail!(
+                        "item '{}' is in phase '{}', not 'hitl'",
+                        item_id,
+                        item.phase
+                    );
+                }
+                let target_phase = match action {
+                    belt_core::queue::HitlRespondAction::Done => QueuePhase::Done,
+                    belt_core::queue::HitlRespondAction::Retry => QueuePhase::Pending,
+                    belt_core::queue::HitlRespondAction::Skip => QueuePhase::Skipped,
+                    belt_core::queue::HitlRespondAction::Replan => QueuePhase::Failed,
+                };
+                db.update_phase(&item_id, target_phase)?;
+                println!(
+                    "Item '{}' transitioned from hitl to {} (action: {}).",
+                    item_id, target_phase, action
+                );
             }
             HitlCommands::List { workspace } => {
                 tracing::info!(?workspace, "listing HITL items...");
-                // TODO: wire to DB to list HITL items
+                let db = open_db()?;
+                let items = db.list_items(Some(QueuePhase::Hitl), workspace.as_deref())?;
+                if items.is_empty() {
+                    println!("No items awaiting human review.");
+                } else {
+                    println!(
+                        "{:<40} {:<20} {:<12} TITLE",
+                        "WORK_ID", "WORKSPACE", "STATE"
+                    );
+                    println!("{}", "-".repeat(80));
+                    for item in &items {
+                        println!(
+                            "{:<40} {:<20} {:<12} {}",
+                            item.work_id,
+                            item.workspace_id,
+                            item.state,
+                            item.title.as_deref().unwrap_or("-"),
+                        );
+                    }
+                    println!("\n{} item(s) awaiting review.", items.len());
+                }
             }
         },
 
