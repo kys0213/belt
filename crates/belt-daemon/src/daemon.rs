@@ -19,6 +19,7 @@ use belt_infra::db::Database;
 use belt_infra::worktree::WorktreeManager;
 
 use crate::concurrency::ConcurrencyTracker;
+use crate::cron::{CronEngine, builtin_jobs};
 use crate::evaluator::Evaluator;
 use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
 
@@ -51,6 +52,8 @@ pub struct Daemon {
     /// History events with full lineage information for failure tracking.
     history_events: Vec<HistoryEvent>,
     evaluator: Evaluator,
+    /// Cron engine for periodic background jobs (HITL timeout, cleanup, etc.).
+    cron_engine: CronEngine,
     /// Graceful shutdown 플래그. true이면 새 아이템 수집을 중단한다.
     shutdown_requested: bool,
     /// Evaluator 스크립트 실행을 위한 Belt home 디렉토리.
@@ -98,6 +101,10 @@ impl Daemon {
         max_concurrent: u32,
     ) -> Self {
         let evaluator = Evaluator::new(&config.name);
+        let mut cron_engine = CronEngine::new();
+        for job in builtin_jobs() {
+            cron_engine.register(job);
+        }
         Self {
             config,
             sources,
@@ -109,6 +116,7 @@ impl Daemon {
             db: None,
             history_events: Vec::new(),
             evaluator,
+            cron_engine,
             shutdown_requested: false,
             belt_home: PathBuf::from(
                 std::env::var("BELT_HOME").unwrap_or_else(|_| ".belt".to_string()),
@@ -713,6 +721,9 @@ impl Daemon {
 
         // Evaluator로 Completed 아이템 평가 (Done vs HITL).
         self.evaluate_completed().await;
+
+        // Cron jobs: HITL timeout, daily report, log cleanup, evaluate 등.
+        self.cron_engine.tick();
 
         Ok(())
     }
