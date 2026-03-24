@@ -614,33 +614,130 @@ impl CronHandler for GapDetectionJob {
     }
 }
 
-/// Extracts knowledge from recently merged PRs (CR-08).
+/// Extracts knowledge from completed (Done) queue items (CR-08).
 ///
-/// Runs every hour. Queries merged PRs since the last run, extracts
-/// decisions, patterns, domain knowledge, and review feedback, then
-/// persists them to the `knowledge_base` DB table.
-pub struct KnowledgeExtractionJob;
+/// Runs every hour. Queries items in the `Done` phase, checks whether
+/// knowledge has already been extracted for each item (via `source_ref`
+/// deduplication), and persists new [`KnowledgeEntry`] rows to the
+/// `knowledge_base` table.
+///
+/// Knowledge is categorised into:
+/// - **decision**: items whose title or state suggests a decision was made
+/// - **pattern**: items related to implementation patterns
+/// - **domain**: general domain knowledge from the item context
+///
+/// [`KnowledgeEntry`]: belt_infra::db::KnowledgeEntry
+pub struct KnowledgeExtractionJob {
+    db: Arc<Database>,
+}
+
+impl KnowledgeExtractionJob {
+    /// Create a new `KnowledgeExtractionJob`.
+    pub fn new(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+}
+
+/// Keywords that signal a "decision" category.
+const DECISION_KEYWORDS: &[&str] = &[
+    "decided", "agreed", "chose", "choose", "decision", "approve", "reject",
+];
+
+/// Keywords that signal a "pattern" category.
+const PATTERN_KEYWORDS: &[&str] = &[
+    "pattern", "refactor", "abstraction", "convention", "template", "reusable",
+];
+
+/// Classify an item into a knowledge category based on its title and state.
+///
+/// Returns `"decision"` if title contains decision keywords, `"pattern"` if it
+/// contains pattern keywords, or `"domain"` as the default category.
+fn classify_knowledge_category(title: &str, state: &str) -> &'static str {
+    let haystack = format!("{} {}", title.to_lowercase(), state.to_lowercase());
+    if DECISION_KEYWORDS
+        .iter()
+        .any(|kw| haystack.contains(kw))
+    {
+        return "decision";
+    }
+    if PATTERN_KEYWORDS.iter().any(|kw| haystack.contains(kw)) {
+        return "pattern";
+    }
+    "domain"
+}
 
 impl CronHandler for KnowledgeExtractionJob {
-    fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
-        tracing::info!("KnowledgeExtractionJob: scanning recently merged PRs for knowledge");
+    fn execute(&self, ctx: &CronContext) -> Result<(), BeltError> {
+        tracing::info!("KnowledgeExtractionJob: scanning completed items for knowledge");
 
-        // Step 1 – Query recently merged PRs via `gh pr list --state merged`.
-        //          The time window is anchored to `last_run_at` of this job.
+        // Step 1: Query all Done items.
+        let done_items = self.db.list_items(Some(QueuePhase::Done), None)?;
 
-        // Step 2 – For each PR, extract knowledge:
-        //          - Decisions: comments containing "decided", "agreed", "chose"
-        //          - Patterns: code changes that establish reusable patterns
-        //          - Domain knowledge: PR body and linked issue descriptions
-        //          - Review feedback: review comments and requested changes
+        if done_items.is_empty() {
+            tracing::info!("KnowledgeExtractionJob: no Done items found, nothing to extract");
+            return Ok(());
+        }
 
-        // Step 3 – Persist extracted entries to `knowledge_base` via Database.
+        tracing::info!(
+            count = done_items.len(),
+            "KnowledgeExtractionJob: found Done items"
+        );
 
-        // TODO: call `gh pr list --state merged --json ...` for recent PRs
-        // TODO: implement keyword-based knowledge extraction from PR data
-        // TODO: persist KnowledgeEntry rows via Database::insert_knowledge
+        let mut extracted_count = 0u32;
+        let mut skipped_count = 0u32;
 
-        tracing::info!("KnowledgeExtractionJob: completed knowledge extraction");
+        for item in &done_items {
+            // Step 2: Deduplicate — skip items whose source_ref already exists.
+            let source_ref = &item.source_id;
+            let existing = self.db.get_knowledge_by_source(source_ref)?;
+            if !existing.is_empty() {
+                skipped_count += 1;
+                continue;
+            }
+
+            // Step 3: Classify and extract knowledge content.
+            let title = item.title.as_deref().unwrap_or(&item.work_id);
+            let category = classify_knowledge_category(title, &item.state);
+            let content = format!(
+                "Completed work item: {} (state: {}, workspace: {})",
+                title, item.state, item.workspace_id,
+            );
+
+            let entry = belt_infra::db::KnowledgeEntry {
+                id: None,
+                workspace: item.workspace_id.clone(),
+                source_ref: source_ref.clone(),
+                category: category.to_string(),
+                content,
+                created_at: ctx.now.to_rfc3339(),
+            };
+
+            // Step 4: Persist.
+            match self.db.insert_knowledge(&entry) {
+                Ok(()) => {
+                    extracted_count += 1;
+                    tracing::info!(
+                        source_ref = %source_ref,
+                        category = %category,
+                        "KnowledgeExtractionJob: extracted knowledge entry"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        source_ref = %source_ref,
+                        error = %e,
+                        "KnowledgeExtractionJob: failed to persist knowledge entry"
+                    );
+                }
+            }
+        }
+
+        tracing::info!(
+            total_done = done_items.len(),
+            extracted = extracted_count,
+            skipped = skipped_count,
+            "KnowledgeExtractionJob: completed knowledge extraction"
+        );
         Ok(())
     }
 }
@@ -828,7 +925,7 @@ pub fn builtin_jobs(deps: BuiltinJobDeps) -> Vec<CronJobDef> {
             workspace: None,
             enabled: true,
             last_run_at: None,
-            handler: Box::new(KnowledgeExtractionJob),
+            handler: Box::new(KnowledgeExtractionJob::new(Arc::clone(&deps.db))),
         },
     ]
 }
@@ -893,6 +990,15 @@ pub fn seed_workspace_crons(engine: &mut CronEngine, workspace: &str, deps: Buil
         enabled: true,
         last_run_at: None,
         handler: Box::new(EvaluateJob),
+    });
+
+    engine.register(CronJobDef {
+        name: format!("{ws}:knowledge_extraction"),
+        schedule: CronSchedule::Interval(Duration::from_secs(3600)),
+        workspace: Some(ws.clone()),
+        enabled: true,
+        last_run_at: None,
+        handler: Box::new(KnowledgeExtractionJob::new(Arc::clone(&deps.db))),
     });
 }
 
@@ -1238,9 +1344,109 @@ mod tests {
 
     #[test]
     fn knowledge_extraction_job_executes_successfully() {
-        let job = KnowledgeExtractionJob;
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let job = KnowledgeExtractionJob::new(Arc::clone(&db));
         let ctx = CronContext { now: Utc::now() };
         assert!(job.execute(&ctx).is_ok());
+    }
+
+    #[test]
+    fn knowledge_extraction_extracts_from_done_items() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+
+        // Insert a Done item.
+        let mut item = belt_core::queue::QueueItem::new(
+            "w1".into(),
+            "s1".into(),
+            "ws".into(),
+            "implement".into(),
+        );
+        item.title = Some("implement authentication handler".to_string());
+        item.phase = QueuePhase::Done;
+        db.insert_item(&item).unwrap();
+
+        let job = KnowledgeExtractionJob::new(Arc::clone(&db));
+        let ctx = CronContext { now: Utc::now() };
+        assert!(job.execute(&ctx).is_ok());
+
+        // Verify knowledge was extracted.
+        let entries = db.get_knowledge_by_source("s1").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].workspace, "ws");
+        assert_eq!(entries[0].category, "domain");
+        assert!(entries[0].content.contains("authentication handler"));
+    }
+
+    #[test]
+    fn knowledge_extraction_deduplicates() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+
+        let mut item = belt_core::queue::QueueItem::new(
+            "w1".into(),
+            "s1".into(),
+            "ws".into(),
+            "implement".into(),
+        );
+        item.title = Some("implement feature".to_string());
+        item.phase = QueuePhase::Done;
+        db.insert_item(&item).unwrap();
+
+        let job = KnowledgeExtractionJob::new(Arc::clone(&db));
+        let ctx = CronContext { now: Utc::now() };
+
+        // Execute twice.
+        job.execute(&ctx).unwrap();
+        job.execute(&ctx).unwrap();
+
+        // Should still have only one entry.
+        let entries = db.get_knowledge_by_source("s1").unwrap();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn knowledge_extraction_classifies_decisions() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+
+        let mut item = belt_core::queue::QueueItem::new(
+            "w1".into(),
+            "s1".into(),
+            "ws".into(),
+            "implement".into(),
+        );
+        item.title = Some("decided to use JWT for authentication".to_string());
+        item.phase = QueuePhase::Done;
+        db.insert_item(&item).unwrap();
+
+        let job = KnowledgeExtractionJob::new(Arc::clone(&db));
+        let ctx = CronContext { now: Utc::now() };
+        job.execute(&ctx).unwrap();
+
+        let entries = db.get_knowledge_by_source("s1").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].category, "decision");
+    }
+
+    #[test]
+    fn knowledge_extraction_classifies_patterns() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+
+        let mut item = belt_core::queue::QueueItem::new(
+            "w1".into(),
+            "s1".into(),
+            "ws".into(),
+            "refactor".into(),
+        );
+        item.title = Some("refactor auth module to use new pattern".to_string());
+        item.phase = QueuePhase::Done;
+        db.insert_item(&item).unwrap();
+
+        let job = KnowledgeExtractionJob::new(Arc::clone(&db));
+        let ctx = CronContext { now: Utc::now() };
+        job.execute(&ctx).unwrap();
+
+        let entries = db.get_knowledge_by_source("s1").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].category, "pattern");
     }
 
     #[test]
@@ -1401,11 +1607,11 @@ mod tests {
     // -- seed_workspace_crons tests --
 
     #[test]
-    fn seed_workspace_crons_registers_four_jobs() {
+    fn seed_workspace_crons_registers_five_jobs() {
         let mut engine = CronEngine::new();
         let deps = make_test_deps();
         seed_workspace_crons(&mut engine, "my-project", deps);
-        assert_eq!(engine.job_count(), 4);
+        assert_eq!(engine.job_count(), 5);
     }
 
     #[test]
@@ -1420,6 +1626,7 @@ mod tests {
         assert!(names.contains(&"auth:daily_report"));
         assert!(names.contains(&"auth:log_cleanup"));
         assert!(names.contains(&"auth:evaluate"));
+        assert!(names.contains(&"auth:knowledge_extraction"));
     }
 
     #[test]
@@ -1440,7 +1647,7 @@ mod tests {
         let deps2 = make_test_deps();
         seed_workspace_crons(&mut engine, "alpha", deps1);
         seed_workspace_crons(&mut engine, "beta", deps2);
-        assert_eq!(engine.job_count(), 8);
+        assert_eq!(engine.job_count(), 10);
     }
 
     #[test]
@@ -1450,7 +1657,7 @@ mod tests {
         let deps2 = make_test_deps();
         seed_workspace_crons(&mut engine, "ws", deps1);
         seed_workspace_crons(&mut engine, "ws", deps2);
-        // register() replaces by name, so should still be 4.
-        assert_eq!(engine.job_count(), 4);
+        // register() replaces by name, so should still be 5.
+        assert_eq!(engine.job_count(), 5);
     }
 }
