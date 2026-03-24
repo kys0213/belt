@@ -211,7 +211,9 @@ impl Database {
                 hitl_created_at  TEXT,
                 hitl_respondent  TEXT,
                 hitl_notes       TEXT,
-                hitl_reason      TEXT
+                hitl_reason          TEXT,
+                hitl_timeout_at      TEXT,
+                hitl_terminal_action TEXT
             );
 
             CREATE TABLE IF NOT EXISTS history (
@@ -307,8 +309,8 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.execute(
-            "INSERT INTO queue_items (work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO queue_items (work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 item.work_id,
                 item.source_id,
@@ -322,6 +324,8 @@ impl Database {
                 item.hitl_respondent,
                 item.hitl_notes,
                 item.hitl_reason.map(|r| r.to_string()),
+                item.hitl_timeout_at,
+                item.hitl_terminal_action,
             ],
         )
         .map_err(|e| BeltError::Database(e.to_string()))?;
@@ -405,6 +409,57 @@ impl Database {
         Ok(work_ids)
     }
 
+    /// Set HITL timeout on a queue item.
+    ///
+    /// Stores `hitl_timeout_at` (the absolute expiry time) and an optional
+    /// `terminal_action` (skip/failed/replan) to apply when the timeout fires.
+    ///
+    /// # Errors
+    /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
+    pub fn set_hitl_timeout(
+        &self,
+        work_id: &str,
+        timeout_at: &str,
+        terminal_action: Option<&str>,
+    ) -> Result<(), BeltError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "UPDATE queue_items SET hitl_timeout_at = ?1, hitl_terminal_action = ?2, updated_at = ?3 WHERE work_id = ?4",
+                params![timeout_at, terminal_action, now, work_id],
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        if rows == 0 {
+            return Err(BeltError::ItemNotFound(work_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// List HITL items that have a timeout set and are pending expiry.
+    ///
+    /// Returns items where `hitl_timeout_at` is set and the item is still in HITL phase.
+    pub fn list_hitl_items_with_timeout(&self) -> Result<Vec<QueueItem>, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action FROM queue_items WHERE phase = 'hitl' AND hitl_timeout_at IS NOT NULL",
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let items = stmt
+            .query_map([], |row| Ok(row_to_queue_item(row)))
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        items.into_iter().collect::<Result<Vec<_>, _>>()
+    }
+
     /// Retrieve a single queue item by `work_id`.
     ///
     /// # Errors
@@ -415,7 +470,7 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.query_row(
-            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason
+            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action
                  FROM queue_items WHERE work_id = ?1",
             params![work_id],
             |row| Ok(row_to_queue_item(row)),
@@ -439,7 +494,7 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let mut sql = String::from(
-            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason FROM queue_items WHERE 1=1",
+            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action FROM queue_items WHERE 1=1",
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -1555,7 +1610,7 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> Result<Spec, BeltError> {
 ///
 /// Column order must match:
 /// `work_id, source_id, workspace_id, state, phase, title, created_at, updated_at,
-///  hitl_created_at, hitl_respondent, hitl_notes, hitl_reason`
+///  hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action`
 fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
     let phase_str: String = row.get(4).map_err(|e| BeltError::Database(e.to_string()))?;
     let hitl_reason_str: Option<String> = row
@@ -1587,6 +1642,12 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
             .get(10)
             .map_err(|e| BeltError::Database(e.to_string()))?,
         hitl_reason,
+        hitl_timeout_at: row
+            .get(12)
+            .map_err(|e| BeltError::Database(e.to_string()))?,
+        hitl_terminal_action: row
+            .get(13)
+            .map_err(|e| BeltError::Database(e.to_string()))?,
         worktree_preserved: false,
     })
 }
@@ -1613,6 +1674,8 @@ mod tests {
             hitl_respondent: None,
             hitl_notes: None,
             hitl_reason: None,
+            hitl_timeout_at: None,
+            hitl_terminal_action: None,
             worktree_preserved: false,
         }
     }
@@ -2358,6 +2421,55 @@ mod tests {
         assert_eq!(expired[0], old_item.work_id);
     }
 
+    #[test]
+    fn set_hitl_timeout_updates_item() {
+        let db = test_db();
+        let mut item = sample_item();
+        item.phase = QueuePhase::Hitl;
+        db.insert_item(&item).unwrap();
+
+        let timeout_at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        db.set_hitl_timeout(&item.work_id, &timeout_at, Some("skip"))
+            .unwrap();
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert_eq!(
+            fetched.hitl_timeout_at.as_deref(),
+            Some(timeout_at.as_str())
+        );
+        assert_eq!(fetched.hitl_terminal_action.as_deref(), Some("skip"));
+    }
+
+    #[test]
+    fn set_hitl_timeout_not_found() {
+        let db = test_db();
+        let result = db.set_hitl_timeout("nonexistent", "2026-01-01T00:00:00Z", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn list_hitl_items_with_timeout_returns_matching() {
+        let db = test_db();
+
+        // Item with timeout set.
+        let mut item1 = sample_item();
+        item1.work_id = "w-timeout".to_string();
+        item1.phase = QueuePhase::Hitl;
+        item1.hitl_timeout_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        item1.hitl_terminal_action = Some("skip".to_string());
+        db.insert_item(&item1).unwrap();
+
+        // Item without timeout.
+        let mut item2 = sample_item();
+        item2.work_id = "w-no-timeout".to_string();
+        item2.phase = QueuePhase::Hitl;
+        db.insert_item(&item2).unwrap();
+
+        let items = db.list_hitl_items_with_timeout().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].work_id, "w-timeout");
+    }
+
     // ---- Transition Events tests -------------------------------------------
 
     #[test]
@@ -2431,5 +2543,4 @@ mod tests {
         assert_eq!(pending, Some(2));
         assert_eq!(running, Some(1));
     }
-
 }

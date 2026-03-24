@@ -107,7 +107,8 @@ sources:
     #[test]
     fn load_minimal_config_applies_defaults() {
         // Only `name` and one source `url` are required; everything else should default.
-        let yaml = "name: minimal-project\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let yaml =
+            "name: minimal-project\nsources:\n  github:\n    url: https://github.com/org/repo\n";
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
 

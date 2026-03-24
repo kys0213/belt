@@ -248,36 +248,59 @@ impl CronHandler for HitlTimeoutJob {
         let mut expired_count = 0u32;
 
         for item in &hitl_items {
-            let updated = DateTime::parse_from_rfc3339(&item.updated_at)
-                .map(|dt| dt.with_timezone(&Utc))
-                .unwrap_or(ctx.now);
+            // Check per-item timeout first (set via `belt hitl timeout set`).
+            let is_expired = if let Some(ref timeout_at_str) = item.hitl_timeout_at {
+                DateTime::parse_from_rfc3339(timeout_at_str)
+                    .map(|dt| dt.with_timezone(&Utc) <= ctx.now)
+                    .unwrap_or(false)
+            } else {
+                // Fall back to global timeout based on updated_at.
+                let updated = DateTime::parse_from_rfc3339(&item.updated_at)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .unwrap_or(ctx.now);
+                updated < threshold
+            };
 
-            if updated < threshold {
-                if let Err(e) = self.db.update_phase(&item.work_id, QueuePhase::Failed) {
-                    tracing::warn!(
-                        work_id = %item.work_id,
-                        error = %e,
-                        "failed to expire HITL item"
-                    );
-                    continue;
-                }
+            if !is_expired {
+                continue;
+            }
 
-                // Clean up the associated worktree.
-                if let Err(e) = self.worktree_mgr.cleanup(&item.work_id) {
-                    tracing::warn!(
-                        work_id = %item.work_id,
-                        error = %e,
-                        "failed to cleanup worktree for expired HITL item"
-                    );
-                }
+            // Determine target phase from per-item terminal action, or default to Failed.
+            let target_phase = match item.hitl_terminal_action.as_deref() {
+                Some("skip") => QueuePhase::Skipped,
+                Some("replan") => QueuePhase::Failed,
+                Some("failed") => QueuePhase::Failed,
+                _ => QueuePhase::Failed,
+            };
 
-                expired_count += 1;
-                tracing::info!(
+            if let Err(e) = self.db.update_phase(&item.work_id, target_phase) {
+                tracing::warn!(
                     work_id = %item.work_id,
-                    "HITL item expired after {} seconds, transitioned to Failed",
-                    self.timeout_secs
+                    error = %e,
+                    "failed to expire HITL item"
+                );
+                continue;
+            }
+
+            // Clean up the associated worktree for terminal phases.
+            if target_phase == QueuePhase::Skipped
+                && let Err(e) = self.worktree_mgr.cleanup(&item.work_id)
+            {
+                tracing::warn!(
+                    work_id = %item.work_id,
+                    error = %e,
+                    "failed to cleanup worktree for expired HITL item"
                 );
             }
+
+            expired_count += 1;
+            tracing::info!(
+                work_id = %item.work_id,
+                target_phase = %target_phase,
+                terminal_action = ?item.hitl_terminal_action,
+                "HITL item expired, transitioned to {}",
+                target_phase
+            );
         }
 
         tracing::info!(
@@ -1334,6 +1357,74 @@ mod tests {
         // Recent item should still be Hitl.
         let still_hitl = db.get_item("w2").unwrap();
         assert_eq!(still_hitl.phase, QueuePhase::Hitl);
+    }
+
+    #[test]
+    fn hitl_timeout_uses_per_item_timeout_at() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
+
+        // Item with per-item timeout in the past (should expire).
+        let mut item = belt_core::queue::QueueItem::new(
+            "w-expired".into(),
+            "s1".into(),
+            "ws".into(),
+            "st".into(),
+        );
+        item.phase = QueuePhase::Hitl;
+        item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339());
+        item.hitl_terminal_action = Some("skip".to_string());
+        db.insert_item(&item).unwrap();
+
+        // Item with per-item timeout in the future (should NOT expire).
+        let mut future_item = belt_core::queue::QueueItem::new(
+            "w-future".into(),
+            "s2".into(),
+            "ws".into(),
+            "st".into(),
+        );
+        future_item.phase = QueuePhase::Hitl;
+        future_item.hitl_timeout_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
+        future_item.hitl_terminal_action = Some("failed".to_string());
+        db.insert_item(&future_item).unwrap();
+
+        let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr);
+        let ctx = CronContext { now: Utc::now() };
+        job.execute(&ctx).unwrap();
+
+        // Expired item should be Skipped (per its terminal action).
+        let expired = db.get_item("w-expired").unwrap();
+        assert_eq!(expired.phase, QueuePhase::Skipped);
+
+        // Future item should still be Hitl.
+        let still_hitl = db.get_item("w-future").unwrap();
+        assert_eq!(still_hitl.phase, QueuePhase::Hitl);
+    }
+
+    #[test]
+    fn hitl_timeout_terminal_action_failed() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
+
+        let mut item =
+            belt_core::queue::QueueItem::new("w1".into(), "s1".into(), "ws".into(), "st".into());
+        item.phase = QueuePhase::Hitl;
+        item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
+        item.hitl_terminal_action = Some("failed".to_string());
+        db.insert_item(&item).unwrap();
+
+        let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr);
+        let ctx = CronContext { now: Utc::now() };
+        job.execute(&ctx).unwrap();
+
+        let updated = db.get_item("w1").unwrap();
+        assert_eq!(updated.phase, QueuePhase::Failed);
     }
 
     #[test]
