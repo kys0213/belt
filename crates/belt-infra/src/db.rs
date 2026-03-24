@@ -3,6 +3,7 @@
 //! Provides CRUD operations for queue items, history events, workspaces,
 //! cron jobs, and token usage — all backed by a single SQLite database.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
@@ -75,6 +76,40 @@ pub struct TokenUsageRow {
     pub duration_ms: Option<u64>,
     /// Timestamp when the usage was recorded.
     pub created_at: DateTime<Utc>,
+}
+
+/// Per-model aggregated statistics from the `token_usage` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelStats {
+    /// Model identifier.
+    pub model: String,
+    /// Total input tokens consumed by this model.
+    pub input_tokens: u64,
+    /// Total output tokens produced by this model.
+    pub output_tokens: u64,
+    /// Combined input + output tokens for this model.
+    pub total_tokens: u64,
+    /// Number of invocations recorded for this model.
+    pub executions: u64,
+    /// Average wall-clock duration in milliseconds (only from rows that have a value).
+    pub avg_duration_ms: Option<f64>,
+}
+
+/// Aggregated runtime statistics across all models.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeStats {
+    /// Total input tokens across all models.
+    pub total_tokens_input: u64,
+    /// Total output tokens across all models.
+    pub total_tokens_output: u64,
+    /// Grand total of input + output tokens.
+    pub total_tokens: u64,
+    /// Total number of runtime invocations.
+    pub executions: u64,
+    /// Average wall-clock duration in milliseconds across all invocations.
+    pub avg_duration_ms: Option<f64>,
+    /// Per-model breakdown.
+    pub by_model: HashMap<String, ModelStats>,
 }
 
 /// SQLite-backed persistence for Belt state.
@@ -683,20 +718,22 @@ impl Database {
             .map_err(|e| BeltError::Database(e.to_string()))?;
 
         rows.into_iter()
-            .map(|(wid, ws, rt, model, input, output, cache_read, cache_write, dur, created)| {
-                Ok(TokenUsageRow {
-                    work_id: wid,
-                    workspace: ws,
-                    runtime: rt,
-                    model,
-                    input_tokens: input as u64,
-                    output_tokens: output as u64,
-                    cache_read_tokens: cache_read.map(|v| v as u64),
-                    cache_write_tokens: cache_write.map(|v| v as u64),
-                    duration_ms: dur.map(|d| d as u64),
-                    created_at: parse_datetime(&created)?,
-                })
-            })
+            .map(
+                |(wid, ws, rt, model, input, output, cache_read, cache_write, dur, created)| {
+                    Ok(TokenUsageRow {
+                        work_id: wid,
+                        workspace: ws,
+                        runtime: rt,
+                        model,
+                        input_tokens: input as u64,
+                        output_tokens: output as u64,
+                        cache_read_tokens: cache_read.map(|v| v as u64),
+                        cache_write_tokens: cache_write.map(|v| v as u64),
+                        duration_ms: dur.map(|d| d as u64),
+                        created_at: parse_datetime(&created)?,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -739,21 +776,111 @@ impl Database {
             .map_err(|e| BeltError::Database(e.to_string()))?;
 
         rows.into_iter()
-            .map(|(wid, ws, rt, model, input, output, cache_read, cache_write, dur, created)| {
-                Ok(TokenUsageRow {
-                    work_id: wid,
-                    workspace: ws,
-                    runtime: rt,
-                    model,
-                    input_tokens: input as u64,
-                    output_tokens: output as u64,
-                    cache_read_tokens: cache_read.map(|v| v as u64),
-                    cache_write_tokens: cache_write.map(|v| v as u64),
-                    duration_ms: dur.map(|d| d as u64),
-                    created_at: parse_datetime(&created)?,
-                })
-            })
+            .map(
+                |(wid, ws, rt, model, input, output, cache_read, cache_write, dur, created)| {
+                    Ok(TokenUsageRow {
+                        work_id: wid,
+                        workspace: ws,
+                        runtime: rt,
+                        model,
+                        input_tokens: input as u64,
+                        output_tokens: output as u64,
+                        cache_read_tokens: cache_read.map(|v| v as u64),
+                        cache_write_tokens: cache_write.map(|v| v as u64),
+                        duration_ms: dur.map(|d| d as u64),
+                        created_at: parse_datetime(&created)?,
+                    })
+                },
+            )
             .collect()
+    }
+
+    /// Aggregate runtime statistics from the last 24 hours, grouped by model.
+    ///
+    /// Returns overall totals and a per-model breakdown of token usage,
+    /// execution count, and average duration.
+    pub fn get_runtime_stats(&self) -> Result<RuntimeStats, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let cutoff = (Utc::now() - chrono::Duration::hours(24)).to_rfc3339();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT model,
+                        SUM(input_tokens)  AS total_input,
+                        SUM(output_tokens) AS total_output,
+                        COUNT(*)           AS exec_count,
+                        AVG(duration_ms)   AS avg_dur
+                 FROM token_usage
+                 WHERE created_at >= ?1
+                 GROUP BY model
+                 ORDER BY model",
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let model_rows = stmt
+            .query_map(params![cutoff], |row| {
+                let model: String = row.get(0)?;
+                let input: i64 = row.get(1)?;
+                let output: i64 = row.get(2)?;
+                let count: i64 = row.get(3)?;
+                let avg_dur: Option<f64> = row.get(4)?;
+                Ok((model, input, output, count, avg_dur))
+            })
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let mut total_input: u64 = 0;
+        let mut total_output: u64 = 0;
+        let mut total_executions: u64 = 0;
+        let mut duration_sum: f64 = 0.0;
+        let mut duration_count: u64 = 0;
+        let mut by_model = HashMap::new();
+
+        for (model, input, output, count, avg_dur) in model_rows {
+            let inp = input as u64;
+            let out = output as u64;
+            let cnt = count as u64;
+            total_input += inp;
+            total_output += out;
+            total_executions += cnt;
+
+            if let Some(d) = avg_dur {
+                duration_sum += d * cnt as f64;
+                duration_count += cnt;
+            }
+
+            by_model.insert(
+                model.clone(),
+                ModelStats {
+                    model,
+                    input_tokens: inp,
+                    output_tokens: out,
+                    total_tokens: inp + out,
+                    executions: cnt,
+                    avg_duration_ms: avg_dur,
+                },
+            );
+        }
+
+        let avg_duration_ms = if duration_count > 0 {
+            Some(duration_sum / duration_count as f64)
+        } else {
+            None
+        };
+
+        Ok(RuntimeStats {
+            total_tokens_input: total_input,
+            total_tokens_output: total_output,
+            total_tokens: total_input + total_output,
+            executions: total_executions,
+            avg_duration_ms,
+            by_model,
+        })
     }
 }
 
@@ -1168,6 +1295,53 @@ mod tests {
     fn parse_datetime_invalid_returns_error() {
         let err = parse_datetime("not-a-date").unwrap_err();
         assert!(matches!(err, BeltError::Database(_)));
+    }
+
+    #[test]
+    fn get_runtime_stats_empty() {
+        let db = test_db();
+        let stats = db.get_runtime_stats().unwrap();
+        assert_eq!(stats.total_tokens, 0);
+        assert_eq!(stats.executions, 0);
+        assert!(stats.avg_duration_ms.is_none());
+        assert!(stats.by_model.is_empty());
+    }
+
+    #[test]
+    fn get_runtime_stats_aggregates_by_model() {
+        let db = test_db();
+        let usage_a = TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 500,
+            ..Default::default()
+        };
+        let usage_b = TokenUsage {
+            input_tokens: 200,
+            output_tokens: 100,
+            ..Default::default()
+        };
+        db.record_token_usage("w1", "ws1", "claude", "opus-4", &usage_a, Some(2000))
+            .unwrap();
+        db.record_token_usage("w2", "ws1", "claude", "opus-4", &usage_a, Some(3000))
+            .unwrap();
+        db.record_token_usage("w3", "ws1", "claude", "sonnet-4", &usage_b, Some(500))
+            .unwrap();
+
+        let stats = db.get_runtime_stats().unwrap();
+        assert_eq!(stats.total_tokens_input, 2200);
+        assert_eq!(stats.total_tokens_output, 1100);
+        assert_eq!(stats.total_tokens, 3300);
+        assert_eq!(stats.executions, 3);
+        assert!(stats.avg_duration_ms.is_some());
+
+        let opus = stats.by_model.get("opus-4").unwrap();
+        assert_eq!(opus.executions, 2);
+        assert_eq!(opus.input_tokens, 2000);
+        assert_eq!(opus.total_tokens, 3000);
+
+        let sonnet = stats.by_model.get("sonnet-4").unwrap();
+        assert_eq!(sonnet.executions, 1);
+        assert_eq!(sonnet.total_tokens, 300);
     }
 
     #[test]

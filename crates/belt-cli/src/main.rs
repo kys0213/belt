@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 
 mod claw;
+mod dashboard;
+mod status;
 
 #[derive(Parser)]
 #[command(
@@ -138,8 +140,7 @@ async fn main() -> anyhow::Result<()> {
             // TODO: daemon stop
         }
         Commands::Status { format } => {
-            tracing::info!(format, "showing status...");
-            // TODO: status display
+            status::show_status(&format)?;
         }
         Commands::Workspace { command } => match command {
             WorkspaceCommands::Add { config } => {
