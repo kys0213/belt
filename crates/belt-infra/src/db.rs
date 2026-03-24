@@ -44,6 +44,8 @@ pub struct CronJob {
     pub name: String,
     /// Cron schedule expression (e.g. "*/5 * * * *").
     pub schedule: String,
+    /// Path to the script to execute.
+    pub script: String,
     /// Optional workspace scope; `None` means global.
     pub workspace: Option<String>,
     /// Whether this job is currently enabled.
@@ -52,6 +54,8 @@ pub struct CronJob {
     pub last_run_at: Option<String>,
     /// When this job was created (RFC 3339).
     pub created_at: String,
+    /// When this job was last updated (RFC 3339).
+    pub updated_at: String,
 }
 
 /// A row from the `knowledge_base` table.
@@ -232,10 +236,12 @@ impl Database {
             CREATE TABLE IF NOT EXISTS cron_jobs (
                 name        TEXT PRIMARY KEY,
                 schedule    TEXT NOT NULL,
+                script      TEXT NOT NULL DEFAULT '',
                 workspace   TEXT,
                 enabled     INTEGER NOT NULL DEFAULT 1,
                 last_run_at TEXT,
-                created_at  TEXT NOT NULL
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS knowledge_base (
@@ -676,6 +682,7 @@ impl Database {
         &self,
         name: &str,
         schedule: &str,
+        script: &str,
         workspace: Option<&str>,
     ) -> Result<(), BeltError> {
         let now = Utc::now().to_rfc3339();
@@ -684,9 +691,9 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.execute(
-            "INSERT INTO cron_jobs (name, schedule, workspace, enabled, created_at)
-                 VALUES (?1, ?2, ?3, 1, ?4)",
-            params![name, schedule, workspace, now],
+            "INSERT INTO cron_jobs (name, schedule, script, workspace, enabled, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5, ?5)",
+            params![name, schedule, script, workspace, now],
         )
         .map_err(|e| BeltError::Database(e.to_string()))?;
         Ok(())
@@ -700,27 +707,64 @@ impl Database {
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let mut stmt = conn
             .prepare(
-                "SELECT name, schedule, workspace, enabled, last_run_at, created_at
+                "SELECT name, schedule, script, workspace, enabled, last_run_at, created_at, updated_at
                  FROM cron_jobs ORDER BY name",
             )
             .map_err(|e| BeltError::Database(e.to_string()))?;
 
         let jobs = stmt
             .query_map([], |row| {
-                let enabled_int: i32 = row.get(3)?;
+                let enabled_int: i32 = row.get(4)?;
                 Ok(CronJob {
                     name: row.get(0)?,
                     schedule: row.get(1)?,
-                    workspace: row.get(2)?,
+                    script: row.get(2)?,
+                    workspace: row.get(3)?,
                     enabled: enabled_int != 0,
-                    last_run_at: row.get(4)?,
-                    created_at: row.get(5)?,
+                    last_run_at: row.get(5)?,
+                    created_at: row.get(6)?,
+                    updated_at: row.get(7)?,
                 })
             })
             .map_err(|e| BeltError::Database(e.to_string()))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         Ok(jobs)
+    }
+
+    /// Get a cron job by name.
+    ///
+    /// # Errors
+    /// Returns `BeltError::ItemNotFound` if no cron job matches the given `name`.
+    pub fn get_cron_job(&self, name: &str) -> Result<CronJob, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, schedule, script, workspace, enabled, last_run_at, created_at, updated_at
+                 FROM cron_jobs WHERE name = ?1",
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        stmt.query_row(params![name], |row| {
+            let enabled_int: i32 = row.get(4)?;
+            Ok(CronJob {
+                name: row.get(0)?,
+                schedule: row.get(1)?,
+                script: row.get(2)?,
+                workspace: row.get(3)?,
+                enabled: enabled_int != 0,
+                last_run_at: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
+            })
+        })
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => BeltError::ItemNotFound(name.to_string()),
+            _ => BeltError::Database(e.to_string()),
+        })
     }
 
     /// Update the `last_run_at` timestamp of a cron job to now.
@@ -747,14 +791,37 @@ impl Database {
     /// # Errors
     /// Returns `BeltError::ItemNotFound` if no cron job matches the given `name`.
     pub fn update_cron_schedule(&self, name: &str, schedule: &str) -> Result<(), BeltError> {
+        let now = Utc::now().to_rfc3339();
         let conn = self
             .conn
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let rows = conn
             .execute(
-                "UPDATE cron_jobs SET schedule = ?1 WHERE name = ?2",
-                params![schedule, name],
+                "UPDATE cron_jobs SET schedule = ?1, updated_at = ?3 WHERE name = ?2",
+                params![schedule, name, now],
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        if rows == 0 {
+            return Err(BeltError::ItemNotFound(name.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Update the script path of an existing cron job.
+    ///
+    /// # Errors
+    /// Returns `BeltError::ItemNotFound` if no cron job matches the given `name`.
+    pub fn update_cron_script(&self, name: &str, script: &str) -> Result<(), BeltError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "UPDATE cron_jobs SET script = ?1, updated_at = ?3 WHERE name = ?2",
+                params![script, name, now],
             )
             .map_err(|e| BeltError::Database(e.to_string()))?;
         if rows == 0 {
@@ -1737,12 +1804,13 @@ mod tests {
     #[test]
     fn cron_job_crud() {
         let db = test_db();
-        db.add_cron_job("sync-issues", "*/5 * * * *", Some("ws1"))
+        db.add_cron_job("sync-issues", "*/5 * * * *", "/usr/local/bin/sync.sh", Some("ws1"))
             .unwrap();
 
         let jobs = db.list_cron_jobs().unwrap();
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].name, "sync-issues");
+        assert_eq!(jobs[0].script, "/usr/local/bin/sync.sh");
         assert!(jobs[0].enabled);
         assert!(jobs[0].last_run_at.is_none());
 
@@ -1762,7 +1830,8 @@ mod tests {
     #[test]
     fn cron_job_global_scope() {
         let db = test_db();
-        db.add_cron_job("global-job", "0 * * * *", None).unwrap();
+        db.add_cron_job("global-job", "0 * * * *", "/bin/run.sh", None)
+            .unwrap();
         let jobs = db.list_cron_jobs().unwrap();
         assert!(jobs[0].workspace.is_none());
     }
@@ -1770,7 +1839,8 @@ mod tests {
     #[test]
     fn update_cron_schedule_changes_schedule() {
         let db = test_db();
-        db.add_cron_job("my-job", "*/5 * * * *", None).unwrap();
+        db.add_cron_job("my-job", "*/5 * * * *", "/bin/run.sh", None)
+            .unwrap();
         db.update_cron_schedule("my-job", "0 */2 * * *").unwrap();
 
         let jobs = db.list_cron_jobs().unwrap();
@@ -1781,6 +1851,45 @@ mod tests {
     fn update_cron_schedule_not_found() {
         let db = test_db();
         let err = db.update_cron_schedule("nope", "* * * * *").unwrap_err();
+        assert!(matches!(err, BeltError::ItemNotFound(_)));
+    }
+
+    #[test]
+    fn update_cron_script_changes_script() {
+        let db = test_db();
+        db.add_cron_job("my-job", "*/5 * * * *", "/bin/old.sh", None)
+            .unwrap();
+        db.update_cron_script("my-job", "/bin/new.sh").unwrap();
+
+        let job = db.get_cron_job("my-job").unwrap();
+        assert_eq!(job.script, "/bin/new.sh");
+    }
+
+    #[test]
+    fn update_cron_script_not_found() {
+        let db = test_db();
+        let err = db.update_cron_script("nope", "/bin/run.sh").unwrap_err();
+        assert!(matches!(err, BeltError::ItemNotFound(_)));
+    }
+
+    #[test]
+    fn get_cron_job_by_name() {
+        let db = test_db();
+        db.add_cron_job("my-job", "*/5 * * * *", "/bin/run.sh", Some("ws1"))
+            .unwrap();
+
+        let job = db.get_cron_job("my-job").unwrap();
+        assert_eq!(job.name, "my-job");
+        assert_eq!(job.schedule, "*/5 * * * *");
+        assert_eq!(job.script, "/bin/run.sh");
+        assert_eq!(job.workspace.as_deref(), Some("ws1"));
+        assert!(job.enabled);
+    }
+
+    #[test]
+    fn get_cron_job_not_found() {
+        let db = test_db();
+        let err = db.get_cron_job("nope").unwrap_err();
         assert!(matches!(err, BeltError::ItemNotFound(_)));
     }
 

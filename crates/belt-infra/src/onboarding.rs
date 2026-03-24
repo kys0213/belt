@@ -103,7 +103,7 @@ fn seed_workspace_cron_jobs(db: &Database, workspace_name: &str) -> anyhow::Resu
             continue;
         }
 
-        db.add_cron_job(&job_name, schedule, Some(workspace_name))?;
+        db.add_cron_job(&job_name, schedule, "", Some(workspace_name))?;
         tracing::info!(job = %job_name, schedule, "cron job seeded");
         seeded += 1;
     }
