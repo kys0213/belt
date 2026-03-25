@@ -238,6 +238,7 @@ impl QueueItem {
                 "retry_max_exceeded" => Ok(HitlReason::RetryMaxExceeded),
                 "timeout" => Ok(HitlReason::Timeout),
                 "manual_escalation" => Ok(HitlReason::ManualEscalation),
+                "spec_conflict" => Ok(HitlReason::SpecConflict),
                 other => Err(format!("invalid hitl_reason: {other}")),
             })
             .transpose()?;
@@ -388,6 +389,7 @@ mod tests {
             HitlReason::ManualEscalation.to_string(),
             "manual_escalation"
         );
+        assert_eq!(HitlReason::SpecConflict.to_string(), "spec_conflict");
     }
 
     #[test]

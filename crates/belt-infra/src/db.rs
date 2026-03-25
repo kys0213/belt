@@ -1826,6 +1826,7 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
             "retry_max_exceeded" => Ok(belt_core::queue::HitlReason::RetryMaxExceeded),
             "timeout" => Ok(belt_core::queue::HitlReason::Timeout),
             "manual_escalation" => Ok(belt_core::queue::HitlReason::ManualEscalation),
+            "spec_conflict" => Ok(belt_core::queue::HitlReason::SpecConflict),
             other => Err(BeltError::Database(format!("unknown hitl_reason: {other}"))),
         })
         .transpose()?;

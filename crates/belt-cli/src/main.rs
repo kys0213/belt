@@ -1762,7 +1762,7 @@ async fn main() -> anyhow::Result<()> {
                     spec.entry_point = entry_point;
 
                     // Detect conflicts with existing specs in the same workspace
-                    if spec.entry_point.is_some() {
+                    let has_conflicts = if spec.entry_point.is_some() {
                         let existing_specs = db.list_specs(Some(&workspace), None)?;
                         let conflicts =
                             belt_core::spec::ConflictDetector::detect(&spec, &existing_specs);
@@ -1779,11 +1779,41 @@ async fn main() -> anyhow::Result<()> {
                             }
                             let conflicts_json = serde_json::to_string(&conflicts)?;
                             eprintln!("conflicts_json: {conflicts_json}");
+                            Some(conflicts_json)
+                        } else {
+                            None
                         }
-                    }
+                    } else {
+                        None
+                    };
 
                     db.insert_spec(&spec)?;
                     println!("spec created: {id}");
+
+                    // Generate HITL item when spec conflicts are detected.
+                    // The spec stays in Draft until a human resolves the conflict.
+                    if let Some(conflicts_json) = has_conflicts {
+                        let work_id = format!("spec-conflict:{id}:review");
+                        let source_id = format!("spec:{id}");
+                        let mut hitl_item = belt_core::queue::QueueItem::new(
+                            work_id,
+                            source_id,
+                            workspace.clone(),
+                            "review".to_string(),
+                        );
+                        hitl_item.phase = QueuePhase::Hitl;
+                        hitl_item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
+                        hitl_item.hitl_reason = Some(belt_core::queue::HitlReason::SpecConflict);
+                        hitl_item.hitl_notes =
+                            Some(format!("spec-conflict-detected: {conflicts_json}"));
+                        hitl_item.title =
+                            Some(format!("Spec conflict detected for '{}'", spec.name));
+                        db.insert_item(&hitl_item)?;
+                        eprintln!(
+                            "hitl item created: {} (reason: spec-conflict-detected)",
+                            hitl_item.work_id
+                        );
+                    }
 
                     // Extract acceptance criteria for decomposition.
                     let criteria = belt_core::spec::extract_acceptance_criteria(&spec.content);
