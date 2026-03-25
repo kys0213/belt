@@ -938,4 +938,177 @@ mod tests {
         assert_eq!(state.selected_index, 0);
         assert!(state.overlay_item.is_none());
     }
+
+    // ---- collect_recent_items (DB-backed) ----
+
+    fn make_db() -> Database {
+        Database::open_in_memory().expect("in-memory DB should open")
+    }
+
+    fn make_item_with_phase(work_id: &str, phase: QueuePhase, updated_at: &str) -> QueueItem {
+        let mut item = QueueItem::new(
+            work_id.to_string(),
+            "src".to_string(),
+            "ws".to_string(),
+            "s".to_string(),
+        );
+        item.phase = phase;
+        item.updated_at = updated_at.to_string();
+        item
+    }
+
+    #[test]
+    fn collect_recent_items_empty_db() {
+        let db = make_db();
+        let items = collect_recent_items(&db);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn collect_recent_items_only_collects_done_failed_completed() {
+        let db = make_db();
+
+        // Insert items of various phases.
+        let pending =
+            make_item_with_phase("w-pending", QueuePhase::Pending, "2026-03-25T01:00:00Z");
+        let running =
+            make_item_with_phase("w-running", QueuePhase::Running, "2026-03-25T02:00:00Z");
+        let done = make_item_with_phase("w-done", QueuePhase::Done, "2026-03-25T03:00:00Z");
+        let failed = make_item_with_phase("w-failed", QueuePhase::Failed, "2026-03-25T04:00:00Z");
+        let completed =
+            make_item_with_phase("w-completed", QueuePhase::Completed, "2026-03-25T05:00:00Z");
+        let ready = make_item_with_phase("w-ready", QueuePhase::Ready, "2026-03-25T06:00:00Z");
+
+        for item in [&pending, &running, &done, &failed, &completed, &ready] {
+            db.insert_item(item).unwrap();
+        }
+
+        let recent = collect_recent_items(&db);
+
+        // Only Done, Failed, Completed should be collected.
+        assert_eq!(recent.len(), 3);
+        let ids: Vec<&str> = recent.iter().map(|i| i.work_id.as_str()).collect();
+        assert!(ids.contains(&"w-done"));
+        assert!(ids.contains(&"w-failed"));
+        assert!(ids.contains(&"w-completed"));
+        assert!(!ids.contains(&"w-pending"));
+        assert!(!ids.contains(&"w-running"));
+        assert!(!ids.contains(&"w-ready"));
+    }
+
+    #[test]
+    fn collect_recent_items_sorted_by_updated_at_descending() {
+        let db = make_db();
+
+        let older = make_item_with_phase("w-old", QueuePhase::Done, "2026-03-25T01:00:00Z");
+        let middle = make_item_with_phase("w-mid", QueuePhase::Failed, "2026-03-25T05:00:00Z");
+        let newest = make_item_with_phase("w-new", QueuePhase::Completed, "2026-03-25T10:00:00Z");
+
+        for item in [&older, &middle, &newest] {
+            db.insert_item(item).unwrap();
+        }
+
+        let recent = collect_recent_items(&db);
+        assert_eq!(recent.len(), 3);
+        assert_eq!(recent[0].work_id, "w-new");
+        assert_eq!(recent[1].work_id, "w-mid");
+        assert_eq!(recent[2].work_id, "w-old");
+    }
+
+    #[test]
+    fn collect_recent_items_truncates_to_8() {
+        let db = make_db();
+
+        // Insert 12 Done items.
+        for i in 0..12 {
+            let item = make_item_with_phase(
+                &format!("w-{i}"),
+                QueuePhase::Done,
+                &format!("2026-03-25T{:02}:00:00Z", i),
+            );
+            db.insert_item(&item).unwrap();
+        }
+
+        let recent = collect_recent_items(&db);
+        assert_eq!(recent.len(), 8);
+        // The most recent (highest hour) should come first.
+        assert_eq!(recent[0].work_id, "w-11");
+        assert_eq!(recent[7].work_id, "w-4");
+    }
+
+    // ---- render_item_detail_overlay ----
+
+    #[test]
+    fn render_item_detail_overlay_no_panic_item_exists() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let db = make_db();
+        let item = QueueItem::new(
+            "w1".to_string(),
+            "src1".to_string(),
+            "ws1".to_string(),
+            "analyze".to_string(),
+        );
+        db.insert_item(&item).unwrap();
+
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_item_detail_overlay(frame, &db, "w1");
+            })
+            .unwrap();
+
+        // Verify the overlay rendered content containing "Item Details".
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("Item Details"));
+        assert!(text.contains("w1"));
+    }
+
+    #[test]
+    fn render_item_detail_overlay_no_panic_item_missing() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let db = make_db();
+
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_item_detail_overlay(frame, &db, "nonexistent");
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("item not found"));
+    }
+
+    #[test]
+    fn render_item_detail_overlay_no_panic_zero_size_frame() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let db = make_db();
+
+        // A very small terminal should not cause a panic.
+        let backend = TestBackend::new(5, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_item_detail_overlay(frame, &db, "any-id");
+            })
+            .unwrap();
+    }
 }
