@@ -568,6 +568,288 @@ mod tests {
     }
 
     #[test]
+    fn collect_status_from_db_multiple_phases() {
+        use belt_core::phase::QueuePhase;
+        use belt_core::queue::QueueItem;
+
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+
+        // Insert items and move them to different phases.
+        for (wid, spec, ws) in [
+            ("a1", "s1", "ws1"),
+            ("a2", "s2", "ws1"),
+            ("b1", "s3", "ws2"),
+            ("c1", "s4", "ws1"),
+        ] {
+            let item = QueueItem::new(
+                wid.to_string(),
+                spec.to_string(),
+                ws.to_string(),
+                "step".to_string(),
+            );
+            db.insert_item(&item).unwrap();
+        }
+        // a1, a2 stay pending; b1 -> running; c1 -> done
+        db.update_phase("b1", QueuePhase::Running).unwrap();
+        db.update_phase("c1", QueuePhase::Done).unwrap();
+
+        let summary = collect_status_from_db(&db).unwrap();
+        assert_eq!(summary.total_items, 4);
+        assert_eq!(summary.hitl_pending, 0);
+        assert!(summary.hitl_items.is_empty());
+        // Verify all phases are represented.
+        let phase_names: Vec<&str> = summary
+            .phase_counts
+            .iter()
+            .map(|(p, _)| p.as_str())
+            .collect();
+        assert!(phase_names.contains(&"pending"));
+        assert!(phase_names.contains(&"running"));
+        assert!(phase_names.contains(&"done"));
+        // Check counts.
+        let pending_count = summary
+            .phase_counts
+            .iter()
+            .find(|(p, _)| p == "pending")
+            .map(|(_, c)| *c);
+        assert_eq!(pending_count, Some(2));
+    }
+
+    #[test]
+    fn collect_status_hitl_item_has_correct_reason_and_title() {
+        use belt_core::phase::QueuePhase;
+        use belt_core::queue::QueueItem;
+
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+
+        let mut item = QueueItem::new(
+            "w-hitl".to_string(),
+            "s1".to_string(),
+            "ws-test".to_string(),
+            "implement".to_string(),
+        );
+        item.title = Some("My HITL task".to_string());
+        item.hitl_reason = Some(belt_core::queue::HitlReason::Timeout);
+        db.insert_item(&item).unwrap();
+        db.update_phase("w-hitl", QueuePhase::Hitl).unwrap();
+
+        let summary = collect_status_from_db(&db).unwrap();
+        assert_eq!(summary.hitl_items.len(), 1);
+        assert_eq!(summary.hitl_items[0].work_id, "w-hitl");
+        assert_eq!(summary.hitl_items[0].workspace, "ws-test");
+        assert_eq!(summary.hitl_items[0].reason, "timeout");
+        assert_eq!(summary.hitl_items[0].title.as_deref(), Some("My HITL task"));
+    }
+
+    #[test]
+    fn status_banner_empty_phases_omits_phases_line() {
+        let summary = StatusSummary {
+            total_items: 0,
+            phase_counts: vec![],
+            hitl_pending: 0,
+            recent_events: vec![],
+            hitl_items: vec![],
+        };
+        let mut output = Vec::new();
+        write_status_banner(&mut output, &summary).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Queue: 0 items"));
+        assert!(!out.contains("Phases:"));
+    }
+
+    #[test]
+    fn status_banner_omits_recent_events_section_when_empty() {
+        let summary = StatusSummary {
+            total_items: 1,
+            phase_counts: vec![("pending".to_string(), 1)],
+            hitl_pending: 0,
+            recent_events: vec![],
+            hitl_items: vec![],
+        };
+        let mut output = Vec::new();
+        write_status_banner(&mut output, &summary).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(!out.contains("Recent events:"));
+    }
+
+    #[test]
+    fn status_banner_shows_multiple_events() {
+        let summary = StatusSummary {
+            total_items: 2,
+            phase_counts: vec![("done".to_string(), 2)],
+            hitl_pending: 0,
+            recent_events: vec![
+                RecentEvent {
+                    item_id: "ev-1".to_string(),
+                    from_state: "pending".to_string(),
+                    to_state: "running".to_string(),
+                    timestamp: "2026-03-24T09:00:00Z".to_string(),
+                },
+                RecentEvent {
+                    item_id: "ev-2".to_string(),
+                    from_state: "running".to_string(),
+                    to_state: "done".to_string(),
+                    timestamp: "2026-03-24T10:00:00Z".to_string(),
+                },
+            ],
+            hitl_items: vec![],
+        };
+        let mut output = Vec::new();
+        write_status_banner(&mut output, &summary).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Recent events:"));
+        assert!(out.contains("ev-1"));
+        assert!(out.contains("ev-2"));
+        assert!(out.contains("pending -> running"));
+        assert!(out.contains("running -> done"));
+    }
+
+    #[test]
+    fn session_dispatches_auto_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_config(&tmp);
+        let mut input = Cursor::new(b"/auto run task\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("[auto]"));
+        assert!(out.contains("run task"));
+    }
+
+    #[test]
+    fn session_dispatches_spec_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_config(&tmp);
+        let mut input = Cursor::new(b"/spec issue-42\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("[spec]"));
+        assert!(out.contains("issue-42"));
+    }
+
+    #[test]
+    fn session_dispatches_claw_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_config(&tmp);
+        let mut input = Cursor::new(b"/claw status\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("[claw]"));
+        assert!(out.contains("test-ws"));
+    }
+
+    #[test]
+    fn session_dispatches_unknown_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_config(&tmp);
+        let mut input = Cursor::new(b"/unknown\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Unknown command"));
+    }
+
+    #[test]
+    fn session_exit_alias_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_config(&tmp);
+        let mut input = Cursor::new(b"/exit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Goodbye."));
+    }
+
+    #[test]
+    fn session_skips_empty_lines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_config(&tmp);
+        let mut input = Cursor::new(b"\n\n\nhello\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        // Empty lines should be skipped, only the freeform text echoed.
+        assert!(out.contains(">> hello"));
+        assert!(out.contains("Goodbye."));
+    }
+
+    #[test]
+    fn session_multiple_commands_in_sequence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_config(&tmp);
+        let mut input = Cursor::new(b"/help\n/auto\n/spec\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("/auto"));
+        assert!(out.contains("[auto]"));
+        assert!(out.contains("[spec]"));
+        assert!(out.contains("Goodbye."));
+    }
+
+    #[test]
+    fn session_no_workspace_context_omits_context_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ClawWorkspace::init(tmp.path()).unwrap();
+        let config = SessionConfig {
+            workspace: None,
+            claw_workspace: ws,
+        };
+        let mut input = Cursor::new(b"/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(!out.contains("Context:"));
+    }
+
+    #[test]
+    fn reason_priority_ordering() {
+        assert!(reason_priority("evaluate_failure") < reason_priority("retry_max_exceeded"));
+        assert!(reason_priority("evaluate_failure") < reason_priority("timeout"));
+        assert_eq!(
+            reason_priority("retry_max_exceeded"),
+            reason_priority("timeout")
+        );
+        assert!(reason_priority("timeout") < reason_priority("manual_escalation"));
+        assert!(reason_priority("timeout") < reason_priority("other"));
+    }
+
+    #[test]
+    fn reason_display_labels_are_correct() {
+        assert_eq!(
+            reason_display_label("evaluate_failure"),
+            "Spec Conflict (evaluate_failure)"
+        );
+        assert_eq!(
+            reason_display_label("retry_max_exceeded"),
+            "Failure (retry_max_exceeded)"
+        );
+        assert_eq!(reason_display_label("timeout"), "Failure (timeout)");
+        assert_eq!(
+            reason_display_label("manual_escalation"),
+            "Other (manual_escalation)"
+        );
+        assert_eq!(reason_display_label("something_else"), "Other");
+    }
+
+    #[test]
+    fn hitl_list_shows_title_dash_when_none() {
+        let items = vec![HitlItemSummary {
+            work_id: "w-no-title".to_string(),
+            workspace: "ws".to_string(),
+            reason: "other".to_string(),
+            title: None,
+        }];
+        let mut output = Vec::new();
+        write_hitl_list(&mut output, &items).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("w-no-title"));
+        assert!(out.contains("-"));
+    }
+
+    #[test]
     fn hitl_list_priority_order_spec_conflict_first() {
         let items = vec![
             HitlItemSummary {
