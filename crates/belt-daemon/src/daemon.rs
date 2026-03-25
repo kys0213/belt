@@ -476,24 +476,37 @@ impl Daemon {
         // Collect on_fail actions for deferred, escalation-aware execution.
         let on_fail_actions: Vec<Action> = state_config.on_fail.iter().map(Action::from).collect();
 
-        let previous_wt = item.previous_worktree_path.as_deref();
-        let worktree = match worktree_mgr.create_or_reuse_with_previous(&ws_name, previous_wt) {
-            Ok(path) => {
-                // Clear the previous_worktree_path after successful handoff.
-                item.previous_worktree_path = None;
-                path
-            }
-            Err(e) => {
-                item.phase = QueuePhase::Failed;
-                return ExecutionResult {
-                    item,
-                    outcome: ExecutionOutcome::WorktreeError {
-                        error: format!("worktree creation failed: {e}"),
-                    },
-                    ws_name,
-                    on_fail_actions: Vec::new(),
-                    worktree: None,
-                };
+        // Try to reuse a preserved worktree from a previous run for this source_id.
+        // Falls back to previous_worktree_path (retry handoff) or fresh creation.
+        let worktree = if let Some(preserved) = worktree_mgr.lookup_preserved(&item.source_id) {
+            tracing::info!(
+                source_id = %item.source_id,
+                ?preserved,
+                "reusing preserved worktree from previous run"
+            );
+            worktree_mgr.clear_preserved(&item.source_id);
+            item.previous_worktree_path = None;
+            preserved
+        } else {
+            let previous_wt = item.previous_worktree_path.as_deref();
+            match worktree_mgr.create_or_reuse_with_previous(&ws_name, previous_wt) {
+                Ok(path) => {
+                    // Clear the previous_worktree_path after successful handoff.
+                    item.previous_worktree_path = None;
+                    path
+                }
+                Err(e) => {
+                    item.phase = QueuePhase::Failed;
+                    return ExecutionResult {
+                        item,
+                        outcome: ExecutionOutcome::WorktreeError {
+                            error: format!("worktree creation failed: {e}"),
+                        },
+                        ws_name,
+                        on_fail_actions: Vec::new(),
+                        worktree: None,
+                    };
+                }
             }
         };
 
@@ -647,8 +660,15 @@ impl Daemon {
 
                 // Q-10: Mark worktree as preserved for Failed items.
                 item.mark_worktree_preserved();
+
+                // Register preserved worktree by source_id for reuse on retry/restart.
+                if let Some(ref wt) = worktree {
+                    self.worktree_mgr
+                        .register_preserved(&item.source_id, wt.clone());
+                }
                 tracing::info!(
                     work_id = %item.work_id,
+                    source_id = %item.source_id,
                     phase = "failed",
                     "worktree preserved for failed item"
                 );
@@ -788,7 +808,14 @@ impl Daemon {
 
         transit(item, QueuePhase::Failed)?;
         item.mark_worktree_preserved();
-        tracing::info!(work_id, "worktree preserved for failed item");
+
+        // Register preserved worktree by source_id for potential reuse.
+        let ws_name = &self.config.name;
+        let wt_path = self.worktree_mgr.path(ws_name);
+        if wt_path.exists() {
+            self.worktree_mgr.register_preserved(&source_id, wt_path);
+        }
+        tracing::info!(work_id, source_id = %source_id, "worktree preserved for failed item");
 
         let attempt = self.count_failures(&source_id, &state) + 1;
 
@@ -854,6 +881,7 @@ impl Daemon {
             let _ = transit(item, QueuePhase::Done);
             self.record_history(item, "done", None);
             let _ = self.worktree_mgr.cleanup(&item.work_id);
+            self.worktree_mgr.clear_preserved(&item.source_id);
             return Ok(true);
         }
 
@@ -877,6 +905,7 @@ impl Daemon {
                 let _ = transit(item, QueuePhase::Done);
                 self.record_history(item, "done", None);
                 let _ = self.worktree_mgr.cleanup(&item.work_id);
+                self.worktree_mgr.clear_preserved(&item.source_id);
                 Ok(true)
             }
         }
@@ -1249,19 +1278,37 @@ impl Daemon {
         }
     }
 
-    /// Running → Pending 롤백. worktree는 보존한다.
+    /// Running → Pending 롤백. worktree는 보존하고 source_id 기반으로 등록한다.
+    ///
+    /// 보존된 worktree 경로를 `WorktreeManager`의 preserved registry에 등록하여
+    /// 재시작 후 동일 source_id의 아이템이 기존 worktree를 재사용할 수 있게 한다.
     fn rollback_running_to_pending(&mut self) {
         let ws_name = self.config.name.clone();
         for item in self.queue.iter_mut() {
             if item.phase == QueuePhase::Running {
+                // Register preserved worktree before rollback so it can be reused.
+                let wt_path = self.worktree_mgr.path(&ws_name);
+                if wt_path.exists() {
+                    self.worktree_mgr
+                        .register_preserved(&item.source_id, wt_path.clone());
+                    tracing::info!(
+                        source_id = %item.source_id,
+                        ?wt_path,
+                        "preserved worktree registered for source_id"
+                    );
+                }
+
+                item.mark_worktree_preserved();
+
                 if let Err(e) = transit(item, QueuePhase::Pending) {
                     tracing::error!("failed to rollback {}: {e}", item.work_id);
                     continue;
                 }
                 self.tracker.release(&ws_name);
                 tracing::info!(
-                    "rolled back {} to Pending (worktree preserved)",
-                    item.work_id
+                    "rolled back {} to Pending (worktree preserved, source_id={})",
+                    item.work_id,
+                    item.source_id,
                 );
             }
         }
@@ -2638,5 +2685,99 @@ sources:
         daemon.rollback_running_to_pending();
         assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
         assert_eq!(daemon.items_in_phase(QueuePhase::Pending).len(), 3);
+    }
+
+    // ---------------------------------------------------------------
+    // Worktree preservation and reuse tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn rollback_registers_preserved_worktree_by_source_id() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Create the workspace worktree directory so it exists for registration.
+        let ws_path = daemon.worktree_mgr.path("test-ws");
+        std::fs::create_dir_all(&ws_path).unwrap();
+
+        let mut item = test_item("github:org/repo#1", "analyze");
+        item.phase = QueuePhase::Running;
+        daemon.push_item(item);
+
+        daemon.rollback_running_to_pending();
+
+        // The preserved worktree should be registered under the source_id.
+        let preserved = daemon.worktree_mgr.lookup_preserved("github:org/repo#1");
+        assert!(preserved.is_some());
+        assert_eq!(preserved.unwrap(), ws_path);
+    }
+
+    #[test]
+    fn rollback_marks_worktree_preserved_flag() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("github:org/repo#1", "analyze");
+        item.phase = QueuePhase::Running;
+        daemon.push_item(item);
+
+        daemon.rollback_running_to_pending();
+
+        let item = daemon.get_item("github:org/repo#1:analyze").unwrap();
+        assert!(item.worktree_preserved);
+        assert_eq!(item.phase, QueuePhase::Pending);
+    }
+
+    #[tokio::test]
+    async fn mark_failed_registers_preserved_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Create the workspace worktree directory.
+        let ws_path = daemon.worktree_mgr.path("test-ws");
+        std::fs::create_dir_all(&ws_path).unwrap();
+
+        let mut item = test_item("github:org/repo#1", "analyze");
+        item.phase = QueuePhase::Running;
+        item.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(item);
+
+        daemon
+            .mark_failed("github:org/repo#1:analyze", "test error".into())
+            .unwrap();
+
+        let preserved = daemon.worktree_mgr.lookup_preserved("github:org/repo#1");
+        assert!(preserved.is_some());
+    }
+
+    #[tokio::test]
+    async fn on_done_clears_preserved_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Register a preserved worktree.
+        let wt_path = daemon.worktree_mgr.path("work-1");
+        std::fs::create_dir_all(&wt_path).unwrap();
+        daemon
+            .worktree_mgr
+            .register_preserved("github:org/repo#1", wt_path);
+
+        let mut item = test_item("github:org/repo#1", "analyze");
+        item.phase = QueuePhase::Completed;
+
+        let success = daemon.execute_on_done(&mut item).await.unwrap();
+        assert!(success);
+
+        // Preserved mapping should be cleared after Done.
+        assert!(
+            daemon
+                .worktree_mgr
+                .lookup_preserved("github:org/repo#1")
+                .is_none()
+        );
     }
 }

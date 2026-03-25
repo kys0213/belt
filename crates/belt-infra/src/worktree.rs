@@ -1,5 +1,7 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
 
 use belt_core::error::BeltError;
 
@@ -37,6 +39,84 @@ pub trait WorktreeManager: Send + Sync {
 
     /// Returns the filesystem path for the worktree associated with `work_id`.
     fn path(&self, work_id: &str) -> PathBuf;
+
+    /// Register a preserved worktree path for a given `source_id`.
+    ///
+    /// Called during graceful shutdown to record that a worktree was preserved
+    /// so it can be reused when the daemon restarts and encounters the same
+    /// `source_id`.
+    fn register_preserved(&self, _source_id: &str, _worktree_path: PathBuf) {}
+
+    /// Look up a previously preserved worktree path by `source_id`.
+    ///
+    /// Returns `Some(path)` if a preserved worktree exists on disk for the
+    /// given source, `None` otherwise.
+    fn lookup_preserved(&self, _source_id: &str) -> Option<PathBuf> {
+        None
+    }
+
+    /// Remove a preserved worktree mapping for the given `source_id`.
+    ///
+    /// Called after the preserved worktree has been successfully handed off
+    /// to a new work item or explicitly cleaned up.
+    fn clear_preserved(&self, _source_id: &str) {}
+}
+
+/// Thread-safe registry for tracking preserved worktrees by `source_id`.
+///
+/// During graceful shutdown, worktrees for running items are preserved
+/// (not cleaned up). This registry remembers which `source_id` maps to which
+/// worktree path so that on restart the daemon can hand the worktree off to
+/// the re-queued item instead of creating a fresh one.
+#[derive(Debug, Default)]
+pub struct WorktreeRegistry {
+    inner: Mutex<HashMap<String, PathBuf>>,
+}
+
+impl WorktreeRegistry {
+    /// Creates an empty registry.
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Register a preserved worktree for a `source_id`.
+    pub fn register(&self, source_id: &str, path: PathBuf) {
+        let mut map = self.inner.lock().expect("worktree registry lock poisoned");
+        tracing::debug!(source_id, ?path, "registered preserved worktree");
+        map.insert(source_id.to_string(), path);
+    }
+
+    /// Look up a preserved worktree by `source_id`.
+    ///
+    /// Only returns `Some` if the recorded path still exists on disk.
+    pub fn lookup(&self, source_id: &str) -> Option<PathBuf> {
+        let map = self.inner.lock().expect("worktree registry lock poisoned");
+        map.get(source_id)
+            .and_then(|p| if p.exists() { Some(p.clone()) } else { None })
+    }
+
+    /// Remove a preserved worktree mapping.
+    pub fn clear(&self, source_id: &str) {
+        let mut map = self.inner.lock().expect("worktree registry lock poisoned");
+        if map.remove(source_id).is_some() {
+            tracing::debug!(source_id, "cleared preserved worktree mapping");
+        }
+    }
+
+    /// Returns the number of registered preserved worktrees.
+    pub fn len(&self) -> usize {
+        self.inner
+            .lock()
+            .expect("worktree registry lock poisoned")
+            .len()
+    }
+
+    /// Returns `true` if no preserved worktrees are registered.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Sanitizes a `work_id` so it is safe for use as a directory name and git branch suffix.
@@ -61,6 +141,8 @@ pub struct GitWorktreeManager {
     base_dir: PathBuf,
     /// Path to the git repository.
     repo_path: PathBuf,
+    /// Registry for preserved worktrees (source_id -> path).
+    registry: WorktreeRegistry,
 }
 
 impl GitWorktreeManager {
@@ -69,6 +151,7 @@ impl GitWorktreeManager {
         Self {
             base_dir,
             repo_path,
+            registry: WorktreeRegistry::new(),
         }
     }
 
@@ -211,6 +294,18 @@ impl WorktreeManager for GitWorktreeManager {
         let sanitized = sanitize_work_id(work_id);
         self.base_dir.join(sanitized)
     }
+
+    fn register_preserved(&self, source_id: &str, worktree_path: PathBuf) {
+        self.registry.register(source_id, worktree_path);
+    }
+
+    fn lookup_preserved(&self, source_id: &str) -> Option<PathBuf> {
+        self.registry.lookup(source_id)
+    }
+
+    fn clear_preserved(&self, source_id: &str) {
+        self.registry.clear(source_id);
+    }
 }
 
 /// Mock implementation of [`WorktreeManager`] for testing.
@@ -219,12 +314,17 @@ impl WorktreeManager for GitWorktreeManager {
 pub struct MockWorktreeManager {
     /// Base directory for mock worktrees.
     base_dir: PathBuf,
+    /// Registry for preserved worktrees (source_id -> path).
+    registry: WorktreeRegistry,
 }
 
 impl MockWorktreeManager {
     /// Creates a new `MockWorktreeManager`.
     pub fn new(base_dir: PathBuf) -> Self {
-        Self { base_dir }
+        Self {
+            base_dir,
+            registry: WorktreeRegistry::new(),
+        }
     }
 }
 
@@ -289,6 +389,18 @@ impl WorktreeManager for MockWorktreeManager {
     fn path(&self, work_id: &str) -> PathBuf {
         let sanitized = sanitize_work_id(work_id);
         self.base_dir.join(sanitized)
+    }
+
+    fn register_preserved(&self, source_id: &str, worktree_path: PathBuf) {
+        self.registry.register(source_id, worktree_path);
+    }
+
+    fn lookup_preserved(&self, source_id: &str) -> Option<PathBuf> {
+        self.registry.lookup(source_id)
+    }
+
+    fn clear_preserved(&self, source_id: &str) {
+        self.registry.clear(source_id);
     }
 }
 
@@ -390,6 +502,79 @@ mod tests {
 
         let path = mgr.path("github:org/repo#42");
         assert_eq!(path, tmp.path().join("github_org_repo_42"));
+    }
+
+    #[test]
+    fn registry_register_and_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = WorktreeRegistry::new();
+        let path = tmp.path().join("wt1");
+        fs::create_dir_all(&path).unwrap();
+
+        registry.register("source-1", path.clone());
+        assert_eq!(registry.lookup("source-1"), Some(path));
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn registry_lookup_returns_none_for_missing_dir() {
+        let registry = WorktreeRegistry::new();
+        registry.register("source-1", PathBuf::from("/nonexistent/path"));
+        // Path does not exist on disk, so lookup should return None.
+        assert_eq!(registry.lookup("source-1"), None);
+    }
+
+    #[test]
+    fn registry_clear_removes_mapping() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = WorktreeRegistry::new();
+        let path = tmp.path().join("wt1");
+        fs::create_dir_all(&path).unwrap();
+
+        registry.register("source-1", path);
+        registry.clear("source-1");
+        assert!(registry.is_empty());
+        assert_eq!(registry.lookup("source-1"), None);
+    }
+
+    #[test]
+    fn registry_overwrite_same_source_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = WorktreeRegistry::new();
+
+        let path1 = tmp.path().join("wt1");
+        let path2 = tmp.path().join("wt2");
+        fs::create_dir_all(&path1).unwrap();
+        fs::create_dir_all(&path2).unwrap();
+
+        registry.register("source-1", path1);
+        registry.register("source-1", path2.clone());
+        assert_eq!(registry.lookup("source-1"), Some(path2));
+        assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn mock_register_and_lookup_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = MockWorktreeManager::new(tmp.path().to_path_buf());
+
+        // Create a worktree first so the path exists.
+        let path = mgr.create_or_reuse("work-1").unwrap();
+        mgr.register_preserved("source-1", path.clone());
+
+        assert_eq!(mgr.lookup_preserved("source-1"), Some(path));
+    }
+
+    #[test]
+    fn mock_clear_preserved_removes_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = MockWorktreeManager::new(tmp.path().to_path_buf());
+
+        let path = mgr.create_or_reuse("work-1").unwrap();
+        mgr.register_preserved("source-1", path);
+        mgr.clear_preserved("source-1");
+
+        assert_eq!(mgr.lookup_preserved("source-1"), None);
     }
 
     #[test]
