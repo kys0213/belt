@@ -55,26 +55,6 @@ pub struct SpecStatus {
     pub phase_counts: Vec<PhaseCount>,
 }
 
-/// Lightweight status output for JSON serialization.
-#[derive(Debug, Serialize)]
-pub struct StatusOutput<'a> {
-    pub status: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub runtime_stats: Option<RuntimeStats>,
-}
-
-/// Display system status in the requested format.
-///
-/// Opens the default Belt database automatically.
-///
-/// # Errors
-/// Returns an error if the database cannot be opened or queried.
-pub fn show_status(format: &str) -> anyhow::Result<()> {
-    let db = open_db()?;
-    let sys_status = gather_status(&db)?;
-    print_status(&sys_status, format)
-}
-
 /// Gather system status from the database.
 pub fn gather_status(db: &Database) -> anyhow::Result<SystemStatus> {
     let phase_counts_raw = db.count_items_by_phase()?;
@@ -188,6 +168,14 @@ mod tests {
     use belt_infra::db::{Database, RuntimeStats, TransitionEvent};
 
     use super::*;
+
+    /// Lightweight status output for JSON serialization.
+    #[derive(Debug, Serialize)]
+    pub struct StatusOutput<'a> {
+        pub status: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub runtime_stats: Option<RuntimeStats>,
+    }
 
     // ---- test helpers ----
 
@@ -481,19 +469,6 @@ mod tests {
     }
 }
 
-/// Open the Belt database from the default location (`~/.belt/belt.db`).
-fn open_db() -> anyhow::Result<Database> {
-    let belt_home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
-        .join(".belt");
-    let db_path = belt_home.join("belt.db");
-    let db = Database::open(
-        db_path
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("invalid database path"))?,
-    )?;
-    Ok(db)
-}
 
 fn print_text_status(status: &SystemStatus) {
     println!("Belt System Status");

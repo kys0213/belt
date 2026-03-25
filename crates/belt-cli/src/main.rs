@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -630,42 +629,17 @@ fn cmd_stop() -> anyhow::Result<()> {
 /// `belt status` -- show queue item counts grouped by phase.
 fn cmd_status(format: &str) -> anyhow::Result<()> {
     let db = open_db()?;
-    let items = db.list_items(None, None)?;
-
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for item in &items {
-        *counts.entry(item.phase.as_str().to_string()).or_insert(0) += 1;
-    }
-
     let daemon_running = read_pid().is_ok();
+    let sys_status = status::gather_status(&db)?;
 
-    match format {
-        "json" => {
-            let output = serde_json::json!({
-                "daemon_running": daemon_running,
-                "total_items": items.len(),
-                "phases": counts,
-            });
-            println!("{}", serde_json::to_string_pretty(&output)?);
-        }
-        _ => {
-            println!(
-                "Daemon: {}",
-                if daemon_running { "running" } else { "stopped" }
-            );
-            println!("Total items: {}", items.len());
-            if !counts.is_empty() {
-                println!("Phases:");
-                let mut sorted: Vec<_> = counts.iter().collect();
-                sorted.sort_by_key(|(k, _)| (*k).clone());
-                for (phase, count) in sorted {
-                    println!("  {phase:<12} {count}");
-                }
-            }
-        }
+    if format != "json" {
+        println!(
+            "Daemon: {}",
+            if daemon_running { "running" } else { "stopped" }
+        );
     }
 
-    Ok(())
+    status::print_status(&sys_status, format)
 }
 
 /// `belt queue list` -- list queue items with optional filters.
@@ -1813,16 +1787,14 @@ async fn main() -> anyhow::Result<()> {
                     let specs = db.list_specs(workspace.as_deref(), status_filter)?;
                     if json {
                         println!("{}", serde_json::to_string_pretty(&specs)?);
+                    } else if specs.is_empty() {
+                        println!("no specs found");
                     } else {
-                        if specs.is_empty() {
-                            println!("no specs found");
-                        } else {
-                            for spec in &specs {
-                                println!(
-                                    "{}\t{}\t{}\t{}",
-                                    spec.id, spec.name, spec.status, spec.workspace_id
-                                );
-                            }
+                        for spec in &specs {
+                            println!(
+                                "{}\t{}\t{}\t{}",
+                                spec.id, spec.name, spec.status, spec.workspace_id
+                            );
                         }
                     }
                 }
