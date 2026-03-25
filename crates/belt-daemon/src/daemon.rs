@@ -270,8 +270,8 @@ impl Daemon {
     /// Workspaces not present in the map use `default_concurrency` (falls back to 1).
     pub fn advance_ready_to_running(
         &mut self,
-        ws_concurrency_limits: &HashMap<String, usize>,
-        default_concurrency: usize,
+        ws_concurrency_limits: &HashMap<String, u32>,
+        default_concurrency: u32,
     ) {
         let ready_indices: Vec<usize> = self
             .queue
@@ -282,13 +282,17 @@ impl Daemon {
             .collect();
 
         for idx in ready_indices {
+            if !self.tracker.can_spawn() {
+                break;
+            }
+
             let ws = self.queue[idx].workspace_id.clone();
             let ws_limit = ws_concurrency_limits
                 .get(&ws)
                 .copied()
                 .unwrap_or(default_concurrency);
 
-            if !self.tracker.can_spawn_in_workspace(&ws, ws_limit as u32) {
+            if !self.tracker.can_spawn_in_workspace(&ws, ws_limit) {
                 continue;
             }
 
@@ -2048,6 +2052,23 @@ sources:
     // advance_ready_to_running tests
     // ---------------------------------------------------------------
 
+    /// Create a Ready item assigned to the given workspace.
+    fn ready_item_for_ws(source_id: &str, workspace_id: &str) -> QueueItem {
+        let mut item = test_item(source_id, "analyze");
+        item.workspace_id = workspace_id.to_string();
+        item.phase = QueuePhase::Ready;
+        item
+    }
+
+    /// Count items in `phase` that belong to `workspace_id`.
+    fn count_in_phase_for_ws(daemon: &Daemon, phase: QueuePhase, workspace_id: &str) -> usize {
+        daemon
+            .items_in_phase(phase)
+            .iter()
+            .filter(|i| i.workspace_id == workspace_id)
+            .count()
+    }
+
     #[test]
     fn advance_ready_to_running_respects_ws_concurrency() {
         let tmp = TempDir::new().unwrap();
@@ -2055,17 +2076,10 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         // 3 items ready, ws_concurrency = 2
-        let mut i1 = test_item("s1", "analyze");
-        i1.phase = QueuePhase::Ready;
-        let mut i2 = test_item("s2", "analyze");
-        i2.phase = QueuePhase::Ready;
-        let mut i3 = test_item("s3", "analyze");
-        i3.phase = QueuePhase::Ready;
-        daemon.push_item(i1);
-        daemon.push_item(i2);
-        daemon.push_item(i3);
+        for id in ["s1", "s2", "s3"] {
+            daemon.push_item(ready_item_for_ws(id, "test-ws"));
+        }
 
-        // All items belong to "test-ws"; limit that workspace to 2.
         let limits = HashMap::from([("test-ws".to_string(), 2)]);
         daemon.advance_ready_to_running(&limits, 1);
 
@@ -2079,12 +2093,9 @@ sources:
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
-        let mut i1 = test_item("s1", "analyze");
-        i1.phase = QueuePhase::Ready;
-        let mut i2 = test_item("s2", "analyze");
-        i2.phase = QueuePhase::Ready;
-        daemon.push_item(i1);
-        daemon.push_item(i2);
+        for id in ["s1", "s2"] {
+            daemon.push_item(ready_item_for_ws(id, "test-ws"));
+        }
 
         let limits = HashMap::from([("test-ws".to_string(), 4)]);
         daemon.advance_ready_to_running(&limits, 1);
@@ -2100,62 +2111,33 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         // ws-alpha: 3 items, limit 2
-        let mut a1 = test_item("a1", "analyze");
-        a1.workspace_id = "ws-alpha".to_string();
-        a1.phase = QueuePhase::Ready;
-        let mut a2 = test_item("a2", "analyze");
-        a2.workspace_id = "ws-alpha".to_string();
-        a2.phase = QueuePhase::Ready;
-        let mut a3 = test_item("a3", "analyze");
-        a3.workspace_id = "ws-alpha".to_string();
-        a3.phase = QueuePhase::Ready;
-
+        for id in ["a1", "a2", "a3"] {
+            daemon.push_item(ready_item_for_ws(id, "ws-alpha"));
+        }
         // ws-beta: 2 items, limit 1
-        let mut b1 = test_item("b1", "analyze");
-        b1.workspace_id = "ws-beta".to_string();
-        b1.phase = QueuePhase::Ready;
-        let mut b2 = test_item("b2", "analyze");
-        b2.workspace_id = "ws-beta".to_string();
-        b2.phase = QueuePhase::Ready;
-
-        daemon.push_item(a1);
-        daemon.push_item(a2);
-        daemon.push_item(a3);
-        daemon.push_item(b1);
-        daemon.push_item(b2);
+        for id in ["b1", "b2"] {
+            daemon.push_item(ready_item_for_ws(id, "ws-beta"));
+        }
 
         let limits = HashMap::from([("ws-alpha".to_string(), 2), ("ws-beta".to_string(), 1)]);
         daemon.advance_ready_to_running(&limits, 1);
 
-        // ws-alpha: 2 running, 1 ready
-        let running: Vec<_> = daemon
-            .items_in_phase(QueuePhase::Running)
-            .into_iter()
-            .filter(|i| i.workspace_id == "ws-alpha")
-            .collect();
-        assert_eq!(running.len(), 2);
-
-        let ready_alpha: Vec<_> = daemon
-            .items_in_phase(QueuePhase::Ready)
-            .into_iter()
-            .filter(|i| i.workspace_id == "ws-alpha")
-            .collect();
-        assert_eq!(ready_alpha.len(), 1);
-
-        // ws-beta: 1 running, 1 ready
-        let running_beta: Vec<_> = daemon
-            .items_in_phase(QueuePhase::Running)
-            .into_iter()
-            .filter(|i| i.workspace_id == "ws-beta")
-            .collect();
-        assert_eq!(running_beta.len(), 1);
-
-        let ready_beta: Vec<_> = daemon
-            .items_in_phase(QueuePhase::Ready)
-            .into_iter()
-            .filter(|i| i.workspace_id == "ws-beta")
-            .collect();
-        assert_eq!(ready_beta.len(), 1);
+        assert_eq!(
+            count_in_phase_for_ws(&daemon, QueuePhase::Running, "ws-alpha"),
+            2
+        );
+        assert_eq!(
+            count_in_phase_for_ws(&daemon, QueuePhase::Ready, "ws-alpha"),
+            1
+        );
+        assert_eq!(
+            count_in_phase_for_ws(&daemon, QueuePhase::Running, "ws-beta"),
+            1
+        );
+        assert_eq!(
+            count_in_phase_for_ws(&daemon, QueuePhase::Ready, "ws-beta"),
+            1
+        );
     }
 
     #[test]
@@ -2165,20 +2147,11 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         // 3 items for "unknown-ws", not in limits map; default = 2
-        let mut i1 = test_item("s1", "analyze");
-        i1.workspace_id = "unknown-ws".to_string();
-        i1.phase = QueuePhase::Ready;
-        let mut i2 = test_item("s2", "analyze");
-        i2.workspace_id = "unknown-ws".to_string();
-        i2.phase = QueuePhase::Ready;
-        let mut i3 = test_item("s3", "analyze");
-        i3.workspace_id = "unknown-ws".to_string();
-        i3.phase = QueuePhase::Ready;
-        daemon.push_item(i1);
-        daemon.push_item(i2);
-        daemon.push_item(i3);
+        for id in ["s1", "s2", "s3"] {
+            daemon.push_item(ready_item_for_ws(id, "unknown-ws"));
+        }
 
-        let limits = HashMap::new(); // empty map
+        let limits = HashMap::new();
         daemon.advance_ready_to_running(&limits, 2);
 
         assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 2);
@@ -2194,16 +2167,10 @@ sources:
 
         // Two workspaces, each with limit 3, but global limit is 4
         for i in 0..3 {
-            let mut item = test_item(&format!("a{i}"), "analyze");
-            item.workspace_id = "ws-a".to_string();
-            item.phase = QueuePhase::Ready;
-            daemon.push_item(item);
+            daemon.push_item(ready_item_for_ws(&format!("a{i}"), "ws-a"));
         }
         for i in 0..3 {
-            let mut item = test_item(&format!("b{i}"), "analyze");
-            item.workspace_id = "ws-b".to_string();
-            item.phase = QueuePhase::Ready;
-            daemon.push_item(item);
+            daemon.push_item(ready_item_for_ws(&format!("b{i}"), "ws-b"));
         }
 
         let limits = HashMap::from([("ws-a".to_string(), 3), ("ws-b".to_string(), 3)]);
