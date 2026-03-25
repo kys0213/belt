@@ -13,6 +13,7 @@ use crate::dashboard;
 #[derive(Debug, Serialize)]
 pub struct SystemStatus {
     pub total_items: u32,
+    pub hitl_count: u32,
     pub phase_counts: Vec<PhaseCount>,
     pub running_items: Vec<ItemSummary>,
     pub recent_events: Vec<EventSummary>,
@@ -59,6 +60,11 @@ pub struct SpecStatus {
 pub fn gather_status(db: &Database) -> anyhow::Result<SystemStatus> {
     let phase_counts_raw = db.count_items_by_phase()?;
     let total_items: u32 = phase_counts_raw.iter().map(|(_, c)| *c).sum();
+    let hitl_count = phase_counts_raw
+        .iter()
+        .find(|(p, _)| p == "hitl")
+        .map(|(_, c)| *c)
+        .unwrap_or(0);
 
     let phase_counts = phase_counts_raw
         .into_iter()
@@ -93,6 +99,7 @@ pub fn gather_status(db: &Database) -> anyhow::Result<SystemStatus> {
 
     Ok(SystemStatus {
         total_items,
+        hitl_count,
         phase_counts,
         running_items,
         recent_events,
@@ -270,6 +277,7 @@ mod tests {
         let status = gather_status(&db).unwrap();
 
         assert_eq!(status.total_items, 0);
+        assert_eq!(status.hitl_count, 0);
         assert!(status.phase_counts.is_empty());
         assert!(status.running_items.is_empty());
         assert!(status.recent_events.is_empty());
@@ -369,6 +377,38 @@ mod tests {
             "expected at most 10 events, got {}",
             status.recent_events.len()
         );
+    }
+
+    #[test]
+    fn gather_status_hitl_count_populated() {
+        let db = test_db();
+
+        let pending = make_item("w1:implement", "w1", "ws-a", QueuePhase::Pending);
+        let hitl1 = make_item("w2:implement", "w2", "ws-a", QueuePhase::Hitl);
+        let hitl2 = make_item("w3:implement", "w3", "ws-b", QueuePhase::Hitl);
+
+        db.insert_item(&pending).unwrap();
+        db.insert_item(&hitl1).unwrap();
+        db.insert_item(&hitl2).unwrap();
+
+        let status = gather_status(&db).unwrap();
+
+        assert_eq!(status.total_items, 3);
+        assert_eq!(status.hitl_count, 2);
+    }
+
+    #[test]
+    fn gather_status_hitl_count_zero_when_none() {
+        let db = test_db();
+
+        let pending = make_item("w1:implement", "w1", "ws-a", QueuePhase::Pending);
+        let running = make_item("w2:implement", "w2", "ws-a", QueuePhase::Running);
+        db.insert_item(&pending).unwrap();
+        db.insert_item(&running).unwrap();
+
+        let status = gather_status(&db).unwrap();
+
+        assert_eq!(status.hitl_count, 0);
     }
 
     // ---- gather_spec_status ----
@@ -473,6 +513,11 @@ fn print_text_status(status: &SystemStatus) {
     println!("Belt System Status");
     println!("==================");
     println!("Total items: {}", status.total_items);
+    if status.hitl_count > 0 {
+        println!("\x1b[31mHITL: {}\x1b[0m", status.hitl_count);
+    } else {
+        println!("HITL: 0");
+    }
     println!();
     if !status.phase_counts.is_empty() {
         println!("Phase breakdown:");
@@ -506,6 +551,13 @@ fn print_text_status(status: &SystemStatus) {
             s.total_tokens, s.executions
         );
     }
+    if status.hitl_count > 0 {
+        println!();
+        println!(
+            "\x1b[33m\u{26a0}\u{fe0f} {} items require human intervention. Run 'belt claw' to review.\x1b[0m",
+            status.hitl_count
+        );
+    }
 }
 
 fn print_rich_status(status: &SystemStatus) {
@@ -513,6 +565,11 @@ fn print_rich_status(status: &SystemStatus) {
     println!("|        Belt System Status            |");
     println!("+--------------------------------------+");
     println!("| Total items: {:<23} |", status.total_items);
+    if status.hitl_count > 0 {
+        println!("| \x1b[31mHITL:        {:<23}\x1b[0m |", status.hitl_count);
+    } else {
+        println!("| HITL:        {:<23} |", 0);
+    }
     println!("+--------------------------------------+");
     if !status.phase_counts.is_empty() {
         println!("| Phase          | Count               |");
@@ -542,6 +599,14 @@ fn print_rich_status(status: &SystemStatus) {
             println!("| {} -> {} [{}]", ev.from_state, ev.to_state, ev.event_type);
         }
         println!("+--------------------------------------+");
+    }
+
+    if status.hitl_count > 0 {
+        println!();
+        println!(
+            "\x1b[33m\u{26a0}\u{fe0f} {} items require human intervention. Run 'belt claw' to review.\x1b[0m",
+            status.hitl_count
+        );
     }
 }
 

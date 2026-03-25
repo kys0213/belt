@@ -23,6 +23,21 @@ pub struct StatusSummary {
     pub hitl_pending: u32,
     /// Most recent transition events (up to 5).
     pub recent_events: Vec<RecentEvent>,
+    /// HITL items grouped by escalation reason for display on claw entry.
+    pub hitl_items: Vec<HitlItemSummary>,
+}
+
+/// Brief summary of a HITL queue item for display.
+#[derive(Debug, Clone)]
+pub struct HitlItemSummary {
+    /// The queue item work_id.
+    pub work_id: String,
+    /// Workspace the item belongs to.
+    pub workspace: String,
+    /// Escalation reason (hitl_reason field), or "other" if unset.
+    pub reason: String,
+    /// Item title if available.
+    pub title: Option<String>,
 }
 
 /// A brief description of a recent transition event.
@@ -73,11 +88,28 @@ fn collect_status_from_db(db: &belt_infra::db::Database) -> Option<StatusSummary
         })
         .collect();
 
+    let hitl_items = db
+        .list_items(Some(belt_core::phase::QueuePhase::Hitl), None)
+        .ok()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|item| HitlItemSummary {
+            work_id: item.work_id,
+            workspace: item.workspace_id,
+            reason: item
+                .hitl_reason
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "other".to_string()),
+            title: item.title,
+        })
+        .collect();
+
     Some(StatusSummary {
         total_items,
         phase_counts,
         hitl_pending,
         recent_events,
+        hitl_items,
     })
 }
 
@@ -115,6 +147,72 @@ fn write_status_banner<W: Write>(output: &mut W, summary: &StatusSummary) -> io:
     }
 
     writeln!(output, "---------------------")?;
+
+    // Display HITL items grouped by escalation reason with priority ordering.
+    if !summary.hitl_items.is_empty() {
+        write_hitl_list(output, &summary.hitl_items)?;
+    }
+
+    Ok(())
+}
+
+/// Priority order for HITL escalation reasons.
+///
+/// Lower value = higher priority. Reasons not in this list get the lowest
+/// priority.
+fn reason_priority(reason: &str) -> u32 {
+    match reason {
+        "evaluate_failure" => 0,               // spec-conflict equivalent
+        "retry_max_exceeded" | "timeout" => 1, // failure category
+        _ => 2,                                // other (manual_escalation, unknown)
+    }
+}
+
+/// Display label for an escalation reason group.
+fn reason_display_label(reason: &str) -> &str {
+    match reason {
+        "evaluate_failure" => "Spec Conflict (evaluate_failure)",
+        "retry_max_exceeded" => "Failure (retry_max_exceeded)",
+        "timeout" => "Failure (timeout)",
+        "manual_escalation" => "Other (manual_escalation)",
+        _ => "Other",
+    }
+}
+
+/// Write HITL items grouped by escalation reason to the output stream.
+fn write_hitl_list<W: Write>(output: &mut W, items: &[HitlItemSummary]) -> io::Result<()> {
+    use std::collections::BTreeMap;
+
+    // Group items by reason.
+    let mut groups: BTreeMap<String, Vec<&HitlItemSummary>> = BTreeMap::new();
+    for item in items {
+        groups.entry(item.reason.clone()).or_default().push(item);
+    }
+
+    // Sort groups by priority.
+    let mut sorted_groups: Vec<(String, Vec<&HitlItemSummary>)> = groups.into_iter().collect();
+    sorted_groups.sort_by_key(|(reason, _)| reason_priority(reason));
+
+    writeln!(output)?;
+    writeln!(
+        output,
+        "--- HITL Items ({} awaiting review) ---",
+        items.len()
+    )?;
+
+    for (reason, group_items) in &sorted_groups {
+        writeln!(output, "  [{}]", reason_display_label(reason))?;
+        for item in group_items {
+            let title = item.title.as_deref().unwrap_or("-");
+            writeln!(
+                output,
+                "    {:<40} {:<16} {}",
+                item.work_id, item.workspace, title
+            )?;
+        }
+    }
+
+    writeln!(output, "---------------------------------------")?;
     Ok(())
 }
 
@@ -302,6 +400,7 @@ mod tests {
                 to_state: "hitl".to_string(),
                 timestamp: "2026-03-24T10:00:00Z".to_string(),
             }],
+            hitl_items: vec![],
         };
         let mut input = Cursor::new(b"/quit\n" as &[u8]);
         let mut output = Vec::new();
@@ -334,6 +433,7 @@ mod tests {
             phase_counts: vec![("pending".to_string(), 3)],
             hitl_pending: 0,
             recent_events: vec![],
+            hitl_items: vec![],
         };
         let mut output = Vec::new();
         write_status_banner(&mut output, &summary).unwrap();
@@ -350,6 +450,7 @@ mod tests {
         assert!(summary.phase_counts.is_empty());
         assert_eq!(summary.hitl_pending, 0);
         assert!(summary.recent_events.is_empty());
+        assert!(summary.hitl_items.is_empty());
     }
 
     #[test]
@@ -368,17 +469,141 @@ mod tests {
         );
         db.insert_item(&item1).unwrap();
 
-        let item2 = QueueItem::new(
+        let mut item2 = QueueItem::new(
             "w2".to_string(),
             "s2".to_string(),
             "ws1".to_string(),
             "implement".to_string(),
         );
+        item2.hitl_reason = Some(belt_core::queue::HitlReason::EvaluateFailure);
         db.insert_item(&item2).unwrap();
         db.update_phase("w2", QueuePhase::Hitl).unwrap();
 
         let summary = collect_status_from_db(&db).unwrap();
         assert_eq!(summary.total_items, 2);
         assert_eq!(summary.hitl_pending, 1);
+        assert_eq!(summary.hitl_items.len(), 1);
+        assert_eq!(summary.hitl_items[0].work_id, "w2");
+    }
+
+    #[test]
+    fn collect_status_hitl_items_empty_when_no_hitl() {
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+
+        let item = belt_core::queue::QueueItem::new(
+            "w1".to_string(),
+            "s1".to_string(),
+            "ws1".to_string(),
+            "analyze".to_string(),
+        );
+        db.insert_item(&item).unwrap();
+
+        let summary = collect_status_from_db(&db).unwrap();
+        assert!(summary.hitl_items.is_empty());
+    }
+
+    #[test]
+    fn claw_entry_displays_hitl_list_grouped_by_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_config(&tmp);
+        let summary = StatusSummary {
+            total_items: 5,
+            phase_counts: vec![("pending".to_string(), 2), ("hitl".to_string(), 3)],
+            hitl_pending: 3,
+            recent_events: vec![],
+            hitl_items: vec![
+                HitlItemSummary {
+                    work_id: "w1:impl".to_string(),
+                    workspace: "ws-a".to_string(),
+                    reason: "evaluate_failure".to_string(),
+                    title: Some("Spec conflict item".to_string()),
+                },
+                HitlItemSummary {
+                    work_id: "w2:impl".to_string(),
+                    workspace: "ws-a".to_string(),
+                    reason: "retry_max_exceeded".to_string(),
+                    title: Some("Retry exceeded item".to_string()),
+                },
+                HitlItemSummary {
+                    work_id: "w3:impl".to_string(),
+                    workspace: "ws-b".to_string(),
+                    reason: "other".to_string(),
+                    title: None,
+                },
+            ],
+        };
+        let mut input = Cursor::new(b"/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, Some(&summary)).unwrap();
+        let out = String::from_utf8(output).unwrap();
+
+        // Verify HITL list is displayed.
+        assert!(out.contains("HITL Items (3 awaiting review)"));
+        // Verify grouping labels appear.
+        assert!(out.contains("Spec Conflict (evaluate_failure)"));
+        assert!(out.contains("Failure (retry_max_exceeded)"));
+        assert!(out.contains("Other"));
+        // Verify items are listed.
+        assert!(out.contains("w1:impl"));
+        assert!(out.contains("w2:impl"));
+        assert!(out.contains("w3:impl"));
+    }
+
+    #[test]
+    fn claw_entry_no_hitl_list_when_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_config(&tmp);
+        let summary = StatusSummary {
+            total_items: 2,
+            phase_counts: vec![("pending".to_string(), 2)],
+            hitl_pending: 0,
+            recent_events: vec![],
+            hitl_items: vec![],
+        };
+        let mut input = Cursor::new(b"/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, Some(&summary)).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(!out.contains("HITL Items"));
+    }
+
+    #[test]
+    fn hitl_list_priority_order_spec_conflict_first() {
+        let items = vec![
+            HitlItemSummary {
+                work_id: "other-item".to_string(),
+                workspace: "ws".to_string(),
+                reason: "other".to_string(),
+                title: None,
+            },
+            HitlItemSummary {
+                work_id: "failure-item".to_string(),
+                workspace: "ws".to_string(),
+                reason: "timeout".to_string(),
+                title: None,
+            },
+            HitlItemSummary {
+                work_id: "spec-item".to_string(),
+                workspace: "ws".to_string(),
+                reason: "evaluate_failure".to_string(),
+                title: None,
+            },
+        ];
+        let mut output = Vec::new();
+        write_hitl_list(&mut output, &items).unwrap();
+        let out = String::from_utf8(output).unwrap();
+
+        // Spec Conflict should appear before Failure, which should appear before Other.
+        let spec_pos = out.find("Spec Conflict").unwrap();
+        let failure_pos = out.find("Failure (timeout)").unwrap();
+        let other_pos = out.find("Other").unwrap();
+        assert!(
+            spec_pos < failure_pos,
+            "spec-conflict should appear before failure"
+        );
+        assert!(
+            failure_pos < other_pos,
+            "failure should appear before other"
+        );
     }
 }
