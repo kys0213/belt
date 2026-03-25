@@ -14,6 +14,8 @@ mod status;
 use belt_core::runtime::RuntimeRegistry;
 use belt_daemon::daemon::Daemon;
 use belt_infra::runtimes::claude::ClaudeRuntime;
+use belt_infra::runtimes::codex::CodexRuntime;
+use belt_infra::runtimes::gemini::GeminiRuntime;
 use belt_infra::sources::github::GitHubDataSource;
 use belt_infra::worktree::{GitWorktreeManager, WorktreeManager};
 
@@ -452,6 +454,8 @@ async fn start_daemon(
     // Runtime registry with Claude as default.
     let mut registry = RuntimeRegistry::new("claude".to_string());
     registry.register(Arc::new(ClaudeRuntime::new(None)));
+    registry.register(Arc::new(GeminiRuntime::new(None)));
+    registry.register(Arc::new(CodexRuntime::new(None)));
 
     // Worktree manager.
     let worktree_base = belt_home.join("worktrees");
@@ -800,6 +804,12 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
     let mut registry = belt_core::runtime::RuntimeRegistry::new("claude".to_string());
     registry.register(std::sync::Arc::new(
         belt_infra::runtimes::claude::ClaudeRuntime::new(None),
+    ));
+    registry.register(std::sync::Arc::new(
+        belt_infra::runtimes::gemini::GeminiRuntime::new(None),
+    ));
+    registry.register(std::sync::Arc::new(
+        belt_infra::runtimes::codex::CodexRuntime::new(None),
     ));
     let executor = belt_daemon::executor::ActionExecutor::new(std::sync::Arc::new(registry));
 
