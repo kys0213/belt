@@ -564,6 +564,11 @@ enum CronCommands {
         /// Name of the cron job to trigger.
         name: String,
     },
+    /// Run a user-defined cron job script immediately (bypasses scheduling).
+    Run {
+        /// Name of the cron job to run.
+        name: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1051,6 +1056,46 @@ fn validate_cron_expression(expr: &str) -> anyhow::Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// `belt cron run` -- execute a user-defined cron job script immediately.
+fn cmd_cron_run(name: &str) -> anyhow::Result<()> {
+    let db = open_db()?;
+    let job = db.get_cron_job(name)?;
+
+    let script_path = std::path::Path::new(&job.script);
+    if !script_path.exists() {
+        anyhow::bail!("script not found: {}", job.script);
+    }
+
+    println!("Running cron job '{name}' (script: {})...", job.script);
+
+    let belt_home = belt_home()?;
+    let output = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&job.script)
+        .env("BELT_HOME", belt_home.to_string_lossy().as_ref())
+        .env("BELT_CRON_JOB", name)
+        .output()?;
+
+    if !output.stdout.is_empty() {
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    if output.status.success() {
+        db.update_cron_last_run(name)?;
+        println!("Cron job '{name}' completed successfully.");
+    } else {
+        anyhow::bail!(
+            "cron job '{name}' failed with exit code {}",
+            output.status.code().unwrap_or(-1)
+        );
+    }
+
     Ok(())
 }
 
@@ -1631,6 +1676,9 @@ async fn main() -> anyhow::Result<()> {
             }
             CronCommands::Trigger { name } => {
                 cmd_cron_trigger(&name)?;
+            }
+            CronCommands::Run { name } => {
+                cmd_cron_run(&name)?;
             }
         },
         Commands::Context {

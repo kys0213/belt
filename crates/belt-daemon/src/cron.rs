@@ -32,6 +32,11 @@ pub enum CronSchedule {
         /// Minute of hour (0–59).
         min: u32,
     },
+    /// Standard 5-field cron expression (minute hour day month weekday).
+    ///
+    /// Stores the raw expression string and evaluates it against the current
+    /// time on each tick.
+    Expression(String),
 }
 
 impl CronSchedule {
@@ -60,11 +65,126 @@ impl CronSchedule {
                     Some(last) => last.date_naive() < now.date_naive(),
                 }
             }
+            CronSchedule::Expression(expr) => {
+                if !cron_expression_matches(expr, now) {
+                    return false;
+                }
+                // Prevent re-running within the same minute.
+                match last_run_at {
+                    None => true,
+                    Some(last) => {
+                        last.date_naive() != now.date_naive()
+                            || last.time().hour() != now.time().hour()
+                            || last.time().minute() != now.time().minute()
+                    }
+                }
+            }
         }
+    }
+
+    /// Parse a cron expression string into a `CronSchedule`.
+    ///
+    /// Accepts standard 5-field cron expressions (minute hour day month weekday)
+    /// where each field may use digits, `*`, `/`, `-`, or `,`.
+    pub fn parse_expression(expr: &str) -> Result<Self, BeltError> {
+        let fields: Vec<&str> = expr.split_whitespace().collect();
+        if fields.len() != 5 {
+            return Err(BeltError::Runtime(format!(
+                "invalid cron expression: expected 5 fields, got {}",
+                fields.len()
+            )));
+        }
+        for field in &fields {
+            if !field
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, '*' | '/' | '-' | ','))
+            {
+                return Err(BeltError::Runtime(format!(
+                    "invalid cron expression field: '{field}'"
+                )));
+            }
+        }
+        Ok(CronSchedule::Expression(expr.to_string()))
     }
 }
 
-use chrono::Timelike;
+/// Check whether the current time matches a 5-field cron expression.
+///
+/// Each field is matched independently: minute, hour, day-of-month, month,
+/// day-of-week. Supports `*`, ranges (`1-5`), step values (`*/10`), and
+/// comma-separated lists (`1,3,5`).
+fn cron_expression_matches(expr: &str, now: DateTime<Utc>) -> bool {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 5 {
+        return false;
+    }
+
+    let now_values = [
+        now.time().minute(),
+        now.time().hour(),
+        now.date_naive().day(),
+        now.date_naive().month(),
+        now.date_naive().weekday().num_days_from_sunday(),
+    ];
+
+    let max_values = [59, 23, 31, 12, 7];
+
+    for (field, (&now_val, &max_val)) in fields.iter().zip(now_values.iter().zip(max_values.iter()))
+    {
+        if !cron_field_matches(field, now_val, max_val) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Match a single cron field against a value.
+///
+/// Supports: `*`, `*/step`, `value`, `start-end`, `start-end/step`, and
+/// comma-separated combinations.
+fn cron_field_matches(field: &str, value: u32, max: u32) -> bool {
+    for part in field.split(',') {
+        if cron_part_matches(part, value, max) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Match a single comma-separated part of a cron field.
+fn cron_part_matches(part: &str, value: u32, max: u32) -> bool {
+    if let Some(slash_pos) = part.find('/') {
+        let range_part = &part[..slash_pos];
+        let step: u32 = match part[slash_pos + 1..].parse() {
+            Ok(s) if s > 0 => s,
+            _ => return false,
+        };
+        let (start, end) = if range_part == "*" {
+            (0, max)
+        } else if let Some(dash_pos) = range_part.find('-') {
+            let s: u32 = range_part[..dash_pos].parse().unwrap_or(0);
+            let e: u32 = range_part[dash_pos + 1..].parse().unwrap_or(max);
+            (s, e)
+        } else {
+            let s: u32 = range_part.parse().unwrap_or(0);
+            (s, max)
+        };
+        if value < start || value > end {
+            return false;
+        }
+        (value - start).is_multiple_of(step)
+    } else if part == "*" {
+        true
+    } else if let Some(dash_pos) = part.find('-') {
+        let start: u32 = part[..dash_pos].parse().unwrap_or(0);
+        let end: u32 = part[dash_pos + 1..].parse().unwrap_or(max);
+        value >= start && value <= end
+    } else {
+        part.parse::<u32>().ok() == Some(value)
+    }
+}
+
+use chrono::{Datelike, Timelike};
 
 // ---------------------------------------------------------------------------
 // CronHandler
@@ -1172,6 +1292,154 @@ pub fn builtin_jobs(deps: BuiltinJobDeps) -> Vec<CronJobDef> {
             handler: Box::new(KnowledgeExtractionJob::new(Arc::clone(&deps.db))),
         },
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Custom (user-defined) script jobs
+// ---------------------------------------------------------------------------
+
+/// A cron handler that executes a user-defined shell script.
+///
+/// When the cron engine fires this job, the handler spawns the script as a
+/// child process and waits for it to complete. The script receives `BELT_HOME`
+/// and `BELT_CRON_JOB` environment variables.
+pub struct CustomScriptJob {
+    /// Absolute path to the script to execute.
+    pub script: String,
+    /// Job name (passed as `BELT_CRON_JOB` env var).
+    pub job_name: String,
+    /// Database handle for updating `last_run_at` after execution.
+    pub db: Arc<Database>,
+}
+
+impl CronHandler for CustomScriptJob {
+    fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
+        tracing::info!(
+            job = %self.job_name,
+            script = %self.script,
+            "CustomScriptJob: executing user-defined script"
+        );
+
+        let belt_home = std::env::var("BELT_HOME").unwrap_or_else(|_| "~/.belt".to_string());
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&self.script)
+            .env("BELT_HOME", &belt_home)
+            .env("BELT_CRON_JOB", &self.job_name)
+            .output()
+            .map_err(|e| {
+                BeltError::Runtime(format!("failed to spawn script '{}': {e}", self.script))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::error!(
+                job = %self.job_name,
+                exit_code = ?output.status.code(),
+                stderr = %stderr,
+                "CustomScriptJob: script failed"
+            );
+            return Err(BeltError::Runtime(format!(
+                "script '{}' exited with status {}: {}",
+                self.script,
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            )));
+        }
+
+        // Update last_run_at in DB so the CLI can display accurate info.
+        if let Err(e) = self.db.update_cron_last_run(&self.job_name) {
+            tracing::warn!(
+                job = %self.job_name,
+                error = %e,
+                "CustomScriptJob: failed to update last_run_at in DB"
+            );
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if !stdout.is_empty() {
+            tracing::info!(
+                job = %self.job_name,
+                stdout = %stdout.trim(),
+                "CustomScriptJob: script output"
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// Load user-defined cron jobs from the database and register them with the engine.
+///
+/// Reads all cron jobs from the `cron_jobs` table, skips any whose name matches
+/// a built-in job, and creates a [`CustomScriptJob`] handler for each.
+pub fn load_custom_jobs(engine: &mut CronEngine, db: &Arc<Database>) {
+    let jobs = match db.list_cron_jobs() {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to load custom cron jobs from DB");
+            return;
+        }
+    };
+
+    let builtin_names = [
+        "hitl_timeout",
+        "daily_report",
+        "log_cleanup",
+        "evaluate",
+        "pr_review_scan",
+        "gap_detection",
+        "knowledge_extraction",
+    ];
+
+    for job in jobs {
+        // Skip built-in jobs (they are registered separately).
+        if builtin_names.contains(&job.name.as_str()) {
+            continue;
+        }
+        // Skip workspace-scoped built-in jobs (e.g. "billing:hitl_timeout").
+        if job.name.contains(':')
+            && builtin_names
+                .iter()
+                .any(|b| job.name.ends_with(&format!(":{b}")))
+        {
+            continue;
+        }
+
+        let schedule = match CronSchedule::parse_expression(&job.schedule) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    job = %job.name,
+                    schedule = %job.schedule,
+                    error = %e,
+                    "skipping custom cron job with invalid schedule"
+                );
+                continue;
+            }
+        };
+
+        tracing::info!(
+            job = %job.name,
+            schedule = %job.schedule,
+            enabled = job.enabled,
+            "registering custom cron job from DB"
+        );
+
+        engine.register(CronJobDef {
+            name: job.name.clone(),
+            schedule,
+            workspace: job.workspace.clone(),
+            enabled: job.enabled,
+            last_run_at: None,
+            handler: Box::new(CustomScriptJob {
+                script: job.script.clone(),
+                job_name: job.name,
+                db: Arc::clone(db),
+            }),
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------

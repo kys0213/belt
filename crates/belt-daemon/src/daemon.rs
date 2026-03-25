@@ -20,7 +20,7 @@ use belt_infra::db::Database;
 use belt_infra::worktree::WorktreeManager;
 
 use crate::concurrency::ConcurrencyTracker;
-use crate::cron::{BuiltinJobDeps, CronEngine, builtin_jobs, seed_workspace_crons};
+use crate::cron::{BuiltinJobDeps, CronEngine, builtin_jobs, load_custom_jobs, seed_workspace_crons};
 use crate::evaluator::Evaluator;
 use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
 
@@ -130,7 +130,8 @@ impl Daemon {
 
     /// Set the database for persisting token usage records.
     ///
-    /// Also initializes the built-in cron jobs which require a database handle.
+    /// Also initializes the built-in cron jobs which require a database handle
+    /// and loads user-defined custom cron jobs from the database.
     pub fn with_db(mut self, db: Database) -> Self {
         let db = Arc::new(db);
         let deps = BuiltinJobDeps {
@@ -157,6 +158,9 @@ impl Daemon {
                 tracing::info!(workspace = %ws_name, "seeded per-workspace cron jobs");
             }
         }
+
+        // Load user-defined custom cron jobs from the DB.
+        load_custom_jobs(&mut cron, &db);
 
         self.cron_engine = Some(cron);
         self.db = Some(db);
