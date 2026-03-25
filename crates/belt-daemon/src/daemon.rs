@@ -858,6 +858,11 @@ impl Daemon {
         let on_done: Vec<Action> = state_config.on_done.iter().map(Action::from).collect();
         let result = self.executor.execute_all(&on_done, &env).await?;
 
+        // Record token usage from on_done handler execution.
+        if let Some(ref r) = result {
+            self.try_record_token_usage(item, r);
+        }
+
         match result {
             Some(r) if !r.success() => {
                 let _ = transit(item, QueuePhase::Failed);
@@ -899,8 +904,42 @@ impl Daemon {
         }
         self.tracker.track_evaluate();
 
-        // Evaluator 스크립트 실행으로 Done vs HITL 판정.
-        let eval_result = self.evaluator.run_evaluate(&self.belt_home).await;
+        // Evaluator: 가능하면 ActionExecutor를 통해 LLM 호출 (token usage 추적),
+        // fallback으로 기존 스크립트 방식 사용.
+        let eval_result = {
+            // Use the first completed item's worktree for the evaluate env.
+            let eval_env = if let Some(work_id) = completed.first() {
+                self.worktree_mgr.create_or_reuse(work_id).ok().map(|wt| {
+                    ActionEnv::new(work_id, &wt)
+                        .with_var("WORKSPACE", &self.config.name)
+                        .with_var("BELT_HOME", &self.belt_home.to_string_lossy())
+                        .with_var("BELT_DB", &self.belt_home.join("belt.db").to_string_lossy())
+                })
+            } else {
+                None
+            };
+
+            if let Some(env) = &eval_env {
+                match self
+                    .evaluator
+                    .run_evaluate_with_executor(&self.executor, env)
+                    .await
+                {
+                    Ok(action_result) => {
+                        // Record token usage from the evaluate LLM call for each completed item.
+                        for work_id in &completed {
+                            if let Some(item) = self.queue.iter().find(|i| i.work_id == *work_id) {
+                                self.try_record_token_usage(item, &action_result);
+                            }
+                        }
+                        Ok(crate::evaluator::EvaluateResult::from(action_result))
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                self.evaluator.run_evaluate(&self.belt_home).await
+            }
+        };
 
         match eval_result {
             Ok(result) if result.success() => {
