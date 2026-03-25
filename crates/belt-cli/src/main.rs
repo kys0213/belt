@@ -1741,6 +1741,7 @@ async fn main() -> anyhow::Result<()> {
                     {
                         let parent_number = extract_issue_number(parent);
                         let mut child_urls: Vec<String> = Vec::new();
+                        let mut child_numbers: Vec<String> = Vec::new();
 
                         for (i, ac) in criteria.iter().enumerate() {
                             let child_title = format!(
@@ -1753,6 +1754,9 @@ async fn main() -> anyhow::Result<()> {
                                 format!("Parent: {}\n\n## Acceptance Criterion\n\n{}", parent, ac);
                             if let Some(url) = create_github_issue(&child_title, &child_body) {
                                 println!("  child issue created: {url}");
+                                if let Some(num) = extract_issue_number(&url) {
+                                    child_numbers.push(num);
+                                }
                                 child_urls.push(url);
                             }
                         }
@@ -1770,6 +1774,20 @@ async fn main() -> anyhow::Result<()> {
                             let updated_body =
                                 format!("{}\n\n## Sub-issues\n{}", spec.content, links);
                             update_github_issue_body(num, &updated_body);
+                        }
+
+                        // Store decomposed issue numbers and transition spec to Active.
+                        if !child_numbers.is_empty() {
+                            spec.decomposed_issues = Some(child_numbers.join(","));
+                            db.update_spec(&spec)?;
+                            spec.transition_to(belt_core::spec::SpecStatus::Active)
+                                .map_err(|e| anyhow::anyhow!("{e}"))?;
+                            db.update_spec_status(&spec.id, spec.status)?;
+                            println!(
+                                "spec {} decomposed into {} issues, status -> active",
+                                id,
+                                child_numbers.len()
+                            );
                         }
                     }
                 }

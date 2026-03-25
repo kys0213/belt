@@ -204,6 +204,9 @@ pub struct Spec {
     /// Optional comma-separated file/module paths this spec touches.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_point: Option<String>,
+    /// Optional comma-separated GitHub issue numbers created by decomposition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub decomposed_issues: Option<String>,
     /// Creation timestamp (RFC 3339).
     pub created_at: String,
     /// Last update timestamp (RFC 3339).
@@ -224,6 +227,7 @@ impl Spec {
             labels: None,
             depends_on: None,
             entry_point: None,
+            decomposed_issues: None,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -251,6 +255,23 @@ impl Spec {
                 .collect(),
             None => Vec::new(),
         }
+    }
+
+    /// Parse the comma-separated `decomposed_issues` field into individual issue numbers.
+    pub fn decomposed_issue_numbers(&self) -> Vec<&str> {
+        match &self.decomposed_issues {
+            Some(issues) => issues
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Returns `true` if this spec was decomposed into child issues.
+    pub fn is_decomposed(&self) -> bool {
+        self.decomposed_issues.is_some()
     }
 }
 
@@ -321,6 +342,16 @@ pub fn extract_acceptance_criteria(content: &str) -> Vec<String> {
     }
 
     criteria
+}
+
+/// Check whether all decomposed issues are closed, indicating the spec
+/// is ready to transition to `Completing`.
+///
+/// `issue_states` should contain `(issue_number, is_closed)` pairs for each
+/// decomposed issue. Returns `true` when all issues are closed and the list
+/// is non-empty.
+pub fn all_decomposed_issues_closed(issue_states: &[(String, bool)]) -> bool {
+    !issue_states.is_empty() && issue_states.iter().all(|(_, closed)| *closed)
 }
 
 /// A detected conflict between two specs.
@@ -809,5 +840,75 @@ mod tests {
         let content = "## Acceptance Criteria\n- Dash item\n* Star item\n";
         let ac = extract_acceptance_criteria(content);
         assert_eq!(ac, vec!["Dash item", "Star item"]);
+    }
+
+    #[test]
+    fn decomposed_issues_none_by_default() {
+        let spec = Spec::new(
+            "s1".to_string(),
+            "ws".to_string(),
+            "name".to_string(),
+            "content".to_string(),
+        );
+        assert!(spec.decomposed_issues.is_none());
+        assert!(!spec.is_decomposed());
+        assert!(spec.decomposed_issue_numbers().is_empty());
+    }
+
+    #[test]
+    fn decomposed_issues_parses_comma_separated() {
+        let mut spec = Spec::new(
+            "s1".to_string(),
+            "ws".to_string(),
+            "name".to_string(),
+            "content".to_string(),
+        );
+        spec.decomposed_issues = Some("42,43,44".to_string());
+        assert!(spec.is_decomposed());
+        assert_eq!(spec.decomposed_issue_numbers(), vec!["42", "43", "44"]);
+    }
+
+    #[test]
+    fn decomposed_issues_handles_whitespace() {
+        let mut spec = Spec::new(
+            "s1".to_string(),
+            "ws".to_string(),
+            "name".to_string(),
+            "content".to_string(),
+        );
+        spec.decomposed_issues = Some("42, 43, 44".to_string());
+        assert_eq!(spec.decomposed_issue_numbers(), vec!["42", "43", "44"]);
+    }
+
+    #[test]
+    fn all_decomposed_closed_returns_true_when_all_closed() {
+        let states = vec![("42".to_string(), true), ("43".to_string(), true)];
+        assert!(all_decomposed_issues_closed(&states));
+    }
+
+    #[test]
+    fn all_decomposed_closed_returns_false_when_some_open() {
+        let states = vec![("42".to_string(), true), ("43".to_string(), false)];
+        assert!(!all_decomposed_issues_closed(&states));
+    }
+
+    #[test]
+    fn all_decomposed_closed_returns_false_when_empty() {
+        let states: Vec<(String, bool)> = vec![];
+        assert!(!all_decomposed_issues_closed(&states));
+    }
+
+    #[test]
+    fn decomposed_spec_json_roundtrip() {
+        let mut spec = Spec::new(
+            "s1".to_string(),
+            "ws".to_string(),
+            "name".to_string(),
+            "content".to_string(),
+        );
+        spec.decomposed_issues = Some("10,20,30".to_string());
+        let json = serde_json::to_string(&spec).unwrap();
+        let parsed: Spec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.decomposed_issues, Some("10,20,30".to_string()));
     }
 }
