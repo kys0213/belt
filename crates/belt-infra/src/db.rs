@@ -280,6 +280,7 @@ impl Database {
                 depends_on        TEXT,
                 entry_point       TEXT,
                 decomposed_issues TEXT,
+                test_commands     TEXT,
                 created_at        TEXT NOT NULL,
                 updated_at        TEXT NOT NULL
             );
@@ -968,8 +969,8 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.execute(
-            "INSERT INTO specs (id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO specs (id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, test_commands, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 spec.id,
                 spec.workspace_id,
@@ -981,6 +982,7 @@ impl Database {
                 spec.depends_on,
                 spec.entry_point,
                 spec.decomposed_issues,
+                spec.test_commands,
                 spec.created_at,
                 spec.updated_at,
             ],
@@ -999,7 +1001,7 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.query_row(
-            "SELECT id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, created_at, updated_at
+            "SELECT id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, test_commands, created_at, updated_at
                  FROM specs WHERE id = ?1",
             params![id],
             |row| Ok(row_to_spec(row)),
@@ -1024,7 +1026,7 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let mut sql = String::from(
-            "SELECT id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, created_at, updated_at FROM specs WHERE 1=1",
+            "SELECT id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, test_commands, created_at, updated_at FROM specs WHERE 1=1",
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -1071,7 +1073,7 @@ impl Database {
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let rows = conn
             .execute(
-                "UPDATE specs SET name = ?1, content = ?2, priority = ?3, labels = ?4, depends_on = ?5, entry_point = ?6, decomposed_issues = ?7, updated_at = ?8 WHERE id = ?9",
+                "UPDATE specs SET name = ?1, content = ?2, priority = ?3, labels = ?4, depends_on = ?5, entry_point = ?6, decomposed_issues = ?7, test_commands = ?8, updated_at = ?9 WHERE id = ?10",
                 params![
                     spec.name,
                     spec.content,
@@ -1080,6 +1082,7 @@ impl Database {
                     spec.depends_on,
                     spec.entry_point,
                     spec.decomposed_issues,
+                    spec.test_commands,
                     now,
                     spec.id,
                 ],
@@ -1785,7 +1788,7 @@ fn str_to_spec_status(s: &str) -> Result<SpecStatus, BeltError> {
 /// Extract a `Spec` from a rusqlite `Row`.
 ///
 /// Column order must match:
-/// `id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, created_at, updated_at`
+/// `id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, test_commands, created_at, updated_at`
 fn row_to_spec(row: &rusqlite::Row<'_>) -> Result<Spec, BeltError> {
     let status_str: String = row.get(3).map_err(|e| BeltError::Database(e.to_string()))?;
 
@@ -1800,11 +1803,12 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> Result<Spec, BeltError> {
         depends_on: row.get(7).map_err(|e| BeltError::Database(e.to_string()))?,
         entry_point: row.get(8).map_err(|e| BeltError::Database(e.to_string()))?,
         decomposed_issues: row.get(9).map_err(|e| BeltError::Database(e.to_string()))?,
+        test_commands: row.get(10).map_err(|e| BeltError::Database(e.to_string()))?,
         created_at: row
-            .get(10)
+            .get(11)
             .map_err(|e| BeltError::Database(e.to_string()))?,
         updated_at: row
-            .get(11)
+            .get(12)
             .map_err(|e| BeltError::Database(e.to_string()))?,
     })
 }
