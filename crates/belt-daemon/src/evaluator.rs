@@ -3,8 +3,11 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use belt_core::action::Action;
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
+
+use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
 
 /// Default maximum number of evaluate failures before HITL escalation.
 pub const DEFAULT_MAX_EVAL_FAILURES: u32 = 3;
@@ -138,7 +141,33 @@ belt agent --workspace "{ws}" -p \
             exit_code: output.status.code().unwrap_or(-1),
             stdout: String::from_utf8_lossy(&output.stdout).to_string(),
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+            action_result: None,
         })
+    }
+
+    /// Build an `Action::Prompt` for the evaluate LLM call.
+    ///
+    /// This allows the evaluate to run through the `ActionExecutor`, capturing
+    /// token usage that would otherwise be lost when running via bash script.
+    pub fn build_evaluate_prompt(&self) -> String {
+        format!(
+            "Completed 아이템의 완료 여부를 판단하고, belt queue done 또는 belt queue hitl 을 실행해줘 (workspace: {ws})",
+            ws = self.workspace_name
+        )
+    }
+
+    /// Run the evaluate step through the `ActionExecutor`, returning a full
+    /// `ActionResult` that includes token usage from the LLM call.
+    ///
+    /// This is the preferred method for evaluate execution as it integrates
+    /// with the daemon's token usage tracking pipeline.
+    pub async fn run_evaluate_with_executor(
+        &self,
+        executor: &ActionExecutor,
+        env: &ActionEnv,
+    ) -> Result<ActionResult> {
+        let action = Action::prompt(&self.build_evaluate_prompt());
+        executor.execute_one(&action, env).await
     }
 }
 
@@ -147,11 +176,25 @@ pub struct EvaluateResult {
     pub exit_code: i32,
     pub stdout: String,
     pub stderr: String,
+    /// The underlying `ActionResult` when the evaluate was run through the
+    /// executor. Contains token usage and runtime metadata for cost accounting.
+    pub action_result: Option<ActionResult>,
 }
 
 impl EvaluateResult {
     pub fn success(&self) -> bool {
         self.exit_code == 0
+    }
+}
+
+impl From<ActionResult> for EvaluateResult {
+    fn from(r: ActionResult) -> Self {
+        Self {
+            exit_code: r.exit_code,
+            stdout: r.stdout.clone(),
+            stderr: r.stderr.clone(),
+            action_result: Some(r),
+        }
     }
 }
 
@@ -260,5 +303,81 @@ mod tests {
         let evaluator = Evaluator::new("test-ws");
         assert_eq!(evaluator.max_eval_failures, DEFAULT_MAX_EVAL_FAILURES);
         assert_eq!(evaluator.max_eval_failures, 3);
+    }
+
+    #[test]
+    fn build_evaluate_prompt_contains_workspace() {
+        let evaluator = Evaluator::new("auth-project");
+        let prompt = evaluator.build_evaluate_prompt();
+        assert!(
+            prompt.contains("auth-project"),
+            "evaluate prompt should contain workspace name"
+        );
+        assert!(
+            prompt.contains("belt queue done"),
+            "evaluate prompt should mention belt queue done"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_evaluate_with_executor_returns_action_result() {
+        use belt_core::runtime::{RuntimeRegistry, TokenUsage};
+        use belt_infra::runtimes::mock::MockRuntime;
+        use std::sync::Arc;
+
+        let mock = MockRuntime::new("mock", vec![0]).with_token_usages(vec![TokenUsage {
+            input_tokens: 500,
+            output_tokens: 200,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        }]);
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(mock));
+        let executor = ActionExecutor::new(Arc::new(registry));
+        let env = ActionEnv::new("test-work-id", std::path::Path::new("/tmp"));
+        let evaluator = Evaluator::new("test-ws");
+
+        let result = evaluator
+            .run_evaluate_with_executor(&executor, &env)
+            .await
+            .unwrap();
+
+        assert!(result.success());
+        let usage = result
+            .token_usage
+            .expect("should have token usage from executor-based evaluate");
+        assert_eq!(usage.input_tokens, 500);
+        assert_eq!(usage.output_tokens, 200);
+    }
+
+    #[test]
+    fn evaluate_result_from_action_result_preserves_token_usage() {
+        use belt_core::runtime::TokenUsage;
+
+        let action_result = ActionResult {
+            exit_code: 0,
+            stdout: "ok".to_string(),
+            stderr: String::new(),
+            duration: std::time::Duration::from_millis(100),
+            token_usage: Some(TokenUsage {
+                input_tokens: 300,
+                output_tokens: 150,
+                cache_read_tokens: Some(10),
+                cache_write_tokens: None,
+            }),
+            runtime_name: Some("claude".to_string()),
+            model: Some("opus-4".to_string()),
+        };
+
+        let eval_result = EvaluateResult::from(action_result);
+        assert!(eval_result.success());
+        assert_eq!(eval_result.stdout, "ok");
+        let ar = eval_result
+            .action_result
+            .expect("should preserve action_result");
+        let usage = ar.token_usage.expect("should preserve token usage");
+        assert_eq!(usage.input_tokens, 300);
+        assert_eq!(usage.output_tokens, 150);
+        assert_eq!(ar.runtime_name.as_deref(), Some("claude"));
     }
 }
