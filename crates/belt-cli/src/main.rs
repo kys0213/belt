@@ -347,6 +347,9 @@ enum SpecCommands {
         /// Decompose spec into child issues based on acceptance criteria.
         #[arg(long)]
         decompose: bool,
+        /// Skip required-section validation for spec content.
+        #[arg(long)]
+        skip_validation: bool,
     },
     /// List specs.
     List {
@@ -1800,7 +1803,19 @@ async fn main() -> anyhow::Result<()> {
                     depends_on,
                     entry_point,
                     decompose,
+                    skip_validation,
                 } => {
+                    // Validate required sections unless skipped
+                    if !skip_validation
+                        && let Err(missing) = belt_core::spec::validate_required_sections(&content)
+                    {
+                        anyhow::bail!(
+                            "spec content is missing required sections: {}. \
+                             Use --skip-validation to bypass this check.",
+                            missing.join(", ")
+                        );
+                    }
+
                     let id = format!("spec-{}", chrono::Utc::now().timestamp_millis());
                     let mut spec =
                         belt_core::spec::Spec::new(id.clone(), workspace.clone(), name, content);
