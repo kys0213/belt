@@ -469,7 +469,6 @@ mod tests {
     }
 }
 
-
 fn print_text_status(status: &SystemStatus) {
     println!("Belt System Status");
     println!("==================");
