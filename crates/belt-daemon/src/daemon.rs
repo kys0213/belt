@@ -1103,7 +1103,10 @@ impl Daemon {
         tracing::info!("belt daemon stopped");
     }
 
-    /// Running 아이템 완료 대기. timeout 초과 또는 두 번째 SIGINT 시 Pending으로 롤백.
+    /// Running 아이템 완료 대기.
+    ///
+    /// - timeout 초과 시 Running -> Failed (강제 전이) + 에러 로깅.
+    /// - 두 번째 SIGINT 시 Running -> Pending 롤백 (worktree 보존).
     async fn drain_with_timeout(&mut self, timeout: std::time::Duration) {
         let running_count = self.items_in_phase(QueuePhase::Running).len();
         if running_count == 0 {
@@ -1137,11 +1140,12 @@ impl Daemon {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     let remaining = self.items_in_phase(QueuePhase::Running).len();
-                    tracing::warn!(
-                        "drain timeout reached, rolling back {} running items to Pending",
+                    tracing::error!(
+                        "drain timeout ({}s) exceeded, force-failing {} running items",
+                        timeout.as_secs(),
                         remaining
                     );
-                    self.rollback_running_to_pending();
+                    self.force_fail_running();
                     return;
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -1150,6 +1154,34 @@ impl Daemon {
                     return;
                 }
             }
+        }
+    }
+
+    /// Running -> Failed 강제 전이 (graceful shutdown 타임아웃 초과 시).
+    ///
+    /// 각 Running 아이템을 Failed로 전이하고 에러 히스토리를 기록한다.
+    /// worktree는 보존하여 후속 디버깅에 활용할 수 있도록 한다.
+    fn force_fail_running(&mut self) {
+        let ws_name = self.config.name.clone();
+        let running_work_ids: Vec<String> = self
+            .queue
+            .iter()
+            .filter(|item| item.phase == QueuePhase::Running)
+            .map(|item| item.work_id.clone())
+            .collect();
+
+        for work_id in running_work_ids {
+            if let Err(e) =
+                self.mark_failed(&work_id, "graceful shutdown timeout exceeded".to_string())
+            {
+                tracing::error!("failed to force-fail {}: {e}", work_id);
+                continue;
+            }
+            self.tracker.release(&ws_name);
+            tracing::error!(
+                "force-failed {} due to shutdown timeout (worktree preserved)",
+                work_id
+            );
         }
     }
 
@@ -1705,6 +1737,84 @@ sources:
             .await;
 
         assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
+    }
+
+    #[test]
+    fn force_fail_running_multiple_items() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Put multiple items directly into Running phase.
+        let mut item1 = test_item("github:org/repo#1", "analyze");
+        item1.phase = QueuePhase::Running;
+        item1.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(item1);
+
+        let mut item2 = test_item("github:org/repo#2", "analyze");
+        item2.phase = QueuePhase::Running;
+        item2.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(item2);
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 2);
+
+        daemon.force_fail_running();
+
+        // Both items should be Failed (not Pending).
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
+        assert_eq!(daemon.items_in_phase(QueuePhase::Pending).len(), 0);
+        assert_eq!(daemon.items_in_phase(QueuePhase::Failed).len(), 2);
+
+        // History events should record the forced failure.
+        assert_eq!(daemon.history_events().len(), 2);
+        for event in daemon.history_events() {
+            assert_eq!(event.status, "failed");
+            assert!(
+                event
+                    .error
+                    .as_ref()
+                    .unwrap()
+                    .contains("shutdown timeout exceeded")
+            );
+        }
+    }
+
+    #[test]
+    fn force_fail_running_transitions_to_failed_with_history() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("github:org/repo#1", "analyze");
+        item.phase = QueuePhase::Running;
+        item.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(item);
+
+        daemon.force_fail_running();
+
+        let failed = daemon.items_in_phase(QueuePhase::Failed);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].work_id, "github:org/repo#1:analyze");
+
+        // Verify history event was recorded.
+        assert_eq!(daemon.history_events().len(), 1);
+        let event = &daemon.history_events()[0];
+        assert_eq!(event.status, "failed");
+        assert_eq!(
+            event.error.as_deref().unwrap(),
+            "graceful shutdown timeout exceeded"
+        );
+    }
+
+    #[test]
+    fn force_fail_running_is_noop_when_no_running_items() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Should not panic on empty queue.
+        daemon.force_fail_running();
+        assert_eq!(daemon.history_events().len(), 0);
     }
 
     #[tokio::test]
