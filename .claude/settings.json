@@ -1,10 +1,4 @@
 {
-  "permissions": {
-    "allow": [
-      "Bash(cargo:*)",
-      "Bash(git:*)"
-    ]
-  },
   "hooks": {
     "PreToolUse": [
       {
@@ -12,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "jq -r '.tool_input.file_path // empty' | { read -r f; echo \"$f\" | grep -q '.env' && echo '{\"continue\":false,\"stopReason\":\".env file modification blocked\"}' || true; }"
+            "command": ".claude/hooks/block-env-edit.sh"
           }
         ]
       },
@@ -21,7 +15,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "CMD=$(jq -r '.tool_input.command // empty'); echo \"$CMD\" | grep -qE 'git\\s+commit' || exit 0; branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); if [ \"$branch\" = \"main\" ] || [ \"$branch\" = \"master\" ]; then echo '{\"continue\":false,\"stopReason\":\"Direct commit on main/master blocked\"}'; exit 0; fi; if ! cargo fmt --check >/dev/null 2>&1; then echo '{\"continue\":false,\"stopReason\":\"cargo fmt --check failed. Run cargo fmt first.\"}'; exit 0; fi; if ! cargo clippy -- -D warnings >/dev/null 2>&1; then echo '{\"continue\":false,\"stopReason\":\"cargo clippy -- -D warnings failed. Fix clippy warnings first.\"}'; exit 0; fi",
+            "command": ".claude/hooks/pre-commit-check.sh",
             "timeout": 120,
             "statusMessage": "Pre-commit: cargo fmt + clippy check..."
           }
@@ -34,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "FILE=$(jq -r '.tool_input.file_path // .tool_response.filePath // empty'); case \"$FILE\" in *.rs) cargo check --quiet 2>&1 | head -20 ;; esac; true",
+            "command": ".claude/hooks/post-edit-cargo-check.sh",
             "timeout": 60,
             "statusMessage": "cargo check..."
           }
