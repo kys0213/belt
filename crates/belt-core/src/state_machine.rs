@@ -1,12 +1,13 @@
 use crate::phase::QueuePhase;
 
-/// 상태 전이 규칙 (15개 유효 전이).
+/// 상태 전이 규칙 (16개 유효 전이).
 pub fn is_valid_transition(from: QueuePhase, to: QueuePhase) -> bool {
     use QueuePhase::*;
     matches!(
         (from, to),
         (Pending, Ready)
             | (Ready, Running)
+            | (Ready, Hitl) // spec conflict detection at advance time
             | (Running, Completed)
             | (Running, Skipped)
             | (Running, Failed)
@@ -68,6 +69,11 @@ mod tests {
     }
 
     #[test]
+    fn ready_hitl_for_conflict_detection() {
+        assert!(transit(Ready, Hitl).is_ok());
+    }
+
+    #[test]
     fn completed_branches() {
         assert!(transit(Completed, Done).is_ok());
         assert!(transit(Completed, Hitl).is_ok());
@@ -123,6 +129,6 @@ mod tests {
             .flat_map(|&from| phases.iter().map(move |&to| (from, to)))
             .filter(|&(from, to)| is_valid_transition(from, to))
             .count();
-        assert_eq!(valid_count, 15);
+        assert_eq!(valid_count, 16);
     }
 }

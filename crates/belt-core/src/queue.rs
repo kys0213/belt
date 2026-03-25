@@ -17,6 +17,10 @@ pub enum HitlReason {
     Timeout,
     /// 수동 escalation (사용자 요청).
     ManualEscalation,
+    /// spec entry_point 충돌 감지 (두 spec이 같은 파일/모듈을 수정).
+    SpecConflict,
+    /// spec Completing 단계 최종 확인 (gap-detection 통과 후 HITL 승인 대기).
+    SpecCompletionReview,
 }
 
 impl fmt::Display for HitlReason {
@@ -26,6 +30,8 @@ impl fmt::Display for HitlReason {
             HitlReason::RetryMaxExceeded => f.write_str("retry_max_exceeded"),
             HitlReason::Timeout => f.write_str("timeout"),
             HitlReason::ManualEscalation => f.write_str("manual_escalation"),
+            HitlReason::SpecConflict => f.write_str("spec_conflict"),
+            HitlReason::SpecCompletionReview => f.write_str("spec_completion_review"),
         }
     }
 }

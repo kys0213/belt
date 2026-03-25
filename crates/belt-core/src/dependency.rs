@@ -1,5 +1,26 @@
 use crate::spec::{Spec, SpecStatus};
 
+/// Result of a conflict check between specs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictCheckResult {
+    /// No conflicts detected.
+    Clear,
+    /// Conflicting specs share overlapping entry_point paths.
+    Conflict {
+        /// IDs of the specs that overlap with the checked spec.
+        conflicting_specs: Vec<String>,
+        /// The overlapping entry_point paths.
+        overlapping_paths: Vec<String>,
+    },
+}
+
+impl ConflictCheckResult {
+    /// Returns `true` if no conflict was detected.
+    pub fn is_clear(&self) -> bool {
+        matches!(self, ConflictCheckResult::Clear)
+    }
+}
+
 /// Result of a dependency check for a single spec.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DependencyCheckResult {
@@ -37,6 +58,15 @@ pub trait DependencyGuard {
     fn check_dependencies<F>(&self, spec: &Spec, resolve_spec: F) -> DependencyCheckResult
     where
         F: Fn(&str) -> Option<Spec>;
+
+    /// Check whether a spec's `entry_point` paths conflict with other active specs.
+    ///
+    /// Two specs conflict when their `entry_point` fields share one or more
+    /// overlapping file/module paths. The `other_specs` callback returns all
+    /// active/running specs that should be checked against.
+    fn check_conflicts<F>(&self, spec: &Spec, other_specs: F) -> ConflictCheckResult
+    where
+        F: Fn() -> Vec<Spec>;
 }
 
 /// Default implementation that blocks execution when any dependency
@@ -75,6 +105,56 @@ impl DependencyGuard for SpecDependencyGuard {
             DependencyCheckResult::Blocked { pending_deps }
         }
     }
+
+    fn check_conflicts<F>(&self, spec: &Spec, other_specs: F) -> ConflictCheckResult
+    where
+        F: Fn() -> Vec<Spec>,
+    {
+        let my_paths = parse_entry_points(spec);
+        if my_paths.is_empty() {
+            return ConflictCheckResult::Clear;
+        }
+
+        let others = other_specs();
+        let mut conflicting_specs: Vec<String> = Vec::new();
+        let mut overlapping_paths: Vec<String> = Vec::new();
+
+        for other in &others {
+            if other.id == spec.id {
+                continue;
+            }
+            let other_paths = parse_entry_points(other);
+            for path in &my_paths {
+                if other_paths.contains(path) && !overlapping_paths.contains(path) {
+                    overlapping_paths.push(path.clone());
+                    if !conflicting_specs.contains(&other.id) {
+                        conflicting_specs.push(other.id.clone());
+                    }
+                }
+            }
+        }
+
+        if conflicting_specs.is_empty() {
+            ConflictCheckResult::Clear
+        } else {
+            ConflictCheckResult::Conflict {
+                conflicting_specs,
+                overlapping_paths,
+            }
+        }
+    }
+}
+
+/// Parse a spec's `entry_point` field into individual trimmed paths.
+fn parse_entry_points(spec: &Spec) -> Vec<String> {
+    match &spec.entry_point {
+        Some(ep) if !ep.trim().is_empty() => ep
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Parse a `depends_on` string into individual spec IDs.
@@ -100,6 +180,18 @@ mod tests {
         );
         spec.status = status;
         spec.depends_on = depends_on.map(|s| s.to_string());
+        spec
+    }
+
+    fn make_spec_with_entry(id: &str, status: SpecStatus, entry_point: Option<&str>) -> Spec {
+        let mut spec = Spec::new(
+            id.to_string(),
+            "ws-1".to_string(),
+            format!("Spec {id}"),
+            "content".to_string(),
+        );
+        spec.status = status;
+        spec.entry_point = entry_point.map(|s| s.to_string());
         spec
     }
 
@@ -209,5 +301,87 @@ mod tests {
     #[test]
     fn parse_depends_on_empty_entries_filtered() {
         assert_eq!(parse_depends_on("s1,,s2,"), vec!["s1", "s2"]);
+    }
+
+    // ---- check_conflicts tests ----
+
+    #[test]
+    fn no_entry_point_is_clear() {
+        let guard = SpecDependencyGuard;
+        let spec = make_spec_with_entry("s1", SpecStatus::Active, None);
+        let result = guard.check_conflicts(&spec, || vec![]);
+        assert_eq!(result, ConflictCheckResult::Clear);
+        assert!(result.is_clear());
+    }
+
+    #[test]
+    fn empty_entry_point_is_clear() {
+        let guard = SpecDependencyGuard;
+        let spec = make_spec_with_entry("s1", SpecStatus::Active, Some(""));
+        let result = guard.check_conflicts(&spec, || vec![]);
+        assert_eq!(result, ConflictCheckResult::Clear);
+    }
+
+    #[test]
+    fn no_overlap_is_clear() {
+        let guard = SpecDependencyGuard;
+        let spec = make_spec_with_entry("s1", SpecStatus::Active, Some("src/auth/mod.rs"));
+        let other = make_spec_with_entry("s2", SpecStatus::Active, Some("src/db/mod.rs"));
+        let result = guard.check_conflicts(&spec, || vec![other.clone()]);
+        assert_eq!(result, ConflictCheckResult::Clear);
+    }
+
+    #[test]
+    fn overlapping_entry_point_detects_conflict() {
+        let guard = SpecDependencyGuard;
+        let spec = make_spec_with_entry(
+            "s1",
+            SpecStatus::Active,
+            Some("src/auth/mod.rs,src/db/mod.rs"),
+        );
+        let other = make_spec_with_entry("s2", SpecStatus::Active, Some("src/auth/mod.rs"));
+        let result = guard.check_conflicts(&spec, || vec![other.clone()]);
+        assert_eq!(
+            result,
+            ConflictCheckResult::Conflict {
+                conflicting_specs: vec!["s2".to_string()],
+                overlapping_paths: vec!["src/auth/mod.rs".to_string()],
+            }
+        );
+        assert!(!result.is_clear());
+    }
+
+    #[test]
+    fn self_is_excluded_from_conflict_check() {
+        let guard = SpecDependencyGuard;
+        let spec = make_spec_with_entry("s1", SpecStatus::Active, Some("src/auth/mod.rs"));
+        let same = make_spec_with_entry("s1", SpecStatus::Active, Some("src/auth/mod.rs"));
+        let result = guard.check_conflicts(&spec, || vec![same.clone()]);
+        assert_eq!(result, ConflictCheckResult::Clear);
+    }
+
+    #[test]
+    fn multiple_conflicts_detected() {
+        let guard = SpecDependencyGuard;
+        let spec = make_spec_with_entry(
+            "s1",
+            SpecStatus::Active,
+            Some("src/auth/mod.rs,src/db/mod.rs"),
+        );
+        let other1 = make_spec_with_entry("s2", SpecStatus::Active, Some("src/auth/mod.rs"));
+        let other2 = make_spec_with_entry("s3", SpecStatus::Active, Some("src/db/mod.rs"));
+        let result = guard.check_conflicts(&spec, || vec![other1.clone(), other2.clone()]);
+        match result {
+            ConflictCheckResult::Conflict {
+                conflicting_specs,
+                overlapping_paths,
+            } => {
+                assert_eq!(conflicting_specs.len(), 2);
+                assert!(conflicting_specs.contains(&"s2".to_string()));
+                assert!(conflicting_specs.contains(&"s3".to_string()));
+                assert_eq!(overlapping_paths.len(), 2);
+            }
+            ConflictCheckResult::Clear => panic!("expected conflict"),
+        }
     }
 }
