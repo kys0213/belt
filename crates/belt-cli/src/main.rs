@@ -48,6 +48,15 @@ enum Commands {
     },
     /// Stop the daemon.
     Stop,
+    /// Restart the daemon (stop then start).
+    Restart {
+        /// Path to workspace.yaml config (defaults to workspace.yaml).
+        #[arg(long, default_value = "workspace.yaml")]
+        config: String,
+        /// Run in background.
+        #[arg(long)]
+        background: bool,
+    },
     /// Show system status.
     Status {
         /// Output format (text, json, rich).
@@ -625,6 +634,51 @@ fn cmd_stop() -> anyhow::Result<()> {
     #[cfg(not(unix))]
     {
         anyhow::bail!("belt stop is only supported on Unix systems");
+    }
+
+    Ok(())
+}
+
+/// `belt restart` -- graceful stop then start.
+///
+/// Sends SIGTERM and waits up to 30 seconds for the process to exit,
+/// then starts the daemon with the given config. When `background` is true
+/// the daemon is spawned as a detached child process.
+async fn cmd_restart(config_path: &str, background: bool) -> anyhow::Result<()> {
+    // -- Phase 1: stop (best-effort) --
+    let had_daemon = read_pid().is_ok();
+    if had_daemon {
+        cmd_stop()?;
+
+        // Wait for the daemon to terminate (max 30 s).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if read_pid().is_err() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("daemon did not stop within 30 seconds -- aborting restart");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        println!("Daemon stopped.");
+    } else {
+        println!("No running daemon found -- skipping stop phase.");
+    }
+
+    // -- Phase 2: start --
+    if background {
+        let exe = std::env::current_exe()?;
+        let child = std::process::Command::new(exe)
+            .args(["start", "--config", config_path])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        println!("Daemon restarted in background (PID {}).", child.id());
+    } else {
+        println!("Starting daemon...");
+        start_daemon(config_path, 30, 4).await?;
     }
 
     Ok(())
@@ -1330,6 +1384,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Stop => {
             cmd_stop()?;
+        }
+        Commands::Restart { config, background } => {
+            cmd_restart(&config, background).await?;
         }
         Commands::Status { format } => {
             cmd_status(&format)?;
