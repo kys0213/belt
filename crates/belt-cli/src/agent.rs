@@ -576,6 +576,241 @@ runtime:
         // Result depends on the environment but should not panic.
         let _ = resolve_rules_dir(&config);
     }
+
+    #[test]
+    fn resolve_rules_dir_falls_back_to_per_workspace_claw_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_rules = tmp
+            .path()
+            .join("workspaces")
+            .join("test-ws")
+            .join("claw")
+            .join("system");
+        std::fs::create_dir_all(&ws_rules).unwrap();
+
+        // Set BELT_HOME to the temp directory so the per-workspace path is found.
+        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
+
+        let config = empty_workspace();
+        let resolved = resolve_rules_dir(&config);
+        assert_eq!(resolved, Some(ws_rules));
+    }
+
+    #[test]
+    fn resolve_rules_dir_falls_back_to_global_claw_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let global_rules = tmp
+            .path()
+            .join("claw-workspace")
+            .join(".claude")
+            .join("rules");
+        std::fs::create_dir_all(&global_rules).unwrap();
+
+        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
+
+        let config = empty_workspace();
+        let resolved = resolve_rules_dir(&config);
+        assert_eq!(resolved, Some(global_rules));
+    }
+
+    #[test]
+    fn resolve_rules_dir_per_workspace_takes_priority_over_global() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws_rules = tmp
+            .path()
+            .join("workspaces")
+            .join("test-ws")
+            .join("claw")
+            .join("system");
+        std::fs::create_dir_all(&ws_rules).unwrap();
+
+        let global_rules = tmp
+            .path()
+            .join("claw-workspace")
+            .join(".claude")
+            .join("rules");
+        std::fs::create_dir_all(&global_rules).unwrap();
+
+        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
+
+        let config = empty_workspace();
+        let resolved = resolve_rules_dir(&config);
+        // Per-workspace (priority 2) should win over global (priority 3).
+        assert_eq!(resolved, Some(ws_rules));
+    }
+
+    #[test]
+    fn resolve_rules_dir_explicit_path_takes_priority_over_belt_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        let explicit_dir = tmp.path().join("explicit-rules");
+        std::fs::create_dir_all(&explicit_dir).unwrap();
+
+        let ws_rules = tmp
+            .path()
+            .join("workspaces")
+            .join("test-ws")
+            .join("claw")
+            .join("system");
+        std::fs::create_dir_all(&ws_rules).unwrap();
+
+        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
+
+        let mut config = empty_workspace();
+        config.claw_config = Some(belt_core::workspace::ClawConfig {
+            rules_path: Some(explicit_dir.to_string_lossy().to_string()),
+            ..Default::default()
+        });
+
+        let resolved = resolve_rules_dir(&config);
+        // Explicit path (priority 1) should win over per-workspace (priority 2).
+        assert_eq!(resolved, Some(explicit_dir));
+    }
+
+    // ---- load_rules_from_dir (additional) ----
+
+    #[test]
+    fn load_rules_from_dir_only_non_md_files_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("readme.txt"), "text file").unwrap();
+        std::fs::write(tmp.path().join("config.yaml"), "yaml: true").unwrap();
+
+        let result = load_rules_from_dir(tmp.path()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn load_rules_from_dir_multiple_files_separated_by_divider() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("01-first.md"), "First rule").unwrap();
+        std::fs::write(tmp.path().join("02-second.md"), "Second rule").unwrap();
+
+        let result = load_rules_from_dir(tmp.path()).unwrap().unwrap();
+        // Files are joined with "---" separator.
+        assert!(result.contains("---"));
+        // Verify the exact separator format.
+        assert!(result.contains("\n\n---\n\n"));
+    }
+
+    #[test]
+    fn load_rules_from_dir_single_file_has_no_separator() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("only-rule.md"), "Single rule").unwrap();
+
+        let result = load_rules_from_dir(tmp.path()).unwrap().unwrap();
+        assert!(!result.contains("---"));
+        assert!(result.contains("# Rule: only-rule.md"));
+        assert!(result.contains("Single rule"));
+    }
+
+    // ---- workspace context injection ----
+
+    #[test]
+    fn workspace_rules_injected_into_action_env() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rules_dir = tmp.path().join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(rules_dir.join("policy.md"), "Always be safe").unwrap();
+
+        let mut config = empty_workspace();
+        config.claw_config = Some(belt_core::workspace::ClawConfig {
+            rules_path: Some(rules_dir.to_string_lossy().to_string()),
+            ..Default::default()
+        });
+
+        // Simulate the same logic as run_agent: resolve rules, load, inject.
+        let resolved = resolve_rules_dir(&config).expect("rules dir should resolve");
+        let system_prompt = load_rules_from_dir(&resolved)
+            .expect("should load")
+            .expect("should have content");
+
+        let working_dir = std::env::current_dir().unwrap();
+        let env = ActionEnv::new("test-agent", &working_dir).with_system_prompt(system_prompt);
+
+        assert!(env.system_prompt.is_some());
+        let prompt = env.system_prompt.unwrap();
+        assert!(prompt.contains("Always be safe"));
+        assert!(prompt.contains("# Rule: policy.md"));
+    }
+
+    #[test]
+    fn workspace_without_rules_has_no_system_prompt() {
+        let config = empty_workspace();
+        // No claw_config, so resolve_rules_dir returns None.
+        // Simulate the run_agent flow.
+        let working_dir = std::env::current_dir().unwrap();
+        let mut env = ActionEnv::new("test-agent", &working_dir);
+
+        if let Some(rules_dir) = resolve_rules_dir(&config) {
+            if let Ok(Some(system_prompt)) = load_rules_from_dir(&rules_dir) {
+                env = env.with_system_prompt(system_prompt);
+            }
+        }
+
+        assert!(env.system_prompt.is_none());
+    }
+
+    #[test]
+    fn workspace_rules_with_multiple_files_injected_as_single_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rules_dir = tmp.path().join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(rules_dir.join("01-safety.md"), "Safety first").unwrap();
+        std::fs::write(rules_dir.join("02-style.md"), "Use Rust idioms").unwrap();
+
+        let mut config = empty_workspace();
+        config.claw_config = Some(belt_core::workspace::ClawConfig {
+            rules_path: Some(rules_dir.to_string_lossy().to_string()),
+            ..Default::default()
+        });
+
+        let resolved = resolve_rules_dir(&config).unwrap();
+        let system_prompt = load_rules_from_dir(&resolved).unwrap().unwrap();
+
+        let working_dir = std::env::current_dir().unwrap();
+        let env = ActionEnv::new("test-agent", &working_dir).with_system_prompt(system_prompt);
+
+        let prompt = env.system_prompt.unwrap();
+        // Both rules should be in the single system prompt.
+        assert!(prompt.contains("Safety first"));
+        assert!(prompt.contains("Use Rust idioms"));
+        // Proper ordering.
+        assert!(prompt.find("Safety first").unwrap() < prompt.find("Use Rust idioms").unwrap());
+    }
+
+    /// RAII guard for setting environment variables in tests.
+    /// Restores (or removes) the variable on drop.
+    struct EnvGuard {
+        key: String,
+        prev: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: These tests run sequentially (not in parallel threads)
+            // so mutating env vars is safe within test context.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: Restoring env var in test teardown; tests using EnvGuard
+            // are not run concurrently with other env-dependent tests.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(&self.key, v),
+                    None => std::env::remove_var(&self.key),
+                }
+            }
+        }
+    }
 }
 
 /// Entry point for `belt agent` command.
