@@ -21,6 +21,8 @@ pub enum HitlReason {
     SpecConflict,
     /// spec Completing 단계 최종 확인 (gap-detection 통과 후 HITL 승인 대기).
     SpecCompletionReview,
+    /// Claw 에이전트가 제안한 스펙 수정.
+    SpecModificationProposed,
 }
 
 impl fmt::Display for HitlReason {
@@ -32,6 +34,7 @@ impl fmt::Display for HitlReason {
             HitlReason::ManualEscalation => f.write_str("manual_escalation"),
             HitlReason::SpecConflict => f.write_str("spec_conflict"),
             HitlReason::SpecCompletionReview => f.write_str("spec_completion_review"),
+            HitlReason::SpecModificationProposed => f.write_str("spec_modification_proposed"),
         }
     }
 }
@@ -153,6 +156,13 @@ pub struct QueueItem {
     /// `WorktreeManager::create_or_reuse`가 기존 worktree를 재사용할 수 있게 한다.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_worktree_path: Option<String>,
+    /// Replan 시도 횟수. 무한 루프 방지를 위해 최대 3회로 제한한다.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub replan_count: u32,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 impl QueueItem {
@@ -175,6 +185,7 @@ impl QueueItem {
             hitl_terminal_action: None,
             worktree_preserved: false,
             previous_worktree_path: None,
+            replan_count: 0,
         }
     }
 
@@ -204,6 +215,7 @@ pub struct QueueItemRow {
     pub hitl_terminal_action: Option<String>,
     pub worktree_preserved: bool,
     pub previous_worktree_path: Option<String>,
+    pub replan_count: u32,
 }
 
 impl QueueItem {
@@ -225,6 +237,7 @@ impl QueueItem {
             hitl_terminal_action: self.hitl_terminal_action.clone(),
             worktree_preserved: self.worktree_preserved,
             previous_worktree_path: self.previous_worktree_path.clone(),
+            replan_count: self.replan_count,
         }
     }
 
@@ -239,6 +252,8 @@ impl QueueItem {
                 "timeout" => Ok(HitlReason::Timeout),
                 "manual_escalation" => Ok(HitlReason::ManualEscalation),
                 "spec_conflict" => Ok(HitlReason::SpecConflict),
+                "spec_completion_review" => Ok(HitlReason::SpecCompletionReview),
+                "spec_modification_proposed" => Ok(HitlReason::SpecModificationProposed),
                 other => Err(format!("invalid hitl_reason: {other}")),
             })
             .transpose()?;
@@ -259,6 +274,7 @@ impl QueueItem {
             hitl_terminal_action: row.hitl_terminal_action.clone(),
             worktree_preserved: row.worktree_preserved,
             previous_worktree_path: row.previous_worktree_path.clone(),
+            replan_count: row.replan_count,
         })
     }
 
@@ -294,6 +310,7 @@ pub mod testing {
             hitl_terminal_action: None,
             worktree_preserved: false,
             previous_worktree_path: None,
+            replan_count: 0,
         }
     }
 }
@@ -390,6 +407,10 @@ mod tests {
             "manual_escalation"
         );
         assert_eq!(HitlReason::SpecConflict.to_string(), "spec_conflict");
+        assert_eq!(
+            HitlReason::SpecModificationProposed.to_string(),
+            "spec_modification_proposed"
+        );
     }
 
     #[test]
@@ -464,6 +485,53 @@ mod tests {
         assert_eq!(
             restored.previous_worktree_path.as_deref(),
             Some("/tmp/worktrees/old-item")
+        );
+    }
+
+    #[test]
+    fn replan_count_default_zero() {
+        let item = test_item("s1", "analyze");
+        assert_eq!(item.replan_count, 0);
+    }
+
+    #[test]
+    fn replan_count_skipped_in_json_when_zero() {
+        let item = test_item("s1", "analyze");
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(!json.contains("replan_count"));
+    }
+
+    #[test]
+    fn replan_count_present_in_json_when_nonzero() {
+        let mut item = test_item("s1", "analyze");
+        item.replan_count = 2;
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"replan_count\":2"));
+    }
+
+    #[test]
+    fn replan_count_row_roundtrip() {
+        let mut item = test_item("s1", "analyze");
+        item.replan_count = 3;
+        let row = item.to_row();
+        assert_eq!(row.replan_count, 3);
+        let restored = QueueItem::from_row(&row).unwrap();
+        assert_eq!(restored.replan_count, 3);
+    }
+
+    #[test]
+    fn spec_modification_proposed_reason_roundtrip() {
+        let mut item = test_item("s1", "analyze");
+        item.hitl_reason = Some(HitlReason::SpecModificationProposed);
+        let row = item.to_row();
+        assert_eq!(
+            row.hitl_reason.as_deref(),
+            Some("spec_modification_proposed")
+        );
+        let restored = QueueItem::from_row(&row).unwrap();
+        assert_eq!(
+            restored.hitl_reason,
+            Some(HitlReason::SpecModificationProposed)
         );
     }
 }

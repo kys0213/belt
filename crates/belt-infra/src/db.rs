@@ -213,7 +213,8 @@ impl Database {
                 hitl_notes       TEXT,
                 hitl_reason          TEXT,
                 hitl_timeout_at      TEXT,
-                hitl_terminal_action TEXT
+                hitl_terminal_action TEXT,
+                replan_count         INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS history (
@@ -327,8 +328,8 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.execute(
-            "INSERT INTO queue_items (work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO queue_items (work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action, replan_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 item.work_id,
                 item.source_id,
@@ -344,6 +345,7 @@ impl Database {
                 item.hitl_reason.map(|r| r.to_string()),
                 item.hitl_timeout_at,
                 item.hitl_terminal_action,
+                item.replan_count,
             ],
         )
         .map_err(|e| BeltError::Database(e.to_string()))?;
@@ -467,7 +469,7 @@ impl Database {
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let mut stmt = conn
             .prepare(
-                "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action FROM queue_items WHERE phase = 'hitl' AND hitl_timeout_at IS NOT NULL",
+                "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action, replan_count FROM queue_items WHERE phase = 'hitl' AND hitl_timeout_at IS NOT NULL",
             )
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let items = stmt
@@ -488,7 +490,7 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.query_row(
-            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action
+            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action, replan_count
                  FROM queue_items WHERE work_id = ?1",
             params![work_id],
             |row| Ok(row_to_queue_item(row)),
@@ -512,7 +514,7 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let mut sql = String::from(
-            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action FROM queue_items WHERE 1=1",
+            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action, replan_count FROM queue_items WHERE 1=1",
         );
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -1831,6 +1833,10 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
             "timeout" => Ok(belt_core::queue::HitlReason::Timeout),
             "manual_escalation" => Ok(belt_core::queue::HitlReason::ManualEscalation),
             "spec_conflict" => Ok(belt_core::queue::HitlReason::SpecConflict),
+            "spec_completion_review" => Ok(belt_core::queue::HitlReason::SpecCompletionReview),
+            "spec_modification_proposed" => {
+                Ok(belt_core::queue::HitlReason::SpecModificationProposed)
+            }
             other => Err(BeltError::Database(format!("unknown hitl_reason: {other}"))),
         })
         .transpose()?;
@@ -1859,6 +1865,7 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
         worktree_preserved: false,
         // previous_worktree_path is transient (in-memory only, not persisted to DB).
         previous_worktree_path: None,
+        replan_count: row.get::<_, u32>(14).unwrap_or(0),
     })
 }
 
@@ -1888,6 +1895,7 @@ mod tests {
             hitl_terminal_action: None,
             worktree_preserved: false,
             previous_worktree_path: None,
+            replan_count: 0,
         }
     }
 

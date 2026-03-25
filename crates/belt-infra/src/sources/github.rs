@@ -417,6 +417,7 @@ impl DataSource for GitHubDataSource {
                                 hitl_terminal_action: None,
                                 worktree_preserved: false,
                                 previous_worktree_path: None,
+                                replan_count: 0,
                             });
                         }
                     }

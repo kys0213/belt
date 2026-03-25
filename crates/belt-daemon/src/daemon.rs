@@ -757,9 +757,17 @@ impl Daemon {
         transit(item, QueuePhase::Pending)
     }
 
+    /// Maximum number of replan attempts before failing permanently.
+    const MAX_REPLAN_COUNT: u32 = 3;
+
     /// Respond to a HITL item with a user action.
     ///
     /// Applies the given [`HitlRespondAction`] and records the respondent.
+    ///
+    /// For `Replan`, the item is rolled back to Pending with an incremented
+    /// `replan_count`, and a new HITL item is created to delegate spec
+    /// modification to the Claw agent. If `replan_count` exceeds
+    /// [`Self::MAX_REPLAN_COUNT`], the item transitions to Failed instead.
     pub fn respond_hitl(
         &mut self,
         work_id: &str,
@@ -789,7 +797,61 @@ impl Daemon {
             HitlRespondAction::Done => transit(item, QueuePhase::Done),
             HitlRespondAction::Retry => transit(item, QueuePhase::Pending),
             HitlRespondAction::Skip => transit(item, QueuePhase::Skipped),
-            HitlRespondAction::Replan => transit(item, QueuePhase::Failed),
+            HitlRespondAction::Replan => {
+                let new_replan_count = item.replan_count + 1;
+
+                if new_replan_count > Self::MAX_REPLAN_COUNT {
+                    tracing::warn!(
+                        work_id,
+                        replan_count = new_replan_count,
+                        max = Self::MAX_REPLAN_COUNT,
+                        "replan limit exceeded, transitioning to Failed"
+                    );
+                    item.replan_count = new_replan_count;
+                    return transit(item, QueuePhase::Failed);
+                }
+
+                // Capture metadata before mutating the item for the new HITL item.
+                let failure_reason = item
+                    .hitl_notes
+                    .clone()
+                    .unwrap_or_else(|| "unknown failure".to_string());
+                let source_id = item.source_id.clone();
+                let workspace_id = item.workspace_id.clone();
+                let state = item.state.clone();
+
+                // Roll back item to Pending with incremented replan_count.
+                item.replan_count = new_replan_count;
+                transit(item, QueuePhase::Pending)?;
+
+                // Create a new HITL item for spec modification proposal.
+                let replan_work_id = format!("{work_id}:replan-{new_replan_count}");
+                let mut replan_item =
+                    QueueItem::new(replan_work_id, source_id, workspace_id, state);
+                // The replan item starts at Pending and moves to Hitl to await
+                // human review of the Claw agent's spec modification proposal.
+                transit(&mut replan_item, QueuePhase::Ready)?;
+                transit(&mut replan_item, QueuePhase::Running)?;
+                transit(&mut replan_item, QueuePhase::Completed)?;
+                transit(&mut replan_item, QueuePhase::Hitl)?;
+                replan_item.hitl_created_at = Some(Utc::now().to_rfc3339());
+                replan_item.hitl_reason = Some(HitlReason::SpecModificationProposed);
+                replan_item.hitl_notes = Some(format!(
+                    "Claw replan delegation (attempt {new_replan_count}): {failure_reason}"
+                ));
+                replan_item.title = Some(format!(
+                    "spec-modification-proposed (replan #{new_replan_count})"
+                ));
+                self.queue.push_back(replan_item);
+
+                tracing::info!(
+                    work_id,
+                    replan_count = new_replan_count,
+                    "replan: item rolled back to Pending, spec modification HITL item created"
+                );
+
+                Ok(())
+            }
         }
     }
 
@@ -2778,6 +2840,143 @@ sources:
                 .worktree_mgr
                 .lookup_preserved("github:org/repo#1")
                 .is_none()
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // respond_hitl replan tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn respond_hitl_replan_rolls_back_to_pending_and_creates_hitl_item() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Hitl;
+        item.hitl_notes = Some("original failure reason".into());
+        daemon.push_item(item);
+
+        let result = daemon.respond_hitl(
+            "s1:analyze",
+            HitlRespondAction::Replan,
+            Some("reviewer".into()),
+            None,
+        );
+        assert!(result.is_ok());
+
+        // Original item should be rolled back to Pending with replan_count = 1.
+        let original = daemon.get_item("s1:analyze").unwrap();
+        assert_eq!(original.phase, QueuePhase::Pending);
+        assert_eq!(original.replan_count, 1);
+
+        // A new HITL item should have been created for spec modification.
+        let replan_item = daemon.get_item("s1:analyze:replan-1").unwrap();
+        assert_eq!(replan_item.phase, QueuePhase::Hitl);
+        assert_eq!(
+            replan_item.hitl_reason,
+            Some(HitlReason::SpecModificationProposed)
+        );
+        assert!(
+            replan_item
+                .hitl_notes
+                .as_ref()
+                .unwrap()
+                .contains("original failure reason")
+        );
+        assert!(
+            replan_item
+                .title
+                .as_ref()
+                .unwrap()
+                .contains("spec-modification-proposed")
+        );
+    }
+
+    #[test]
+    fn respond_hitl_replan_increments_count_on_successive_replans() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Hitl;
+        item.replan_count = 1; // Already replanned once.
+        daemon.push_item(item);
+
+        let result = daemon.respond_hitl(
+            "s1:analyze",
+            HitlRespondAction::Replan,
+            None,
+            Some("second failure".into()),
+        );
+        assert!(result.is_ok());
+
+        let original = daemon.get_item("s1:analyze").unwrap();
+        assert_eq!(original.phase, QueuePhase::Pending);
+        assert_eq!(original.replan_count, 2);
+
+        let replan_item = daemon.get_item("s1:analyze:replan-2").unwrap();
+        assert_eq!(replan_item.phase, QueuePhase::Hitl);
+    }
+
+    #[test]
+    fn respond_hitl_replan_exceeds_limit_transitions_to_failed() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Hitl;
+        item.replan_count = 3; // Already at max.
+        daemon.push_item(item);
+
+        let result = daemon.respond_hitl("s1:analyze", HitlRespondAction::Replan, None, None);
+        assert!(result.is_ok());
+
+        // Should transition to Failed, not Pending.
+        let original = daemon.get_item("s1:analyze").unwrap();
+        assert_eq!(original.phase, QueuePhase::Failed);
+        assert_eq!(original.replan_count, 4);
+
+        // No replan HITL item should be created.
+        assert!(daemon.get_item("s1:analyze:replan-4").is_none());
+    }
+
+    #[test]
+    fn respond_hitl_replan_requires_hitl_phase() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Item is in Pending, not Hitl.
+        daemon.push_item(test_item("s1", "analyze"));
+
+        let result = daemon.respond_hitl("s1:analyze", HitlRespondAction::Replan, None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn respond_hitl_done_still_works() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Hitl;
+        daemon.push_item(item);
+
+        let result = daemon.respond_hitl(
+            "s1:analyze",
+            HitlRespondAction::Done,
+            Some("reviewer".into()),
+            None,
+        );
+        assert!(result.is_ok());
+        assert_eq!(
+            daemon.get_item("s1:analyze").unwrap().phase,
+            QueuePhase::Done
         );
     }
 }
