@@ -5,9 +5,17 @@
 //! collected from the Belt database (queue item counts by phase, HITL
 //! pending count, recent transition events, and per-workspace statistics)
 //! and displayed to the user.
+//!
+//! Free-form text input is forwarded to the configured [`AgentRuntime`] for
+//! LLM processing. The session maintains a conversation history and tracks
+//! cumulative token usage across invocations.
 
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use belt_core::runtime::{AgentRuntime, RuntimeRequest, TokenUsage};
 
 use super::ClawWorkspace;
 use super::slash::{SlashCommand, SlashDispatcher};
@@ -75,6 +83,44 @@ pub struct WorkspaceStats {
     pub running_items_count: u32,
     /// Recent HITL events scoped to this workspace (up to 5).
     pub recent_hitl_events: Vec<RecentEvent>,
+}
+
+/// A single message in the session conversation history.
+#[derive(Debug, Clone)]
+pub struct SessionMessage {
+    /// The role of the message sender.
+    pub role: MessageRole,
+    /// The text content of the message.
+    pub content: String,
+}
+
+/// Role of a message sender in the session history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageRole {
+    /// User input.
+    User,
+    /// LLM assistant response.
+    Assistant,
+}
+
+/// Cumulative token usage tracked across the session.
+#[derive(Debug, Clone, Default)]
+pub struct SessionTokenUsage {
+    /// Total input tokens consumed across all invocations.
+    pub total_input_tokens: u64,
+    /// Total output tokens consumed across all invocations.
+    pub total_output_tokens: u64,
+    /// Number of LLM invocations made during the session.
+    pub invocation_count: u32,
+}
+
+impl SessionTokenUsage {
+    /// Accumulate token usage from a single invocation.
+    fn accumulate(&mut self, usage: &TokenUsage) {
+        self.total_input_tokens += usage.input_tokens;
+        self.total_output_tokens += usage.output_tokens;
+        self.invocation_count += 1;
+    }
 }
 
 /// Open the default Belt database at `~/.belt/belt.db`.
@@ -356,12 +402,79 @@ fn write_workspace_stats_banner<W: Write>(
     Ok(())
 }
 
+/// Display token usage summary for a single invocation.
+fn write_token_usage<W: Write>(output: &mut W, usage: &TokenUsage) -> io::Result<()> {
+    writeln!(
+        output,
+        "  [tokens: in={}, out={}]",
+        usage.input_tokens, usage.output_tokens
+    )
+}
+
+/// Display cumulative session token usage.
+fn write_session_usage<W: Write>(output: &mut W, usage: &SessionTokenUsage) -> io::Result<()> {
+    writeln!(
+        output,
+        "Session totals: {} invocations, {} input tokens, {} output tokens",
+        usage.invocation_count, usage.total_input_tokens, usage.total_output_tokens
+    )
+}
+
+/// Build a system prompt incorporating workspace and session context.
+fn build_system_prompt(workspace: Option<&str>, history: &[SessionMessage]) -> String {
+    let mut parts = Vec::new();
+    parts.push("You are the Belt Claw interactive assistant.".to_string());
+
+    if let Some(ws) = workspace {
+        parts.push(format!("Current workspace: {ws}"));
+    }
+
+    if !history.is_empty() {
+        parts.push(format!(
+            "Conversation history has {} previous messages.",
+            history.len()
+        ));
+    }
+
+    parts.join("\n")
+}
+
+/// Build a prompt string that includes recent conversation history for context.
+fn build_prompt_with_history(user_input: &str, history: &[SessionMessage]) -> String {
+    if history.is_empty() {
+        return user_input.to_string();
+    }
+
+    // Include up to the last 10 messages as context.
+    let context_window = if history.len() > 10 {
+        &history[history.len() - 10..]
+    } else {
+        history
+    };
+
+    let mut prompt = String::from("<conversation_history>\n");
+    for msg in context_window {
+        let role = match msg.role {
+            MessageRole::User => "user",
+            MessageRole::Assistant => "assistant",
+        };
+        prompt.push_str(&format!("[{role}]: {}\n", msg.content));
+    }
+    prompt.push_str("</conversation_history>\n\n");
+    prompt.push_str(user_input);
+    prompt
+}
+
 /// Interactive session configuration.
 pub struct SessionConfig {
     /// Workspace name context (if running inside a specific workspace).
     pub workspace: Option<String>,
     /// The Claw workspace root.
     pub claw_workspace: ClawWorkspace,
+    /// Optional agent runtime for processing free-form input via LLM.
+    ///
+    /// When `None`, free-form input is echoed back (legacy behavior).
+    pub runtime: Option<Arc<dyn AgentRuntime>>,
 }
 
 /// Run the interactive REPL session.
@@ -372,8 +485,13 @@ pub struct SessionConfig {
 /// is unavailable).  An optional [`WorkspaceStats`] adds per-workspace
 /// statistics below the system-wide banner.
 ///
+/// When a runtime is configured in [`SessionConfig`], free-form text input
+/// is forwarded to the LLM agent. The session maintains conversation
+/// history and tracks cumulative token usage. Without a runtime, free-form
+/// input is echoed back.
+///
 /// This signature allows testing without real stdio.
-pub fn run_session<R: BufRead, W: Write>(
+pub async fn run_session<R: BufRead, W: Write>(
     config: &SessionConfig,
     input: &mut R,
     output: &mut W,
@@ -404,8 +522,21 @@ pub fn run_session<R: BufRead, W: Write>(
         write_workspace_stats_banner(output, ws_stats)?;
     }
 
+    if config.runtime.is_some() {
+        writeln!(
+            output,
+            "LLM agent connected. Free-form input will be processed by the agent."
+        )?;
+    }
+
     writeln!(output, "Type /help for available commands, /quit to exit.")?;
     writeln!(output)?;
+
+    // Session state: conversation history and cumulative token usage.
+    let mut history: Vec<SessionMessage> = Vec::new();
+    let mut session_usage = SessionTokenUsage::default();
+
+    let working_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     let mut line = String::new();
     loop {
@@ -428,6 +559,11 @@ pub fn run_session<R: BufRead, W: Write>(
         if let Some(cmd) = SlashCommand::parse(trimmed) {
             match cmd {
                 SlashCommand::Quit => {
+                    // Display session summary before quitting if any LLM
+                    // invocations were made.
+                    if session_usage.invocation_count > 0 {
+                        write_session_usage(output, &session_usage)?;
+                    }
                     writeln!(output, "Goodbye.")?;
                     break;
                 }
@@ -436,8 +572,59 @@ pub fn run_session<R: BufRead, W: Write>(
                     writeln!(output, "{response}")?;
                 }
             }
+        } else if let Some(ref runtime) = config.runtime {
+            // Forward free-form input to LLM agent.
+            let user_input = trimmed.to_string();
+
+            let prompt = build_prompt_with_history(&user_input, &history);
+            let system_prompt = build_system_prompt(config.workspace.as_deref(), &history);
+
+            let request = RuntimeRequest {
+                working_dir: working_dir.clone(),
+                prompt,
+                model: None,
+                system_prompt: Some(system_prompt),
+                session_id: None,
+                structured_output: None,
+            };
+
+            let response = runtime.invoke(request).await;
+
+            // Record user message in history.
+            history.push(SessionMessage {
+                role: MessageRole::User,
+                content: user_input,
+            });
+
+            if response.success() {
+                let response_text = response.stdout.trim();
+                if !response_text.is_empty() {
+                    writeln!(output, "{response_text}")?;
+                }
+
+                // Record assistant response in history.
+                history.push(SessionMessage {
+                    role: MessageRole::Assistant,
+                    content: response.stdout.trim().to_string(),
+                });
+            } else {
+                writeln!(
+                    output,
+                    "[error] Agent invocation failed (exit code {})",
+                    response.exit_code
+                )?;
+                if !response.stderr.is_empty() {
+                    writeln!(output, "[error] {}", response.stderr.trim())?;
+                }
+            }
+
+            // Track token usage.
+            if let Some(ref usage) = response.token_usage {
+                write_token_usage(output, usage)?;
+                session_usage.accumulate(usage);
+            }
         } else {
-            // Free-form text input (future: pass to LLM agent).
+            // No runtime configured — echo back (legacy behavior).
             writeln!(output, ">> {trimmed}")?;
         }
     }
@@ -450,7 +637,10 @@ pub fn run_session<R: BufRead, W: Write>(
 /// Automatically collects system status and per-workspace statistics from
 /// the Belt database and displays them as banners.  If the database is
 /// unavailable the session starts without banners.
-pub fn run_interactive(config: SessionConfig) -> anyhow::Result<()> {
+///
+/// When available, a [`ClaudeRuntime`](belt_infra::runtimes::claude::ClaudeRuntime)
+/// is configured as the LLM agent for processing free-form input.
+pub async fn run_interactive(config: SessionConfig) -> anyhow::Result<()> {
     let status = collect_status();
     let ws_stats = collect_workspace_stats(config.workspace.as_deref());
     let stdin = io::stdin();
@@ -464,6 +654,7 @@ pub fn run_interactive(config: SessionConfig) -> anyhow::Result<()> {
         status.as_ref(),
         ws_stats.as_ref(),
     )
+    .await
 }
 
 #[cfg(test)]
@@ -471,73 +662,235 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    use belt_infra::runtimes::mock::MockRuntime;
+
     fn make_config(tmp: &tempfile::TempDir) -> SessionConfig {
         let ws = ClawWorkspace::init(tmp.path()).unwrap();
         SessionConfig {
             workspace: Some("test-ws".to_string()),
             claw_workspace: ws,
+            runtime: None,
         }
     }
 
-    #[test]
-    fn session_quit_on_slash_quit() {
+    fn make_config_with_runtime(
+        tmp: &tempfile::TempDir,
+        runtime: Arc<dyn AgentRuntime>,
+    ) -> SessionConfig {
+        let ws = ClawWorkspace::init(tmp.path()).unwrap();
+        SessionConfig {
+            workspace: Some("test-ws".to_string()),
+            claw_workspace: ws,
+            runtime: Some(runtime),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_quit_on_slash_quit() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("Goodbye."));
     }
 
-    #[test]
-    fn session_quit_on_eof() {
+    #[tokio::test]
+    async fn session_quit_on_eof() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("Belt Claw interactive session"));
     }
 
-    #[test]
-    fn session_dispatches_help() {
+    #[tokio::test]
+    async fn session_dispatches_help() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/help\n/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("/auto"));
         assert!(out.contains("/spec"));
         assert!(out.contains("/claw"));
     }
 
-    #[test]
-    fn session_echoes_freeform_text() {
+    #[tokio::test]
+    async fn session_echoes_freeform_text_without_runtime() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"hello world\n/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains(">> hello world"));
     }
 
-    #[test]
-    fn session_shows_workspace_context() {
+    #[tokio::test]
+    async fn session_forwards_freeform_to_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::always_ok("mock"));
+        let config = make_config_with_runtime(&tmp, runtime.clone());
+        let mut input = Cursor::new(b"hello agent\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        // Should NOT echo with ">>" prefix when runtime is configured.
+        assert!(!out.contains(">> hello agent"));
+        // Should contain mock response.
+        assert!(out.contains("mock response for:"));
+        // Verify the runtime received the prompt.
+        assert_eq!(runtime.calls().len(), 1);
+        assert!(runtime.calls()[0].contains("hello agent"));
+    }
+
+    #[tokio::test]
+    async fn session_tracks_token_usage() {
+        let tmp = tempfile::tempdir().unwrap();
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        };
+        let runtime = Arc::new(MockRuntime::always_ok("mock").with_token_usages(vec![usage]));
+        let config = make_config_with_runtime(&tmp, runtime);
+        let mut input = Cursor::new(b"test prompt\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        // Per-invocation token usage.
+        assert!(out.contains("[tokens: in=100, out=50]"));
+        // Session summary on quit.
+        assert!(out.contains("Session totals: 1 invocations"));
+        assert!(out.contains("100 input tokens"));
+        assert!(out.contains("50 output tokens"));
+    }
+
+    #[tokio::test]
+    async fn session_accumulates_token_usage_across_invocations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let usages = vec![
+            TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            },
+            TokenUsage {
+                input_tokens: 200,
+                output_tokens: 75,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            },
+        ];
+        let runtime = Arc::new(MockRuntime::always_ok("mock").with_token_usages(usages));
+        let config = make_config_with_runtime(&tmp, runtime);
+        let mut input = Cursor::new(b"first\nsecond\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        // Session summary shows accumulated totals.
+        assert!(out.contains("2 invocations"));
+        assert!(out.contains("300 input tokens"));
+        assert!(out.contains("125 output tokens"));
+    }
+
+    #[tokio::test]
+    async fn session_displays_error_on_runtime_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::new("mock", vec![1]));
+        let config = make_config_with_runtime(&tmp, runtime);
+        let mut input = Cursor::new(b"fail this\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("[error] Agent invocation failed"));
+    }
+
+    #[tokio::test]
+    async fn session_maintains_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::always_ok("mock"));
+        let config = make_config_with_runtime(&tmp, runtime.clone());
+        let mut input = Cursor::new(b"first message\nsecond message\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
+        // The second call should include conversation history in the prompt.
+        let calls = runtime.calls();
+        assert_eq!(calls.len(), 2);
+        // First call has no history context.
+        assert!(!calls[0].contains("conversation_history"));
+        // Second call should include history context.
+        assert!(calls[1].contains("conversation_history"));
+        assert!(calls[1].contains("first message"));
+    }
+
+    #[tokio::test]
+    async fn session_shows_llm_connected_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::always_ok("mock"));
+        let config = make_config_with_runtime(&tmp, runtime);
+        let mut input = Cursor::new(b"/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("LLM agent connected"));
+    }
+
+    #[tokio::test]
+    async fn session_no_llm_message_without_runtime() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(!out.contains("LLM agent connected"));
+    }
+
+    #[tokio::test]
+    async fn session_shows_workspace_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_config(&tmp);
+        let mut input = Cursor::new(b"/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("Context: test-ws"));
     }
 
-    #[test]
-    fn session_displays_status_banner() {
+    #[tokio::test]
+    async fn session_displays_status_banner() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let summary = StatusSummary {
@@ -559,7 +912,9 @@ mod tests {
         };
         let mut input = Cursor::new(b"/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, Some(&summary), None).unwrap();
+        run_session(&config, &mut input, &mut output, Some(&summary), None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("System Status"));
         assert!(out.contains("Queue: 12 items"));
@@ -570,13 +925,15 @@ mod tests {
         assert!(out.contains("running -> hitl"));
     }
 
-    #[test]
-    fn session_no_banner_when_status_is_none() {
+    #[tokio::test]
+    async fn session_no_banner_when_status_is_none() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(!out.contains("System Status"));
     }
@@ -657,8 +1014,8 @@ mod tests {
         assert!(summary.hitl_items.is_empty());
     }
 
-    #[test]
-    fn claw_entry_displays_hitl_list_grouped_by_reason() {
+    #[tokio::test]
+    async fn claw_entry_displays_hitl_list_grouped_by_reason() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let summary = StatusSummary {
@@ -689,7 +1046,9 @@ mod tests {
         };
         let mut input = Cursor::new(b"/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, Some(&summary)).unwrap();
+        run_session(&config, &mut input, &mut output, Some(&summary), None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
 
         // Verify HITL list is displayed.
@@ -704,8 +1063,8 @@ mod tests {
         assert!(out.contains("w3:impl"));
     }
 
-    #[test]
-    fn claw_entry_no_hitl_list_when_empty() {
+    #[tokio::test]
+    async fn claw_entry_no_hitl_list_when_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let summary = StatusSummary {
@@ -717,7 +1076,9 @@ mod tests {
         };
         let mut input = Cursor::new(b"/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, Some(&summary)).unwrap();
+        run_session(&config, &mut input, &mut output, Some(&summary), None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(!out.contains("HITL Items"));
     }
@@ -859,84 +1220,98 @@ mod tests {
         assert!(out.contains("running -> done"));
     }
 
-    #[test]
-    fn session_dispatches_auto_command() {
+    #[tokio::test]
+    async fn session_dispatches_auto_command() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/auto run task\n/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("[auto]"));
         assert!(out.contains("run task"));
     }
 
-    #[test]
-    fn session_dispatches_spec_command() {
+    #[tokio::test]
+    async fn session_dispatches_spec_command() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/spec issue-42\n/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("[spec]"));
         assert!(out.contains("issue-42"));
     }
 
-    #[test]
-    fn session_dispatches_claw_command() {
+    #[tokio::test]
+    async fn session_dispatches_claw_command() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/claw status\n/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("[claw]"));
         assert!(out.contains("test-ws"));
     }
 
-    #[test]
-    fn session_dispatches_unknown_command() {
+    #[tokio::test]
+    async fn session_dispatches_unknown_command() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/unknown\n/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("Unknown command"));
     }
 
-    #[test]
-    fn session_exit_alias_works() {
+    #[tokio::test]
+    async fn session_exit_alias_works() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/exit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("Goodbye."));
     }
 
-    #[test]
-    fn session_skips_empty_lines() {
+    #[tokio::test]
+    async fn session_skips_empty_lines() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"\n\n\nhello\n/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         // Empty lines should be skipped, only the freeform text echoed.
         assert!(out.contains(">> hello"));
         assert!(out.contains("Goodbye."));
     }
 
-    #[test]
-    fn session_multiple_commands_in_sequence() {
+    #[tokio::test]
+    async fn session_multiple_commands_in_sequence() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/help\n/auto\n/spec\n/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("/auto"));
         assert!(out.contains("[auto]"));
@@ -944,17 +1319,20 @@ mod tests {
         assert!(out.contains("Goodbye."));
     }
 
-    #[test]
-    fn session_no_workspace_context_omits_context_line() {
+    #[tokio::test]
+    async fn session_no_workspace_context_omits_context_line() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = ClawWorkspace::init(tmp.path()).unwrap();
         let config = SessionConfig {
             workspace: None,
             claw_workspace: ws,
+            runtime: None,
         };
         let mut input = Cursor::new(b"/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(!out.contains("Context:"));
     }
@@ -1044,7 +1422,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn workspace_stats_banner_displays_counts() {
         let stats = WorkspaceStats {
             workspace_name: "my-project".to_string(),
@@ -1103,8 +1480,8 @@ mod tests {
         assert!(!out.contains("Recent HITL events"));
     }
 
-    #[test]
-    fn session_displays_workspace_stats() {
+    #[tokio::test]
+    async fn session_displays_workspace_stats() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let stats = WorkspaceStats {
@@ -1118,20 +1495,24 @@ mod tests {
         };
         let mut input = Cursor::new(b"/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None, Some(&stats)).unwrap();
+        run_session(&config, &mut input, &mut output, None, Some(&stats))
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("Workspace: test-ws ---"));
         assert!(out.contains("active=2"));
         assert!(out.contains("pending=3"));
     }
 
-    #[test]
-    fn session_no_workspace_stats_when_none() {
+    #[tokio::test]
+    async fn session_no_workspace_stats_when_none() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(!out.contains("Specs:"));
         assert!(!out.contains("Items:"));
@@ -1248,5 +1629,64 @@ mod tests {
         let stats2 = collect_workspace_stats_from_db(&db, "ws2").unwrap();
         assert_eq!(stats2.active_spec_count, 1);
         assert_eq!(stats2.pending_items_count, 1);
+    }
+
+    #[test]
+    fn build_prompt_with_empty_history() {
+        let prompt = build_prompt_with_history("hello", &[]);
+        assert_eq!(prompt, "hello");
+    }
+
+    #[test]
+    fn build_prompt_includes_history() {
+        let history = vec![
+            SessionMessage {
+                role: MessageRole::User,
+                content: "first".to_string(),
+            },
+            SessionMessage {
+                role: MessageRole::Assistant,
+                content: "response".to_string(),
+            },
+        ];
+        let prompt = build_prompt_with_history("second", &history);
+        assert!(prompt.contains("conversation_history"));
+        assert!(prompt.contains("[user]: first"));
+        assert!(prompt.contains("[assistant]: response"));
+        assert!(prompt.contains("second"));
+    }
+
+    #[test]
+    fn session_token_usage_accumulation() {
+        let mut usage = SessionTokenUsage::default();
+        usage.accumulate(&TokenUsage {
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        });
+        usage.accumulate(&TokenUsage {
+            input_tokens: 200,
+            output_tokens: 75,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        });
+        assert_eq!(usage.total_input_tokens, 300);
+        assert_eq!(usage.total_output_tokens, 125);
+        assert_eq!(usage.invocation_count, 2);
+    }
+
+    #[test]
+    fn build_system_prompt_includes_workspace() {
+        let prompt = build_system_prompt(Some("my-ws"), &[]);
+        assert!(prompt.contains("my-ws"));
+        assert!(prompt.contains("Belt Claw"));
+    }
+
+    #[test]
+    fn build_system_prompt_without_workspace() {
+        let prompt = build_system_prompt(None, &[]);
+        assert!(prompt.contains("Belt Claw"));
+        assert!(!prompt.contains("Current workspace"));
     }
 }
