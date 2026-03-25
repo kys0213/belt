@@ -216,10 +216,7 @@ fn run_loop(
             DashboardTab::PerWorkspace => {
                 // Items filtered by selected workspace.
                 if let Some(ws) = workspaces.get(state.selected_workspace) {
-                    all_items
-                        .iter()
-                        .filter(|i| i.workspace_id == ws.0)
-                        .count()
+                    all_items.iter().filter(|i| i.workspace_id == ws.0).count()
                 } else {
                     0
                 }
@@ -423,10 +420,7 @@ fn handle_nav_down(
 }
 
 /// Handle Left arrow navigation.
-fn handle_nav_left(
-    state: &mut DashboardState,
-    workspaces: &[(String, String, String)],
-) {
+fn handle_nav_left(state: &mut DashboardState, workspaces: &[(String, String, String)]) {
     match state.active_tab {
         DashboardTab::Dashboard => {
             let ts = state.current_tab_state_mut();
@@ -858,6 +852,7 @@ fn render_dashboard_tab(
             Constraint::Length(5),
             Constraint::Min(8),
             Constraint::Length(10),
+            Constraint::Length(10),
         ])
         .split(area);
 
@@ -880,6 +875,9 @@ fn render_dashboard_tab(
         tab_state.selected_index,
     );
     frame.render_widget(recent_table, chunks[2]);
+
+    let runtime_widget = render_runtime_panel_tui(db);
+    frame.render_widget(runtime_widget, chunks[3]);
 }
 
 /// Render the per-workspace tab showing items filtered by the selected workspace.
@@ -1431,6 +1429,85 @@ pub fn phase_color(phase: &str) -> Color {
         "skipped" => Color::DarkGray,
         _ => Color::White,
     }
+}
+
+/// Render the runtime statistics as a ratatui [`Table`] widget for the TUI dashboard.
+///
+/// Fetches runtime stats from the database and displays token totals, execution
+/// count, average duration, and a per-model breakdown inside a bordered panel.
+fn render_runtime_panel_tui(db: &Database) -> Table<'static> {
+    let stats = db.get_runtime_stats().ok();
+
+    let header = Row::new(vec![
+        Cell::from("Model"),
+        Cell::from("Input"),
+        Cell::from("Output"),
+        Cell::from("Total"),
+        Cell::from("Runs"),
+        Cell::from("Avg ms"),
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let mut rows: Vec<Row<'static>> = Vec::new();
+
+    if let Some(ref stats) = stats {
+        // Summary row with overall totals.
+        let avg = stats
+            .avg_duration_ms
+            .map_or_else(|| "-".to_string(), |d| format!("{d:.0}"));
+        rows.push(
+            Row::new(vec![
+                Cell::from("(all)"),
+                Cell::from(format_number(stats.total_tokens_input)),
+                Cell::from(format_number(stats.total_tokens_output)),
+                Cell::from(format_number(stats.total_tokens)),
+                Cell::from(stats.executions.to_string()),
+                Cell::from(avg),
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+        );
+
+        // Per-model rows sorted by total_tokens descending.
+        let mut models: Vec<_> = stats.by_model.values().collect();
+        models.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+
+        for m in models {
+            let avg = m
+                .avg_duration_ms
+                .map_or_else(|| "-".to_string(), |d| format!("{d:.0}"));
+            rows.push(Row::new(vec![
+                Cell::from(m.model.clone()),
+                Cell::from(format_number(m.input_tokens)),
+                Cell::from(format_number(m.output_tokens)),
+                Cell::from(format_number(m.total_tokens)),
+                Cell::from(m.executions.to_string()),
+                Cell::from(avg),
+            ]));
+        }
+    }
+
+    Table::new(
+        rows,
+        [
+            Constraint::Min(20),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(6),
+            Constraint::Length(10),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .title(" Runtime Stats (24h) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta)),
+    )
 }
 
 /// Render the runtime statistics panel to stdout.
