@@ -1,11 +1,13 @@
 //! TUI Dashboard and runtime statistics panel for Belt.
 //!
 //! Provides two display modes:
-//! - `run()`: interactive ratatui-based real-time TUI dashboard (3-panel layout)
+//! - `run()`: interactive ratatui-based real-time TUI dashboard with multiple tabs
 //! - `render_runtime_panel()`: text-based runtime statistics panel for non-TUI output
 //!
-//! The dashboard supports item selection with arrow keys and an item detail
-//! overlay (Enter) that displays transition timeline history.
+//! The dashboard supports:
+//! - Tab switching: `d` (dashboard), `s` (spec progress), `w` (per-workspace)
+//! - Item selection with arrow keys and item detail overlay (Enter)
+//! - Help overlay (`h`) showing all available key bindings
 
 use std::io;
 use std::sync::Arc;
@@ -25,6 +27,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
+use belt_core::spec::SpecStatus;
 use belt_infra::db::{Database, RuntimeStats, TransitionEvent};
 
 /// Which panel is currently focused for item selection.
@@ -34,22 +37,42 @@ enum ActivePanel {
     Recent,
 }
 
+/// Which top-level tab is displayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardTab {
+    /// Main dashboard with phase summary + running/recent items.
+    Dashboard,
+    /// Per-workspace view showing items grouped by workspace.
+    PerWorkspace,
+    /// Spec progress view showing specs and their statuses.
+    Spec,
+}
+
 /// Dashboard UI state for navigation and overlay management.
 struct DashboardState {
-    /// Which panel is focused.
+    /// Which top-level tab is active.
+    active_tab: DashboardTab,
+    /// Which panel is focused (used in Dashboard tab).
     active_panel: ActivePanel,
-    /// Selected row index within the active panel.
+    /// Selected row index within the active panel/list.
     selected_index: usize,
     /// When set, the item detail overlay is shown for this work_id.
     overlay_item: Option<String>,
+    /// Whether the help overlay is visible.
+    show_help: bool,
+    /// Selected workspace index (used in PerWorkspace tab).
+    selected_workspace: usize,
 }
 
 impl DashboardState {
     fn new() -> Self {
         Self {
+            active_tab: DashboardTab::Dashboard,
             active_panel: ActivePanel::Running,
             selected_index: 0,
             overlay_item: None,
+            show_help: false,
+            selected_workspace: 0,
         }
     }
 }
@@ -82,67 +105,93 @@ fn run_loop(
     let mut state = DashboardState::new();
 
     loop {
-        // Collect items for display and selection.
+        // Collect data depending on the active tab.
         let running_items = db
             .list_items(Some(QueuePhase::Running), None)
             .unwrap_or_default();
-
         let recent_items = collect_recent_items(db);
+        let workspaces = db.list_workspaces().unwrap_or_default();
+        let specs = db.list_specs(None, None).unwrap_or_default();
 
-        let active_panel_len = match state.active_panel {
-            ActivePanel::Running => running_items.len(),
-            ActivePanel::Recent => recent_items.len(),
+        // Compute list length for navigation clamping.
+        let active_list_len = match state.active_tab {
+            DashboardTab::Dashboard => match state.active_panel {
+                ActivePanel::Running => running_items.len(),
+                ActivePanel::Recent => recent_items.len(),
+            },
+            DashboardTab::PerWorkspace => {
+                // Items filtered by selected workspace.
+                if let Some(ws) = workspaces.get(state.selected_workspace) {
+                    db.list_items(None, Some(&ws.0)).unwrap_or_default().len()
+                } else {
+                    0
+                }
+            }
+            DashboardTab::Spec => specs.len(),
         };
 
         // Clamp selected_index.
-        if active_panel_len == 0 {
+        if active_list_len == 0 {
             state.selected_index = 0;
-        } else if state.selected_index >= active_panel_len {
-            state.selected_index = active_panel_len.saturating_sub(1);
+        } else if state.selected_index >= active_list_len {
+            state.selected_index = active_list_len.saturating_sub(1);
+        }
+
+        // Clamp workspace index.
+        if !workspaces.is_empty() && state.selected_workspace >= workspaces.len() {
+            state.selected_workspace = workspaces.len().saturating_sub(1);
         }
 
         terminal.draw(|frame| {
-            let chunks = Layout::default()
+            // Tab bar at top.
+            let outer_chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(5),
-                    Constraint::Min(8),
-                    Constraint::Length(10),
-                ])
+                .constraints([Constraint::Length(3), Constraint::Min(5)])
                 .split(frame.area());
 
-            // Top: phase summary
-            let summary = render_phase_summary(db);
-            frame.render_widget(summary, chunks[0]);
+            let tab_bar = render_tab_bar(state.active_tab);
+            frame.render_widget(tab_bar, outer_chunks[0]);
 
-            // Middle: running items (with selection highlight)
-            let running_table = render_running_items_stateful(
-                &running_items,
-                state.active_panel == ActivePanel::Running,
-                state.selected_index,
-            );
-            frame.render_widget(running_table, chunks[1]);
+            match state.active_tab {
+                DashboardTab::Dashboard => {
+                    render_dashboard_tab(
+                        frame,
+                        db,
+                        outer_chunks[1],
+                        &running_items,
+                        &recent_items,
+                        &state,
+                    );
+                }
+                DashboardTab::PerWorkspace => {
+                    render_per_workspace_tab(frame, db, outer_chunks[1], &workspaces, &state);
+                }
+                DashboardTab::Spec => {
+                    render_spec_tab(frame, outer_chunks[1], &specs, state.selected_index);
+                }
+            }
 
-            // Bottom: recent completed/failed (with selection highlight)
-            let recent_table = render_recent_items_stateful(
-                &recent_items,
-                state.active_panel == ActivePanel::Recent,
-                state.selected_index,
-            );
-            frame.render_widget(recent_table, chunks[2]);
-
-            // Overlay: item detail
+            // Overlays (rendered on top of everything).
             if let Some(ref work_id) = state.overlay_item {
                 render_item_detail_overlay(frame, db, work_id);
             }
+            if state.show_help {
+                render_help_overlay(frame);
+            }
         })?;
 
-        // Poll for keyboard events with 1 second timeout
+        // Poll for keyboard events with 1 second timeout.
         if event::poll(Duration::from_secs(1))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            // When overlay is open, only handle close keys.
+            // Help overlay: close on any key.
+            if state.show_help {
+                state.show_help = false;
+                continue;
+            }
+
+            // Item detail overlay: close on q/Esc.
             if state.overlay_item.is_some() {
                 if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
                     state.overlay_item = None;
@@ -152,29 +201,70 @@ fn run_loop(
 
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                // Tab switching keys.
+                KeyCode::Char('d') => {
+                    state.active_tab = DashboardTab::Dashboard;
+                    state.selected_index = 0;
+                }
+                KeyCode::Char('s') => {
+                    state.active_tab = DashboardTab::Spec;
+                    state.selected_index = 0;
+                }
+                KeyCode::Char('w') => {
+                    state.active_tab = DashboardTab::PerWorkspace;
+                    state.selected_index = 0;
+                }
+                KeyCode::Char('h') => {
+                    state.show_help = true;
+                }
+                // Navigation.
                 KeyCode::Up | KeyCode::Char('k') => {
                     state.selected_index = state.selected_index.saturating_sub(1);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if active_panel_len > 0 {
+                    if active_list_len > 0 {
                         state.selected_index =
-                            (state.selected_index + 1).min(active_panel_len.saturating_sub(1));
+                            (state.selected_index + 1).min(active_list_len.saturating_sub(1));
+                    }
+                }
+                KeyCode::Left => {
+                    if state.active_tab == DashboardTab::PerWorkspace {
+                        state.selected_workspace = state.selected_workspace.saturating_sub(1);
+                        state.selected_index = 0;
+                    }
+                }
+                KeyCode::Right => {
+                    if state.active_tab == DashboardTab::PerWorkspace && !workspaces.is_empty() {
+                        state.selected_workspace =
+                            (state.selected_workspace + 1).min(workspaces.len().saturating_sub(1));
+                        state.selected_index = 0;
                     }
                 }
                 KeyCode::Tab => {
-                    state.active_panel = match state.active_panel {
-                        ActivePanel::Running => ActivePanel::Recent,
-                        ActivePanel::Recent => ActivePanel::Running,
-                    };
-                    state.selected_index = 0;
+                    if state.active_tab == DashboardTab::Dashboard {
+                        state.active_panel = match state.active_panel {
+                            ActivePanel::Running => ActivePanel::Recent,
+                            ActivePanel::Recent => ActivePanel::Running,
+                        };
+                        state.selected_index = 0;
+                    }
                 }
                 KeyCode::Enter => {
-                    let items = match state.active_panel {
-                        ActivePanel::Running => &running_items,
-                        ActivePanel::Recent => &recent_items,
-                    };
-                    if let Some(item) = items.get(state.selected_index) {
-                        state.overlay_item = Some(item.work_id.clone());
+                    if state.active_tab == DashboardTab::Dashboard {
+                        let items = match state.active_panel {
+                            ActivePanel::Running => &running_items,
+                            ActivePanel::Recent => &recent_items,
+                        };
+                        if let Some(item) = items.get(state.selected_index) {
+                            state.overlay_item = Some(item.work_id.clone());
+                        }
+                    } else if state.active_tab == DashboardTab::PerWorkspace
+                        && let Some(ws) = workspaces.get(state.selected_workspace)
+                    {
+                        let ws_items = db.list_items(None, Some(&ws.0)).unwrap_or_default();
+                        if let Some(item) = ws_items.get(state.selected_index) {
+                            state.overlay_item = Some(item.work_id.clone());
+                        }
                     }
                 }
                 _ => {}
@@ -373,6 +463,442 @@ fn render_recent_items_stateful(
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border_color)),
     )
+}
+
+/// Render the tab bar showing available tabs with the active one highlighted.
+fn render_tab_bar(active: DashboardTab) -> Paragraph<'static> {
+    let tabs = [
+        ("d", "Dashboard", DashboardTab::Dashboard),
+        ("w", "Workspace", DashboardTab::PerWorkspace),
+        ("s", "Spec", DashboardTab::Spec),
+    ];
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, (key, label, tab)) in tabs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = if *tab == active {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(format!("[{key}] {label}"), style));
+    }
+
+    spans.push(Span::raw("    "));
+    spans.push(Span::styled(
+        "[h] Help",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    Paragraph::new(Line::from(spans)).block(
+        Block::default()
+            .title(" Belt TUI ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    )
+}
+
+/// Render the main dashboard tab content (phase summary + running/recent items).
+fn render_dashboard_tab(
+    frame: &mut ratatui::Frame,
+    db: &Database,
+    area: Rect,
+    running_items: &[QueueItem],
+    recent_items: &[QueueItem],
+    state: &DashboardState,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(8),
+            Constraint::Length(10),
+        ])
+        .split(area);
+
+    let summary = render_phase_summary(db);
+    frame.render_widget(summary, chunks[0]);
+
+    let running_table = render_running_items_stateful(
+        running_items,
+        state.active_panel == ActivePanel::Running,
+        state.selected_index,
+    );
+    frame.render_widget(running_table, chunks[1]);
+
+    let recent_table = render_recent_items_stateful(
+        recent_items,
+        state.active_panel == ActivePanel::Recent,
+        state.selected_index,
+    );
+    frame.render_widget(recent_table, chunks[2]);
+}
+
+/// Render the per-workspace tab showing items filtered by the selected workspace.
+fn render_per_workspace_tab(
+    frame: &mut ratatui::Frame,
+    db: &Database,
+    area: Rect,
+    workspaces: &[(String, String, String)],
+    state: &DashboardState,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .split(area);
+
+    // Workspace selector bar.
+    if workspaces.is_empty() {
+        let msg = Paragraph::new(Line::from(Span::styled(
+            "(no workspaces registered)",
+            Style::default().fg(Color::DarkGray),
+        )))
+        .block(
+            Block::default()
+                .title(" Workspaces [<-/->] ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+        frame.render_widget(msg, chunks[0]);
+        return;
+    }
+
+    let mut ws_spans: Vec<Span<'static>> = Vec::new();
+    for (i, ws) in workspaces.iter().enumerate() {
+        if i > 0 {
+            ws_spans.push(Span::raw("  "));
+        }
+        let style = if i == state.selected_workspace {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        ws_spans.push(Span::styled(ws.0.clone(), style));
+    }
+
+    let ws_bar = Paragraph::new(Line::from(ws_spans)).block(
+        Block::default()
+            .title(" Workspaces [<-/->] ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(ws_bar, chunks[0]);
+
+    // Items for the selected workspace.
+    let selected_ws = &workspaces[state.selected_workspace].0;
+    let ws_items = db.list_items(None, Some(selected_ws)).unwrap_or_default();
+
+    let rows: Vec<Row<'static>> = ws_items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let phase_str = item.phase.as_str().to_string();
+            let color = phase_color(&phase_str);
+            let row = Row::new(vec![
+                Cell::from(item.work_id.clone()),
+                Cell::from(phase_str).style(Style::default().fg(color)),
+                Cell::from(item.state.clone()),
+                Cell::from(item.updated_at.clone()),
+            ]);
+            if i == state.selected_index {
+                row.style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                row
+            }
+        })
+        .collect();
+
+    let header = Row::new(vec!["Work ID", "Phase", "State", "Updated"])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .bottom_margin(1);
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(30),
+            Constraint::Percentage(15),
+            Constraint::Percentage(25),
+            Constraint::Percentage(30),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .title(format!(" Items [{selected_ws}] "))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Green)),
+    );
+    frame.render_widget(table, chunks[1]);
+}
+
+/// Render the spec progress tab showing all specs with status and progress.
+fn render_spec_tab(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    specs: &[belt_core::spec::Spec],
+    selected: usize,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(5)])
+        .split(area);
+
+    // Spec status summary (progress overview).
+    let status_counts = count_spec_statuses(specs);
+    let total = specs.len();
+    let completed = status_counts.completed;
+    let progress_pct = if total > 0 {
+        (completed as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let summary_spans = vec![
+        Span::styled(
+            format!("Total: {total}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("draft: {}", status_counts.draft),
+            Style::default().fg(Color::Gray),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("active: {}", status_counts.active),
+            Style::default().fg(Color::Blue),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("paused: {}", status_counts.paused),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("completing: {}", status_counts.completing),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("completed: {completed}"),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("Progress: {progress_pct:.0}%"),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+
+    // Build a progress bar line.
+    let bar_width = 30usize;
+    let filled = if total > 0 {
+        (completed * bar_width) / total
+    } else {
+        0
+    };
+    let empty = bar_width.saturating_sub(filled);
+    let bar_line = Line::from(vec![
+        Span::raw("  ["),
+        Span::styled("#".repeat(filled), Style::default().fg(Color::Green)),
+        Span::styled("-".repeat(empty), Style::default().fg(Color::DarkGray)),
+        Span::raw("]"),
+    ]);
+
+    let summary = Paragraph::new(vec![Line::from(summary_spans), Line::from(""), bar_line]).block(
+        Block::default()
+            .title(" Spec Progress ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta)),
+    );
+    frame.render_widget(summary, chunks[0]);
+
+    // Spec list table.
+    let rows: Vec<Row<'static>> = specs
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| {
+            let status_str = spec.status.as_str().to_string();
+            let color = spec_status_color(&status_str);
+            let ws = spec.workspace_id.clone();
+            let row = Row::new(vec![
+                Cell::from(spec.name.clone()),
+                Cell::from(ws),
+                Cell::from(status_str).style(Style::default().fg(color)),
+                Cell::from(spec.updated_at.clone()),
+            ]);
+            if i == selected {
+                row.style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                row
+            }
+        })
+        .collect();
+
+    let header = Row::new(vec!["Name", "Workspace", "Status", "Updated"])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .bottom_margin(1);
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(30),
+            Constraint::Percentage(20),
+            Constraint::Percentage(15),
+            Constraint::Percentage(35),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .title(" Specs ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta)),
+    );
+    frame.render_widget(table, chunks[1]);
+}
+
+/// Aggregate counts of spec statuses.
+struct SpecStatusCounts {
+    draft: usize,
+    active: usize,
+    paused: usize,
+    completing: usize,
+    completed: usize,
+}
+
+fn count_spec_statuses(specs: &[belt_core::spec::Spec]) -> SpecStatusCounts {
+    let mut counts = SpecStatusCounts {
+        draft: 0,
+        active: 0,
+        paused: 0,
+        completing: 0,
+        completed: 0,
+    };
+    for spec in specs {
+        match spec.status {
+            SpecStatus::Draft => counts.draft += 1,
+            SpecStatus::Active => counts.active += 1,
+            SpecStatus::Paused => counts.paused += 1,
+            SpecStatus::Completing => counts.completing += 1,
+            SpecStatus::Completed => counts.completed += 1,
+            SpecStatus::Archived => {} // excluded from list by default
+        }
+    }
+    counts
+}
+
+/// Map spec status strings to colors.
+fn spec_status_color(status: &str) -> Color {
+    match status {
+        "draft" => Color::Gray,
+        "active" => Color::Blue,
+        "paused" => Color::Yellow,
+        "completing" => Color::Cyan,
+        "completed" => Color::Green,
+        "archived" => Color::DarkGray,
+        _ => Color::White,
+    }
+}
+
+/// Render the help overlay showing all key bindings.
+fn render_help_overlay(frame: &mut ratatui::Frame) {
+    let area = centered_rect(50, 60, frame.area());
+    frame.render_widget(Clear, area);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "Key Bindings",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::UNDERLINED),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  d       ", Style::default().fg(Color::Yellow)),
+            Span::raw("Switch to Dashboard tab"),
+        ]),
+        Line::from(vec![
+            Span::styled("  w       ", Style::default().fg(Color::Yellow)),
+            Span::raw("Switch to Per-Workspace tab"),
+        ]),
+        Line::from(vec![
+            Span::styled("  s       ", Style::default().fg(Color::Yellow)),
+            Span::raw("Switch to Spec progress tab"),
+        ]),
+        Line::from(vec![
+            Span::styled("  h       ", Style::default().fg(Color::Yellow)),
+            Span::raw("Show this help"),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  j/Down  ", Style::default().fg(Color::Cyan)),
+            Span::raw("Move selection down"),
+        ]),
+        Line::from(vec![
+            Span::styled("  k/Up    ", Style::default().fg(Color::Cyan)),
+            Span::raw("Move selection up"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Left    ", Style::default().fg(Color::Cyan)),
+            Span::raw("Previous workspace (Workspace tab)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Right   ", Style::default().fg(Color::Cyan)),
+            Span::raw("Next workspace (Workspace tab)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Tab     ", Style::default().fg(Color::Cyan)),
+            Span::raw("Switch panel (Dashboard tab)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  Enter   ", Style::default().fg(Color::Cyan)),
+            Span::raw("Open item detail overlay"),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  q/Esc   ", Style::default().fg(Color::Red)),
+            Span::raw("Quit / close overlay"),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press any key to close",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .title(" Help ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+    frame.render_widget(paragraph, area);
 }
 
 /// Render the item detail overlay as a centered popup.
@@ -1110,5 +1636,83 @@ mod tests {
                 render_item_detail_overlay(frame, &db, "any-id");
             })
             .unwrap();
+    }
+
+    // ---- DashboardState new defaults ----
+
+    #[test]
+    fn dashboard_state_defaults() {
+        let state = DashboardState::new();
+        assert_eq!(state.active_tab, DashboardTab::Dashboard);
+        assert!(!state.show_help);
+        assert_eq!(state.selected_workspace, 0);
+    }
+
+    // ---- spec_status_color ----
+
+    #[test]
+    fn spec_status_color_known_statuses() {
+        assert_eq!(spec_status_color("draft"), Color::Gray);
+        assert_eq!(spec_status_color("active"), Color::Blue);
+        assert_eq!(spec_status_color("paused"), Color::Yellow);
+        assert_eq!(spec_status_color("completing"), Color::Cyan);
+        assert_eq!(spec_status_color("completed"), Color::Green);
+        assert_eq!(spec_status_color("archived"), Color::DarkGray);
+    }
+
+    #[test]
+    fn spec_status_color_unknown_returns_white() {
+        assert_eq!(spec_status_color("unknown"), Color::White);
+        assert_eq!(spec_status_color(""), Color::White);
+    }
+
+    // ---- count_spec_statuses ----
+
+    #[test]
+    fn count_spec_statuses_empty() {
+        let counts = count_spec_statuses(&[]);
+        assert_eq!(counts.draft, 0);
+        assert_eq!(counts.active, 0);
+        assert_eq!(counts.paused, 0);
+        assert_eq!(counts.completing, 0);
+        assert_eq!(counts.completed, 0);
+    }
+
+    #[test]
+    fn count_spec_statuses_mixed() {
+        use belt_core::spec::Spec;
+
+        let mut specs = Vec::new();
+        let mut s1 = Spec::new("s1".into(), "ws".into(), "n1".into(), "c".into());
+        // Draft by default
+        specs.push(s1.clone());
+
+        s1.id = "s2".into();
+        s1.status = SpecStatus::Active;
+        specs.push(s1.clone());
+
+        s1.id = "s3".into();
+        s1.status = SpecStatus::Completed;
+        specs.push(s1.clone());
+
+        s1.id = "s4".into();
+        s1.status = SpecStatus::Completed;
+        specs.push(s1);
+
+        let counts = count_spec_statuses(&specs);
+        assert_eq!(counts.draft, 1);
+        assert_eq!(counts.active, 1);
+        assert_eq!(counts.completed, 2);
+        assert_eq!(counts.paused, 0);
+        assert_eq!(counts.completing, 0);
+    }
+
+    // ---- DashboardTab equality ----
+
+    #[test]
+    fn dashboard_tab_equality() {
+        assert_eq!(DashboardTab::Dashboard, DashboardTab::Dashboard);
+        assert_ne!(DashboardTab::Dashboard, DashboardTab::Spec);
+        assert_ne!(DashboardTab::Spec, DashboardTab::PerWorkspace);
     }
 }
