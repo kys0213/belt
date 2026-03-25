@@ -1132,36 +1132,55 @@ fn cmd_cron_run(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `belt cron trigger` -- reset last_run_at so the job fires on next tick.
+/// `belt cron trigger` -- persist trigger state and signal daemon.
+///
+/// Resets the job's `last_run_at` to `NULL` in the database so the cron
+/// engine treats it as never-run, then sends `SIGUSR1` to the daemon
+/// (if running) to sync triggers and execute an immediate tick.
 fn cmd_cron_trigger(name: &str) -> anyhow::Result<()> {
     let db = open_db()?;
-    // Reset last_run_at to NULL by toggling enabled (no direct reset API),
-    // but we do have update_cron_last_run which sets it to now -- that's not
-    // what we want. Instead, we verify the job exists then inform the user
-    // that the next daemon tick will run it. For a true trigger, we'd need
-    // the daemon to expose an RPC. For now, we update last_run_at to a very
-    // old timestamp to ensure the scheduler picks it up.
-    //
-    // Since the DB API doesn't expose a "clear last_run_at" method, we
-    // update it to epoch so the interval/daily check will fire next tick.
-    let jobs = db.list_cron_jobs()?;
-    let found = jobs.iter().any(|j| j.name == name);
-    if !found {
-        anyhow::bail!("cron job not found: {name}");
+
+    // Verify the job exists and reset its last_run_at to NULL.
+    db.reset_cron_last_run(name)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    println!("Trigger persisted for cron job '{name}' (last_run_at reset).");
+
+    // Signal the daemon to sync triggers from DB and run an immediate tick.
+    match signal_daemon() {
+        Ok(()) => {
+            println!("Daemon notified (SIGUSR1). The job will execute shortly.");
+        }
+        Err(e) => {
+            println!("Could not signal daemon: {e}");
+            println!("The job will execute on the next daemon tick.");
+        }
     }
 
-    // Use update_cron_last_run to set a sentinel. The scheduler will fire
-    // because we set it to now, but that means it just ran -- not what we
-    // want. We need a different approach: toggle enabled off then on to
-    // "nudge" the job. Actually, the cleanest approach given the DB API is
-    // to record that a trigger was requested. For the MVP, we update
-    // last_run_at to epoch (1970) via a direct workaround.
-    //
-    // The CronEngine in the daemon uses in-memory state, so the DB cron_jobs
-    // table is a registry. Triggering means telling the daemon to
-    // force_trigger. Without IPC, the best we can do is inform the user.
-    println!("Trigger requested for cron job '{name}'.");
-    println!("The job will execute on the next daemon tick.");
+    Ok(())
+}
+
+/// Send SIGUSR1 to the running daemon process to trigger a cron sync.
+fn signal_daemon() -> anyhow::Result<()> {
+    let pid = read_pid()?;
+
+    #[cfg(unix)]
+    {
+        use std::process::Command;
+        let status = Command::new("kill")
+            .args(["-USR1", &pid.to_string()])
+            .status()?;
+        if !status.success() {
+            anyhow::bail!("failed to send SIGUSR1 to PID {pid}");
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        anyhow::bail!("daemon signaling is only supported on Unix systems");
+    }
+
     Ok(())
 }
 

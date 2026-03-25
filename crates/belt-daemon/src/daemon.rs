@@ -1238,6 +1238,57 @@ impl Daemon {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs));
         tracing::info!("belt daemon started (tick={}s)", tick_interval_secs);
 
+        self.run_select_loop(&mut tick).await;
+
+        // Running 아이템 완료를 최대 30초 대기. timeout 시 Pending으로 롤백.
+        self.drain_with_timeout(std::time::Duration::from_secs(30))
+            .await;
+
+        tracing::info!("belt daemon stopped");
+    }
+
+    /// Handle SIGUSR1 by syncing cron triggers from DB and running an
+    /// immediate tick.
+    async fn handle_cron_trigger_signal(&mut self) {
+        tracing::info!("received SIGUSR1, syncing cron triggers from DB...");
+        if let (Some(engine), Some(db)) = (&mut self.cron_engine, &self.db) {
+            engine.sync_triggers_from_db(db);
+        }
+        // Run an immediate tick so the triggered job executes now.
+        if let Err(e) = self.tick().await {
+            tracing::error!("tick error after SIGUSR1: {e}");
+        }
+    }
+
+    /// Select loop with SIGUSR1 support (unix).
+    #[cfg(unix)]
+    async fn run_select_loop(&mut self, tick: &mut tokio::time::Interval) {
+        let mut sigusr1 =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+                .expect("failed to register SIGUSR1 handler");
+
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    if let Err(e) = self.tick().await {
+                        tracing::error!("tick error: {e}");
+                    }
+                }
+                _ = sigusr1.recv() => {
+                    self.handle_cron_trigger_signal().await;
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("received SIGINT, initiating graceful shutdown...");
+                    self.shutdown_requested = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Select loop without SIGUSR1 (non-unix).
+    #[cfg(not(unix))]
+    async fn run_select_loop(&mut self, tick: &mut tokio::time::Interval) {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
@@ -1252,12 +1303,6 @@ impl Daemon {
                 }
             }
         }
-
-        // Running 아이템 완료를 최대 30초 대기. timeout 시 Pending으로 롤백.
-        self.drain_with_timeout(std::time::Duration::from_secs(30))
-            .await;
-
-        tracing::info!("belt daemon stopped");
     }
 
     /// Running 아이템 완료 대기.
