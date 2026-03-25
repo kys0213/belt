@@ -655,13 +655,22 @@ impl Daemon {
     }
 
     /// Mark a Completed item as Done.
+    ///
+    /// After transitioning to Done, automatically cleans up the associated
+    /// worktree. Cleanup errors are logged but do not fail the operation.
     pub fn mark_done(&mut self, work_id: &str) -> Result<(), BeltError> {
         let item = self
             .queue
             .iter_mut()
             .find(|it| it.work_id == work_id)
             .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-        transit(item, QueuePhase::Done)
+        transit(item, QueuePhase::Done)?;
+
+        if let Err(e) = self.worktree_mgr.cleanup(work_id) {
+            tracing::warn!(work_id, error = %e, "worktree cleanup failed on mark_done, continuing");
+        }
+
+        Ok(())
     }
 
     /// Mark a Completed item as Hitl (human-in-the-loop) with reason and optional notes.
@@ -1442,6 +1451,31 @@ sources:
         assert_eq!(
             daemon.get_item("s1:analyze").unwrap().phase,
             QueuePhase::Done
+        );
+    }
+
+    #[test]
+    fn mark_done_cleans_up_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Running;
+        item.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(item);
+
+        // Create a worktree for this item.
+        daemon.worktree_mgr.create_or_reuse("s1:analyze").unwrap();
+        assert!(daemon.worktree_mgr.exists("s1:analyze"));
+
+        assert!(daemon.complete_item("s1:analyze").is_ok());
+        assert!(daemon.mark_done("s1:analyze").is_ok());
+
+        // Worktree should have been cleaned up.
+        assert!(
+            !daemon.worktree_mgr.exists("s1:analyze"),
+            "worktree should be removed after mark_done"
         );
     }
 
