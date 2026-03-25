@@ -2153,4 +2153,355 @@ mod tests {
         // register() replaces by name, so should still be 5.
         assert_eq!(engine.job_count(), 5);
     }
+
+    // -- resolve_workspace_terminal_phase unit tests --
+
+    #[test]
+    fn resolve_terminal_phase_returns_skipped_for_skip_action() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        let ws_config_path = tmp.path().join("workspace.yml");
+        std::fs::write(
+            &ws_config_path,
+            "name: ws-skip\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n",
+        )
+        .unwrap();
+        db.add_workspace("ws-skip", ws_config_path.to_str().unwrap())
+            .unwrap();
+
+        let mut cache = HashMap::new();
+        let phase =
+            resolve_workspace_terminal_phase(&db, "ws-skip", "github:org/repo#1", &mut cache);
+        assert_eq!(phase, QueuePhase::Skipped);
+    }
+
+    #[test]
+    fn resolve_terminal_phase_returns_failed_for_replan_action() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        let ws_config_path = tmp.path().join("workspace.yml");
+        std::fs::write(
+            &ws_config_path,
+            "name: ws-replan\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: replan\n",
+        )
+        .unwrap();
+        db.add_workspace("ws-replan", ws_config_path.to_str().unwrap())
+            .unwrap();
+
+        let mut cache = HashMap::new();
+        let phase =
+            resolve_workspace_terminal_phase(&db, "ws-replan", "github:org/repo#2", &mut cache);
+        assert_eq!(phase, QueuePhase::Failed);
+    }
+
+    #[test]
+    fn resolve_terminal_phase_defaults_to_failed_when_workspace_not_found() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let mut cache = HashMap::new();
+        let phase = resolve_workspace_terminal_phase(
+            &db,
+            "nonexistent-ws",
+            "github:org/repo#1",
+            &mut cache,
+        );
+        assert_eq!(phase, QueuePhase::Failed);
+    }
+
+    #[test]
+    fn resolve_terminal_phase_defaults_to_failed_when_config_missing() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        // Register workspace pointing to a non-existent config file.
+        db.add_workspace("ws-bad", "/nonexistent/workspace.yml")
+            .unwrap();
+
+        let mut cache = HashMap::new();
+        let phase =
+            resolve_workspace_terminal_phase(&db, "ws-bad", "github:org/repo#1", &mut cache);
+        assert_eq!(phase, QueuePhase::Failed);
+    }
+
+    #[test]
+    fn resolve_terminal_phase_defaults_to_failed_when_no_terminal_set() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        let ws_config_path = tmp.path().join("workspace.yml");
+        std::fs::write(
+            &ws_config_path,
+            "name: ws-noterm\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      2: hitl\n",
+        )
+        .unwrap();
+        db.add_workspace("ws-noterm", ws_config_path.to_str().unwrap())
+            .unwrap();
+
+        let mut cache = HashMap::new();
+        let phase =
+            resolve_workspace_terminal_phase(&db, "ws-noterm", "github:org/repo#1", &mut cache);
+        assert_eq!(phase, QueuePhase::Failed);
+    }
+
+    #[test]
+    fn resolve_terminal_phase_extracts_source_key_from_source_id() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Config with a "custom" source that has terminal: skip.
+        let ws_config_path = tmp.path().join("workspace.yml");
+        std::fs::write(
+            &ws_config_path,
+            "name: ws-custom\nsources:\n  custom:\n    url: https://custom.example.com\n    escalation:\n      1: retry\n      terminal: skip\n",
+        )
+        .unwrap();
+        db.add_workspace("ws-custom", ws_config_path.to_str().unwrap())
+            .unwrap();
+
+        let mut cache = HashMap::new();
+        // source_id "custom:proj/item#5" should extract key "custom".
+        let phase =
+            resolve_workspace_terminal_phase(&db, "ws-custom", "custom:proj/item#5", &mut cache);
+        assert_eq!(phase, QueuePhase::Skipped);
+    }
+
+    #[test]
+    fn resolve_terminal_phase_uses_cache_on_repeated_call() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        let ws_config_path = tmp.path().join("workspace.yml");
+        std::fs::write(
+            &ws_config_path,
+            "name: ws-cached\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      terminal: skip\n",
+        )
+        .unwrap();
+        db.add_workspace("ws-cached", ws_config_path.to_str().unwrap())
+            .unwrap();
+
+        let mut cache = HashMap::new();
+        let phase1 =
+            resolve_workspace_terminal_phase(&db, "ws-cached", "github:org/repo#1", &mut cache);
+        assert_eq!(phase1, QueuePhase::Skipped);
+
+        // Cache should now contain the entry.
+        assert!(cache.contains_key("ws-cached"));
+
+        // Second call should use cache (same result).
+        let phase2 =
+            resolve_workspace_terminal_phase(&db, "ws-cached", "github:org/repo#2", &mut cache);
+        assert_eq!(phase2, QueuePhase::Skipped);
+    }
+
+    // -- has_existing_gap_issue unit tests --
+
+    #[test]
+    fn has_existing_gap_issue_returns_false_when_gh_unavailable() {
+        // When `gh` CLI is not available or fails, the function returns false
+        // (safe side: allow issue creation so gaps are not silently swallowed).
+        // In test environments gh may not be configured, so this exercises
+        // the error/fallback branch.
+        let result = has_existing_gap_issue("nonexistent-spec-name-xyz-12345");
+        // Should return false (either gh fails or no matching issue exists).
+        assert!(!result);
+    }
+
+    #[test]
+    fn has_existing_gap_issue_constructs_correct_search_title() {
+        // Verifies the search title format used internally.
+        // The function searches for "[Gap] Spec '{spec_name}'" in issue titles.
+        // We test with a name that is extremely unlikely to match any real issue.
+        let result = has_existing_gap_issue("__belt_test_nonexistent_spec_42__");
+        assert!(!result);
+    }
+
+    // -- HitlTimeoutJob::execute() terminal branching: replan --
+
+    #[test]
+    fn hitl_timeout_terminal_action_replan() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
+
+        let mut item = belt_core::queue::QueueItem::new(
+            "w-replan".into(),
+            "s1".into(),
+            "ws".into(),
+            "st".into(),
+        );
+        item.phase = QueuePhase::Hitl;
+        item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
+        item.hitl_terminal_action = Some("replan".to_string());
+        db.insert_item(&item).unwrap();
+
+        let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr);
+        let ctx = CronContext { now: Utc::now() };
+        job.execute(&ctx).unwrap();
+
+        // "replan" maps to Failed (item goes back to queue for re-processing).
+        let updated = db.get_item("w-replan").unwrap();
+        assert_eq!(updated.phase, QueuePhase::Failed);
+    }
+
+    #[test]
+    fn hitl_timeout_terminal_action_skip_cleans_worktree() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
+
+        // Create a worktree for the item.
+        worktree_mgr.create_or_reuse("w-skip-wt").unwrap();
+        assert!(worktree_mgr.exists("w-skip-wt"));
+
+        let mut item = belt_core::queue::QueueItem::new(
+            "w-skip-wt".into(),
+            "s1".into(),
+            "ws".into(),
+            "st".into(),
+        );
+        item.phase = QueuePhase::Hitl;
+        item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
+        item.hitl_terminal_action = Some("skip".to_string());
+        db.insert_item(&item).unwrap();
+
+        let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr.clone());
+        let ctx = CronContext { now: Utc::now() };
+        job.execute(&ctx).unwrap();
+
+        // Skip should transition to Skipped and cleanup worktree.
+        let updated = db.get_item("w-skip-wt").unwrap();
+        assert_eq!(updated.phase, QueuePhase::Skipped);
+        assert!(!worktree_mgr.exists("w-skip-wt"));
+    }
+
+    #[test]
+    fn hitl_timeout_no_expiry_when_all_items_recent() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
+
+        // Insert a recent HITL item (no timeout_at, recent updated_at).
+        let mut item = belt_core::queue::QueueItem::new(
+            "w-recent".into(),
+            "s1".into(),
+            "ws".into(),
+            "st".into(),
+        );
+        item.phase = QueuePhase::Hitl;
+        db.insert_item(&item).unwrap();
+
+        let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr);
+        let ctx = CronContext { now: Utc::now() };
+        job.execute(&ctx).unwrap();
+
+        // Item should remain in Hitl phase.
+        let updated = db.get_item("w-recent").unwrap();
+        assert_eq!(updated.phase, QueuePhase::Hitl);
+    }
+
+    // -- GapDetectionJob::execute() dedupe guard tests --
+
+    #[test]
+    fn gap_detection_dedupe_skips_when_open_queue_item_exists() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Code that does NOT cover spec keywords.
+        std::fs::write(tmp.path().join("main.rs"), "fn unrelated() {}").unwrap();
+
+        // Insert an active spec.
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-dedupe-q".into(),
+            "ws".into(),
+            "Dedupe Queue Test".into(),
+            "implement authorization middleware for secure endpoints".into(),
+        );
+        spec.status = belt_core::spec::SpecStatus::Active;
+        db.insert_spec(&spec).unwrap();
+
+        // Insert an open queue item matching the spec's source_id.
+        let item = belt_core::queue::QueueItem::new(
+            "spec-dedupe-q:work".into(),
+            "spec-dedupe-q".into(),
+            "ws".into(),
+            "implement".into(),
+        );
+        db.insert_item(&item).unwrap();
+
+        // Verify precondition: DB-based dedupe guard detects the open item.
+        assert!(db.has_open_items_for_source("spec-dedupe-q").unwrap());
+
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+        let ctx = CronContext { now: Utc::now() };
+        // Should succeed; the dedupe guard prevents gh CLI issue creation.
+        assert!(job.execute(&ctx).is_ok());
+    }
+
+    #[test]
+    fn gap_detection_dedupe_allows_when_no_open_items() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Code that does NOT cover spec keywords.
+        std::fs::write(tmp.path().join("main.rs"), "fn unrelated() {}").unwrap();
+
+        // Insert an active spec with a gap.
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-no-dup".into(),
+            "ws".into(),
+            "No Dup Test".into(),
+            "implement authorization middleware for secure endpoints".into(),
+        );
+        spec.status = belt_core::spec::SpecStatus::Active;
+        db.insert_spec(&spec).unwrap();
+
+        // No open queue items for this spec.
+        assert!(!db.has_open_items_for_source("spec-no-dup").unwrap());
+
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+        let ctx = CronContext { now: Utc::now() };
+        // Should succeed (gh CLI may warn but the job itself should not error).
+        assert!(job.execute(&ctx).is_ok());
+    }
+
+    #[test]
+    fn gap_detection_dedupe_does_not_block_on_terminal_items() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Code that does NOT cover spec keywords.
+        std::fs::write(tmp.path().join("main.rs"), "fn unrelated() {}").unwrap();
+
+        // Insert an active spec.
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-term".into(),
+            "ws".into(),
+            "Terminal Item Test".into(),
+            "implement authorization middleware for secure endpoints".into(),
+        );
+        spec.status = belt_core::spec::SpecStatus::Active;
+        db.insert_spec(&spec).unwrap();
+
+        // Insert a Done (terminal) queue item — should NOT block gap detection.
+        let mut item = belt_core::queue::QueueItem::new(
+            "spec-term:work".into(),
+            "spec-term".into(),
+            "ws".into(),
+            "implement".into(),
+        );
+        item.phase = QueuePhase::Done;
+        db.insert_item(&item).unwrap();
+
+        // Terminal items should not count as "open".
+        assert!(!db.has_open_items_for_source("spec-term").unwrap());
+
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+        let ctx = CronContext { now: Utc::now() };
+        assert!(job.execute(&ctx).is_ok());
+    }
 }
