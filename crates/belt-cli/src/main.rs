@@ -1347,11 +1347,20 @@ fn parse_github_issue_ref(target: &str) -> Option<(String, String)> {
 
 /// Create a GitHub issue via the `gh` CLI and return the issue URL on success.
 fn create_github_issue(title: &str, body: &str) -> Option<String> {
+    create_github_issue_with_labels(title, body, &["autopilot:ready"])
+}
+
+/// Create a GitHub issue with the given title, body, and labels via the `gh` CLI.
+///
+/// Returns the URL of the created issue on success.
+fn create_github_issue_with_labels(title: &str, body: &str, labels: &[&str]) -> Option<String> {
     let mut gh_cmd = std::process::Command::new("gh");
     gh_cmd.args(["issue", "create"]);
     gh_cmd.args(["--title", title]);
     gh_cmd.args(["--body", body]);
-    gh_cmd.args(["--label", "autopilot:ready"]);
+    for label in labels {
+        gh_cmd.args(["--label", label]);
+    }
     match gh_cmd.output() {
         Ok(output) => {
             if output.status.success() {
@@ -1920,6 +1929,15 @@ async fn main() -> anyhow::Result<()> {
 
                     let parent_url = create_github_issue(&spec.name, &parent_body);
 
+                    // Store parent issue URL as a spec link for traceability.
+                    if let Some(ref url) = parent_url {
+                        let link_id = format!("link-{}-parent", id);
+                        let link = belt_core::spec::SpecLink::new(link_id, id.clone(), url.clone());
+                        if let Err(e) = db.insert_spec_link(&link) {
+                            eprintln!("warning: failed to store parent spec link: {e}");
+                        }
+                    }
+
                     if decompose
                         && !criteria.is_empty()
                         && let Some(ref parent) = parent_url
@@ -1937,7 +1955,12 @@ async fn main() -> anyhow::Result<()> {
                             );
                             let child_body =
                                 format!("Parent: {}\n\n## Acceptance Criterion\n\n{}", parent, ac);
-                            if let Some(url) = create_github_issue(&child_title, &child_body) {
+                            // Child issues get autopilot:trigger label so autopilot picks them up.
+                            if let Some(url) = create_github_issue_with_labels(
+                                &child_title,
+                                &child_body,
+                                &["autopilot:ready", "autopilot:trigger"],
+                            ) {
                                 println!("  child issue created: {url}");
                                 if let Some(num) = extract_issue_number(&url) {
                                     child_numbers.push(num);
@@ -1959,6 +1982,20 @@ async fn main() -> anyhow::Result<()> {
                             let updated_body =
                                 format!("{}\n\n## Sub-issues\n{}", spec.content, links);
                             update_github_issue_body(num, &updated_body);
+                        }
+
+                        // Store child issue URLs as spec links for traceability.
+                        for url in &child_urls {
+                            let link_id = format!(
+                                "link-{}-{}",
+                                id,
+                                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+                            );
+                            let link =
+                                belt_core::spec::SpecLink::new(link_id, id.clone(), url.clone());
+                            if let Err(e) = db.insert_spec_link(&link) {
+                                eprintln!("warning: failed to store spec link for {url}: {e}");
+                            }
                         }
 
                         // Store decomposed issue numbers and transition spec to Active.
