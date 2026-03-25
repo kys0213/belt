@@ -660,12 +660,7 @@ fn all_linked_issues_done(db: &Database, spec_id: &str) -> bool {
                 let idx = parts.iter().position(|p| *p == "issues");
                 if let Some(i) = idx {
                     if i >= 2 && i + 1 < parts.len() {
-                        format!(
-                            "{}/{}#{}",
-                            parts[i - 2],
-                            parts[i - 1],
-                            parts[i + 1]
-                        )
+                        format!("{}/{}#{}", parts[i - 2], parts[i - 1], parts[i + 1])
                     } else {
                         continue;
                     }
@@ -1360,10 +1355,16 @@ impl CronHandler for KnowledgeExtractionJob {
 
 /// Classifies completed queue items into Done or HITL.
 ///
-/// This cron job triggers the evaluate cycle via `belt agent -p` invocation
-/// (see [`crate::evaluator::Evaluator::build_evaluate_script`]).
-/// The actual evaluate logic including per-item failure tracking and HITL
-/// escalation is handled by [`crate::daemon::Daemon::evaluate_completed`].
+/// This cron job triggers the evaluate cycle. The actual evaluation is
+/// performed by [`crate::evaluator::Evaluator::run_evaluate`], which
+/// spawns `belt agent --workspace <config> -p <prompt> --json` as an
+/// isolated subprocess with:
+/// - **Workspace isolation**: `WORKSPACE`, `BELT_HOME`, `BELT_DB` env vars
+/// - **Timeout handling**: configurable timeout (default 5 min) with child kill
+/// - **IPC**: structured JSON result collected from subprocess stdout
+///
+/// Per-item failure tracking and HITL escalation are handled by
+/// [`crate::daemon::Daemon::evaluate_completed`].
 ///
 /// The cron schedule ensures periodic evaluation, while `force_trigger("evaluate")`
 /// is called on every Completed transition for immediate evaluation.
@@ -1374,7 +1375,7 @@ impl CronHandler for EvaluateJob {
         // The actual evaluate_completed() logic runs in the daemon's async tick.
         // This cron handler serves as the schedule trigger point.
         // When the cron engine fires this job, the daemon's next tick will
-        // pick up Completed items and run the evaluator.
+        // pick up Completed items and invoke the evaluator subprocess.
         tracing::info!("EvaluateJob: triggering evaluate cycle for completed items");
         Ok(())
     }
