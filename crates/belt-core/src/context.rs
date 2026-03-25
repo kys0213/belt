@@ -168,6 +168,42 @@ impl PrContext {
     }
 }
 
+/// Extract a nested field from a JSON value using dot notation.
+///
+/// Supports jq-style paths with optional leading dot.
+/// Numeric segments are treated as array indices.
+///
+/// # Examples
+///
+/// ```
+/// use serde_json::json;
+/// use belt_core::context::extract_field;
+///
+/// let v = json!({"queue": {"state": "implement"}, "history": [{"state": "analyze"}]});
+/// assert_eq!(extract_field(&v, ".queue.state"), Some(&json!("implement")));
+/// assert_eq!(extract_field(&v, "queue.state"), Some(&json!("implement")));
+/// assert_eq!(extract_field(&v, "history.0.state"), Some(&json!("analyze")));
+/// assert_eq!(extract_field(&v, ".missing"), None);
+/// ```
+pub fn extract_field<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let path = path.strip_prefix('.').unwrap_or(path);
+    if path.is_empty() {
+        return Some(value);
+    }
+
+    path.split('.').try_fold(value, |v, key| {
+        // Try numeric index first for arrays.
+        if let Ok(idx) = key.parse::<usize>() {
+            v.get(idx)
+        } else {
+            v.get(key)
+        }
+    })
+}
+
 impl ItemContext {
     /// history에서 특정 state의 failure 횟수를 계산한다.
     pub fn failure_count(&self, state: &str) -> u32 {
@@ -383,5 +419,87 @@ mod tests {
         assert_eq!(parsed.reviews.len(), 1);
         assert_eq!(parsed.reviews[0].state, "CHANGES_REQUESTED");
         assert!(parsed.has_changes_requested());
+    }
+
+    #[test]
+    fn extract_field_top_level() {
+        let ctx = make_context(vec![]);
+        let value = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(
+            extract_field(&value, "work_id"),
+            Some(&serde_json::json!("github:org/repo#42:implement"))
+        );
+    }
+
+    #[test]
+    fn extract_field_with_leading_dot() {
+        let ctx = make_context(vec![]);
+        let value = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(
+            extract_field(&value, ".workspace"),
+            Some(&serde_json::json!("test-ws"))
+        );
+    }
+
+    #[test]
+    fn extract_field_nested() {
+        let ctx = make_context(vec![]);
+        let value = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(
+            extract_field(&value, "queue.state"),
+            Some(&serde_json::json!("implement"))
+        );
+        assert_eq!(
+            extract_field(&value, ".queue.phase"),
+            Some(&serde_json::json!("running"))
+        );
+    }
+
+    #[test]
+    fn extract_field_deeply_nested() {
+        let ctx = make_context(vec![]);
+        let value = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(
+            extract_field(&value, ".issue.number"),
+            Some(&serde_json::json!(42))
+        );
+        assert_eq!(
+            extract_field(&value, "issue.title"),
+            Some(&serde_json::json!("JWT middleware"))
+        );
+    }
+
+    #[test]
+    fn extract_field_array_index() {
+        let ctx = make_context(vec![
+            make_history_entry("analyze", HistoryStatus::Done, 1),
+            make_history_entry("implement", HistoryStatus::Running, 1),
+        ]);
+        let value = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(
+            extract_field(&value, "history.0.state"),
+            Some(&serde_json::json!("analyze"))
+        );
+        assert_eq!(
+            extract_field(&value, ".history.1.state"),
+            Some(&serde_json::json!("implement"))
+        );
+    }
+
+    #[test]
+    fn extract_field_missing_returns_none() {
+        let ctx = make_context(vec![]);
+        let value = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(extract_field(&value, "nonexistent"), None);
+        assert_eq!(extract_field(&value, ".queue.missing"), None);
+        assert_eq!(extract_field(&value, "history.99.state"), None);
+    }
+
+    #[test]
+    fn extract_field_empty_path_returns_root() {
+        let ctx = make_context(vec![]);
+        let value = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(extract_field(&value, ""), Some(&value));
+        assert_eq!(extract_field(&value, "."), Some(&value));
     }
 }

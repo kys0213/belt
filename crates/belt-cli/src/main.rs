@@ -1691,7 +1691,7 @@ async fn main() -> anyhow::Result<()> {
 
             if let Some(ref field_path) = field {
                 let value = serde_json::to_value(&ctx)?;
-                let extracted = field_path.split('.').try_fold(&value, |v, key| v.get(key));
+                let extracted = belt_core::context::extract_field(&value, field_path);
                 match extracted {
                     Some(v) if v.is_string() => {
                         println!("{}", v.as_str().unwrap());
