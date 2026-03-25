@@ -22,6 +22,20 @@ pub struct SystemStatus {
     pub running_items: Vec<ItemSummary>,
     pub recent_events: Vec<EventSummary>,
     pub runtime_stats: Option<RuntimeStats>,
+    /// Per-workspace item breakdown for the rich status table.
+    pub workspace_summary: Vec<WorkspaceSummary>,
+    /// Items currently in the failed phase.
+    pub error_items: Vec<ItemSummary>,
+    /// Items currently awaiting human intervention.
+    pub hitl_items: Vec<ItemSummary>,
+}
+
+/// Per-workspace item summary for the system status table.
+#[derive(Debug, Serialize)]
+pub struct WorkspaceSummary {
+    pub workspace: String,
+    pub total: u32,
+    pub phase_counts: Vec<PhaseCount>,
 }
 
 /// Count of items in a specific phase.
@@ -129,6 +143,57 @@ pub fn gather_status(db: &Database) -> anyhow::Result<SystemStatus> {
 
     let runtime_stats = db.get_runtime_stats().ok();
 
+    // Per-workspace breakdown
+    let workspaces = db.list_workspaces().unwrap_or_default();
+    let mut workspace_summary = Vec::new();
+    for (ws_name, _config, _created) in &workspaces {
+        let ws_items = db.list_items(None, Some(ws_name)).unwrap_or_default();
+        if ws_items.is_empty() {
+            continue;
+        }
+        let ws_total = ws_items.len() as u32;
+        let mut counts = std::collections::HashMap::<String, u32>::new();
+        for item in &ws_items {
+            *counts.entry(item.phase.as_str().to_string()).or_insert(0) += 1;
+        }
+        let mut ws_phases: Vec<PhaseCount> = counts
+            .into_iter()
+            .map(|(phase, count)| PhaseCount { phase, count })
+            .collect();
+        ws_phases.sort_by(|a, b| a.phase.cmp(&b.phase));
+        workspace_summary.push(WorkspaceSummary {
+            workspace: ws_name.clone(),
+            total: ws_total,
+            phase_counts: ws_phases,
+        });
+    }
+
+    // Error items (failed phase)
+    let failed = db.list_items(Some(QueuePhase::Failed), None)?;
+    let error_items = failed
+        .into_iter()
+        .map(|item| ItemSummary {
+            work_id: item.work_id,
+            workspace: item.workspace_id,
+            state: item.state,
+            phase: item.phase.as_str().to_string(),
+            updated_at: item.updated_at,
+        })
+        .collect();
+
+    // HITL items
+    let hitl = db.list_items(Some(QueuePhase::Hitl), None)?;
+    let hitl_items = hitl
+        .into_iter()
+        .map(|item| ItemSummary {
+            work_id: item.work_id,
+            workspace: item.workspace_id,
+            state: item.state,
+            phase: item.phase.as_str().to_string(),
+            updated_at: item.updated_at,
+        })
+        .collect();
+
     Ok(SystemStatus {
         total_items,
         hitl_count,
@@ -136,6 +201,9 @@ pub fn gather_status(db: &Database) -> anyhow::Result<SystemStatus> {
         running_items,
         recent_events,
         runtime_stats,
+        workspace_summary,
+        error_items,
+        hitl_items,
     })
 }
 
@@ -358,6 +426,9 @@ mod tests {
         assert!(status.phase_counts.is_empty());
         assert!(status.running_items.is_empty());
         assert!(status.recent_events.is_empty());
+        assert!(status.workspace_summary.is_empty());
+        assert!(status.error_items.is_empty());
+        assert!(status.hitl_items.is_empty());
     }
 
     #[test]
@@ -472,6 +543,29 @@ mod tests {
 
         assert_eq!(status.total_items, 3);
         assert_eq!(status.hitl_count, 2);
+    }
+
+    #[test]
+    fn gather_status_error_and_hitl_items_populated() {
+        let db = test_db();
+        db.add_workspace("ws-a", "/a.yaml").unwrap();
+
+        let failed = make_item("f1:implement", "f1", "ws-a", QueuePhase::Failed);
+        let hitl = make_item("h1:implement", "h1", "ws-a", QueuePhase::Hitl);
+        let pending = make_item("p1:implement", "p1", "ws-a", QueuePhase::Pending);
+        db.insert_item(&failed).unwrap();
+        db.insert_item(&hitl).unwrap();
+        db.insert_item(&pending).unwrap();
+
+        let status = gather_status(&db).unwrap();
+
+        assert_eq!(status.error_items.len(), 1);
+        assert_eq!(status.error_items[0].work_id, "f1:implement");
+        assert_eq!(status.hitl_items.len(), 1);
+        assert_eq!(status.hitl_items[0].work_id, "h1:implement");
+        assert_eq!(status.workspace_summary.len(), 1);
+        assert_eq!(status.workspace_summary[0].workspace, "ws-a");
+        assert_eq!(status.workspace_summary[0].total, 3);
     }
 
     #[test]
@@ -695,6 +789,9 @@ mod tests {
                 timestamp: "2026-03-25T00:00:00Z".to_string(),
             }],
             runtime_stats: None,
+            workspace_summary: vec![],
+            error_items: vec![],
+            hitl_items: vec![],
         };
         // Should not panic
         super::print_rich_status(&status);
@@ -834,6 +931,9 @@ mod tests {
             running_items: vec![],
             recent_events: vec![],
             runtime_stats: None,
+            workspace_summary: vec![],
+            error_items: vec![],
+            hitl_items: vec![],
         };
         // Calling print_status with "rich" should not panic.
         super::print_status(&status, "rich").unwrap();
@@ -870,6 +970,22 @@ mod tests {
                 timestamp: "2026-01-01T00:00:00Z".to_string(),
             }],
             runtime_stats: Some(sample_stats()),
+            workspace_summary: vec![WorkspaceSummary {
+                workspace: "ws-a".to_string(),
+                total: 3,
+                phase_counts: vec![
+                    PhaseCount {
+                        phase: "pending".to_string(),
+                        count: 1,
+                    },
+                    PhaseCount {
+                        phase: "running".to_string(),
+                        count: 2,
+                    },
+                ],
+            }],
+            error_items: vec![],
+            hitl_items: vec![],
         }
     }
 
@@ -881,6 +997,9 @@ mod tests {
             running_items: vec![],
             recent_events: vec![],
             runtime_stats: None,
+            workspace_summary: vec![],
+            error_items: vec![],
+            hitl_items: vec![],
         }
     }
 
@@ -1029,6 +1148,74 @@ mod tests {
         print_rich_status(&status);
     }
 
+    #[test]
+    fn print_rich_status_with_errors_and_hitl_does_not_panic() {
+        let status = SystemStatus {
+            total_items: 4,
+            hitl_count: 1,
+            phase_counts: vec![
+                PhaseCount {
+                    phase: "failed".to_string(),
+                    count: 2,
+                },
+                PhaseCount {
+                    phase: "hitl".to_string(),
+                    count: 1,
+                },
+                PhaseCount {
+                    phase: "running".to_string(),
+                    count: 1,
+                },
+            ],
+            running_items: vec![],
+            recent_events: vec![],
+            runtime_stats: None,
+            workspace_summary: vec![WorkspaceSummary {
+                workspace: "ws-err".to_string(),
+                total: 4,
+                phase_counts: vec![
+                    PhaseCount {
+                        phase: "failed".to_string(),
+                        count: 2,
+                    },
+                    PhaseCount {
+                        phase: "hitl".to_string(),
+                        count: 1,
+                    },
+                    PhaseCount {
+                        phase: "running".to_string(),
+                        count: 1,
+                    },
+                ],
+            }],
+            error_items: vec![
+                ItemSummary {
+                    work_id: "err1:impl".to_string(),
+                    workspace: "ws-err".to_string(),
+                    state: "failed".to_string(),
+                    phase: "failed".to_string(),
+                    updated_at: "2026-03-25T10:00:00Z".to_string(),
+                },
+                ItemSummary {
+                    work_id: "err2:impl".to_string(),
+                    workspace: "ws-err".to_string(),
+                    state: "failed".to_string(),
+                    phase: "failed".to_string(),
+                    updated_at: "2026-03-25T11:00:00Z".to_string(),
+                },
+            ],
+            hitl_items: vec![ItemSummary {
+                work_id: "hitl1:impl".to_string(),
+                workspace: "ws-err".to_string(),
+                state: "hitl".to_string(),
+                phase: "hitl".to_string(),
+                updated_at: "2026-03-25T12:00:00Z".to_string(),
+            }],
+        };
+        // Exercises workspace summary, error items, and HITL items branches.
+        print_rich_status(&status);
+    }
+
     // ---- print_text_spec_status ----
 
     #[test]
@@ -1150,32 +1337,89 @@ fn print_rich_status(status: &SystemStatus) {
         "\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}"
     );
 
-    // Phase table with colours
+    // Phase table with colours and progress bar
     if !status.phase_counts.is_empty() {
+        let total = status.total_items.max(1);
         let _ = writeln!(stdout);
         let _ = writeln!(
             stdout,
-            "  {} {:<14} {} {:<8}",
+            "  {} {:<14} {} {:<8} {} {}",
             "\u{2502}".dark_grey(),
             "Phase".bold().underlined(),
             "\u{2502}".dark_grey(),
             "Count".bold().underlined(),
+            "\u{2502}".dark_grey(),
+            "Progress".bold().underlined(),
         );
         let _ = writeln!(
             stdout,
-            "  {}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "  {}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{253c}".dark_grey(),
             "\u{253c}".dark_grey(),
             "\u{253c}".dark_grey(),
         );
         for pc in &status.phase_counts {
             let color = to_crossterm_color(dashboard::phase_color(&pc.phase));
             let phase_styled = style::style(format!("{:<14}", pc.phase)).with(color);
+            let pct = (pc.count as f64 / total as f64 * 100.0) as u32;
+            let bar = render_progress_bar(pct, 12);
             let _ = writeln!(
                 stdout,
-                "  {} {phase_styled} {} {:<8}",
+                "  {} {phase_styled} {} {:<8} {} {} {:>3}%",
                 "\u{2502}".dark_grey(),
                 "\u{2502}".dark_grey(),
                 pc.count,
+                "\u{2502}".dark_grey(),
+                bar,
+                pct,
+            );
+        }
+    }
+
+    // Per-workspace breakdown
+    if !status.workspace_summary.is_empty() {
+        let _ = writeln!(stdout);
+        let _ = writeln!(stdout, "  {}", "Per-Workspace Status".bold().cyan());
+        let _ = writeln!(
+            stdout,
+            "  {}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{253c}".dark_grey(),
+            "\u{253c}".dark_grey(),
+            "\u{253c}".dark_grey(),
+        );
+        let _ = writeln!(
+            stdout,
+            "  {} {:<14} {} {:<5} {} {}",
+            "\u{2502}".dark_grey(),
+            "Workspace".bold().underlined(),
+            "\u{2502}".dark_grey(),
+            "Items".bold().underlined(),
+            "\u{2502}".dark_grey(),
+            "Phases".bold().underlined(),
+        );
+        let _ = writeln!(
+            stdout,
+            "  {}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{253c}".dark_grey(),
+            "\u{253c}".dark_grey(),
+            "\u{253c}".dark_grey(),
+        );
+        for ws in &status.workspace_summary {
+            let phases_str: String = ws
+                .phase_counts
+                .iter()
+                .map(|pc| format!("{}:{}", pc.phase, pc.count))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                stdout,
+                "  {} {:<14} {} {:<5} {} {}",
+                "\u{2502}".dark_grey(),
+                ws.workspace,
+                "\u{2502}".dark_grey(),
+                ws.total,
+                "\u{2502}".dark_grey(),
+                phases_str.dark_grey(),
             );
         }
     }
@@ -1213,11 +1457,55 @@ fn print_rich_status(status: &SystemStatus) {
         }
     }
 
-    if status.hitl_count > 0 {
-        println!();
-        println!(
-            "\x1b[33m\u{26a0}\u{fe0f} {} items require human intervention. Run 'belt claw' to review.\x1b[0m",
-            status.hitl_count
+    // Error/HITL summary
+    if !status.error_items.is_empty() {
+        let _ = writeln!(stdout);
+        let header = format!("Recent Errors ({} items)", status.error_items.len());
+        let _ = writeln!(stdout, "  {}", header.bold().red());
+        for item in &status.error_items {
+            let _ = writeln!(
+                stdout,
+                "    {} {} {}",
+                "\u{2716}".red(),
+                item.work_id.as_str().red(),
+                format!("({}) {}", item.workspace, item.updated_at).dark_grey(),
+            );
+        }
+    }
+
+    if !status.hitl_items.is_empty() {
+        let _ = writeln!(stdout);
+        let header = format!("HITL Pending ({} items)", status.hitl_items.len());
+        let _ = writeln!(stdout, "  {}", header.bold().yellow());
+        for item in &status.hitl_items {
+            let _ = writeln!(
+                stdout,
+                "    {} {} {}",
+                "\u{26a0}".yellow(),
+                item.work_id.as_str().yellow(),
+                format!("({}) {}", item.workspace, item.updated_at).dark_grey(),
+            );
+        }
+        let _ = writeln!(stdout);
+        let _ = writeln!(
+            stdout,
+            "  {}",
+            format!(
+                "{} items require human intervention. Run 'belt claw' to review.",
+                status.hitl_items.len()
+            )
+            .yellow(),
+        );
+    } else if status.hitl_count > 0 {
+        let _ = writeln!(stdout);
+        let _ = writeln!(
+            stdout,
+            "  {}",
+            format!(
+                "{} items require human intervention. Run 'belt claw' to review.",
+                status.hitl_count
+            )
+            .yellow(),
         );
     }
 }
