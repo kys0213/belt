@@ -89,6 +89,19 @@ impl ClawWorkspace {
             default_auto_approve_policy(),
         )?;
 
+        // YAML policy files for machine-readable classification and HITL rules.
+        write_file(
+            &workspace_path.join("classify-policy.yaml"),
+            default_classify_policy_yaml(),
+        )?;
+        write_file(
+            &workspace_path.join("hitl-policy.yaml"),
+            default_hitl_policy_yaml(),
+        )?;
+
+        // Default skill example.
+        write_file(&skills_dir.join("default.py"), default_skill_py())?;
+
         Ok(ClawWorkspace {
             path: workspace_path,
         })
@@ -252,6 +265,134 @@ Define conditions under which items can proceed without human review.
 "#
 }
 
+/// Returns the default classify-policy YAML template.
+///
+/// Provides machine-readable classification rules that the daemon uses
+/// to route incoming queue items.
+pub fn default_classify_policy_yaml() -> &'static str {
+    r#"# Classification Policy (machine-readable)
+#
+# Rules evaluated top-to-bottom; first match wins.
+
+version: 1
+
+rules:
+  - name: unknown-source
+    description: Items from unregistered data sources require human review
+    condition:
+      source_registered: false
+    action: hitl
+
+  - name: missing-fields
+    description: Items missing required fields are rejected
+    condition:
+      required_fields_present: false
+    action: reject
+
+  - name: workspace-match
+    description: Items matching a registered workspace pattern are auto-routed
+    condition:
+      workspace_pattern_match: true
+    action: auto
+
+  - name: default
+    description: Fallback — escalate to human review
+    condition: {}
+    action: hitl
+"#
+}
+
+/// Returns the default HITL policy YAML template.
+///
+/// Defines machine-readable escalation conditions for human-in-the-loop
+/// review triggers.
+pub fn default_hitl_policy_yaml() -> &'static str {
+    r#"# Human-in-the-Loop (HITL) Policy (machine-readable)
+#
+# Defines when items require human review before proceeding.
+
+version: 1
+
+triggers:
+  - name: low-confidence
+    description: Classification confidence below threshold
+    condition:
+      confidence_below: 0.7
+
+  - name: destructive-operation
+    description: Operations that delete or overwrite data
+    condition:
+      operation_type:
+        - delete
+        - overwrite
+
+  - name: sensitive-path
+    description: Items touching sensitive paths or data
+    condition:
+      path_pattern:
+        - "*.env"
+        - "**/secrets/**"
+        - "**/credentials/**"
+
+  - name: first-time-pattern
+    description: Patterns not previously seen
+    condition:
+      pattern_seen_before: false
+
+escalation:
+  default_action: hitl
+  require_context: true
+  require_suggested_action: true
+  timeout_minutes: 60
+"#
+}
+
+/// Returns a default skill example script.
+///
+/// Placed in `skills/default.py` as a starting point for custom skill
+/// development.
+pub fn default_skill_py() -> &'static str {
+    r#"#!/usr/bin/env python3
+"""Default skill example for Belt Claw.
+
+Skills are executable scripts invoked by the daemon. They receive
+context via environment variables:
+
+  WORK_ID   - The queue item identifier
+  WORKTREE  - Path to the isolated worktree
+
+The script should exit 0 on success, non-zero on failure.
+Output is captured and attached to the queue item.
+"""
+
+import json
+import os
+import sys
+
+
+def main():
+    work_id = os.environ.get("WORK_ID", "")
+    worktree = os.environ.get("WORKTREE", "")
+
+    if not work_id:
+        print("ERROR: WORK_ID not set", file=sys.stderr)
+        sys.exit(1)
+
+    result = {
+        "work_id": work_id,
+        "worktree": worktree,
+        "status": "ok",
+        "message": "Default skill executed successfully",
+    }
+
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    main()
+"#
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,6 +423,7 @@ mod tests {
         assert!(ws.path.join("skills").is_dir());
         assert!(ws.path.join("skills/gap-detect").is_dir());
         assert!(ws.path.join("skills/prioritize").is_dir());
+        assert!(ws.path.join("skills/default.py").is_file());
     }
 
     #[test]
@@ -289,14 +431,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ws = ClawWorkspace::init(tmp.path()).unwrap();
 
-        // Modify CLAUDE.md after initial init.
+        // Modify CLAUDE.md and a YAML policy after initial init.
         let custom_content = "# Custom content";
         fs::write(ws.path.join("CLAUDE.md"), custom_content).unwrap();
+        fs::write(ws.path.join("classify-policy.yaml"), custom_content).unwrap();
 
-        // Re-init without force — should preserve the custom file.
+        // Re-init without force — should preserve the custom files.
         let ws2 = ClawWorkspace::init(tmp.path()).unwrap();
         let content = fs::read_to_string(ws2.path.join("CLAUDE.md")).unwrap();
         assert_eq!(content, custom_content);
+        let yaml_content = fs::read_to_string(ws2.path.join("classify-policy.yaml")).unwrap();
+        assert_eq!(yaml_content, custom_content);
     }
 
     #[test]
@@ -323,11 +468,45 @@ mod tests {
     }
 
     #[test]
+    fn init_creates_yaml_policy_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ClawWorkspace::init(tmp.path()).unwrap();
+
+        assert!(ws.path.join("classify-policy.yaml").is_file());
+        assert!(ws.path.join("hitl-policy.yaml").is_file());
+
+        let classify = fs::read_to_string(ws.path.join("classify-policy.yaml")).unwrap();
+        assert!(classify.contains("version: 1"));
+        assert!(classify.contains("action: hitl"));
+
+        let hitl = fs::read_to_string(ws.path.join("hitl-policy.yaml")).unwrap();
+        assert!(hitl.contains("version: 1"));
+        assert!(hitl.contains("timeout_minutes:"));
+    }
+
+    #[test]
+    fn init_creates_default_skill() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ClawWorkspace::init(tmp.path()).unwrap();
+
+        let skill_path = ws.path.join("skills/default.py");
+        assert!(skill_path.is_file());
+
+        let content = fs::read_to_string(&skill_path).unwrap();
+        assert!(content.contains("WORK_ID"));
+        assert!(content.contains("WORKTREE"));
+        assert!(content.contains("def main()"));
+    }
+
+    #[test]
     fn default_templates_are_not_empty() {
         assert!(!default_claude_md().is_empty());
         assert!(!default_classify_policy().is_empty());
         assert!(!default_hitl_policy().is_empty());
         assert!(!default_auto_approve_policy().is_empty());
+        assert!(!default_classify_policy_yaml().is_empty());
+        assert!(!default_hitl_policy_yaml().is_empty());
+        assert!(!default_skill_py().is_empty());
     }
 
     #[test]
