@@ -1,4 +1,10 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(cargo:*)",
+      "Bash(git:*)"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
@@ -6,7 +12,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if echo \"$TOOL_INPUT\" | grep -q '\"file_path\".*\\.env'; then echo 'BLOCK: .env 파일 수정 금지' >&2; exit 1; fi"
+            "command": "jq -r '.tool_input.file_path // empty' | { read -r f; echo \"$f\" | grep -q '.env' && echo '{\"continue\":false,\"stopReason\":\".env file modification blocked\"}' || true; }"
           }
         ]
       },
@@ -15,7 +21,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if echo \"$TOOL_INPUT\" | grep -qE 'git\\s+commit'; then branch=$(git -C /Users/irene/Documents/belt-3 rev-parse --abbrev-ref HEAD 2>/dev/null); if [ \"$branch\" = \"main\" ] || [ \"$branch\" = \"master\" ]; then echo 'BLOCK: main/master 브랜치에서 직접 커밋 금지. 별도 브랜치를 사용하세요.' >&2; exit 1; fi; fi"
+            "command": "CMD=$(jq -r '.tool_input.command // empty'); echo \"$CMD\" | grep -qE 'git\\s+commit' || exit 0; branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null); if [ \"$branch\" = \"main\" ] || [ \"$branch\" = \"master\" ]; then echo '{\"continue\":false,\"stopReason\":\"Direct commit on main/master blocked\"}'; exit 0; fi; if ! cargo fmt --check >/dev/null 2>&1; then echo '{\"continue\":false,\"stopReason\":\"cargo fmt --check failed. Run cargo fmt first.\"}'; exit 0; fi; if ! cargo clippy -- -D warnings >/dev/null 2>&1; then echo '{\"continue\":false,\"stopReason\":\"cargo clippy -- -D warnings failed. Fix clippy warnings first.\"}'; exit 0; fi",
+            "timeout": 120,
+            "statusMessage": "Pre-commit: cargo fmt + clippy check..."
           }
         ]
       }
@@ -26,8 +34,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if echo \"$TOOL_INPUT\" | grep -qE '\"file_path\".*\\.rs\"'; then cd /Users/irene/Documents/belt-3 && cargo check --quiet 2>&1 | head -20; fi",
-            "timeout": 30000
+            "command": "FILE=$(jq -r '.tool_input.file_path // .tool_response.filePath // empty'); case \"$FILE\" in *.rs) cargo check --quiet 2>&1 | head -20 ;; esac; true",
+            "timeout": 60,
+            "statusMessage": "cargo check..."
           }
         ]
       }
