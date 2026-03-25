@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if echo \"$TOOL_INPUT\" | grep -q '\"file_path\".*\\.env'; then echo 'BLOCK: .env 파일 수정 금지' >&2; exit 1; fi"
+            "command": ".claude/hooks/block-env-edit.sh"
           }
         ]
       },
@@ -15,7 +15,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if echo \"$TOOL_INPUT\" | grep -qE 'git\\s+commit'; then branch=$(git -C /Users/irene/Documents/belt-3 rev-parse --abbrev-ref HEAD 2>/dev/null); if [ \"$branch\" = \"main\" ] || [ \"$branch\" = \"master\" ]; then echo 'BLOCK: main/master 브랜치에서 직접 커밋 금지. 별도 브랜치를 사용하세요.' >&2; exit 1; fi; fi"
+            "command": ".claude/hooks/pre-commit-check.sh",
+            "timeout": 120,
+            "statusMessage": "Pre-commit: cargo fmt + clippy check..."
           }
         ]
       }
@@ -26,8 +28,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "if echo \"$TOOL_INPUT\" | grep -qE '\"file_path\".*\\.rs\"'; then cd /Users/irene/Documents/belt-3 && cargo check --quiet 2>&1 | head -20; fi",
-            "timeout": 30000
+            "command": ".claude/hooks/post-edit-cargo-check.sh",
+            "timeout": 60,
+            "statusMessage": "cargo check..."
           }
         ]
       }
