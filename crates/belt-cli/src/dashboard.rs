@@ -2140,4 +2140,199 @@ mod tests {
     fn truncate_str_very_small_max() {
         assert_eq!(truncate_str("hello", 3), "hel");
     }
+
+    // ---- DashboardTab next/prev roundtrip ----
+
+    #[test]
+    fn tab_next_full_cycle_returns_to_start() {
+        let start = DashboardTab::Dashboard;
+        let result = start.next().next().next().next();
+        assert_eq!(result, start);
+    }
+
+    #[test]
+    fn tab_prev_full_cycle_returns_to_start() {
+        let start = DashboardTab::Dashboard;
+        let result = start.prev().prev().prev().prev();
+        assert_eq!(result, start);
+    }
+
+    #[test]
+    fn tab_next_full_cycle_from_each_variant() {
+        for tab in [
+            DashboardTab::Dashboard,
+            DashboardTab::PerWorkspace,
+            DashboardTab::Spec,
+            DashboardTab::Board,
+        ] {
+            assert_eq!(tab.next().next().next().next(), tab);
+        }
+    }
+
+    #[test]
+    fn tab_prev_full_cycle_from_each_variant() {
+        for tab in [
+            DashboardTab::Dashboard,
+            DashboardTab::PerWorkspace,
+            DashboardTab::Spec,
+            DashboardTab::Board,
+        ] {
+            assert_eq!(tab.prev().prev().prev().prev(), tab);
+        }
+    }
+
+    #[test]
+    fn tab_next_then_prev_is_identity() {
+        for tab in [
+            DashboardTab::Dashboard,
+            DashboardTab::PerWorkspace,
+            DashboardTab::Spec,
+            DashboardTab::Board,
+        ] {
+            assert_eq!(tab.next().prev(), tab);
+        }
+    }
+
+    #[test]
+    fn tab_prev_then_next_is_identity() {
+        for tab in [
+            DashboardTab::Dashboard,
+            DashboardTab::PerWorkspace,
+            DashboardTab::Spec,
+            DashboardTab::Board,
+        ] {
+            assert_eq!(tab.prev().next(), tab);
+        }
+    }
+
+    // ---- DashboardState tab_key mapping ----
+
+    #[test]
+    fn tab_key_maps_correctly_for_all_tabs() {
+        let mut state = DashboardState::new();
+
+        state.active_tab = DashboardTab::Dashboard;
+        assert_eq!(state.tab_key(), 0);
+
+        state.active_tab = DashboardTab::PerWorkspace;
+        assert_eq!(state.tab_key(), 1);
+
+        state.active_tab = DashboardTab::Spec;
+        assert_eq!(state.tab_key(), 2);
+
+        state.active_tab = DashboardTab::Board;
+        assert_eq!(state.tab_key(), 3);
+    }
+
+    // ---- Board view state ----
+
+    #[test]
+    fn board_state_initial_selection() {
+        let state = DashboardState::new();
+        assert_eq!(state.board_selected_col, 0);
+        assert_eq!(state.board_selected_row, 0);
+    }
+
+    #[test]
+    fn board_selected_col_within_board_columns_range() {
+        let mut state = DashboardState::new();
+        // Simulate navigating columns within the valid range.
+        for col in 0..BOARD_COLUMNS.len() {
+            state.board_selected_col = col;
+            assert!(state.board_selected_col < BOARD_COLUMNS.len());
+        }
+    }
+
+    #[test]
+    fn board_state_preserves_selection_across_tab_switch() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Board;
+        state.board_selected_col = 3;
+        state.board_selected_row = 2;
+
+        // Switch away and back.
+        state.active_tab = DashboardTab::Dashboard;
+        state.active_tab = DashboardTab::Board;
+
+        // Board col/row are stored on DashboardState directly, so they persist.
+        assert_eq!(state.board_selected_col, 3);
+        assert_eq!(state.board_selected_row, 2);
+    }
+
+    // ---- Tab state management ----
+
+    #[test]
+    fn tab_states_initialized_for_all_tabs() {
+        let state = DashboardState::new();
+        // All four tab states (keys 0..=3) should exist.
+        for key in 0..=3u8 {
+            assert!(
+                state.tab_states.contains_key(&key),
+                "tab_states should contain key {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_state_default_has_zero_selected_index() {
+        let ts = TabState::default();
+        assert_eq!(ts.selected_index, 0);
+        assert_eq!(ts.active_panel, None);
+    }
+
+    #[test]
+    fn dashboard_tab_state_has_running_panel() {
+        let state = DashboardState::new();
+        let dashboard_state = state.tab_states.get(&0).unwrap();
+        assert_eq!(dashboard_state.active_panel, Some(ActivePanel::Running));
+    }
+
+    #[test]
+    fn non_dashboard_tab_states_have_no_active_panel() {
+        let state = DashboardState::new();
+        for key in 1..=3u8 {
+            let ts = state.tab_states.get(&key).unwrap();
+            assert_eq!(
+                ts.active_panel, None,
+                "tab {key} should have no active_panel"
+            );
+        }
+    }
+
+    #[test]
+    fn current_tab_state_mut_modifies_correct_tab() {
+        let mut state = DashboardState::new();
+
+        // Modify PerWorkspace tab state.
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.current_tab_state_mut().selected_index = 10;
+
+        // Modify Spec tab state.
+        state.active_tab = DashboardTab::Spec;
+        state.current_tab_state_mut().selected_index = 20;
+
+        // Verify each tab has its own state.
+        state.active_tab = DashboardTab::PerWorkspace;
+        assert_eq!(state.current_tab_state().selected_index, 10);
+
+        state.active_tab = DashboardTab::Spec;
+        assert_eq!(state.current_tab_state().selected_index, 20);
+
+        // Dashboard tab should still be at 0.
+        state.active_tab = DashboardTab::Dashboard;
+        assert_eq!(state.current_tab_state().selected_index, 0);
+    }
+
+    #[test]
+    fn overlay_and_help_are_independent_of_tab() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Board;
+        state.overlay_item = Some("w-123".to_string());
+        state.show_help = true;
+
+        // Switch tab -- overlay and help state should persist.
+        state.active_tab = DashboardTab::Dashboard;
+        assert_eq!(state.overlay_item, Some("w-123".to_string()));
+        assert!(state.show_help);
+    }
 }
