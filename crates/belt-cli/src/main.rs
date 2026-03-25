@@ -2260,17 +2260,61 @@ async fn main() -> anyhow::Result<()> {
                         item.phase
                     );
                 }
-                let target_phase = match action {
-                    belt_core::queue::HitlRespondAction::Done => QueuePhase::Done,
-                    belt_core::queue::HitlRespondAction::Retry => QueuePhase::Pending,
-                    belt_core::queue::HitlRespondAction::Skip => QueuePhase::Skipped,
-                    belt_core::queue::HitlRespondAction::Replan => QueuePhase::Failed,
-                };
-                db.update_phase(&item_id, target_phase)?;
-                println!(
-                    "Item '{}' transitioned from hitl to {} (action: {}).",
-                    item_id, target_phase, action
-                );
+                match action {
+                    belt_core::queue::HitlRespondAction::Replan => {
+                        let max_replan = 3u32;
+                        let new_count = item.replan_count + 1;
+                        if new_count > max_replan {
+                            db.update_phase(&item_id, QueuePhase::Failed)?;
+                            println!(
+                                "Item '{}' replan limit exceeded ({}/{}), transitioned to failed.",
+                                item_id, new_count, max_replan
+                            );
+                        } else {
+                            // Roll back original item to Pending.
+                            db.update_phase(&item_id, QueuePhase::Pending)?;
+                            // Create a spec-modification-proposed HITL item.
+                            let failure_reason =
+                                item.hitl_notes.as_deref().unwrap_or("unknown failure");
+                            let replan_work_id = format!("{item_id}:replan-{new_count}");
+                            let mut replan_item = belt_core::queue::QueueItem::new(
+                                replan_work_id.clone(),
+                                item.source_id.clone(),
+                                item.workspace_id.clone(),
+                                item.state.clone(),
+                            );
+                            replan_item.phase = QueuePhase::Hitl;
+                            replan_item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
+                            replan_item.hitl_reason =
+                                Some(belt_core::queue::HitlReason::SpecModificationProposed);
+                            replan_item.hitl_notes = Some(format!(
+                                "Claw replan delegation (attempt {new_count}): {failure_reason}"
+                            ));
+                            replan_item.title =
+                                Some(format!("spec-modification-proposed (replan #{new_count})"));
+                            replan_item.replan_count = new_count;
+                            db.insert_item(&replan_item)?;
+                            println!(
+                                "Item '{}' rolled back to pending (replan {}/{}). \
+                                 Created HITL item '{}' for spec modification review.",
+                                item_id, new_count, max_replan, replan_work_id
+                            );
+                        }
+                    }
+                    _ => {
+                        let target_phase = match action {
+                            belt_core::queue::HitlRespondAction::Done => QueuePhase::Done,
+                            belt_core::queue::HitlRespondAction::Retry => QueuePhase::Pending,
+                            belt_core::queue::HitlRespondAction::Skip => QueuePhase::Skipped,
+                            belt_core::queue::HitlRespondAction::Replan => unreachable!(),
+                        };
+                        db.update_phase(&item_id, target_phase)?;
+                        println!(
+                            "Item '{}' transitioned from hitl to {} (action: {}).",
+                            item_id, target_phase, action
+                        );
+                    }
+                }
             }
             HitlCommands::List { workspace } => {
                 tracing::info!(?workspace, "listing HITL items...");

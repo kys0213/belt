@@ -30,4 +30,11 @@ pub enum BeltError {
 
     #[error("invalid spec transition: {from} -> {to}")]
     InvalidSpecTransition { from: String, to: String },
+
+    #[error("replan limit exceeded for {work_id}: {count} attempts (max {max})")]
+    ReplanLimitExceeded {
+        work_id: String,
+        count: u32,
+        max: u32,
+    },
 }
