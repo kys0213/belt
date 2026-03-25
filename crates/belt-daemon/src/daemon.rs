@@ -20,7 +20,9 @@ use belt_infra::db::Database;
 use belt_infra::worktree::WorktreeManager;
 
 use crate::concurrency::ConcurrencyTracker;
-use crate::cron::{BuiltinJobDeps, CronEngine, builtin_jobs, load_custom_jobs, seed_workspace_crons};
+use crate::cron::{
+    BuiltinJobDeps, CronEngine, builtin_jobs, load_custom_jobs, seed_workspace_crons,
+};
 use crate::evaluator::Evaluator;
 use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
 
@@ -134,10 +136,12 @@ impl Daemon {
     /// and loads user-defined custom cron jobs from the database.
     pub fn with_db(mut self, db: Database) -> Self {
         let db = Arc::new(db);
+        let report_dir = Some(self.belt_home.join("reports"));
         let deps = BuiltinJobDeps {
             db: Arc::clone(&db),
             worktree_mgr: Arc::clone(&self.worktree_mgr),
             workspace_root: self.belt_home.clone(),
+            report_dir: report_dir.clone(),
         };
         let mut cron = self.cron_engine.take().unwrap_or_default();
         for job in builtin_jobs(deps) {
@@ -153,6 +157,7 @@ impl Daemon {
                     db: Arc::clone(&db),
                     worktree_mgr: Arc::clone(&self.worktree_mgr),
                     workspace_root: self.belt_home.clone(),
+                    report_dir: report_dir.clone(),
                 };
                 seed_workspace_crons(&mut cron, ws_name, ws_deps);
                 tracing::info!(workspace = %ws_name, "seeded per-workspace cron jobs");

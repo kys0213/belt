@@ -331,6 +331,9 @@ pub struct BuiltinJobDeps {
     pub worktree_mgr: Arc<dyn WorktreeManager>,
     /// Root directory of the workspace (used by gap detection to scan code).
     pub workspace_root: std::path::PathBuf,
+    /// Directory where daily report JSON files are stored.
+    /// When `None`, reports are only logged (not persisted to files).
+    pub report_dir: Option<std::path::PathBuf>,
 }
 
 /// Expires unanswered HITL (human-in-the-loop) items after a configurable timeout.
@@ -506,34 +509,248 @@ fn resolve_workspace_terminal_phase(
     }
 }
 
-/// Generates a daily summary report by aggregating queue item statistics.
-///
-/// Counts items in each relevant phase (Done, Failed, Hitl, Running, Pending)
-/// and logs a summary.
+/// Structured daily report containing queue statistics and runtime usage.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DailyReport {
+    /// Report generation date (YYYY-MM-DD).
+    pub date: String,
+    /// RFC 3339 timestamp when the report was generated.
+    pub generated_at: String,
+    /// Queue item counts grouped by phase.
+    pub phase_summary: HashMap<String, u32>,
+    /// Total number of queue items across all phases.
+    pub total_items: u32,
+    /// Items that failed in the last 24 hours.
+    pub recent_failures: Vec<DailyReportFailure>,
+    /// Items currently waiting for human review.
+    pub hitl_waiting: Vec<DailyReportHitlItem>,
+    /// Aggregated token usage from the last 24 hours.
+    pub token_usage: DailyReportTokenUsage,
+}
+
+/// A failed item summary included in the daily report.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DailyReportFailure {
+    /// Work item ID.
+    pub work_id: String,
+    /// Source identifier.
+    pub source_id: String,
+    /// Optional title of the item.
+    pub title: Option<String>,
+    /// When the item was last updated.
+    pub updated_at: String,
+}
+
+/// A HITL-waiting item summary included in the daily report.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DailyReportHitlItem {
+    /// Work item ID.
+    pub work_id: String,
+    /// Source identifier.
+    pub source_id: String,
+    /// Optional title of the item.
+    pub title: Option<String>,
+    /// When HITL was created.
+    pub hitl_created_at: Option<String>,
+    /// Notes attached to the HITL request.
+    pub hitl_notes: Option<String>,
+}
+
+/// Token usage summary for the daily report.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DailyReportTokenUsage {
+    /// Total input tokens consumed in the period.
+    pub total_input_tokens: u64,
+    /// Total output tokens produced in the period.
+    pub total_output_tokens: u64,
+    /// Combined input + output tokens.
+    pub total_tokens: u64,
+    /// Number of runtime invocations.
+    pub executions: u64,
+    /// Average invocation duration in milliseconds.
+    pub avg_duration_ms: Option<f64>,
+    /// Per-model breakdown of token usage.
+    pub by_model: HashMap<String, DailyReportModelUsage>,
+}
+
+/// Per-model token usage in the daily report.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DailyReportModelUsage {
+    /// Total input tokens for this model.
+    pub input_tokens: u64,
+    /// Total output tokens for this model.
+    pub output_tokens: u64,
+    /// Number of invocations for this model.
+    pub executions: u64,
+}
+
+/// Generates a daily summary report by aggregating queue item statistics,
+/// recent failures, HITL items, and token usage. Persists the report as a
+/// JSON file under the configured report directory.
 pub struct DailyReportJob {
     db: Arc<Database>,
+    /// Directory where report JSON files are written.
+    /// When `None`, reports are only logged (not persisted).
+    report_dir: Option<std::path::PathBuf>,
+}
+
+impl DailyReportJob {
+    /// Create a new `DailyReportJob`.
+    pub fn new(db: Arc<Database>, report_dir: Option<std::path::PathBuf>) -> Self {
+        Self { db, report_dir }
+    }
+
+    /// Generate the daily report from current database state.
+    fn generate_report(&self, ctx: &CronContext) -> Result<DailyReport, BeltError> {
+        // Phase summary via efficient grouped query.
+        let phase_counts = self.db.count_items_by_phase()?;
+        let mut phase_summary: HashMap<String, u32> = HashMap::new();
+        let mut total_items: u32 = 0;
+        for (phase, count) in &phase_counts {
+            phase_summary.insert(phase.clone(), *count);
+            total_items += count;
+        }
+
+        // Recent failures (items currently in Failed phase).
+        let failed_items = self.db.list_items(Some(QueuePhase::Failed), None)?;
+        let recent_failures: Vec<DailyReportFailure> = failed_items
+            .iter()
+            .map(|item| DailyReportFailure {
+                work_id: item.work_id.clone(),
+                source_id: item.source_id.clone(),
+                title: item.title.clone(),
+                updated_at: item.updated_at.clone(),
+            })
+            .collect();
+
+        // HITL-waiting items.
+        let hitl_items = self.db.list_items(Some(QueuePhase::Hitl), None)?;
+        let hitl_waiting: Vec<DailyReportHitlItem> = hitl_items
+            .iter()
+            .map(|item| DailyReportHitlItem {
+                work_id: item.work_id.clone(),
+                source_id: item.source_id.clone(),
+                title: item.title.clone(),
+                hitl_created_at: item.hitl_created_at.clone(),
+                hitl_notes: item.hitl_notes.clone(),
+            })
+            .collect();
+
+        // Token usage stats (last 24 hours).
+        let runtime_stats = self.db.get_runtime_stats()?;
+        let by_model: HashMap<String, DailyReportModelUsage> = runtime_stats
+            .by_model
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    DailyReportModelUsage {
+                        input_tokens: v.input_tokens,
+                        output_tokens: v.output_tokens,
+                        executions: v.executions,
+                    },
+                )
+            })
+            .collect();
+
+        let token_usage = DailyReportTokenUsage {
+            total_input_tokens: runtime_stats.total_tokens_input,
+            total_output_tokens: runtime_stats.total_tokens_output,
+            total_tokens: runtime_stats.total_tokens,
+            executions: runtime_stats.executions,
+            avg_duration_ms: runtime_stats.avg_duration_ms,
+            by_model,
+        };
+
+        Ok(DailyReport {
+            date: ctx.now.format("%Y-%m-%d").to_string(),
+            generated_at: ctx.now.to_rfc3339(),
+            phase_summary,
+            total_items,
+            recent_failures,
+            hitl_waiting,
+            token_usage,
+        })
+    }
+
+    /// Persist the report as a JSON file in the report directory.
+    fn save_report(&self, report: &DailyReport) -> Result<Option<std::path::PathBuf>, BeltError> {
+        let Some(ref dir) = self.report_dir else {
+            return Ok(None);
+        };
+
+        std::fs::create_dir_all(dir).map_err(|e| {
+            BeltError::Runtime(format!(
+                "failed to create report directory '{}': {e}",
+                dir.display()
+            ))
+        })?;
+
+        let filename = format!("daily-report-{}.json", report.date);
+        let path = dir.join(&filename);
+
+        let json = serde_json::to_string_pretty(report)
+            .map_err(|e| BeltError::Runtime(format!("failed to serialize daily report: {e}")))?;
+
+        std::fs::write(&path, &json).map_err(|e| {
+            BeltError::Runtime(format!(
+                "failed to write daily report to '{}': {e}",
+                path.display()
+            ))
+        })?;
+
+        Ok(Some(path))
+    }
 }
 
 impl CronHandler for DailyReportJob {
-    fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
+    fn execute(&self, ctx: &CronContext) -> Result<(), BeltError> {
         tracing::info!("DailyReportJob: generating daily report");
 
-        let done_count = self.db.list_items(Some(QueuePhase::Done), None)?.len();
-        let failed_count = self.db.list_items(Some(QueuePhase::Failed), None)?.len();
-        let hitl_count = self.db.list_items(Some(QueuePhase::Hitl), None)?.len();
-        let running_count = self.db.list_items(Some(QueuePhase::Running), None)?.len();
-        let pending_count = self.db.list_items(Some(QueuePhase::Pending), None)?.len();
-        let completed_count = self.db.list_items(Some(QueuePhase::Completed), None)?.len();
+        let report = self.generate_report(ctx)?;
 
+        // Log the summary.
         tracing::info!(
-            done = done_count,
-            failed = failed_count,
-            hitl_waiting = hitl_count,
-            running = running_count,
-            pending = pending_count,
-            completed = completed_count,
+            date = %report.date,
+            total_items = report.total_items,
+            failed = report.recent_failures.len(),
+            hitl_waiting = report.hitl_waiting.len(),
+            total_tokens = report.token_usage.total_tokens,
+            executions = report.token_usage.executions,
             "=== Daily Report ==="
         );
+
+        // Log per-phase breakdown.
+        for (phase, count) in &report.phase_summary {
+            tracing::info!(phase = %phase, count = count, "phase summary");
+        }
+
+        // Log failed items for visibility.
+        for failure in &report.recent_failures {
+            tracing::warn!(
+                work_id = %failure.work_id,
+                source_id = %failure.source_id,
+                title = ?failure.title,
+                "failed item in report"
+            );
+        }
+
+        // Persist to disk.
+        match self.save_report(&report) {
+            Ok(Some(path)) => {
+                tracing::info!(
+                    path = %path.display(),
+                    "daily report saved"
+                );
+            }
+            Ok(None) => {
+                tracing::debug!("no report directory configured, skipping file persistence");
+            }
+            Err(e) => {
+                // File persistence failure is non-fatal; the report was already logged.
+                tracing::warn!(error = %e, "failed to persist daily report to file");
+            }
+        }
 
         Ok(())
     }
@@ -660,12 +877,7 @@ fn all_linked_issues_done(db: &Database, spec_id: &str) -> bool {
                 let idx = parts.iter().position(|p| *p == "issues");
                 if let Some(i) = idx {
                     if i >= 2 && i + 1 < parts.len() {
-                        format!(
-                            "{}/{}#{}",
-                            parts[i - 2],
-                            parts[i - 1],
-                            parts[i + 1]
-                        )
+                        format!("{}/{}#{}", parts[i - 2], parts[i - 1], parts[i + 1])
                     } else {
                         continue;
                     }
@@ -1496,9 +1708,10 @@ pub fn builtin_jobs(deps: BuiltinJobDeps) -> Vec<CronJobDef> {
             workspace: None,
             enabled: true,
             last_run_at: None,
-            handler: Box::new(DailyReportJob {
-                db: Arc::clone(&deps.db),
-            }),
+            handler: Box::new(DailyReportJob::new(
+                Arc::clone(&deps.db),
+                deps.report_dir.clone(),
+            )),
         },
         CronJobDef {
             name: "log_cleanup".to_string(),
@@ -1735,9 +1948,10 @@ pub fn seed_workspace_crons(engine: &mut CronEngine, workspace: &str, deps: Buil
         workspace: Some(ws.clone()),
         enabled: true,
         last_run_at: None,
-        handler: Box::new(DailyReportJob {
-            db: Arc::clone(&deps.db),
-        }),
+        handler: Box::new(DailyReportJob::new(
+            Arc::clone(&deps.db),
+            deps.report_dir.clone(),
+        )),
     });
 
     engine.register(CronJobDef {
@@ -1975,6 +2189,7 @@ mod tests {
             db,
             worktree_mgr,
             workspace_root: tmp.path().to_path_buf(),
+            report_dir: None,
         }
     }
 
@@ -2546,12 +2761,92 @@ mod tests {
         failed_item.phase = QueuePhase::Failed;
         db.insert_item(&failed_item).unwrap();
 
-        let job = DailyReportJob {
-            db: Arc::clone(&db),
-        };
+        let job = DailyReportJob::new(Arc::clone(&db), None);
         let ctx = CronContext { now: Utc::now() };
         // Should not error even with items in various states.
         job.execute(&ctx).unwrap();
+    }
+
+    #[test]
+    fn daily_report_generates_correct_summary() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+
+        // Insert items in multiple phases.
+        let mut done1 =
+            belt_core::queue::QueueItem::new("d1".into(), "s1".into(), "ws".into(), "st".into());
+        done1.phase = QueuePhase::Done;
+        db.insert_item(&done1).unwrap();
+
+        let mut done2 =
+            belt_core::queue::QueueItem::new("d2".into(), "s2".into(), "ws".into(), "st".into());
+        done2.phase = QueuePhase::Done;
+        db.insert_item(&done2).unwrap();
+
+        let mut failed1 =
+            belt_core::queue::QueueItem::new("f1".into(), "s3".into(), "ws".into(), "st".into());
+        failed1.phase = QueuePhase::Failed;
+        failed1.title = Some("failed task".into());
+        db.insert_item(&failed1).unwrap();
+
+        let mut hitl1 =
+            belt_core::queue::QueueItem::new("h1".into(), "s4".into(), "ws".into(), "st".into());
+        hitl1.phase = QueuePhase::Hitl;
+        hitl1.hitl_notes = Some("needs review".into());
+        db.insert_item(&hitl1).unwrap();
+
+        let job = DailyReportJob::new(Arc::clone(&db), None);
+        let ctx = CronContext { now: Utc::now() };
+        let report = job.generate_report(&ctx).unwrap();
+
+        assert_eq!(report.total_items, 4);
+        assert_eq!(*report.phase_summary.get("done").unwrap_or(&0), 2);
+        assert_eq!(*report.phase_summary.get("failed").unwrap_or(&0), 1);
+        assert_eq!(*report.phase_summary.get("hitl").unwrap_or(&0), 1);
+        assert_eq!(report.recent_failures.len(), 1);
+        assert_eq!(report.recent_failures[0].work_id, "f1");
+        assert_eq!(report.hitl_waiting.len(), 1);
+        assert_eq!(report.hitl_waiting[0].work_id, "h1");
+    }
+
+    #[test]
+    fn daily_report_saves_to_disk() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let report_dir = tmp.path().join("reports");
+
+        let mut item =
+            belt_core::queue::QueueItem::new("w1".into(), "s1".into(), "ws".into(), "st".into());
+        item.phase = QueuePhase::Done;
+        db.insert_item(&item).unwrap();
+
+        let job = DailyReportJob::new(Arc::clone(&db), Some(report_dir.clone()));
+        let ctx = CronContext { now: Utc::now() };
+        job.execute(&ctx).unwrap();
+
+        // Verify file was created.
+        let date_str = ctx.now.format("%Y-%m-%d").to_string();
+        let report_path = report_dir.join(format!("daily-report-{date_str}.json"));
+        assert!(report_path.exists(), "report file should be created");
+
+        // Verify contents are valid JSON.
+        let content = std::fs::read_to_string(&report_path).unwrap();
+        let parsed: DailyReport = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.date, date_str);
+        assert_eq!(parsed.total_items, 1);
+    }
+
+    #[test]
+    fn daily_report_empty_db() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let job = DailyReportJob::new(Arc::clone(&db), None);
+        let ctx = CronContext { now: Utc::now() };
+
+        let report = job.generate_report(&ctx).unwrap();
+        assert_eq!(report.total_items, 0);
+        assert!(report.recent_failures.is_empty());
+        assert!(report.hitl_waiting.is_empty());
+        assert_eq!(report.token_usage.total_tokens, 0);
+        assert_eq!(report.token_usage.executions, 0);
     }
 
     #[test]

@@ -863,6 +863,30 @@ impl Database {
         })
     }
 
+    /// Reset the `last_run_at` timestamp of a cron job to `NULL`.
+    ///
+    /// This causes the cron engine to treat the job as never-run, so it will
+    /// fire on the next tick regardless of schedule.
+    ///
+    /// # Errors
+    /// Returns `BeltError::ItemNotFound` if no cron job matches the given `name`.
+    pub fn reset_cron_last_run(&self, name: &str) -> Result<(), BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "UPDATE cron_jobs SET last_run_at = NULL WHERE name = ?1",
+                params![name],
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        if rows == 0 {
+            return Err(BeltError::ItemNotFound(name.to_string()));
+        }
+        Ok(())
+    }
+
     /// Update the `last_run_at` timestamp of a cron job to now.
     pub fn update_cron_last_run(&self, name: &str) -> Result<(), BeltError> {
         let now = Utc::now().to_rfc3339();
@@ -1805,7 +1829,9 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> Result<Spec, BeltError> {
         depends_on: row.get(7).map_err(|e| BeltError::Database(e.to_string()))?,
         entry_point: row.get(8).map_err(|e| BeltError::Database(e.to_string()))?,
         decomposed_issues: row.get(9).map_err(|e| BeltError::Database(e.to_string()))?,
-        test_commands: row.get(10).map_err(|e| BeltError::Database(e.to_string()))?,
+        test_commands: row
+            .get(10)
+            .map_err(|e| BeltError::Database(e.to_string()))?,
         created_at: row
             .get(11)
             .map_err(|e| BeltError::Database(e.to_string()))?,
@@ -2177,6 +2203,30 @@ mod tests {
     fn get_cron_job_not_found() {
         let db = test_db();
         let err = db.get_cron_job("nope").unwrap_err();
+        assert!(matches!(err, BeltError::ItemNotFound(_)));
+    }
+
+    #[test]
+    fn reset_cron_last_run_clears_timestamp() {
+        let db = test_db();
+        db.add_cron_job("reset-job", "*/5 * * * *", "/bin/run.sh", None)
+            .unwrap();
+
+        // Set last_run_at to now.
+        db.update_cron_last_run("reset-job").unwrap();
+        let job = db.get_cron_job("reset-job").unwrap();
+        assert!(job.last_run_at.is_some());
+
+        // Reset should clear it.
+        db.reset_cron_last_run("reset-job").unwrap();
+        let job = db.get_cron_job("reset-job").unwrap();
+        assert!(job.last_run_at.is_none());
+    }
+
+    #[test]
+    fn reset_cron_last_run_not_found() {
+        let db = test_db();
+        let err = db.reset_cron_last_run("nope").unwrap_err();
         assert!(matches!(err, BeltError::ItemNotFound(_)));
     }
 
