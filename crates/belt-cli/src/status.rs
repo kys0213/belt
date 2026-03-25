@@ -47,6 +47,31 @@ pub struct EventSummary {
     pub timestamp: String,
 }
 
+/// Token usage summary for a workspace.
+#[derive(Debug, Serialize)]
+pub struct TokenUsageSummary {
+    /// Total input tokens consumed.
+    pub total_input: u64,
+    /// Total output tokens produced.
+    pub total_output: u64,
+    /// Grand total of input + output tokens.
+    pub total_tokens: u64,
+    /// Number of runtime invocations.
+    pub executions: u64,
+    /// Per-model breakdown: (model_name, input, output, total, count).
+    pub by_model: Vec<ModelTokenSummary>,
+}
+
+/// Per-model token usage breakdown.
+#[derive(Debug, Serialize)]
+pub struct ModelTokenSummary {
+    pub model: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub executions: u64,
+}
+
 /// Workspace spec status.
 #[derive(Debug, Serialize)]
 pub struct SpecStatus {
@@ -54,6 +79,9 @@ pub struct SpecStatus {
     pub config_path: String,
     pub item_count: u32,
     pub phase_counts: Vec<PhaseCount>,
+    /// Optional token usage summary, populated when rich format is requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<TokenUsageSummary>,
 }
 
 /// Gather system status from the database.
@@ -125,11 +153,56 @@ pub fn gather_spec_status(db: &Database, workspace: &str) -> anyhow::Result<Spec
         .collect();
     phase_counts.sort_by(|a, b| a.phase.cmp(&b.phase));
 
+    // Gather token usage for the workspace.
+    let token_usage = gather_workspace_token_usage(db, workspace);
+
     Ok(SpecStatus {
         workspace: name,
         config_path,
         item_count,
         phase_counts,
+        token_usage,
+    })
+}
+
+/// Aggregate token usage rows into a summary for a workspace.
+fn gather_workspace_token_usage(db: &Database, workspace: &str) -> Option<TokenUsageSummary> {
+    let rows = db.get_token_usage_by_workspace(workspace).ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut total_input: u64 = 0;
+    let mut total_output: u64 = 0;
+    let mut model_map = std::collections::HashMap::<String, (u64, u64, u64)>::new();
+
+    for row in &rows {
+        total_input += row.input_tokens;
+        total_output += row.output_tokens;
+        let entry = model_map.entry(row.model.clone()).or_insert((0, 0, 0));
+        entry.0 += row.input_tokens;
+        entry.1 += row.output_tokens;
+        entry.2 += 1;
+    }
+
+    let mut by_model: Vec<ModelTokenSummary> = model_map
+        .into_iter()
+        .map(|(model, (inp, out, cnt))| ModelTokenSummary {
+            model,
+            input_tokens: inp,
+            output_tokens: out,
+            total_tokens: inp + out,
+            executions: cnt,
+        })
+        .collect();
+    by_model.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+
+    Some(TokenUsageSummary {
+        total_input,
+        total_output,
+        total_tokens: total_input + total_output,
+        executions: rows.len() as u64,
+        by_model,
     })
 }
 
@@ -507,6 +580,138 @@ mod tests {
         assert_eq!(spec_status.phase_counts.len(), 1);
         assert_eq!(spec_status.phase_counts[0].phase, "pending");
     }
+
+    // ---- token usage in spec status ----
+
+    #[test]
+    fn gather_spec_status_no_token_usage_returns_none() {
+        let db = test_db();
+        db.add_workspace("ws-empty", "/e.yaml").unwrap();
+
+        let spec_status = gather_spec_status(&db, "ws-empty").unwrap();
+        assert!(spec_status.token_usage.is_none());
+    }
+
+    #[test]
+    fn gather_spec_status_with_token_usage() {
+        use belt_core::runtime::TokenUsage;
+
+        let db = test_db();
+        db.add_workspace("ws-tok", "/tok.yaml").unwrap();
+
+        let usage = TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        };
+        db.record_token_usage("w1:impl", "ws-tok", "claude", "sonnet", &usage, Some(200))
+            .unwrap();
+        db.record_token_usage("w2:impl", "ws-tok", "claude", "haiku", &usage, None)
+            .unwrap();
+
+        let spec_status = gather_spec_status(&db, "ws-tok").unwrap();
+        let tu = spec_status.token_usage.as_ref().unwrap();
+
+        assert_eq!(tu.total_input, 2_000);
+        assert_eq!(tu.total_output, 1_000);
+        assert_eq!(tu.total_tokens, 3_000);
+        assert_eq!(tu.executions, 2);
+        assert_eq!(tu.by_model.len(), 2);
+        // by_model should be sorted by total_tokens descending (equal here)
+        for m in &tu.by_model {
+            assert_eq!(m.total_tokens, 1_500);
+            assert_eq!(m.executions, 1);
+        }
+    }
+
+    // ---- print_rich_spec_status output ----
+
+    #[test]
+    fn print_spec_status_rich_does_not_panic() {
+        let status = SpecStatus {
+            workspace: "test-ws".to_string(),
+            config_path: "/test.yaml".to_string(),
+            item_count: 5,
+            phase_counts: vec![
+                PhaseCount {
+                    phase: "done".to_string(),
+                    count: 3,
+                },
+                PhaseCount {
+                    phase: "running".to_string(),
+                    count: 2,
+                },
+            ],
+            token_usage: Some(TokenUsageSummary {
+                total_input: 10_000,
+                total_output: 5_000,
+                total_tokens: 15_000,
+                executions: 10,
+                by_model: vec![ModelTokenSummary {
+                    model: "sonnet".to_string(),
+                    input_tokens: 10_000,
+                    output_tokens: 5_000,
+                    total_tokens: 15_000,
+                    executions: 10,
+                }],
+            }),
+        };
+        // Must not panic.
+        print_spec_status(&status, "rich").unwrap();
+    }
+
+    #[test]
+    fn print_spec_status_rich_no_token_usage() {
+        let status = SpecStatus {
+            workspace: "ws".to_string(),
+            config_path: "/ws.yaml".to_string(),
+            item_count: 0,
+            phase_counts: vec![],
+            token_usage: None,
+        };
+        print_spec_status(&status, "rich").unwrap();
+    }
+
+    // ---- render_progress_bar ----
+
+    #[test]
+    fn render_progress_bar_zero_percent() {
+        let bar = super::render_progress_bar(0, 10);
+        assert_eq!(bar, "[..........]");
+    }
+
+    #[test]
+    fn render_progress_bar_fifty_percent() {
+        let bar = super::render_progress_bar(50, 10);
+        assert_eq!(bar, "[#####.....]");
+    }
+
+    #[test]
+    fn render_progress_bar_hundred_percent() {
+        let bar = super::render_progress_bar(100, 10);
+        assert_eq!(bar, "[##########]");
+    }
+
+    #[test]
+    fn render_progress_bar_over_hundred_clamped() {
+        let bar = super::render_progress_bar(150, 10);
+        assert_eq!(bar, "[##########]");
+    }
+
+    // ---- fmt_num ----
+
+    #[test]
+    fn fmt_num_small() {
+        assert_eq!(super::fmt_num(0), "0");
+        assert_eq!(super::fmt_num(999), "999");
+    }
+
+    #[test]
+    fn fmt_num_thousands() {
+        assert_eq!(super::fmt_num(1_000), "1,000");
+        assert_eq!(super::fmt_num(1_234_567), "1,234,567");
+    }
 }
 
 fn print_text_status(status: &SystemStatus) {
@@ -631,12 +836,93 @@ fn print_rich_spec_status(status: &SpecStatus) {
     println!("| Config:    {:<25} |", status.config_path);
     println!("| Items:     {:<25} |", status.item_count);
     println!("+--------------------------------------+");
+
     if !status.phase_counts.is_empty() {
-        println!("| Phase          | Count               |");
-        println!("+----------------+---------------------+");
+        println!();
+        println!("+-- AC Progress ---------------------------+");
+        println!("| Phase          | Count | Progress        |");
+        println!("+----------------+-------+-----------------+");
+        let total = status.item_count.max(1);
         for pc in &status.phase_counts {
-            println!("| {:<14} | {:<19} |", pc.phase, pc.count);
+            let pct = (pc.count as f64 / total as f64 * 100.0) as u32;
+            let bar = render_progress_bar(pct, 12);
+            println!(
+                "| {:<14} | {:>5} | {} {:>3}% |",
+                pc.phase, pc.count, bar, pct
+            );
         }
-        println!("+----------------+---------------------+");
+        println!("+----------------+-------+-----------------+");
+
+        // Overall completion: done + completed + skipped as "finished"
+        let finished: u32 = status
+            .phase_counts
+            .iter()
+            .filter(|pc| matches!(pc.phase.as_str(), "done" | "completed" | "skipped"))
+            .map(|pc| pc.count)
+            .sum();
+        let overall_pct = (finished as f64 / total as f64 * 100.0) as u32;
+        let overall_bar = render_progress_bar(overall_pct, 28);
+        println!(
+            "| Overall: {}/{:<5} {} {:>3}% |",
+            finished, total, overall_bar, overall_pct
+        );
+        println!("+------------------------------------------+");
     }
+
+    // Token usage analysis
+    if let Some(ref usage) = status.token_usage {
+        println!();
+        println!("+-- Token Usage ----------------------------+");
+        println!(
+            "| Total:  {} (in: {} / out: {})",
+            fmt_num(usage.total_tokens),
+            fmt_num(usage.total_input),
+            fmt_num(usage.total_output),
+        );
+        println!("| Executions: {}", usage.executions);
+        if !usage.by_model.is_empty() {
+            println!("|");
+            println!(
+                "| {:<20} {:>10} {:>10} {:>10} {:>5}",
+                "Model", "Input", "Output", "Total", "Runs"
+            );
+            println!("| {}", "-".repeat(58));
+            for m in &usage.by_model {
+                println!(
+                    "| {:<20} {:>10} {:>10} {:>10} {:>5}",
+                    m.model,
+                    fmt_num(m.input_tokens),
+                    fmt_num(m.output_tokens),
+                    fmt_num(m.total_tokens),
+                    m.executions,
+                );
+            }
+        }
+        println!("+-------------------------------------------+");
+    }
+}
+
+/// Render a text-based progress bar of the given width.
+///
+/// `pct` is a value 0..=100 and `width` is the number of character cells.
+fn render_progress_bar(pct: u32, width: usize) -> String {
+    let filled = (pct as usize * width / 100).min(width);
+    let empty = width - filled;
+    format!("[{}{}]", "#".repeat(filled), ".".repeat(empty),)
+}
+
+/// Format a number with comma separators for readability.
+fn fmt_num(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
 }
