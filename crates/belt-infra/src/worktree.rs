@@ -11,6 +11,24 @@ pub trait WorktreeManager: Send + Sync {
     /// Creates a worktree or reuses an existing one for the given `work_id`.
     fn create_or_reuse(&self, work_id: &str) -> Result<PathBuf, BeltError>;
 
+    /// Creates a worktree or reuses an existing one, optionally reusing a
+    /// preserved worktree from a previous (failed) item.
+    ///
+    /// When `previous_worktree_path` is provided and the directory exists,
+    /// the implementation renames/moves it to the new work_id location so
+    /// that the retry item inherits the preserved working tree state.
+    /// Falls back to [`create_or_reuse`](Self::create_or_reuse) when the
+    /// previous path is `None` or does not exist.
+    fn create_or_reuse_with_previous(
+        &self,
+        work_id: &str,
+        previous_worktree_path: Option<&str>,
+    ) -> Result<PathBuf, BeltError> {
+        // Default implementation: ignore previous path and delegate.
+        let _ = previous_worktree_path;
+        self.create_or_reuse(work_id)
+    }
+
     /// Cleans up a worktree (`git worktree remove` + branch deletion).
     fn cleanup(&self, work_id: &str) -> Result<(), BeltError>;
 
@@ -61,6 +79,60 @@ impl GitWorktreeManager {
 }
 
 impl WorktreeManager for GitWorktreeManager {
+    fn create_or_reuse_with_previous(
+        &self,
+        work_id: &str,
+        previous_worktree_path: Option<&str>,
+    ) -> Result<PathBuf, BeltError> {
+        let wt_path = self.path(work_id);
+
+        if wt_path.exists() {
+            tracing::debug!(work_id, ?wt_path, "worktree already exists, reusing");
+            return Ok(wt_path);
+        }
+
+        // If a previous worktree path is provided and exists on disk, rename
+        // it to the new location so the retry item inherits the preserved state.
+        if let Some(prev) = previous_worktree_path {
+            let prev_path = PathBuf::from(prev);
+            if prev_path.exists() {
+                tracing::info!(
+                    work_id,
+                    ?prev_path,
+                    ?wt_path,
+                    "reusing preserved worktree from previous item"
+                );
+
+                // git worktree move <old> <new>
+                let output = Command::new("git")
+                    .args(["worktree", "move"])
+                    .arg(&prev_path)
+                    .arg(&wt_path)
+                    .current_dir(&self.repo_path)
+                    .output()
+                    .map_err(|e| {
+                        BeltError::Worktree(format!("failed to run git worktree move: {e}"))
+                    })?;
+
+                if output.status.success() {
+                    tracing::info!(work_id, ?wt_path, "worktree moved from preserved location");
+                    return Ok(wt_path);
+                }
+
+                // Move failed — fall through to normal creation.
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!(
+                    work_id,
+                    ?prev_path,
+                    "git worktree move failed, falling back to fresh create: {stderr}"
+                );
+            }
+        }
+
+        // Fallback to normal creation.
+        self.create_or_reuse(work_id)
+    }
+
     fn create_or_reuse(&self, work_id: &str) -> Result<PathBuf, BeltError> {
         let wt_path = self.path(work_id);
 
@@ -157,6 +229,33 @@ impl MockWorktreeManager {
 }
 
 impl WorktreeManager for MockWorktreeManager {
+    fn create_or_reuse_with_previous(
+        &self,
+        work_id: &str,
+        previous_worktree_path: Option<&str>,
+    ) -> Result<PathBuf, BeltError> {
+        let wt_path = self.path(work_id);
+
+        if wt_path.exists() {
+            return Ok(wt_path);
+        }
+
+        // If a previous worktree directory exists, rename it for the new work_id.
+        if let Some(prev) = previous_worktree_path {
+            let prev_path = PathBuf::from(prev);
+            if prev_path.exists() {
+                std::fs::rename(&prev_path, &wt_path).map_err(|e| {
+                    BeltError::Worktree(format!(
+                        "failed to rename previous worktree {prev_path:?} to {wt_path:?}: {e}"
+                    ))
+                })?;
+                return Ok(wt_path);
+            }
+        }
+
+        self.create_or_reuse(work_id)
+    }
+
     fn create_or_reuse(&self, work_id: &str) -> Result<PathBuf, BeltError> {
         let wt_path = self.path(work_id);
 
@@ -337,5 +436,67 @@ mod tests {
         // cleanup
         mgr.cleanup("task-1").unwrap();
         assert!(!mgr.exists("task-1"));
+    }
+
+    #[test]
+    fn mock_create_or_reuse_with_previous_renames_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = MockWorktreeManager::new(tmp.path().to_path_buf());
+
+        // Create a "previous" worktree with some content.
+        let prev_path = mgr.create_or_reuse("old-work").unwrap();
+        fs::write(prev_path.join("state.txt"), "preserved").unwrap();
+
+        // Create the retry worktree reusing the previous one.
+        let new_path = mgr
+            .create_or_reuse_with_previous("new-work", Some(prev_path.to_str().unwrap()))
+            .unwrap();
+
+        // New path should exist with the preserved content.
+        assert!(new_path.exists());
+        assert_eq!(
+            fs::read_to_string(new_path.join("state.txt")).unwrap(),
+            "preserved"
+        );
+
+        // Old path should no longer exist (it was renamed).
+        assert!(!prev_path.exists());
+    }
+
+    #[test]
+    fn mock_create_or_reuse_with_previous_none_falls_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = MockWorktreeManager::new(tmp.path().to_path_buf());
+
+        let path = mgr.create_or_reuse_with_previous("work-1", None).unwrap();
+        assert!(path.exists());
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn mock_create_or_reuse_with_previous_nonexistent_falls_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = MockWorktreeManager::new(tmp.path().to_path_buf());
+
+        let path = mgr
+            .create_or_reuse_with_previous("work-1", Some("/nonexistent/path"))
+            .unwrap();
+        assert!(path.exists());
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn mock_create_or_reuse_with_previous_existing_target_reuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = MockWorktreeManager::new(tmp.path().to_path_buf());
+
+        // Pre-create the target directory.
+        let existing = mgr.create_or_reuse("work-1").unwrap();
+
+        // Even with a previous path, the existing target takes precedence.
+        let path = mgr
+            .create_or_reuse_with_previous("work-1", Some("/some/old/path"))
+            .unwrap();
+        assert_eq!(path, existing);
     }
 }

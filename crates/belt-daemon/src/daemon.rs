@@ -456,8 +456,13 @@ impl Daemon {
         // Collect on_fail actions for deferred, escalation-aware execution.
         let on_fail_actions: Vec<Action> = state_config.on_fail.iter().map(Action::from).collect();
 
-        let worktree = match worktree_mgr.create_or_reuse(&ws_name) {
-            Ok(path) => path,
+        let previous_wt = item.previous_worktree_path.as_deref();
+        let worktree = match worktree_mgr.create_or_reuse_with_previous(&ws_name, previous_wt) {
+            Ok(path) => {
+                // Clear the previous_worktree_path after successful handoff.
+                item.previous_worktree_path = None;
+                path
+            }
             Err(e) => {
                 item.phase = QueuePhase::Failed;
                 return ExecutionResult {
@@ -1262,6 +1267,19 @@ impl Daemon {
                 let mut retry_item = item.clone();
                 retry_item.phase = QueuePhase::Pending;
                 retry_item.updated_at = now;
+                // Carry over the preserved worktree path so the retry item
+                // can reuse the existing working tree via create_or_reuse_with_previous.
+                if item.worktree_preserved {
+                    let prev_path = self.worktree_mgr.path(&item.work_id);
+                    retry_item.previous_worktree_path =
+                        Some(prev_path.to_string_lossy().into_owned());
+                    tracing::info!(
+                        work_id = %item.work_id,
+                        ?prev_path,
+                        "storing preserved worktree path for retry item"
+                    );
+                }
+                retry_item.worktree_preserved = false;
                 self.queue.push_back(retry_item);
             }
             EscalationAction::Skip => {

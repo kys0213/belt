@@ -1846,6 +1846,8 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
             .get(13)
             .map_err(|e| BeltError::Database(e.to_string()))?,
         worktree_preserved: false,
+        // previous_worktree_path is transient (in-memory only, not persisted to DB).
+        previous_worktree_path: None,
     })
 }
 
@@ -1874,6 +1876,7 @@ mod tests {
             hitl_timeout_at: None,
             hitl_terminal_action: None,
             worktree_preserved: false,
+            previous_worktree_path: None,
         }
     }
 

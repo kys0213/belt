@@ -147,6 +147,12 @@ pub struct QueueItem {
     /// cleanup 없이 보존되었음을 명시적으로 기록한다.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub worktree_preserved: bool,
+    /// 이전 아이템(보존된)의 worktree 경로.
+    ///
+    /// Retry 아이템 생성 시 실패한 원본 아이템의 worktree 경로를 저장하여
+    /// `WorktreeManager::create_or_reuse`가 기존 worktree를 재사용할 수 있게 한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_worktree_path: Option<String>,
 }
 
 impl QueueItem {
@@ -168,6 +174,7 @@ impl QueueItem {
             hitl_timeout_at: None,
             hitl_terminal_action: None,
             worktree_preserved: false,
+            previous_worktree_path: None,
         }
     }
 
@@ -196,6 +203,7 @@ pub struct QueueItemRow {
     pub hitl_timeout_at: Option<String>,
     pub hitl_terminal_action: Option<String>,
     pub worktree_preserved: bool,
+    pub previous_worktree_path: Option<String>,
 }
 
 impl QueueItem {
@@ -216,6 +224,7 @@ impl QueueItem {
             hitl_timeout_at: self.hitl_timeout_at.clone(),
             hitl_terminal_action: self.hitl_terminal_action.clone(),
             worktree_preserved: self.worktree_preserved,
+            previous_worktree_path: self.previous_worktree_path.clone(),
         }
     }
 
@@ -248,6 +257,7 @@ impl QueueItem {
             hitl_timeout_at: row.hitl_timeout_at.clone(),
             hitl_terminal_action: row.hitl_terminal_action.clone(),
             worktree_preserved: row.worktree_preserved,
+            previous_worktree_path: row.previous_worktree_path.clone(),
         })
     }
 
@@ -282,6 +292,7 @@ pub mod testing {
             hitl_timeout_at: None,
             hitl_terminal_action: None,
             worktree_preserved: false,
+            previous_worktree_path: None,
         }
     }
 }
@@ -415,5 +426,42 @@ mod tests {
         assert!(row.worktree_preserved);
         let restored = QueueItem::from_row(&row).unwrap();
         assert!(restored.worktree_preserved);
+    }
+
+    #[test]
+    fn previous_worktree_path_default_none() {
+        let item = test_item("s1", "analyze");
+        assert!(item.previous_worktree_path.is_none());
+    }
+
+    #[test]
+    fn previous_worktree_path_skipped_in_json_when_none() {
+        let item = test_item("s1", "analyze");
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(!json.contains("previous_worktree_path"));
+    }
+
+    #[test]
+    fn previous_worktree_path_present_in_json_when_set() {
+        let mut item = test_item("s1", "analyze");
+        item.previous_worktree_path = Some("/tmp/worktrees/old-item".to_string());
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(json.contains("\"previous_worktree_path\":\"/tmp/worktrees/old-item\""));
+    }
+
+    #[test]
+    fn previous_worktree_path_row_roundtrip() {
+        let mut item = test_item("s1", "analyze");
+        item.previous_worktree_path = Some("/tmp/worktrees/old-item".to_string());
+        let row = item.to_row();
+        assert_eq!(
+            row.previous_worktree_path.as_deref(),
+            Some("/tmp/worktrees/old-item")
+        );
+        let restored = QueueItem::from_row(&row).unwrap();
+        assert_eq!(
+            restored.previous_worktree_path.as_deref(),
+            Some("/tmp/worktrees/old-item")
+        );
     }
 }
