@@ -1,4 +1,4 @@
-use crate::spec::{Spec, SpecStatus};
+use crate::spec::{OverlapType, Spec, SpecConflict, SpecStatus};
 
 /// Result of a conflict check between specs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -164,6 +164,85 @@ pub fn parse_depends_on(depends_on: &str) -> Vec<&str> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Action to take when a spec conflict is detected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictAction {
+    /// Automatically register the existing spec as a dependency.
+    /// Used for module-level overlaps where ordering is sufficient.
+    AutoDependency {
+        /// ID of the existing spec to depend on.
+        dependency_spec_id: String,
+    },
+    /// Escalate to human review via HITL.
+    /// Used for file-level overlaps where automatic resolution is unsafe.
+    Hitl {
+        /// Description of why HITL is needed.
+        reason: String,
+    },
+}
+
+/// Resolved conflict pairing a detected conflict with its recommended action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictResolution {
+    /// The original detected conflict.
+    pub conflict: SpecConflict,
+    /// The recommended action.
+    pub action: ConflictAction,
+}
+
+/// Resolve a list of spec conflicts into actionable resolutions.
+///
+/// Resolution strategy:
+/// - **File overlap** (`OverlapType::File`): Escalate to HITL. Two specs
+///   modifying the exact same file are likely to produce merge conflicts
+///   that require human judgment.
+/// - **Module overlap** (`OverlapType::Module`): Auto-register the existing
+///   spec as a dependency. Parent/child directory relationships can be
+///   safely serialized by ensuring the existing spec completes first.
+pub fn resolve_conflicts(conflicts: &[SpecConflict]) -> Vec<ConflictResolution> {
+    conflicts
+        .iter()
+        .map(|conflict| {
+            let action = match conflict.overlap_type {
+                OverlapType::File => ConflictAction::Hitl {
+                    reason: format!(
+                        "file-level overlap at '{}' with spec '{}' ({}): requires human review",
+                        conflict.path, conflict.existing_spec_name, conflict.existing_spec_id,
+                    ),
+                },
+                OverlapType::Module => ConflictAction::AutoDependency {
+                    dependency_spec_id: conflict.existing_spec_id.clone(),
+                },
+            };
+            ConflictResolution {
+                conflict: conflict.clone(),
+                action,
+            }
+        })
+        .collect()
+}
+
+/// Append dependency spec IDs to an existing `depends_on` string.
+///
+/// Deduplicates IDs and returns the updated comma-separated string.
+pub fn append_dependencies(current: Option<&str>, new_dep_ids: &[&str]) -> Option<String> {
+    let mut existing: Vec<String> = current
+        .map(|s| parse_depends_on(s).into_iter().map(String::from).collect())
+        .unwrap_or_default();
+
+    for id in new_dep_ids {
+        if !existing.iter().any(|e| e == id) {
+            existing.push(id.to_string());
+        }
+    }
+
+    if existing.is_empty() {
+        None
+    } else {
+        Some(existing.join(","))
+    }
 }
 
 #[cfg(test)]
@@ -383,5 +462,98 @@ mod tests {
             }
             ConflictCheckResult::Clear => panic!("expected conflict"),
         }
+    }
+
+    // ---- resolve_conflicts tests ----
+
+    #[test]
+    fn resolve_file_conflict_produces_hitl() {
+        let conflict = SpecConflict {
+            existing_spec_id: "s1".to_string(),
+            existing_spec_name: "Auth".to_string(),
+            overlap_type: OverlapType::File,
+            path: "src/auth.rs".to_string(),
+        };
+        let resolutions = resolve_conflicts(&[conflict.clone()]);
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(resolutions[0].conflict, conflict);
+        assert!(matches!(resolutions[0].action, ConflictAction::Hitl { .. }));
+    }
+
+    #[test]
+    fn resolve_module_conflict_produces_auto_dependency() {
+        let conflict = SpecConflict {
+            existing_spec_id: "s1".to_string(),
+            existing_spec_name: "Auth".to_string(),
+            overlap_type: OverlapType::Module,
+            path: "src/auth/token.rs".to_string(),
+        };
+        let resolutions = resolve_conflicts(&[conflict.clone()]);
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(
+            resolutions[0].action,
+            ConflictAction::AutoDependency {
+                dependency_spec_id: "s1".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_mixed_conflicts() {
+        let file_conflict = SpecConflict {
+            existing_spec_id: "s1".to_string(),
+            existing_spec_name: "Auth".to_string(),
+            overlap_type: OverlapType::File,
+            path: "src/auth.rs".to_string(),
+        };
+        let module_conflict = SpecConflict {
+            existing_spec_id: "s2".to_string(),
+            existing_spec_name: "DB".to_string(),
+            overlap_type: OverlapType::Module,
+            path: "src/db/mod.rs".to_string(),
+        };
+        let resolutions = resolve_conflicts(&[file_conflict, module_conflict]);
+        assert_eq!(resolutions.len(), 2);
+        assert!(matches!(resolutions[0].action, ConflictAction::Hitl { .. }));
+        assert!(matches!(
+            resolutions[1].action,
+            ConflictAction::AutoDependency { .. }
+        ));
+    }
+
+    #[test]
+    fn resolve_empty_conflicts() {
+        let resolutions = resolve_conflicts(&[]);
+        assert!(resolutions.is_empty());
+    }
+
+    #[test]
+    fn append_dependencies_to_none() {
+        let result = append_dependencies(None, &["s1", "s2"]);
+        assert_eq!(result.as_deref(), Some("s1,s2"));
+    }
+
+    #[test]
+    fn append_dependencies_to_existing() {
+        let result = append_dependencies(Some("s1"), &["s2", "s3"]);
+        assert_eq!(result.as_deref(), Some("s1,s2,s3"));
+    }
+
+    #[test]
+    fn append_dependencies_deduplicates() {
+        let result = append_dependencies(Some("s1,s2"), &["s2", "s3"]);
+        assert_eq!(result.as_deref(), Some("s1,s2,s3"));
+    }
+
+    #[test]
+    fn append_dependencies_empty_new() {
+        let result = append_dependencies(Some("s1"), &[]);
+        assert_eq!(result.as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn append_dependencies_both_empty() {
+        let result = append_dependencies(None, &[]);
+        assert_eq!(result, None);
     }
 }

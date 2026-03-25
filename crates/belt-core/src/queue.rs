@@ -17,7 +17,7 @@ pub enum HitlReason {
     Timeout,
     /// 수동 escalation (사용자 요청).
     ManualEscalation,
-    /// spec entry_point 충돌 감지 (두 spec이 같은 파일/모듈을 수정).
+    /// Spec 충돌 감지 — 파일 수준 overlap으로 사람의 판단 필요.
     SpecConflict,
     /// spec Completing 단계 최종 확인 (gap-detection 통과 후 HITL 승인 대기).
     SpecCompletionReview,

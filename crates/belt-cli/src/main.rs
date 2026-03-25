@@ -1810,21 +1810,49 @@ async fn main() -> anyhow::Result<()> {
                     spec.entry_point = entry_point;
 
                     // Detect conflicts with existing specs in the same workspace
+                    // and resolve them: auto-register dependencies for module
+                    // overlaps, escalate file overlaps to HITL.
+                    let mut has_hitl_conflicts = false;
                     let has_conflicts = if spec.entry_point.is_some() {
                         let existing_specs = db.list_specs(Some(&workspace), None)?;
                         let conflicts =
                             belt_core::spec::ConflictDetector::detect(&spec, &existing_specs);
                         if !conflicts.is_empty() {
-                            eprintln!("warning: spec conflicts detected:");
-                            for c in &conflicts {
-                                eprintln!(
-                                    "  - {} overlap with spec '{}' ({}) at path: {}",
-                                    c.overlap_type,
-                                    c.existing_spec_name,
-                                    c.existing_spec_id,
-                                    c.path
+                            let resolutions = belt_core::dependency::resolve_conflicts(&conflicts);
+
+                            let mut auto_dep_ids: Vec<String> = Vec::new();
+
+                            for resolution in &resolutions {
+                                match &resolution.action {
+                                    belt_core::dependency::ConflictAction::AutoDependency {
+                                        dependency_spec_id,
+                                    } => {
+                                        eprintln!(
+                                            "info: auto-registering dependency on spec '{}' ({}) \
+                                             due to module overlap at '{}'",
+                                            resolution.conflict.existing_spec_name,
+                                            dependency_spec_id,
+                                            resolution.conflict.path,
+                                        );
+                                        auto_dep_ids.push(dependency_spec_id.clone());
+                                    }
+                                    belt_core::dependency::ConflictAction::Hitl { reason } => {
+                                        eprintln!("warning: HITL required - {reason}");
+                                        has_hitl_conflicts = true;
+                                    }
+                                }
+                            }
+
+                            // Append auto-dependencies to the spec
+                            if !auto_dep_ids.is_empty() {
+                                let dep_refs: Vec<&str> =
+                                    auto_dep_ids.iter().map(|s| s.as_str()).collect();
+                                spec.depends_on = belt_core::dependency::append_dependencies(
+                                    spec.depends_on.as_deref(),
+                                    &dep_refs,
                                 );
                             }
+
                             let conflicts_json = serde_json::to_string(&conflicts)?;
                             eprintln!("conflicts_json: {conflicts_json}");
                             Some(conflicts_json)
@@ -1836,6 +1864,18 @@ async fn main() -> anyhow::Result<()> {
                     };
 
                     db.insert_spec(&spec)?;
+
+                    // If file-level conflicts require HITL, print a notice.
+                    // The spec remains in Draft (Pending) status so it won't
+                    // be acted upon until the conflict is resolved by a human.
+                    if has_hitl_conflicts {
+                        eprintln!(
+                            "notice: spec '{}' has file-level conflicts requiring human review. \
+                             Spec stays in draft status until conflicts are resolved.",
+                            id,
+                        );
+                    }
+
                     println!("spec created: {id}");
 
                     // Generate HITL item when spec conflicts are detected.
