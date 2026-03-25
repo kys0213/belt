@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -264,17 +265,14 @@ impl Daemon {
     }
 
     /// Advance Ready items to Running, respecting both per-workspace and global concurrency.
-    pub fn advance_ready_to_running(&mut self, ws_concurrency: usize) {
-        let ws_counts: std::collections::HashMap<String, usize> = {
-            let mut m = std::collections::HashMap::new();
-            for item in self.queue.iter() {
-                if item.phase == QueuePhase::Running {
-                    *m.entry(item.workspace_id.clone()).or_insert(0) += 1;
-                }
-            }
-            m
-        };
-
+    ///
+    /// `ws_concurrency_limits` maps workspace IDs to their concurrency limits.
+    /// Workspaces not present in the map use `default_concurrency` (falls back to 1).
+    pub fn advance_ready_to_running(
+        &mut self,
+        ws_concurrency_limits: &HashMap<String, usize>,
+        default_concurrency: usize,
+    ) {
         let ready_indices: Vec<usize> = self
             .queue
             .iter()
@@ -283,24 +281,19 @@ impl Daemon {
             .map(|(i, _)| i)
             .collect();
 
-        let mut ws_started: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-
         for idx in ready_indices {
             let ws = self.queue[idx].workspace_id.clone();
-            let already_running = ws_counts.get(&ws).copied().unwrap_or(0)
-                + ws_started.get(&ws).copied().unwrap_or(0);
-            if already_running >= ws_concurrency {
-                continue;
-            }
+            let ws_limit = ws_concurrency_limits
+                .get(&ws)
+                .copied()
+                .unwrap_or(default_concurrency);
 
-            if !self.tracker.can_spawn() {
-                break;
+            if !self.tracker.can_spawn_in_workspace(&ws, ws_limit as u32) {
+                continue;
             }
 
             if transit(&mut self.queue[idx], QueuePhase::Running).is_ok() {
                 self.tracker.track(&ws);
-                *ws_started.entry(ws).or_insert(0) += 1;
             }
         }
     }
@@ -2072,7 +2065,9 @@ sources:
         daemon.push_item(i2);
         daemon.push_item(i3);
 
-        daemon.advance_ready_to_running(2);
+        // All items belong to "test-ws"; limit that workspace to 2.
+        let limits = HashMap::from([("test-ws".to_string(), 2)]);
+        daemon.advance_ready_to_running(&limits, 1);
 
         assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 2);
         assert_eq!(daemon.items_in_phase(QueuePhase::Ready).len(), 1);
@@ -2091,10 +2086,132 @@ sources:
         daemon.push_item(i1);
         daemon.push_item(i2);
 
-        daemon.advance_ready_to_running(4);
+        let limits = HashMap::from([("test-ws".to_string(), 4)]);
+        daemon.advance_ready_to_running(&limits, 1);
 
         assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 2);
         assert_eq!(daemon.items_in_phase(QueuePhase::Ready).len(), 0);
+    }
+
+    #[test]
+    fn advance_ready_to_running_per_workspace_independent_limits() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // ws-alpha: 3 items, limit 2
+        let mut a1 = test_item("a1", "analyze");
+        a1.workspace_id = "ws-alpha".to_string();
+        a1.phase = QueuePhase::Ready;
+        let mut a2 = test_item("a2", "analyze");
+        a2.workspace_id = "ws-alpha".to_string();
+        a2.phase = QueuePhase::Ready;
+        let mut a3 = test_item("a3", "analyze");
+        a3.workspace_id = "ws-alpha".to_string();
+        a3.phase = QueuePhase::Ready;
+
+        // ws-beta: 2 items, limit 1
+        let mut b1 = test_item("b1", "analyze");
+        b1.workspace_id = "ws-beta".to_string();
+        b1.phase = QueuePhase::Ready;
+        let mut b2 = test_item("b2", "analyze");
+        b2.workspace_id = "ws-beta".to_string();
+        b2.phase = QueuePhase::Ready;
+
+        daemon.push_item(a1);
+        daemon.push_item(a2);
+        daemon.push_item(a3);
+        daemon.push_item(b1);
+        daemon.push_item(b2);
+
+        let limits = HashMap::from([("ws-alpha".to_string(), 2), ("ws-beta".to_string(), 1)]);
+        daemon.advance_ready_to_running(&limits, 1);
+
+        // ws-alpha: 2 running, 1 ready
+        let running: Vec<_> = daemon
+            .items_in_phase(QueuePhase::Running)
+            .into_iter()
+            .filter(|i| i.workspace_id == "ws-alpha")
+            .collect();
+        assert_eq!(running.len(), 2);
+
+        let ready_alpha: Vec<_> = daemon
+            .items_in_phase(QueuePhase::Ready)
+            .into_iter()
+            .filter(|i| i.workspace_id == "ws-alpha")
+            .collect();
+        assert_eq!(ready_alpha.len(), 1);
+
+        // ws-beta: 1 running, 1 ready
+        let running_beta: Vec<_> = daemon
+            .items_in_phase(QueuePhase::Running)
+            .into_iter()
+            .filter(|i| i.workspace_id == "ws-beta")
+            .collect();
+        assert_eq!(running_beta.len(), 1);
+
+        let ready_beta: Vec<_> = daemon
+            .items_in_phase(QueuePhase::Ready)
+            .into_iter()
+            .filter(|i| i.workspace_id == "ws-beta")
+            .collect();
+        assert_eq!(ready_beta.len(), 1);
+    }
+
+    #[test]
+    fn advance_ready_to_running_uses_default_for_unknown_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // 3 items for "unknown-ws", not in limits map; default = 2
+        let mut i1 = test_item("s1", "analyze");
+        i1.workspace_id = "unknown-ws".to_string();
+        i1.phase = QueuePhase::Ready;
+        let mut i2 = test_item("s2", "analyze");
+        i2.workspace_id = "unknown-ws".to_string();
+        i2.phase = QueuePhase::Ready;
+        let mut i3 = test_item("s3", "analyze");
+        i3.workspace_id = "unknown-ws".to_string();
+        i3.phase = QueuePhase::Ready;
+        daemon.push_item(i1);
+        daemon.push_item(i2);
+        daemon.push_item(i3);
+
+        let limits = HashMap::new(); // empty map
+        daemon.advance_ready_to_running(&limits, 2);
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 2);
+        assert_eq!(daemon.items_in_phase(QueuePhase::Ready).len(), 1);
+    }
+
+    #[test]
+    fn advance_ready_to_running_respects_global_limit() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        // Global max_concurrent = 4 from setup_daemon
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Two workspaces, each with limit 3, but global limit is 4
+        for i in 0..3 {
+            let mut item = test_item(&format!("a{i}"), "analyze");
+            item.workspace_id = "ws-a".to_string();
+            item.phase = QueuePhase::Ready;
+            daemon.push_item(item);
+        }
+        for i in 0..3 {
+            let mut item = test_item(&format!("b{i}"), "analyze");
+            item.workspace_id = "ws-b".to_string();
+            item.phase = QueuePhase::Ready;
+            daemon.push_item(item);
+        }
+
+        let limits = HashMap::from([("ws-a".to_string(), 3), ("ws-b".to_string(), 3)]);
+        daemon.advance_ready_to_running(&limits, 1);
+
+        // Global limit is 4, so only 4 total should be running
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 4);
+        assert_eq!(daemon.items_in_phase(QueuePhase::Ready).len(), 2);
     }
 
     // ---------------------------------------------------------------
