@@ -772,11 +772,22 @@ impl CronHandler for GapDetectionJob {
             }
         }
 
-        // Step 5: Transition fully-covered specs to Completing.
+        // Step 5: Transition fully-covered specs to Completing and create HITL items.
         // Per spec lifecycle, Active -> Completing when gap-detection finds
-        // no gaps. The HITL final confirmation flow will then advance to Completed.
+        // no gaps. A HITL queue item is created for final human confirmation
+        // before the spec can advance to Completed.
         let mut completing_count = 0usize;
         for spec_id in &covered_spec_ids {
+            // Skip if there is already an open queue item for this spec
+            // (avoids duplicate HITL items on repeated cron runs).
+            if self.db.has_open_items_for_source(spec_id).unwrap_or(false) {
+                tracing::debug!(
+                    spec_id = %spec_id,
+                    "GapDetectionJob: skipping Completing transition — open item exists"
+                );
+                continue;
+            }
+
             if let Err(e) = self
                 .db
                 .update_spec_status(spec_id, belt_core::spec::SpecStatus::Completing)
@@ -792,6 +803,40 @@ impl CronHandler for GapDetectionJob {
                     "GapDetectionJob: spec transitioned to Completing (no gaps found)"
                 );
                 completing_count += 1;
+
+                // Create a HITL queue item for spec-completion final review.
+                let now = chrono::Utc::now().to_rfc3339();
+                let mut hitl_item = belt_core::queue::QueueItem::new(
+                    format!("{spec_id}:spec-completion-review"),
+                    spec_id.clone(),
+                    String::new(), // workspace_id filled below
+                    "spec-completion-review".to_string(),
+                );
+                // Look up the spec to populate workspace_id.
+                if let Ok(s) = self.db.get_spec(spec_id) {
+                    hitl_item.workspace_id = s.workspace_id;
+                    hitl_item.title = Some(format!("Spec completion review: {}", s.name));
+                }
+                hitl_item.phase = QueuePhase::Hitl;
+                hitl_item.hitl_created_at = Some(now);
+                hitl_item.hitl_reason = Some(belt_core::queue::HitlReason::SpecCompletionReview);
+                hitl_item.hitl_notes = Some(format!(
+                    "spec-completion-review: spec '{spec_id}' passed gap detection, awaiting human approval to mark Completed"
+                ));
+
+                if let Err(e) = self.db.insert_item(&hitl_item) {
+                    tracing::warn!(
+                        spec_id = %spec_id,
+                        error = %e,
+                        "GapDetectionJob: failed to create HITL item for spec completion review"
+                    );
+                } else {
+                    tracing::info!(
+                        spec_id = %spec_id,
+                        work_id = %hitl_item.work_id,
+                        "GapDetectionJob: created HITL item for spec completion review"
+                    );
+                }
             }
         }
 

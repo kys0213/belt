@@ -192,7 +192,7 @@ impl Daemon {
     pub fn advance(&mut self) -> usize {
         let mut advanced = 0;
 
-        // Pending -> Ready (uses safe transit + dependency gate)
+        // Pending -> Ready (uses safe transit + dependency gate + conflict detection)
         // Collect indices first to avoid borrow issues with self.
         let pending_indices: Vec<usize> = self
             .queue
@@ -219,6 +219,21 @@ impl Daemon {
 
             if transit(&mut self.queue[idx], QueuePhase::Ready).is_ok() {
                 advanced += 1;
+
+                // Conflict detection: after transitioning to Ready, check if spec
+                // entry_points overlap with other active specs. If so, escalate to HITL.
+                let conflict = self.check_conflict_gate(&self.queue[idx].source_id.clone());
+                if let Some(notes) = conflict {
+                    tracing::warn!(
+                        work_id = %self.queue[idx].work_id,
+                        "spec conflict detected, escalating to HITL: {notes}"
+                    );
+                    let now = Utc::now().to_rfc3339();
+                    let _ = transit(&mut self.queue[idx], QueuePhase::Hitl);
+                    self.queue[idx].hitl_created_at = Some(now);
+                    self.queue[idx].hitl_reason = Some(HitlReason::SpecConflict);
+                    self.queue[idx].hitl_notes = Some(notes);
+                }
             }
         }
 
@@ -316,6 +331,43 @@ impl Daemon {
         }
 
         result.is_ready()
+    }
+
+    /// Check whether a queue item's associated spec has entry_point conflicts
+    /// with other active specs.
+    ///
+    /// Returns `Some(notes)` with conflict details when a conflict is detected,
+    /// or `None` when no conflict exists. If no database is configured or no
+    /// matching spec is found, returns `None` (gate open).
+    fn check_conflict_gate(&self, source_id: &str) -> Option<String> {
+        let db = match &self.db {
+            Some(db) => db,
+            None => return None,
+        };
+
+        let spec = match db.get_spec(source_id) {
+            Ok(spec) => spec,
+            Err(_) => return None,
+        };
+
+        let db_ref = Arc::clone(db);
+        let result = self.dependency_guard.check_conflicts(&spec, || {
+            db_ref
+                .list_specs(None, Some(belt_core::spec::SpecStatus::Active))
+                .unwrap_or_default()
+        });
+
+        match result {
+            belt_core::dependency::ConflictCheckResult::Clear => None,
+            belt_core::dependency::ConflictCheckResult::Conflict {
+                conflicting_specs,
+                overlapping_paths,
+            } => Some(format!(
+                "spec-conflict: entry_point overlap with [{}] on paths [{}]",
+                conflicting_specs.join(", "),
+                overlapping_paths.join(", ")
+            )),
+        }
     }
 
     // ---------------------------------------------------------------
