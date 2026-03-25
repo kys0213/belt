@@ -1,10 +1,14 @@
 //! Status display for `belt status` and `belt spec status`.
 //!
 //! Supports `text`, `json`, and `rich` output formats.
-//! The `rich` format includes runtime statistics alongside system status.
+//! The `rich` format uses crossterm colours, box-drawing tables, and a
+//! progress bar to visualise queue-phase distribution in the terminal.
+
+use std::io::{self, Write};
 
 use belt_core::phase::QueuePhase;
 use belt_infra::db::{Database, RuntimeStats};
+use crossterm::style::{self, Stylize};
 use serde::Serialize;
 
 use crate::dashboard;
@@ -581,6 +585,7 @@ mod tests {
         assert_eq!(spec_status.phase_counts[0].phase, "pending");
     }
 
+
     // ---- token usage in spec status ----
 
     #[test]
@@ -623,6 +628,77 @@ mod tests {
             assert_eq!(m.total_tokens, 1_500);
             assert_eq!(m.executions, 1);
         }
+    }
+
+    // ---- rich format helpers ----
+
+    #[test]
+    fn to_crossterm_color_maps_known_phases() {
+        use ratatui::style::Color as RC;
+
+        assert_eq!(
+            super::to_crossterm_color(RC::Gray),
+            crossterm::style::Color::Grey,
+        );
+        assert_eq!(
+            super::to_crossterm_color(RC::Red),
+            crossterm::style::Color::Red,
+        );
+        assert_eq!(
+            super::to_crossterm_color(RC::Green),
+            crossterm::style::Color::Green,
+        );
+        assert_eq!(
+            super::to_crossterm_color(RC::Yellow),
+            crossterm::style::Color::Yellow,
+        );
+    }
+
+    #[test]
+    fn to_crossterm_color_unknown_falls_back_to_white() {
+        assert_eq!(
+            super::to_crossterm_color(ratatui::style::Color::Magenta),
+            crossterm::style::Color::White,
+        );
+    }
+
+    #[test]
+    fn print_status_rich_does_not_panic() {
+        let status = SystemStatus {
+            total_items: 5,
+            hitl_count: 0,
+            phase_counts: vec![
+                PhaseCount {
+                    phase: "pending".to_string(),
+                    count: 2,
+                },
+                PhaseCount {
+                    phase: "running".to_string(),
+                    count: 1,
+                },
+                PhaseCount {
+                    phase: "done".to_string(),
+                    count: 2,
+                },
+            ],
+            running_items: vec![ItemSummary {
+                work_id: "w1:impl".to_string(),
+                workspace: "ws-a".to_string(),
+                state: "running".to_string(),
+                phase: "running".to_string(),
+                updated_at: "2026-03-25T00:00:00Z".to_string(),
+            }],
+            recent_events: vec![EventSummary {
+                item_id: "w1:impl".to_string(),
+                from_state: "pending".to_string(),
+                to_state: "running".to_string(),
+                event_type: "phase_change".to_string(),
+                timestamp: "2026-03-25T00:00:00Z".to_string(),
+            }],
+            runtime_stats: None,
+        };
+        // Should not panic
+        super::print_rich_status(&status);
     }
 
     // ---- print_rich_spec_status output ----
@@ -712,6 +788,20 @@ mod tests {
         assert_eq!(super::fmt_num(1_000), "1,000");
         assert_eq!(super::fmt_num(1_234_567), "1,234,567");
     }
+
+    #[test]
+    fn print_status_rich_format_dispatches_correctly() {
+        let status = SystemStatus {
+            total_items: 0,
+            hitl_count: 0,
+            phase_counts: vec![],
+            running_items: vec![],
+            recent_events: vec![],
+            runtime_stats: None,
+        };
+        // Calling print_status with "rich" should not panic.
+        super::print_status(&status, "rich").unwrap();
+    }
 }
 
 fn print_text_status(status: &SystemStatus) {
@@ -765,45 +855,109 @@ fn print_text_status(status: &SystemStatus) {
     }
 }
 
-fn print_rich_status(status: &SystemStatus) {
-    println!("+--------------------------------------+");
-    println!("|        Belt System Status            |");
-    println!("+--------------------------------------+");
-    println!("| Total items: {:<23} |", status.total_items);
-    if status.hitl_count > 0 {
-        println!("| \x1b[31mHITL:        {:<23}\x1b[0m |", status.hitl_count);
-    } else {
-        println!("| HITL:        {:<23} |", 0);
+/// Map a ratatui [`ratatui::style::Color`] to the corresponding
+/// [`crossterm::style::Color`] for terminal output outside the TUI.
+fn to_crossterm_color(c: ratatui::style::Color) -> crossterm::style::Color {
+    match c {
+        ratatui::style::Color::Gray => crossterm::style::Color::Grey,
+        ratatui::style::Color::Blue => crossterm::style::Color::Blue,
+        ratatui::style::Color::Green => crossterm::style::Color::Green,
+        ratatui::style::Color::Cyan => crossterm::style::Color::Cyan,
+        ratatui::style::Color::White => crossterm::style::Color::White,
+        ratatui::style::Color::Yellow => crossterm::style::Color::Yellow,
+        ratatui::style::Color::Red => crossterm::style::Color::Red,
+        ratatui::style::Color::DarkGray => crossterm::style::Color::DarkGrey,
+        _ => crossterm::style::Color::White,
     }
-    println!("+--------------------------------------+");
-    if !status.phase_counts.is_empty() {
-        println!("| Phase          | Count               |");
-        println!("+----------------+---------------------+");
-        for pc in &status.phase_counts {
-            println!("| {:<14} | {:<19} |", pc.phase, pc.count);
-        }
-        println!("+----------------+---------------------+");
-    }
+}
 
-    if !status.running_items.is_empty() {
-        println!();
-        println!("+-- Running Items ----------------------+");
-        for item in &status.running_items {
-            println!(
-                "| {:<36} |",
-                format!("{} ({})", item.work_id, item.workspace)
+
+fn print_rich_status(status: &SystemStatus) {
+    let mut stdout = io::stdout();
+
+    // Header
+    let _ = writeln!(
+        stdout,
+        "\u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}"
+    );
+    let title = format!("{:^36}", "Belt System Status").bold();
+    let _ = writeln!(stdout, "\u{2502} {title}  \u{2502}");
+    let _ = writeln!(
+        stdout,
+        "\u{251c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2524}"
+    );
+    let _ = writeln!(
+        stdout,
+        "\u{2502} Total items: {:<23} \u{2502}",
+        status.total_items
+    );
+    let _ = writeln!(
+        stdout,
+        "\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}"
+    );
+
+    // Phase table with colours
+    if !status.phase_counts.is_empty() {
+        let _ = writeln!(stdout);
+        let _ = writeln!(
+            stdout,
+            "  {} {:<14} {} {:<8}",
+            "\u{2502}".dark_grey(),
+            "Phase".bold().underlined(),
+            "\u{2502}".dark_grey(),
+            "Count".bold().underlined(),
+        );
+        let _ = writeln!(
+            stdout,
+            "  {}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{253c}".dark_grey(),
+            "\u{253c}".dark_grey(),
+        );
+        for pc in &status.phase_counts {
+            let color = to_crossterm_color(dashboard::phase_color(&pc.phase));
+            let phase_styled = style::style(format!("{:<14}", pc.phase)).with(color);
+            let _ = writeln!(
+                stdout,
+                "  {} {phase_styled} {} {:<8}",
+                "\u{2502}".dark_grey(),
+                "\u{2502}".dark_grey(),
+                pc.count,
             );
         }
-        println!("+--------------------------------------+");
+
     }
 
-    if !status.recent_events.is_empty() {
-        println!();
-        println!("+-- Recent Transitions -----------------+");
-        for ev in &status.recent_events {
-            println!("| {} -> {} [{}]", ev.from_state, ev.to_state, ev.event_type);
+    // Running items
+    if !status.running_items.is_empty() {
+        let _ = writeln!(stdout);
+        let _ = writeln!(stdout, "  {}", "Running Items".bold().green());
+        for item in &status.running_items {
+            let _ = writeln!(
+                stdout,
+                "    {} {} {}",
+                "\u{25cf}".green(),
+                item.work_id,
+                format!("({})", item.workspace).dark_grey(),
+            );
         }
-        println!("+--------------------------------------+");
+    }
+
+    // Recent transitions
+    if !status.recent_events.is_empty() {
+        let _ = writeln!(stdout);
+        let _ = writeln!(stdout, "  {}", "Recent Transitions".bold());
+        for ev in &status.recent_events {
+            let from_color = to_crossterm_color(dashboard::phase_color(&ev.from_state));
+            let to_color = to_crossterm_color(dashboard::phase_color(&ev.to_state));
+            let from = style::style(&ev.from_state).with(from_color);
+            let to = style::style(&ev.to_state).with(to_color);
+            let _ = writeln!(
+                stdout,
+                "    {from} \u{2192} {to}  {} {}",
+                ev.item_id.as_str().dark_grey(),
+                format!("[{}]", ev.event_type).dark_grey(),
+            );
+        }
     }
 
     if status.hitl_count > 0 {
@@ -831,27 +985,65 @@ fn print_text_spec_status(status: &SpecStatus) {
 }
 
 fn print_rich_spec_status(status: &SpecStatus) {
-    println!("+--------------------------------------+");
-    println!("| Workspace: {:<25} |", status.workspace);
-    println!("| Config:    {:<25} |", status.config_path);
-    println!("| Items:     {:<25} |", status.item_count);
-    println!("+--------------------------------------+");
+    let mut stdout = io::stdout();
+
+    let _ = writeln!(
+        stdout,
+        "\u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}"
+    );
+    let ws_name = status.workspace.clone().bold();
+    let _ = writeln!(stdout, "\u{2502} Workspace: {ws_name:<25} \u{2502}");
+    let _ = writeln!(
+        stdout,
+        "\u{2502} Config:    {:<25} \u{2502}",
+        status.config_path
+    );
+    let _ = writeln!(
+        stdout,
+        "\u{2502} Items:     {:<25} \u{2502}",
+        status.item_count
+    );
+    let _ = writeln!(
+        stdout,
+        "\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}"
+    );
 
     if !status.phase_counts.is_empty() {
-        println!();
-        println!("+-- AC Progress ---------------------------+");
-        println!("| Phase          | Count | Progress        |");
-        println!("+----------------+-------+-----------------+");
+        let _ = writeln!(stdout);
+        let _ = writeln!(
+            stdout,
+            "  {} {:<14} {} {:<8} {} {}",
+            "\u{2502}".dark_grey(),
+            "Phase".bold().underlined(),
+            "\u{2502}".dark_grey(),
+            "Count".bold().underlined(),
+            "\u{2502}".dark_grey(),
+            "Progress".bold().underlined(),
+        );
+        let _ = writeln!(
+            stdout,
+            "  {}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{253c}".dark_grey(),
+            "\u{253c}".dark_grey(),
+            "\u{253c}".dark_grey(),
+        );
         let total = status.item_count.max(1);
         for pc in &status.phase_counts {
+            let color = to_crossterm_color(dashboard::phase_color(&pc.phase));
+            let phase_styled = style::style(format!("{:<14}", pc.phase)).with(color);
             let pct = (pc.count as f64 / total as f64 * 100.0) as u32;
             let bar = render_progress_bar(pct, 12);
-            println!(
-                "| {:<14} | {:>5} | {} {:>3}% |",
-                pc.phase, pc.count, bar, pct
+            let _ = writeln!(
+                stdout,
+                "  {} {phase_styled} {} {:<8} {} {} {:>3}%",
+                "\u{2502}".dark_grey(),
+                "\u{2502}".dark_grey(),
+                pc.count,
+                "\u{2502}".dark_grey(),
+                bar,
+                pct,
             );
         }
-        println!("+----------------+-------+-----------------+");
 
         // Overall completion: done + completed + skipped as "finished"
         let finished: u32 = status
@@ -862,34 +1054,41 @@ fn print_rich_spec_status(status: &SpecStatus) {
             .sum();
         let overall_pct = (finished as f64 / total as f64 * 100.0) as u32;
         let overall_bar = render_progress_bar(overall_pct, 28);
-        println!(
-            "| Overall: {}/{:<5} {} {:>3}% |",
+        let _ = writeln!(stdout);
+        let _ = writeln!(
+            stdout,
+            "  Overall: {}/{} {} {:>3}%",
             finished, total, overall_bar, overall_pct
         );
-        println!("+------------------------------------------+");
     }
 
     // Token usage analysis
     if let Some(ref usage) = status.token_usage {
-        println!();
-        println!("+-- Token Usage ----------------------------+");
-        println!(
-            "| Total:  {} (in: {} / out: {})",
+        let _ = writeln!(stdout);
+        let _ = writeln!(stdout, "  {}", "Token Usage".bold());
+        let _ = writeln!(
+            stdout,
+            "  Total:  {} (in: {} / out: {})",
             fmt_num(usage.total_tokens),
             fmt_num(usage.total_input),
             fmt_num(usage.total_output),
         );
-        println!("| Executions: {}", usage.executions);
+        let _ = writeln!(stdout, "  Executions: {}", usage.executions);
         if !usage.by_model.is_empty() {
-            println!("|");
-            println!(
-                "| {:<20} {:>10} {:>10} {:>10} {:>5}",
-                "Model", "Input", "Output", "Total", "Runs"
+            let _ = writeln!(stdout);
+            let _ = writeln!(
+                stdout,
+                "  {:<20} {:>10} {:>10} {:>10} {:>5}",
+                "Model".bold().underlined(),
+                "Input".bold().underlined(),
+                "Output".bold().underlined(),
+                "Total".bold().underlined(),
+                "Runs".bold().underlined(),
             );
-            println!("| {}", "-".repeat(58));
             for m in &usage.by_model {
-                println!(
-                    "| {:<20} {:>10} {:>10} {:>10} {:>5}",
+                let _ = writeln!(
+                    stdout,
+                    "  {:<20} {:>10} {:>10} {:>10} {:>5}",
                     m.model,
                     fmt_num(m.input_tokens),
                     fmt_num(m.output_tokens),
@@ -898,7 +1097,6 @@ fn print_rich_spec_status(status: &SpecStatus) {
                 );
             }
         }
-        println!("+-------------------------------------------+");
     }
 }
 

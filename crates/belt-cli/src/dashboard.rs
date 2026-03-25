@@ -1068,7 +1068,10 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
-fn phase_color(phase: &str) -> Color {
+/// Return the ratatui [`Color`] associated with a queue phase name.
+///
+/// Used by the dashboard TUI and the `belt status --format rich` output.
+pub fn phase_color(phase: &str) -> Color {
     match phase {
         "pending" => Color::Gray,
         "ready" => Color::Blue,
