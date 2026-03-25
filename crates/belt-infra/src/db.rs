@@ -1805,7 +1805,9 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> Result<Spec, BeltError> {
         depends_on: row.get(7).map_err(|e| BeltError::Database(e.to_string()))?,
         entry_point: row.get(8).map_err(|e| BeltError::Database(e.to_string()))?,
         decomposed_issues: row.get(9).map_err(|e| BeltError::Database(e.to_string()))?,
-        test_commands: row.get(10).map_err(|e| BeltError::Database(e.to_string()))?,
+        test_commands: row
+            .get(10)
+            .map_err(|e| BeltError::Database(e.to_string()))?,
         created_at: row
             .get(11)
             .map_err(|e| BeltError::Database(e.to_string()))?,

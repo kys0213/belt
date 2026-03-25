@@ -660,12 +660,7 @@ fn all_linked_issues_done(db: &Database, spec_id: &str) -> bool {
                 let idx = parts.iter().position(|p| *p == "issues");
                 if let Some(i) = idx {
                     if i >= 2 && i + 1 < parts.len() {
-                        format!(
-                            "{}/{}#{}",
-                            parts[i - 2],
-                            parts[i - 1],
-                            parts[i + 1]
-                        )
+                        format!("{}/{}#{}", parts[i - 2], parts[i - 1], parts[i + 1])
                     } else {
                         continue;
                     }
