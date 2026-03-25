@@ -20,7 +20,7 @@ use belt_infra::db::Database;
 use belt_infra::worktree::WorktreeManager;
 
 use crate::concurrency::ConcurrencyTracker;
-use crate::cron::{BuiltinJobDeps, CronEngine, builtin_jobs};
+use crate::cron::{BuiltinJobDeps, CronEngine, builtin_jobs, seed_workspace_crons};
 use crate::evaluator::Evaluator;
 use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
 
@@ -142,6 +142,22 @@ impl Daemon {
         for job in builtin_jobs(deps) {
             cron.register(job);
         }
+
+        // Seed per-workspace cron jobs for all registered workspaces (CR-13).
+        // This ensures that workspace-scoped cron handlers are active when the
+        // daemon starts, not only when `workspace add` is run.
+        if let Ok(workspaces) = db.list_workspaces() {
+            for (ws_name, _config_path, _created_at) in &workspaces {
+                let ws_deps = BuiltinJobDeps {
+                    db: Arc::clone(&db),
+                    worktree_mgr: Arc::clone(&self.worktree_mgr),
+                    workspace_root: self.belt_home.clone(),
+                };
+                seed_workspace_crons(&mut cron, ws_name, ws_deps);
+                tracing::info!(workspace = %ws_name, "seeded per-workspace cron jobs");
+            }
+        }
+
         self.cron_engine = Some(cron);
         self.db = Some(db);
         self
