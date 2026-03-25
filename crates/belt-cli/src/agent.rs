@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -15,6 +16,82 @@ fn load_workspace_config(path: &str) -> Result<WorkspaceConfig> {
     let config: WorkspaceConfig =
         serde_yaml::from_str(&content).with_context(|| "failed to parse workspace config")?;
     Ok(config)
+}
+
+/// Resolve the workspace rules directory path.
+///
+/// Priority:
+/// 1. `claw_config.rules_path` (explicit override from workspace YAML)
+/// 2. Per-workspace Claw directory: `~/.belt/workspaces/<name>/claw/system/`
+/// 3. Global Claw workspace: `~/.belt/claw-workspace/.claude/rules/`
+///
+/// Returns `None` if no rules directory is found.
+fn resolve_rules_dir(config: &WorkspaceConfig) -> Option<PathBuf> {
+    // 1. Explicit rules_path in claw_config.
+    if let Some(ref claw) = config.claw_config
+        && let Some(ref path) = claw.rules_path
+    {
+        let p = PathBuf::from(path);
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
+
+    // 2. Per-workspace Claw directory under BELT_HOME.
+    let belt_home = std::env::var("BELT_HOME")
+        .map(PathBuf::from)
+        .ok()
+        .or_else(|| dirs::home_dir().map(|h| h.join(".belt")));
+
+    if let Some(ref home) = belt_home {
+        let ws_rules = home
+            .join("workspaces")
+            .join(&config.name)
+            .join("claw")
+            .join("system");
+        if ws_rules.is_dir() {
+            return Some(ws_rules);
+        }
+    }
+
+    // 3. Global Claw workspace rules.
+    if let Some(ref home) = belt_home {
+        let global_rules = home.join("claw-workspace").join(".claude").join("rules");
+        if global_rules.is_dir() {
+            return Some(global_rules);
+        }
+    }
+
+    None
+}
+
+/// Load all `.md` rule files from a directory into a single system prompt.
+///
+/// Files are sorted by name for deterministic ordering and concatenated
+/// with a header per file.
+fn load_rules_from_dir(dir: &Path) -> Result<Option<String>> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("failed to read rules directory: {}", dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "md"))
+        .collect();
+
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    entries.sort();
+
+    let mut parts = Vec::new();
+    for path in &entries {
+        let filename = path.file_name().unwrap_or_default().to_string_lossy();
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read rule file: {}", path.display()))?;
+        parts.push(format!("# Rule: {filename}\n\n{content}"));
+    }
+
+    Ok(Some(parts.join("\n\n---\n\n")))
 }
 
 /// Build a RuntimeRegistry from workspace config.
@@ -53,13 +130,19 @@ fn collect_actions(config: &WorkspaceConfig, prompt_override: Option<&str>) -> V
 }
 
 /// Plan output: display what would be executed without running.
-fn print_plan(config: &WorkspaceConfig, actions: &[Action], json_output: bool) -> Result<()> {
+fn print_plan(
+    config: &WorkspaceConfig,
+    actions: &[Action],
+    rules_dir: Option<&Path>,
+    json_output: bool,
+) -> Result<()> {
     if json_output {
         let plan = serde_json::json!({
             "workspace": config.name,
             "runtime": {
                 "default": config.runtime.default,
             },
+            "rules_dir": rules_dir.map(|p| p.display().to_string()),
             "actions": actions.iter().map(|a| match a {
                 Action::Prompt { text, runtime, model } => serde_json::json!({
                     "type": "prompt",
@@ -77,6 +160,11 @@ fn print_plan(config: &WorkspaceConfig, actions: &[Action], json_output: bool) -
     } else {
         println!("Plan for workspace: {}", config.name);
         println!("Default runtime: {}", config.runtime.default);
+        if let Some(dir) = rules_dir {
+            println!("Rules directory: {}", dir.display());
+        } else {
+            println!("Rules directory: (none)");
+        }
         println!("Actions ({}):", actions.len());
         for (i, action) in actions.iter().enumerate() {
             match action {
@@ -403,6 +491,91 @@ runtime:
         assert!(action["runtime"].is_null());
         assert!(action["model"].is_null());
     }
+
+    // ---- load_rules_from_dir ----
+
+    #[test]
+    fn load_rules_from_dir_empty_directory_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = load_rules_from_dir(tmp.path()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn load_rules_from_dir_loads_md_files_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("b-policy.md"), "Rule B content").unwrap();
+        std::fs::write(tmp.path().join("a-policy.md"), "Rule A content").unwrap();
+        // Non-md file should be ignored.
+        std::fs::write(tmp.path().join("notes.txt"), "ignored").unwrap();
+
+        let result = load_rules_from_dir(tmp.path()).unwrap().unwrap();
+        // a-policy.md should come before b-policy.md (sorted).
+        assert!(result.contains("Rule A content"));
+        assert!(result.contains("Rule B content"));
+        assert!(!result.contains("ignored"));
+
+        // Verify ordering: A before B.
+        let a_pos = result.find("a-policy.md").unwrap();
+        let b_pos = result.find("b-policy.md").unwrap();
+        assert!(a_pos < b_pos);
+    }
+
+    #[test]
+    fn load_rules_from_dir_nonexistent_directory_errors() {
+        let result = load_rules_from_dir(Path::new("/nonexistent/rules"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_rules_from_dir_includes_file_headers() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("hitl-policy.md"), "HITL rules here").unwrap();
+
+        let result = load_rules_from_dir(tmp.path()).unwrap().unwrap();
+        assert!(result.contains("# Rule: hitl-policy.md"));
+        assert!(result.contains("HITL rules here"));
+    }
+
+    // ---- resolve_rules_dir ----
+
+    #[test]
+    fn resolve_rules_dir_explicit_path_takes_priority() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rules_dir = tmp.path().join("custom-rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+
+        let mut config = empty_workspace();
+        config.claw_config = Some(belt_core::workspace::ClawConfig {
+            rules_path: Some(rules_dir.to_string_lossy().to_string()),
+            ..Default::default()
+        });
+
+        let resolved = resolve_rules_dir(&config);
+        assert_eq!(resolved, Some(rules_dir));
+    }
+
+    #[test]
+    fn resolve_rules_dir_returns_none_when_no_dirs_exist() {
+        let config = empty_workspace();
+        // With no BELT_HOME set and no explicit rules_path, this should not
+        // panic. The result depends on the environment, but the function
+        // should not error.
+        let _ = resolve_rules_dir(&config);
+    }
+
+    #[test]
+    fn resolve_rules_dir_skips_nonexistent_explicit_path() {
+        let mut config = empty_workspace();
+        config.claw_config = Some(belt_core::workspace::ClawConfig {
+            rules_path: Some("/nonexistent/rules/dir".to_string()),
+            ..Default::default()
+        });
+
+        // The explicit path doesn't exist, so it should fall through.
+        // Result depends on the environment but should not panic.
+        let _ = resolve_rules_dir(&config);
+    }
 }
 
 /// Entry point for `belt agent` command.
@@ -425,7 +598,8 @@ pub async fn run_agent(
     }
 
     if plan {
-        print_plan(&config, &actions, json_output)?;
+        let rules_dir = resolve_rules_dir(&config);
+        print_plan(&config, &actions, rules_dir.as_deref(), json_output)?;
         return Ok(0);
     }
 
@@ -435,11 +609,38 @@ pub async fn run_agent(
 
     // Use current directory as working directory.
     let working_dir = std::env::current_dir().context("failed to determine current directory")?;
-    let env = ActionEnv::new("cli-agent", &working_dir);
+
+    // Resolve workspace rules and inject as system prompt.
+    let mut env = ActionEnv::new("cli-agent", &working_dir);
+    if let Some(rules_dir) = resolve_rules_dir(&config) {
+        match load_rules_from_dir(&rules_dir) {
+            Ok(Some(system_prompt)) => {
+                tracing::info!(
+                    rules_dir = %rules_dir.display(),
+                    "loaded workspace rules as system prompt"
+                );
+                env = env.with_system_prompt(system_prompt);
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    rules_dir = %rules_dir.display(),
+                    "rules directory exists but contains no .md files"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    rules_dir = %rules_dir.display(),
+                    error = %e,
+                    "failed to load workspace rules, continuing without"
+                );
+            }
+        }
+    }
 
     tracing::info!(
         workspace = config.name,
         actions = actions.len(),
+        has_rules = env.system_prompt.is_some(),
         "executing agent"
     );
 

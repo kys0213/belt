@@ -112,7 +112,7 @@ impl ActionExecutor {
             working_dir: env.worktree.clone(),
             prompt: text.to_string(),
             model: resolved_model.clone(),
-            system_prompt: None,
+            system_prompt: env.system_prompt.clone(),
             session_id: None,
             structured_output: None,
         };
@@ -174,6 +174,11 @@ pub struct ActionEnv {
     pub work_id: String,
     pub worktree: PathBuf,
     pub extra_vars: HashMap<String, String>,
+    /// Optional system prompt injected from workspace rules.
+    ///
+    /// When set, this is passed as the `system_prompt` field on
+    /// [`RuntimeRequest`] for prompt actions.
+    pub system_prompt: Option<String>,
 }
 
 impl ActionEnv {
@@ -182,11 +187,18 @@ impl ActionEnv {
             work_id: work_id.to_string(),
             worktree: worktree.to_path_buf(),
             extra_vars: HashMap::new(),
+            system_prompt: None,
         }
     }
 
     pub fn with_var(mut self, key: &str, value: &str) -> Self {
         self.extra_vars.insert(key.to_string(), value.to_string());
+        self
+    }
+
+    /// Set the system prompt for agent runtime invocations.
+    pub fn with_system_prompt(mut self, prompt: String) -> Self {
+        self.system_prompt = Some(prompt);
         self
     }
 }
@@ -375,6 +387,23 @@ mod tests {
         assert_eq!(env.worktree, PathBuf::from("/workspace"));
         assert_eq!(env.extra_vars.get("FOO").map(|s| s.as_str()), Some("bar"));
         assert_eq!(env.extra_vars.get("BAZ").map(|s| s.as_str()), Some("qux"));
+    }
+
+    #[test]
+    fn action_env_with_system_prompt_builder() {
+        let env = ActionEnv::new("wid", Path::new("/workspace"))
+            .with_system_prompt("You are a code assistant.".to_string());
+
+        assert_eq!(
+            env.system_prompt.as_deref(),
+            Some("You are a code assistant.")
+        );
+    }
+
+    #[test]
+    fn action_env_system_prompt_defaults_to_none() {
+        let env = ActionEnv::new("wid", Path::new("/workspace"));
+        assert!(env.system_prompt.is_none());
     }
 
     #[tokio::test]

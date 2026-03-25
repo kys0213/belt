@@ -37,6 +37,12 @@ pub struct ClawConfig {
     /// Custom slash commands enabled for this workspace.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enabled_commands: Vec<String>,
+    /// Path to workspace-specific rules directory.
+    ///
+    /// When set, all `.md` files in this directory are loaded and injected
+    /// as context into the agent runtime's system prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules_path: Option<String>,
 }
 
 /// DataSource별 설정.
@@ -312,5 +318,35 @@ claw_config:
         assert!(claw.auto_approve);
         assert_eq!(claw.hitl_policy.as_deref(), Some("custom-hitl.md"));
         assert_eq!(claw.enabled_commands, vec!["auto", "spec"]);
+    }
+
+    #[test]
+    fn claw_config_parses_rules_path() {
+        let yaml = r#"
+name: with-rules
+sources:
+  github:
+    url: https://github.com/org/repo
+claw_config:
+  rules_path: /custom/rules
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let claw = config.claw_config.unwrap();
+        assert_eq!(claw.rules_path.as_deref(), Some("/custom/rules"));
+    }
+
+    #[test]
+    fn claw_config_rules_path_defaults_to_none() {
+        let yaml = r#"
+name: no-rules
+sources:
+  github:
+    url: https://github.com/org/repo
+claw_config:
+  auto_approve: false
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let claw = config.claw_config.unwrap();
+        assert!(claw.rules_path.is_none());
     }
 }
