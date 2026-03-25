@@ -585,7 +585,6 @@ mod tests {
         assert_eq!(spec_status.phase_counts[0].phase, "pending");
     }
 
-
     // ---- token usage in spec status ----
 
     #[test]
@@ -1090,7 +1089,6 @@ fn to_crossterm_color(c: ratatui::style::Color) -> crossterm::style::Color {
     }
 }
 
-
 fn print_rich_status(status: &SystemStatus) {
     let mut stdout = io::stdout();
 
@@ -1143,7 +1141,6 @@ fn print_rich_status(status: &SystemStatus) {
                 pc.count,
             );
         }
-
     }
 
     // Running items
