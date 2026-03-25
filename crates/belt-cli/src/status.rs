@@ -802,6 +802,225 @@ mod tests {
         // Calling print_status with "rich" should not panic.
         super::print_status(&status, "rich").unwrap();
     }
+
+    // ---- formatter test helpers ----
+
+    fn sample_system_status() -> SystemStatus {
+        SystemStatus {
+            total_items: 3,
+            hitl_count: 0,
+            phase_counts: vec![
+                PhaseCount {
+                    phase: "pending".to_string(),
+                    count: 1,
+                },
+                PhaseCount {
+                    phase: "running".to_string(),
+                    count: 2,
+                },
+            ],
+            running_items: vec![ItemSummary {
+                work_id: "w1:implement".to_string(),
+                workspace: "ws-a".to_string(),
+                state: "active".to_string(),
+                phase: "running".to_string(),
+                updated_at: "2026-01-01T00:00:00Z".to_string(),
+            }],
+            recent_events: vec![EventSummary {
+                item_id: "w1:implement".to_string(),
+                from_state: "pending".to_string(),
+                to_state: "running".to_string(),
+                event_type: "phase_change".to_string(),
+                timestamp: "2026-01-01T00:00:00Z".to_string(),
+            }],
+            runtime_stats: Some(sample_stats()),
+        }
+    }
+
+    fn empty_system_status() -> SystemStatus {
+        SystemStatus {
+            total_items: 0,
+            hitl_count: 0,
+            phase_counts: vec![],
+            running_items: vec![],
+            recent_events: vec![],
+            runtime_stats: None,
+        }
+    }
+
+    fn sample_spec_status() -> SpecStatus {
+        SpecStatus {
+            workspace: "ws-test".to_string(),
+            config_path: "/path/to/config.yaml".to_string(),
+            item_count: 5,
+            phase_counts: vec![
+                PhaseCount {
+                    phase: "done".to_string(),
+                    count: 3,
+                },
+                PhaseCount {
+                    phase: "pending".to_string(),
+                    count: 2,
+                },
+            ],
+            token_usage: None,
+        }
+    }
+
+    fn empty_spec_status() -> SpecStatus {
+        SpecStatus {
+            workspace: "ws-empty".to_string(),
+            config_path: "/empty/config.yaml".to_string(),
+            item_count: 0,
+            phase_counts: vec![],
+            token_usage: None,
+        }
+    }
+
+    // ---- print_status (format dispatcher) ----
+
+    #[test]
+    fn print_status_json_format_returns_ok() {
+        let status = sample_system_status();
+        let result = print_status(&status, "json");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_status_json_contains_expected_fields() {
+        let status = sample_system_status();
+        let json = serde_json::to_string_pretty(&status).unwrap();
+        assert!(json.contains("\"total_items\": 3"));
+        assert!(json.contains("\"phase_counts\""));
+        assert!(json.contains("\"running_items\""));
+        assert!(json.contains("\"recent_events\""));
+        assert!(json.contains("\"runtime_stats\""));
+        assert!(json.contains("\"pending\""));
+        assert!(json.contains("\"running\""));
+    }
+
+    #[test]
+    fn print_status_text_format_returns_ok() {
+        let status = sample_system_status();
+        let result = print_status(&status, "text");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_status_rich_format_returns_ok() {
+        let status = sample_system_status();
+        let result = print_status(&status, "rich");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_status_unknown_format_falls_back_to_text() {
+        let status = sample_system_status();
+        // Unknown format should not error — falls back to text.
+        let result = print_status(&status, "unknown");
+        assert!(result.is_ok());
+    }
+
+    // ---- print_spec_status (format dispatcher) ----
+
+    #[test]
+    fn print_spec_status_json_format_returns_ok() {
+        let status = sample_spec_status();
+        let result = print_spec_status(&status, "json");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_spec_status_json_contains_expected_fields() {
+        let status = sample_spec_status();
+        let json = serde_json::to_string_pretty(&status).unwrap();
+        assert!(json.contains("\"workspace\": \"ws-test\""));
+        assert!(json.contains("\"config_path\""));
+        assert!(json.contains("\"item_count\": 5"));
+        assert!(json.contains("\"phase_counts\""));
+    }
+
+    #[test]
+    fn print_spec_status_text_format_returns_ok() {
+        let status = sample_spec_status();
+        let result = print_spec_status(&status, "text");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_spec_status_rich_format_returns_ok() {
+        let status = sample_spec_status();
+        let result = print_spec_status(&status, "rich");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn print_spec_status_unknown_format_falls_back_to_text() {
+        let status = sample_spec_status();
+        let result = print_spec_status(&status, "unknown");
+        assert!(result.is_ok());
+    }
+
+    // ---- print_text_status ----
+
+    #[test]
+    fn print_text_status_with_data_does_not_panic() {
+        let status = sample_system_status();
+        // Exercises all branches: phase_counts non-empty, running_items non-empty,
+        // recent_events non-empty, runtime_stats present.
+        print_text_status(&status);
+    }
+
+    #[test]
+    fn print_text_status_empty_does_not_panic() {
+        let status = empty_system_status();
+        // Exercises empty branches: no phases, no running items ("No items currently running."),
+        // no events, no runtime stats.
+        print_text_status(&status);
+    }
+
+    // ---- print_rich_status ----
+
+    #[test]
+    fn print_rich_status_with_data_does_not_panic() {
+        let status = sample_system_status();
+        print_rich_status(&status);
+    }
+
+    #[test]
+    fn print_rich_status_empty_does_not_panic() {
+        let status = empty_system_status();
+        print_rich_status(&status);
+    }
+
+    // ---- print_text_spec_status ----
+
+    #[test]
+    fn print_text_spec_status_with_data_does_not_panic() {
+        let status = sample_spec_status();
+        print_text_spec_status(&status);
+    }
+
+    #[test]
+    fn print_text_spec_status_empty_does_not_panic() {
+        let status = empty_spec_status();
+        // Exercises "No items in this workspace." branch.
+        print_text_spec_status(&status);
+    }
+
+    // ---- print_rich_spec_status ----
+
+    #[test]
+    fn print_rich_spec_status_with_data_does_not_panic() {
+        let status = sample_spec_status();
+        print_rich_spec_status(&status);
+    }
+
+    #[test]
+    fn print_rich_spec_status_empty_does_not_panic() {
+        let status = empty_spec_status();
+        print_rich_spec_status(&status);
+    }
 }
 
 fn print_text_status(status: &SystemStatus) {
