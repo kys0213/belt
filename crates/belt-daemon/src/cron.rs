@@ -614,6 +614,119 @@ impl GapDetectionJob {
     }
 }
 
+/// Check whether all linked GitHub issues for a spec are in a closed/done state.
+///
+/// Iterates over the spec's linked targets (from the `spec_links` table).
+/// For each target that looks like a GitHub issue reference (contains `#`),
+/// queries the `gh` CLI to check whether the issue is closed.
+///
+/// Returns `true` when there are no linked issues or all linked issues are closed.
+/// Returns `false` if any linked issue is still open.
+fn all_linked_issues_done(db: &Database, spec_id: &str) -> bool {
+    let links = match db.list_spec_links(spec_id) {
+        Ok(links) => links,
+        Err(e) => {
+            tracing::warn!(
+                spec_id = %spec_id,
+                error = %e,
+                "failed to list spec links, treating as not-all-done"
+            );
+            return false;
+        }
+    };
+
+    // If no linked issues, condition is satisfied.
+    if links.is_empty() {
+        return true;
+    }
+
+    for link in &links {
+        let target = &link.target;
+
+        // Only check GitHub issue references (URLs containing /issues/ or shorthand with #).
+        let is_github_issue = target.contains("/issues/") || target.contains('#');
+        if !is_github_issue {
+            continue;
+        }
+
+        // Extract the issue reference for `gh issue view`.
+        // Handles both URL format (https://github.com/org/repo/issues/42)
+        // and shorthand format (org/repo#42).
+        let issue_ref = if target.contains("/issues/") {
+            // URL format: extract "org/repo#number"
+            // e.g. https://github.com/org/repo/issues/42 -> org/repo#42
+            let parts: Vec<&str> = target.split('/').collect();
+            if parts.len() >= 5 {
+                let idx = parts.iter().position(|p| *p == "issues");
+                if let Some(i) = idx {
+                    if i >= 2 && i + 1 < parts.len() {
+                        format!(
+                            "{}/{}#{}",
+                            parts[i - 2],
+                            parts[i - 1],
+                            parts[i + 1]
+                        )
+                    } else {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            }
+        } else {
+            // Shorthand like "org/repo#42"
+            target.clone()
+        };
+
+        // Use `gh issue view` to check status.
+        let result = std::process::Command::new("gh")
+            .args([
+                "issue", "view", &issue_ref, "--json", "state", "--jq", ".state",
+            ])
+            .output();
+
+        match result {
+            Ok(output) if output.status.success() => {
+                let state = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .to_uppercase();
+                if state != "CLOSED" {
+                    tracing::info!(
+                        spec_id = %spec_id,
+                        issue = %issue_ref,
+                        state = %state,
+                        "linked issue is not closed"
+                    );
+                    return false;
+                }
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                tracing::warn!(
+                    spec_id = %spec_id,
+                    issue = %issue_ref,
+                    stderr = %stderr.trim(),
+                    "failed to check linked issue status, treating as not-done"
+                );
+                return false;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    spec_id = %spec_id,
+                    error = %e,
+                    "failed to invoke gh CLI for linked issue check"
+                );
+                // When gh is unavailable, err on safe side: do not auto-advance.
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
 /// Minimum keyword length to consider meaningful for gap detection.
 const MIN_KEYWORD_LEN: usize = 4;
 
@@ -736,6 +849,89 @@ fn has_existing_gap_issue(spec_name: &str) -> bool {
             // If gh CLI is unavailable or fails, err on the safe side and
             // allow issue creation so gaps are not silently swallowed.
             false
+        }
+    }
+}
+
+/// Create a HITL queue item for final human confirmation before Completing -> Completed.
+fn create_spec_completion_hitl(db: &Database, spec: &belt_core::spec::Spec, detail: &str) {
+    let work_id = format!("spec-completion:{}:hitl", spec.id);
+    let mut item = belt_core::queue::QueueItem::new(
+        work_id.clone(),
+        spec.id.clone(),
+        spec.workspace_id.clone(),
+        "spec_completion".to_string(),
+    );
+    item.phase = QueuePhase::Hitl;
+    item.title = Some(format!("Spec '{}' ready for final review", spec.name));
+    item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
+    item.hitl_notes = Some(format!(
+        "Spec '{}' has no gaps and all linked issues are done. {}. \
+         Approve to advance from Completing to Completed.",
+        spec.name, detail,
+    ));
+
+    match db.insert_item(&item) {
+        Ok(()) => {
+            tracing::info!(
+                spec_id = %spec.id,
+                work_id = %work_id,
+                "created HITL item for spec completion final review"
+            );
+        }
+        Err(BeltError::Database(ref msg)) if msg.contains("UNIQUE constraint") => {
+            tracing::debug!(
+                spec_id = %spec.id,
+                "HITL item for spec completion already exists, skipping"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                spec_id = %spec.id,
+                error = %e,
+                "failed to create HITL item for spec completion"
+            );
+        }
+    }
+}
+
+/// Create a HITL queue item when test commands fail for a spec.
+fn create_spec_test_failure_hitl(db: &Database, spec: &belt_core::spec::Spec, detail: &str) {
+    let work_id = format!("spec-test-fail:{}:hitl", spec.id);
+    let mut item = belt_core::queue::QueueItem::new(
+        work_id.clone(),
+        spec.id.clone(),
+        spec.workspace_id.clone(),
+        "spec_test_failure".to_string(),
+    );
+    item.phase = QueuePhase::Hitl;
+    item.title = Some(format!("Spec '{}' test commands failed", spec.name));
+    item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
+    item.hitl_notes = Some(format!(
+        "Spec '{}' passed gap detection but test commands failed. {}",
+        spec.name, detail,
+    ));
+
+    match db.insert_item(&item) {
+        Ok(()) => {
+            tracing::info!(
+                spec_id = %spec.id,
+                work_id = %work_id,
+                "created HITL item for spec test failure"
+            );
+        }
+        Err(BeltError::Database(ref msg)) if msg.contains("UNIQUE constraint") => {
+            tracing::debug!(
+                spec_id = %spec.id,
+                "HITL item for spec test failure already exists, skipping"
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                spec_id = %spec.id,
+                error = %e,
+                "failed to create HITL item for spec test failure"
+            );
         }
     }
 }
@@ -892,10 +1088,9 @@ impl CronHandler for GapDetectionJob {
             }
         }
 
-        // Step 5: Transition fully-covered specs to Completing and create HITL items.
-        // Per spec lifecycle, Active -> Completing when gap-detection finds
-        // no gaps. A HITL queue item is created for final human confirmation
-        // before the spec can advance to Completed.
+        // Step 5: For fully-covered specs, verify linked issues are all Done,
+        // then transition Active -> Completing, run test commands, and create
+        // HITL items for final confirmation.
         let mut completing_count = 0usize;
         for spec_id in &covered_spec_ids {
             // Skip if there is already an open queue item for this spec
@@ -908,6 +1103,16 @@ impl CronHandler for GapDetectionJob {
                 continue;
             }
 
+            // 5a: Check all linked GitHub issues are closed/done.
+            if !all_linked_issues_done(&self.db, spec_id) {
+                tracing::info!(
+                    spec_id = %spec_id,
+                    "GapDetectionJob: skipping spec — not all linked issues are done"
+                );
+                continue;
+            }
+
+            // 5b: Transition Active -> Completing.
             if let Err(e) = self
                 .db
                 .update_spec_status(spec_id, belt_core::spec::SpecStatus::Completing)
@@ -917,46 +1122,98 @@ impl CronHandler for GapDetectionJob {
                     error = %e,
                     "GapDetectionJob: failed to transition spec to Completing"
                 );
-            } else {
-                tracing::info!(
-                    spec_id = %spec_id,
-                    "GapDetectionJob: spec transitioned to Completing (no gaps found)"
-                );
-                completing_count += 1;
+                continue;
+            }
 
-                // Create a HITL queue item for spec-completion final review.
-                let now = chrono::Utc::now().to_rfc3339();
-                let mut hitl_item = belt_core::queue::QueueItem::new(
-                    format!("{spec_id}:spec-completion-review"),
-                    spec_id.clone(),
-                    String::new(), // workspace_id filled below
-                    "spec-completion-review".to_string(),
-                );
-                // Look up the spec to populate workspace_id.
-                if let Ok(s) = self.db.get_spec(spec_id) {
-                    hitl_item.workspace_id = s.workspace_id;
-                    hitl_item.title = Some(format!("Spec completion review: {}", s.name));
-                }
-                hitl_item.phase = QueuePhase::Hitl;
-                hitl_item.hitl_created_at = Some(now);
-                hitl_item.hitl_reason = Some(belt_core::queue::HitlReason::SpecCompletionReview);
-                hitl_item.hitl_notes = Some(format!(
-                    "spec-completion-review: spec '{spec_id}' passed gap detection, awaiting human approval to mark Completed"
-                ));
+            tracing::info!(
+                spec_id = %spec_id,
+                "GapDetectionJob: spec transitioned to Completing (no gaps, all linked issues done)"
+            );
+            completing_count += 1;
 
-                if let Err(e) = self.db.insert_item(&hitl_item) {
+            // 5c: Run test commands if the spec defines them.
+            let spec = match self.db.get_spec(spec_id) {
+                Ok(s) => s,
+                Err(e) => {
                     tracing::warn!(
                         spec_id = %spec_id,
                         error = %e,
-                        "GapDetectionJob: failed to create HITL item for spec completion review"
+                        "GapDetectionJob: failed to reload spec for test execution"
                     );
-                } else {
-                    tracing::info!(
-                        spec_id = %spec_id,
-                        work_id = %hitl_item.work_id,
-                        "GapDetectionJob: created HITL item for spec completion review"
-                    );
+                    continue;
                 }
+            };
+
+            let test_cmds = spec.test_command_list();
+            if !test_cmds.is_empty() {
+                tracing::info!(
+                    spec_id = %spec_id,
+                    commands = ?test_cmds,
+                    "GapDetectionJob: running test commands for spec"
+                );
+
+                match belt_infra::test_runner::run_test_commands(
+                    &test_cmds,
+                    &self.workspace_root,
+                    true, // fail-fast
+                ) {
+                    Ok(result) if result.all_passed => {
+                        tracing::info!(
+                            spec_id = %spec_id,
+                            "GapDetectionJob: all test commands passed"
+                        );
+                        // Tests passed — create HITL for final human confirmation
+                        // before advancing Completing -> Completed.
+                        create_spec_completion_hitl(&self.db, &spec, "All test commands passed.");
+                    }
+                    Ok(result) => {
+                        // Test failure — revert spec back to Active and create HITL.
+                        let failed_cmds: Vec<&str> = result
+                            .results
+                            .iter()
+                            .filter(|r| !r.success)
+                            .map(|r| r.command.as_str())
+                            .collect();
+                        tracing::warn!(
+                            spec_id = %spec_id,
+                            failed_commands = ?failed_cmds,
+                            "GapDetectionJob: test commands failed, reverting to Active"
+                        );
+                        if let Err(e) = self
+                            .db
+                            .update_spec_status(spec_id, belt_core::spec::SpecStatus::Active)
+                        {
+                            tracing::warn!(
+                                spec_id = %spec_id,
+                                error = %e,
+                                "GapDetectionJob: failed to revert spec to Active after test failure"
+                            );
+                        }
+                        // Create HITL so a human can investigate the test failure.
+                        let detail = format!("Test commands failed: {}", failed_cmds.join(", "));
+                        create_spec_test_failure_hitl(&self.db, &spec, &detail);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            spec_id = %spec_id,
+                            error = %e,
+                            "GapDetectionJob: failed to run test commands, reverting to Active"
+                        );
+                        if let Err(e2) = self
+                            .db
+                            .update_spec_status(spec_id, belt_core::spec::SpecStatus::Active)
+                        {
+                            tracing::warn!(
+                                spec_id = %spec_id,
+                                error = %e2,
+                                "GapDetectionJob: failed to revert spec to Active"
+                            );
+                        }
+                    }
+                }
+            } else {
+                // No test commands — go straight to HITL for final confirmation.
+                create_spec_completion_hitl(&self.db, &spec, "No test commands configured.");
             }
         }
 

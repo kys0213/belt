@@ -207,6 +207,13 @@ pub struct Spec {
     /// Optional comma-separated GitHub issue numbers created by decomposition.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub decomposed_issues: Option<String>,
+    /// Optional comma-separated shell commands to run for spec verification.
+    ///
+    /// When gap detection determines a spec is fully covered, these commands
+    /// are executed by the `TestRunner`. All must succeed for the spec to
+    /// advance from Completing to Completed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_commands: Option<String>,
     /// Creation timestamp (RFC 3339).
     pub created_at: String,
     /// Last update timestamp (RFC 3339).
@@ -228,6 +235,7 @@ impl Spec {
             depends_on: None,
             entry_point: None,
             decomposed_issues: None,
+            test_commands: None,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -243,6 +251,18 @@ impl Spec {
         self.status = to;
         self.updated_at = chrono::Utc::now().to_rfc3339();
         Ok(previous)
+    }
+
+    /// Parse the comma-separated `test_commands` field into individual commands.
+    pub fn test_command_list(&self) -> Vec<&str> {
+        match &self.test_commands {
+            Some(tc) => tc
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect(),
+            None => Vec::new(),
+        }
     }
 
     /// Parse the comma-separated `entry_point` field into individual paths.
