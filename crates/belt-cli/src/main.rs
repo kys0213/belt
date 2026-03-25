@@ -175,14 +175,20 @@ enum HitlCommands {
         /// Filter by workspace.
         #[arg(long)]
         workspace: Option<String>,
+        /// Output format (text, json).
+        #[arg(long, default_value = "text")]
+        format: String,
     },
     /// Show HITL item details.
     Show {
         /// Queue item work_id.
         item_id: String,
-        /// Output format.
+        /// Output format (text, json).
         #[arg(long, default_value = "text")]
         format: String,
+        /// Interactive mode: display details then prompt for a response action.
+        #[arg(long)]
+        interactive: bool,
     },
     /// Set or query HITL timeouts.
     Timeout {
@@ -1132,8 +1138,52 @@ fn cmd_cron_trigger(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Determine a recommended action based on the HITL reason.
+///
+/// Returns a tuple of `(action, explanation)` where `action` is the
+/// suggested `HitlRespondAction` string and `explanation` describes why.
+fn recommended_action(
+    reason: Option<&belt_core::queue::HitlReason>,
+) -> (&'static str, &'static str) {
+    use belt_core::queue::HitlReason;
+    match reason {
+        Some(HitlReason::EvaluateFailure) => (
+            "retry",
+            "Evaluation failed; a retry may succeed after transient issues are resolved.",
+        ),
+        Some(HitlReason::RetryMaxExceeded) => (
+            "skip",
+            "Maximum retries exhausted; consider skipping or investigating the root cause.",
+        ),
+        Some(HitlReason::Timeout) => (
+            "retry",
+            "Execution timed out; retry with a longer timeout or investigate the workload.",
+        ),
+        Some(HitlReason::ManualEscalation) => (
+            "done",
+            "Manually escalated; review the item and mark done if the issue is resolved.",
+        ),
+        Some(HitlReason::SpecConflict) => (
+            "replan",
+            "Spec conflict detected; replan to resolve overlapping specifications.",
+        ),
+        Some(HitlReason::SpecCompletionReview) => (
+            "done",
+            "Spec completion review; approve to mark as done if the spec is satisfactory.",
+        ),
+        Some(HitlReason::SpecModificationProposed) => (
+            "done",
+            "Spec modification proposed; review changes and approve or skip.",
+        ),
+        None => (
+            "skip",
+            "No HITL reason recorded; review manually and decide.",
+        ),
+    }
+}
+
 /// `belt hitl show` -- show HITL item details.
-fn cmd_hitl_show(item_id: &str, format: &str) -> anyhow::Result<()> {
+fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Result<()> {
     let db = open_db()?;
     let item = db.get_item(item_id)?;
 
@@ -1145,9 +1195,25 @@ fn cmd_hitl_show(item_id: &str, format: &str) -> anyhow::Result<()> {
         );
     }
 
+    let (rec_action, rec_explanation) = recommended_action(item.hitl_reason.as_ref());
+
     match format {
         "json" => {
-            println!("{}", serde_json::to_string_pretty(&item)?);
+            // Build an enriched JSON output that includes the recommended action.
+            let mut value = serde_json::to_value(&item)?;
+            if let serde_json::Value::Object(ref mut map) = value {
+                let mut rec = serde_json::Map::new();
+                rec.insert(
+                    "action".to_string(),
+                    serde_json::Value::String(rec_action.to_string()),
+                );
+                rec.insert(
+                    "explanation".to_string(),
+                    serde_json::Value::String(rec_explanation.to_string()),
+                );
+                map.insert("recommended".to_string(), serde_json::Value::Object(rec));
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
         }
         _ => {
             println!("Work ID:      {}", item.work_id);
@@ -1177,6 +1243,99 @@ fn cmd_hitl_show(item_id: &str, format: &str) -> anyhow::Result<()> {
             }
             if let Some(action) = &item.hitl_terminal_action {
                 println!("Timeout Act:  {action}");
+            }
+            println!();
+            println!("Recommended:  {rec_action}");
+            println!("              {rec_explanation}");
+        }
+    }
+
+    if interactive {
+        println!();
+        println!("Available actions: done, retry, skip, replan");
+        print!("Enter action [{}]: ", rec_action);
+        // Flush stdout so the prompt appears before reading.
+        use std::io::Write;
+        std::io::stdout().flush()?;
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim();
+
+        // Use the recommended action as default when the user presses Enter.
+        let chosen = if input.is_empty() { rec_action } else { input };
+
+        let action: belt_core::queue::HitlRespondAction =
+            chosen.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+
+        print!("Notes (optional): ");
+        std::io::stdout().flush()?;
+        let mut notes_input = String::new();
+        std::io::stdin().read_line(&mut notes_input)?;
+        let notes = notes_input.trim();
+        let notes = if notes.is_empty() {
+            None
+        } else {
+            Some(notes.to_string())
+        };
+
+        // Apply the response action.
+        match action {
+            belt_core::queue::HitlRespondAction::Replan => {
+                let max_replan = 3u32;
+                let new_count = item.replan_count + 1;
+                if new_count > max_replan {
+                    db.update_phase(item_id, QueuePhase::Failed)?;
+                    println!(
+                        "Item '{}' replan limit exceeded ({}/{}), transitioned to failed.",
+                        item_id, new_count, max_replan
+                    );
+                } else {
+                    db.update_phase(item_id, QueuePhase::Pending)?;
+                    let failure_reason = item.hitl_notes.as_deref().unwrap_or("unknown failure");
+                    let replan_work_id = format!("{item_id}:replan-{new_count}");
+                    let mut replan_item = belt_core::queue::QueueItem::new(
+                        replan_work_id.clone(),
+                        item.source_id.clone(),
+                        item.workspace_id.clone(),
+                        item.state.clone(),
+                    );
+                    replan_item.phase = QueuePhase::Hitl;
+                    replan_item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
+                    replan_item.hitl_reason =
+                        Some(belt_core::queue::HitlReason::SpecModificationProposed);
+                    replan_item.hitl_notes = Some(format!(
+                        "Claw replan delegation (attempt {new_count}): {failure_reason}"
+                    ));
+                    replan_item.title =
+                        Some(format!("spec-modification-proposed (replan #{new_count})"));
+                    replan_item.replan_count = new_count;
+                    if let Some(n) = &notes {
+                        replan_item.hitl_notes = Some(n.clone());
+                    }
+                    db.insert_item(&replan_item)?;
+                    println!(
+                        "Item '{}' rolled back to pending (replan {}/{}). \
+                         Created HITL item '{}' for spec modification review.",
+                        item_id, new_count, max_replan, replan_work_id
+                    );
+                }
+            }
+            _ => {
+                let target_phase = match action {
+                    belt_core::queue::HitlRespondAction::Done => QueuePhase::Done,
+                    belt_core::queue::HitlRespondAction::Retry => QueuePhase::Pending,
+                    belt_core::queue::HitlRespondAction::Skip => QueuePhase::Skipped,
+                    belt_core::queue::HitlRespondAction::Replan => unreachable!(),
+                };
+                db.update_phase(item_id, target_phase)?;
+                if let Some(n) = &notes {
+                    println!("Notes recorded: {n}");
+                }
+                println!(
+                    "Item '{}' transitioned from hitl to {} (action: {}).",
+                    item_id, target_phase, action
+                );
             }
         }
     }
@@ -2316,32 +2475,49 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            HitlCommands::List { workspace } => {
+            HitlCommands::List { workspace, format } => {
                 tracing::info!(?workspace, "listing HITL items...");
                 let db = open_db()?;
                 let items = db.list_items(Some(QueuePhase::Hitl), workspace.as_deref())?;
-                if items.is_empty() {
-                    println!("No items awaiting human review.");
-                } else {
-                    println!(
-                        "{:<40} {:<20} {:<12} TITLE",
-                        "WORK_ID", "WORKSPACE", "STATE"
-                    );
-                    println!("{}", "-".repeat(80));
-                    for item in &items {
-                        println!(
-                            "{:<40} {:<20} {:<12} {}",
-                            item.work_id,
-                            item.workspace_id,
-                            item.state,
-                            item.title.as_deref().unwrap_or("-"),
-                        );
+                match format.as_str() {
+                    "json" => {
+                        println!("{}", serde_json::to_string_pretty(&items)?);
                     }
-                    println!("\n{} item(s) awaiting review.", items.len());
+                    _ => {
+                        if items.is_empty() {
+                            println!("No items awaiting human review.");
+                        } else {
+                            println!(
+                                "{:<40} {:<20} {:<12} {:<24} TITLE",
+                                "WORK_ID", "WORKSPACE", "STATE", "REASON"
+                            );
+                            println!("{}", "-".repeat(104));
+                            for item in &items {
+                                let reason = item
+                                    .hitl_reason
+                                    .as_ref()
+                                    .map(|r| r.to_string())
+                                    .unwrap_or_else(|| "-".to_string());
+                                println!(
+                                    "{:<40} {:<20} {:<12} {:<24} {}",
+                                    item.work_id,
+                                    item.workspace_id,
+                                    item.state,
+                                    reason,
+                                    item.title.as_deref().unwrap_or("-"),
+                                );
+                            }
+                            println!("\n{} item(s) awaiting review.", items.len());
+                        }
+                    }
                 }
             }
-            HitlCommands::Show { item_id, format } => {
-                cmd_hitl_show(&item_id, &format)?;
+            HitlCommands::Show {
+                item_id,
+                format,
+                interactive,
+            } => {
+                cmd_hitl_show(&item_id, &format, interactive)?;
             }
             HitlCommands::Timeout { command } => {
                 cmd_hitl_timeout(command)?;
@@ -2469,5 +2645,60 @@ mod tests {
             extract_issue_number("https://github.com/owner/repo/issues/abc"),
             None
         );
+    }
+
+    #[test]
+    fn recommended_action_evaluate_failure() {
+        use belt_core::queue::HitlReason;
+        let (action, _) = recommended_action(Some(&HitlReason::EvaluateFailure));
+        assert_eq!(action, "retry");
+    }
+
+    #[test]
+    fn recommended_action_retry_max_exceeded() {
+        use belt_core::queue::HitlReason;
+        let (action, _) = recommended_action(Some(&HitlReason::RetryMaxExceeded));
+        assert_eq!(action, "skip");
+    }
+
+    #[test]
+    fn recommended_action_timeout() {
+        use belt_core::queue::HitlReason;
+        let (action, _) = recommended_action(Some(&HitlReason::Timeout));
+        assert_eq!(action, "retry");
+    }
+
+    #[test]
+    fn recommended_action_manual_escalation() {
+        use belt_core::queue::HitlReason;
+        let (action, _) = recommended_action(Some(&HitlReason::ManualEscalation));
+        assert_eq!(action, "done");
+    }
+
+    #[test]
+    fn recommended_action_spec_conflict() {
+        use belt_core::queue::HitlReason;
+        let (action, _) = recommended_action(Some(&HitlReason::SpecConflict));
+        assert_eq!(action, "replan");
+    }
+
+    #[test]
+    fn recommended_action_spec_completion_review() {
+        use belt_core::queue::HitlReason;
+        let (action, _) = recommended_action(Some(&HitlReason::SpecCompletionReview));
+        assert_eq!(action, "done");
+    }
+
+    #[test]
+    fn recommended_action_spec_modification_proposed() {
+        use belt_core::queue::HitlReason;
+        let (action, _) = recommended_action(Some(&HitlReason::SpecModificationProposed));
+        assert_eq!(action, "done");
+    }
+
+    #[test]
+    fn recommended_action_none_reason() {
+        let (action, _) = recommended_action(None);
+        assert_eq!(action, "skip");
     }
 }
