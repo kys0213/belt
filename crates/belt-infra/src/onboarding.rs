@@ -501,6 +501,143 @@ sources:
         );
     }
 
+    // ── init_workspace_claw_dir() unit tests ──────────────────────────
+
+    #[test]
+    fn init_claw_dir_already_exists_preserves_content() {
+        let belt_home = test_belt_home();
+
+        // First call creates the structure.
+        let claw_dir = init_workspace_claw_dir(belt_home.path(), "existing-ws").unwrap();
+        assert!(claw_dir.join("config.yaml").is_file());
+
+        // Write extra files into the created directories.
+        std::fs::write(claw_dir.join("system/custom.txt"), "keep me").unwrap();
+        std::fs::write(claw_dir.join("session/state.json"), "{}").unwrap();
+
+        // Second call should succeed without removing existing content.
+        let claw_dir2 = init_workspace_claw_dir(belt_home.path(), "existing-ws").unwrap();
+        assert_eq!(claw_dir, claw_dir2);
+
+        // Custom files should still be present.
+        assert_eq!(
+            std::fs::read_to_string(claw_dir.join("system/custom.txt")).unwrap(),
+            "keep me"
+        );
+        assert_eq!(
+            std::fs::read_to_string(claw_dir.join("session/state.json")).unwrap(),
+            "{}"
+        );
+    }
+
+    #[test]
+    fn init_claw_dir_preserves_existing_config_yaml() {
+        let belt_home = test_belt_home();
+
+        // Create the directory once.
+        let claw_dir = init_workspace_claw_dir(belt_home.path(), "preserve-ws").unwrap();
+
+        // Overwrite config.yaml with custom content.
+        let custom_config = "# user-customized\nauto_approve: true\n";
+        std::fs::write(claw_dir.join("config.yaml"), custom_config).unwrap();
+
+        // Re-initialize should NOT overwrite the existing config.yaml.
+        init_workspace_claw_dir(belt_home.path(), "preserve-ws").unwrap();
+
+        let content = std::fs::read_to_string(claw_dir.join("config.yaml")).unwrap();
+        assert_eq!(content, custom_config);
+    }
+
+    #[test]
+    fn init_claw_dir_config_yaml_contains_workspace_name() {
+        let belt_home = test_belt_home();
+        let claw_dir = init_workspace_claw_dir(belt_home.path(), "named-ws").unwrap();
+
+        let content = std::fs::read_to_string(claw_dir.join("config.yaml")).unwrap();
+        assert!(content.contains("workspace: named-ws"));
+        assert!(content.contains("auto_approve: false"));
+    }
+
+    #[test]
+    fn init_claw_dir_invalid_path_returns_error() {
+        // Use a path that cannot be created (file used as directory component).
+        let belt_home = test_belt_home();
+        let blocker = belt_home.path().join("workspaces");
+        // Create a *file* where a directory is expected.
+        std::fs::write(&blocker, "I am a file, not a directory").unwrap();
+
+        let result = init_workspace_claw_dir(belt_home.path(), "blocked-ws");
+        assert!(result.is_err(), "should fail when path component is a file");
+    }
+
+    // ── seed_workspace_cron_jobs() unit tests ───────────────────────────
+
+    #[test]
+    fn seed_cron_jobs_creates_all_expected_jobs() {
+        let db = test_db();
+        let seeded = seed_workspace_cron_jobs(&db, "seed-test").unwrap();
+
+        assert_eq!(seeded, WORKSPACE_CRON_SEEDS.len());
+
+        let jobs = db.list_cron_jobs().unwrap();
+        assert_eq!(jobs.len(), WORKSPACE_CRON_SEEDS.len());
+
+        for (suffix, schedule) in WORKSPACE_CRON_SEEDS {
+            let expected_name = format!("seed-test:{suffix}");
+            let job = jobs.iter().find(|j| j.name == expected_name);
+            assert!(job.is_some(), "missing cron job: {expected_name}");
+            assert_eq!(job.unwrap().schedule, *schedule);
+            assert_eq!(job.unwrap().workspace.as_deref(), Some("seed-test"));
+        }
+    }
+
+    #[test]
+    fn seed_cron_jobs_skips_duplicates() {
+        let db = test_db();
+
+        let first = seed_workspace_cron_jobs(&db, "dup-ws").unwrap();
+        assert_eq!(first, 4);
+
+        // Second call should seed zero new jobs.
+        let second = seed_workspace_cron_jobs(&db, "dup-ws").unwrap();
+        assert_eq!(second, 0);
+
+        // Total jobs unchanged.
+        assert_eq!(db.list_cron_jobs().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn seed_cron_jobs_different_workspaces_are_independent() {
+        let db = test_db();
+
+        let seeded_a = seed_workspace_cron_jobs(&db, "ws-alpha").unwrap();
+        let seeded_b = seed_workspace_cron_jobs(&db, "ws-beta").unwrap();
+
+        assert_eq!(seeded_a, 4);
+        assert_eq!(seeded_b, 4);
+        assert_eq!(db.list_cron_jobs().unwrap().len(), 8);
+
+        // Re-seeding one workspace should not affect the other.
+        let re_a = seed_workspace_cron_jobs(&db, "ws-alpha").unwrap();
+        assert_eq!(re_a, 0);
+        assert_eq!(db.list_cron_jobs().unwrap().len(), 8);
+    }
+
+    #[test]
+    fn seed_cron_jobs_job_names_use_colon_separator() {
+        let db = test_db();
+        seed_workspace_cron_jobs(&db, "sep-check").unwrap();
+
+        let jobs = db.list_cron_jobs().unwrap();
+        for job in &jobs {
+            assert!(
+                job.name.starts_with("sep-check:"),
+                "job name '{}' should start with 'sep-check:'",
+                job.name
+            );
+        }
+    }
+
     #[test]
     fn multiple_workspaces_get_separate_claw_dirs() {
         let db = test_db();
