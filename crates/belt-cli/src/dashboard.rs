@@ -4,11 +4,18 @@
 //! - `run()`: interactive ratatui-based real-time TUI dashboard with multiple tabs
 //! - `render_runtime_panel()`: text-based runtime statistics panel for non-TUI output
 //!
-//! The dashboard supports:
-//! - Tab switching: `d` (dashboard), `s` (spec progress), `w` (per-workspace)
-//! - Item selection with arrow keys and item detail overlay (Enter)
-//! - Help overlay (`h`) showing all available key bindings
+//! The dashboard supports four tabs:
+//! - **Dashboard** (`d`): phase summary + running/recent items
+//! - **PerWorkspace** (`w`): items filtered by a selected workspace
+//! - **Spec** (`s`): spec progress view
+//! - **Board** (`b`): kanban-style board with columns per queue phase
+//!
+//! Tab switching: `d/w/s/b` to jump, or `Tab`/`Shift+Tab` to cycle.
+//! Item selection with arrow keys and item detail overlay (Enter).
+//! Help overlay (`h`) showing all available key bindings.
+//! Scroll positions are preserved per tab.
 
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,42 +53,120 @@ enum DashboardTab {
     PerWorkspace,
     /// Spec progress view showing specs and their statuses.
     Spec,
+    /// Kanban board with columns per queue phase.
+    Board,
+}
+
+impl DashboardTab {
+    /// Return the next tab in forward order (Tab key).
+    fn next(self) -> Self {
+        match self {
+            DashboardTab::Dashboard => DashboardTab::PerWorkspace,
+            DashboardTab::PerWorkspace => DashboardTab::Spec,
+            DashboardTab::Spec => DashboardTab::Board,
+            DashboardTab::Board => DashboardTab::Dashboard,
+        }
+    }
+
+    /// Return the previous tab in reverse order (Shift+Tab).
+    fn prev(self) -> Self {
+        match self {
+            DashboardTab::Dashboard => DashboardTab::Board,
+            DashboardTab::PerWorkspace => DashboardTab::Dashboard,
+            DashboardTab::Spec => DashboardTab::PerWorkspace,
+            DashboardTab::Board => DashboardTab::Spec,
+        }
+    }
+}
+
+/// Board view columns corresponding to queue phases.
+const BOARD_COLUMNS: [QueuePhase; 7] = [
+    QueuePhase::Pending,
+    QueuePhase::Ready,
+    QueuePhase::Running,
+    QueuePhase::Completed,
+    QueuePhase::Done,
+    QueuePhase::Hitl,
+    QueuePhase::Failed,
+];
+
+/// Per-tab scroll/selection state, preserved across tab switches.
+#[derive(Debug, Clone, Default)]
+struct TabState {
+    /// Selected row index within the primary list.
+    selected_index: usize,
+    /// For Dashboard tab: which sub-panel is focused.
+    active_panel: Option<ActivePanel>,
 }
 
 /// Dashboard UI state for navigation and overlay management.
 struct DashboardState {
     /// Which top-level tab is active.
     active_tab: DashboardTab,
-    /// Which panel is focused (used in Dashboard tab).
-    active_panel: ActivePanel,
-    /// Selected row index within the active panel/list.
-    selected_index: usize,
+    /// Per-tab state (scroll positions preserved on tab switch).
+    tab_states: HashMap<u8, TabState>,
     /// When set, the item detail overlay is shown for this work_id.
     overlay_item: Option<String>,
     /// Whether the help overlay is visible.
     show_help: bool,
     /// Selected workspace index (used in PerWorkspace tab).
     selected_workspace: usize,
+    /// Currently selected column in Board view.
+    board_selected_col: usize,
+    /// Currently selected row within the selected Board column.
+    board_selected_row: usize,
 }
 
 impl DashboardState {
     fn new() -> Self {
+        let mut tab_states = HashMap::new();
+        tab_states.insert(
+            0,
+            TabState {
+                selected_index: 0,
+                active_panel: Some(ActivePanel::Running),
+            },
+        );
+        tab_states.insert(1, TabState::default());
+        tab_states.insert(2, TabState::default());
+        tab_states.insert(3, TabState::default());
+
         Self {
             active_tab: DashboardTab::Dashboard,
-            active_panel: ActivePanel::Running,
-            selected_index: 0,
+            tab_states,
             overlay_item: None,
             show_help: false,
             selected_workspace: 0,
+            board_selected_col: 0,
+            board_selected_row: 0,
         }
+    }
+
+    fn tab_key(&self) -> u8 {
+        match self.active_tab {
+            DashboardTab::Dashboard => 0,
+            DashboardTab::PerWorkspace => 1,
+            DashboardTab::Spec => 2,
+            DashboardTab::Board => 3,
+        }
+    }
+
+    fn current_tab_state(&self) -> &TabState {
+        self.tab_states.get(&self.tab_key()).unwrap()
+    }
+
+    fn current_tab_state_mut(&mut self) -> &mut TabState {
+        let key = self.tab_key();
+        self.tab_states.entry(key).or_default()
     }
 }
 
 /// Run the interactive TUI dashboard.
 ///
 /// The dashboard refreshes every second and exits on `q` or `Esc`.
-/// Use arrow keys or `j`/`k` to navigate items, `Tab` to switch panels,
-/// and `Enter` to open the item detail overlay with transition timeline.
+/// Use arrow keys or `j`/`k` to navigate items, `Tab`/`Shift+Tab` to switch
+/// tabs, number keys `1`/`2`/`3` to jump to a tab, and `Enter` to open the
+/// item detail overlay with transition timeline.
 pub fn run(db: Arc<Database>) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -105,41 +190,76 @@ fn run_loop(
     let mut state = DashboardState::new();
 
     loop {
-        // Collect data depending on the active tab.
-        let running_items = db
-            .list_items(Some(QueuePhase::Running), None)
-            .unwrap_or_default();
+        // Collect data for all tabs.
+        let all_items = db.list_items(None, None).unwrap_or_default();
+        let running_items: Vec<_> = all_items
+            .iter()
+            .filter(|i| i.phase == QueuePhase::Running)
+            .cloned()
+            .collect();
         let recent_items = collect_recent_items(db);
         let workspaces = db.list_workspaces().unwrap_or_default();
         let specs = db.list_specs(None, None).unwrap_or_default();
 
         // Compute list length for navigation clamping.
         let active_list_len = match state.active_tab {
-            DashboardTab::Dashboard => match state.active_panel {
-                ActivePanel::Running => running_items.len(),
-                ActivePanel::Recent => recent_items.len(),
-            },
+            DashboardTab::Dashboard => {
+                let panel = state
+                    .current_tab_state()
+                    .active_panel
+                    .unwrap_or(ActivePanel::Running);
+                match panel {
+                    ActivePanel::Running => running_items.len(),
+                    ActivePanel::Recent => recent_items.len(),
+                }
+            }
             DashboardTab::PerWorkspace => {
                 // Items filtered by selected workspace.
                 if let Some(ws) = workspaces.get(state.selected_workspace) {
-                    db.list_items(None, Some(&ws.0)).unwrap_or_default().len()
+                    all_items
+                        .iter()
+                        .filter(|i| i.workspace_id == ws.0)
+                        .count()
                 } else {
                     0
                 }
             }
             DashboardTab::Spec => specs.len(),
+            DashboardTab::Board => 0, // Board uses column/row navigation, not a single list.
         };
 
-        // Clamp selected_index.
-        if active_list_len == 0 {
-            state.selected_index = 0;
-        } else if state.selected_index >= active_list_len {
-            state.selected_index = active_list_len.saturating_sub(1);
+        // Clamp selected_index for non-Board tabs.
+        if state.active_tab != DashboardTab::Board {
+            let ts = state.current_tab_state_mut();
+            if active_list_len == 0 {
+                ts.selected_index = 0;
+            } else if ts.selected_index >= active_list_len {
+                ts.selected_index = active_list_len.saturating_sub(1);
+            }
         }
 
         // Clamp workspace index.
         if !workspaces.is_empty() && state.selected_workspace >= workspaces.len() {
             state.selected_workspace = workspaces.len().saturating_sub(1);
+        }
+
+        // Build per-column items for Board view.
+        let board_columns: Vec<Vec<&QueueItem>> = BOARD_COLUMNS
+            .iter()
+            .map(|phase| all_items.iter().filter(|i| i.phase == *phase).collect())
+            .collect();
+
+        // Clamp board selection.
+        if state.board_selected_col >= BOARD_COLUMNS.len() {
+            state.board_selected_col = 0;
+        }
+        let col_len = board_columns
+            .get(state.board_selected_col)
+            .map_or(0, |v| v.len());
+        if col_len == 0 {
+            state.board_selected_row = 0;
+        } else if state.board_selected_row >= col_len {
+            state.board_selected_row = col_len.saturating_sub(1);
         }
 
         terminal.draw(|frame| {
@@ -167,7 +287,15 @@ fn run_loop(
                     render_per_workspace_tab(frame, db, outer_chunks[1], &workspaces, &state);
                 }
                 DashboardTab::Spec => {
-                    render_spec_tab(frame, outer_chunks[1], &specs, state.selected_index);
+                    render_spec_tab(
+                        frame,
+                        outer_chunks[1],
+                        &specs,
+                        state.current_tab_state().selected_index,
+                    );
+                }
+                DashboardTab::Board => {
+                    render_board_tab(frame, outer_chunks[1], &board_columns, &state);
                 }
             }
 
@@ -201,75 +329,325 @@ fn run_loop(
 
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                // Tab switching keys.
+                // Tab switching keys: letter keys for direct jump.
                 KeyCode::Char('d') => {
                     state.active_tab = DashboardTab::Dashboard;
-                    state.selected_index = 0;
                 }
                 KeyCode::Char('s') => {
                     state.active_tab = DashboardTab::Spec;
-                    state.selected_index = 0;
                 }
                 KeyCode::Char('w') => {
                     state.active_tab = DashboardTab::PerWorkspace;
-                    state.selected_index = 0;
+                }
+                KeyCode::Char('b') => {
+                    state.active_tab = DashboardTab::Board;
                 }
                 KeyCode::Char('h') => {
                     state.show_help = true;
                 }
-                // Navigation.
+                // Tab/Shift+Tab to cycle through tabs.
+                KeyCode::Tab => {
+                    state.active_tab = state.active_tab.next();
+                }
+                KeyCode::BackTab => {
+                    state.active_tab = state.active_tab.prev();
+                }
+                // Navigation within the current tab.
                 KeyCode::Up | KeyCode::Char('k') => {
-                    state.selected_index = state.selected_index.saturating_sub(1);
+                    handle_nav_up(&mut state, &board_columns);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if active_list_len > 0 {
-                        state.selected_index =
-                            (state.selected_index + 1).min(active_list_len.saturating_sub(1));
-                    }
+                    handle_nav_down(&mut state, active_list_len, &board_columns);
                 }
                 KeyCode::Left => {
-                    if state.active_tab == DashboardTab::PerWorkspace {
-                        state.selected_workspace = state.selected_workspace.saturating_sub(1);
-                        state.selected_index = 0;
-                    }
+                    handle_nav_left(&mut state, &workspaces);
                 }
                 KeyCode::Right => {
-                    if state.active_tab == DashboardTab::PerWorkspace && !workspaces.is_empty() {
-                        state.selected_workspace =
-                            (state.selected_workspace + 1).min(workspaces.len().saturating_sub(1));
-                        state.selected_index = 0;
-                    }
+                    handle_nav_right(&mut state, &workspaces, &board_columns);
                 }
-                KeyCode::Tab => {
-                    if state.active_tab == DashboardTab::Dashboard {
-                        state.active_panel = match state.active_panel {
-                            ActivePanel::Running => ActivePanel::Recent,
-                            ActivePanel::Recent => ActivePanel::Running,
-                        };
-                        state.selected_index = 0;
-                    }
-                }
+
                 KeyCode::Enter => {
-                    if state.active_tab == DashboardTab::Dashboard {
-                        let items = match state.active_panel {
-                            ActivePanel::Running => &running_items,
-                            ActivePanel::Recent => &recent_items,
-                        };
-                        if let Some(item) = items.get(state.selected_index) {
-                            state.overlay_item = Some(item.work_id.clone());
-                        }
-                    } else if state.active_tab == DashboardTab::PerWorkspace
-                        && let Some(ws) = workspaces.get(state.selected_workspace)
-                    {
-                        let ws_items = db.list_items(None, Some(&ws.0)).unwrap_or_default();
-                        if let Some(item) = ws_items.get(state.selected_index) {
-                            state.overlay_item = Some(item.work_id.clone());
-                        }
-                    }
+                    handle_enter(
+                        &mut state,
+                        &running_items,
+                        &recent_items,
+                        &all_items,
+                        &workspaces,
+                        db,
+                        &board_columns,
+                    );
                 }
                 _ => {}
             }
         }
+    }
+}
+
+/// Handle Up/k navigation.
+fn handle_nav_up(state: &mut DashboardState, board_columns: &[Vec<&QueueItem>]) {
+    match state.active_tab {
+        DashboardTab::Board => {
+            state.board_selected_row = state.board_selected_row.saturating_sub(1);
+        }
+        _ => {
+            let ts = state.current_tab_state_mut();
+            ts.selected_index = ts.selected_index.saturating_sub(1);
+        }
+    }
+    let _ = board_columns; // suppress unused warning in non-Board paths
+}
+
+/// Handle Down/j navigation.
+fn handle_nav_down(
+    state: &mut DashboardState,
+    active_list_len: usize,
+    board_columns: &[Vec<&QueueItem>],
+) {
+    match state.active_tab {
+        DashboardTab::Board => {
+            let col_len = board_columns
+                .get(state.board_selected_col)
+                .map_or(0, |v| v.len());
+            if col_len > 0 {
+                state.board_selected_row =
+                    (state.board_selected_row + 1).min(col_len.saturating_sub(1));
+            }
+        }
+        _ => {
+            if active_list_len > 0 {
+                let ts = state.current_tab_state_mut();
+                ts.selected_index = (ts.selected_index + 1).min(active_list_len.saturating_sub(1));
+            }
+        }
+    }
+}
+
+/// Handle Left arrow navigation.
+fn handle_nav_left(
+    state: &mut DashboardState,
+    workspaces: &[(String, String, String)],
+) {
+    match state.active_tab {
+        DashboardTab::Dashboard => {
+            let ts = state.current_tab_state_mut();
+            ts.active_panel = Some(ActivePanel::Running);
+            ts.selected_index = 0;
+        }
+        DashboardTab::PerWorkspace => {
+            if state.selected_workspace > 0 {
+                state.selected_workspace -= 1;
+                state.current_tab_state_mut().selected_index = 0;
+            }
+        }
+        DashboardTab::Board => {
+            state.board_selected_col = state.board_selected_col.saturating_sub(1);
+            state.board_selected_row = 0;
+        }
+        DashboardTab::Spec => {}
+    }
+    let _ = workspaces;
+}
+
+/// Handle Right arrow navigation.
+fn handle_nav_right(
+    state: &mut DashboardState,
+    workspaces: &[(String, String, String)],
+    board_columns: &[Vec<&QueueItem>],
+) {
+    match state.active_tab {
+        DashboardTab::Dashboard => {
+            let ts = state.current_tab_state_mut();
+            ts.active_panel = Some(ActivePanel::Recent);
+            ts.selected_index = 0;
+        }
+        DashboardTab::PerWorkspace => {
+            if !workspaces.is_empty() && state.selected_workspace < workspaces.len() - 1 {
+                state.selected_workspace += 1;
+                state.current_tab_state_mut().selected_index = 0;
+            }
+        }
+        DashboardTab::Board => {
+            if state.board_selected_col < board_columns.len().saturating_sub(1) {
+                state.board_selected_col += 1;
+                state.board_selected_row = 0;
+            }
+        }
+        DashboardTab::Spec => {}
+    }
+}
+
+/// Handle Enter key to open item detail overlay.
+fn handle_enter(
+    state: &mut DashboardState,
+    running_items: &[QueueItem],
+    recent_items: &[QueueItem],
+    all_items: &[QueueItem],
+    workspaces: &[(String, String, String)],
+    db: &Database,
+    board_columns: &[Vec<&QueueItem>],
+) {
+    match state.active_tab {
+        DashboardTab::Dashboard => {
+            let panel = state
+                .current_tab_state()
+                .active_panel
+                .unwrap_or(ActivePanel::Running);
+            let idx = state.current_tab_state().selected_index;
+            let items: &[QueueItem] = match panel {
+                ActivePanel::Running => running_items,
+                ActivePanel::Recent => recent_items,
+            };
+            if let Some(item) = items.get(idx) {
+                state.overlay_item = Some(item.work_id.clone());
+            }
+        }
+        DashboardTab::PerWorkspace => {
+            if let Some(ws) = workspaces.get(state.selected_workspace) {
+                let ws_items = db.list_items(None, Some(&ws.0)).unwrap_or_default();
+                let idx = state.current_tab_state().selected_index;
+                if let Some(item) = ws_items.get(idx) {
+                    state.overlay_item = Some(item.work_id.clone());
+                }
+            }
+        }
+        DashboardTab::Spec => {
+            // Spec tab: no overlay on Enter (could be extended in future).
+        }
+        DashboardTab::Board => {
+            if let Some(col) = board_columns.get(state.board_selected_col)
+                && let Some(item) = col.get(state.board_selected_row)
+            {
+                state.overlay_item = Some(item.work_id.clone());
+            }
+        }
+    }
+    let _ = all_items;
+}
+
+// ---------------------------------------------------------------------------
+// Rendering
+// ---------------------------------------------------------------------------
+
+/// Render the tab bar showing available tabs with the active one highlighted.
+fn render_tab_bar(active: DashboardTab) -> Paragraph<'static> {
+    let tabs = [
+        ("d", "Dashboard", DashboardTab::Dashboard),
+        ("w", "Workspace", DashboardTab::PerWorkspace),
+        ("s", "Spec", DashboardTab::Spec),
+        ("b", "Board", DashboardTab::Board),
+    ];
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, (key, label, tab)) in tabs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = if *tab == active {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(format!("[{key}] {label}"), style));
+    }
+
+    spans.push(Span::raw("    "));
+    spans.push(Span::styled(
+        "[h] Help  [Tab/Shift+Tab] Cycle",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    Paragraph::new(Line::from(spans)).block(
+        Block::default()
+            .title(" Belt TUI ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    )
+}
+
+/// Render the Board tab as a kanban-style view with columns per phase.
+fn render_board_tab(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    board_columns: &[Vec<&QueueItem>],
+    state: &DashboardState,
+) {
+    let num_cols = BOARD_COLUMNS.len();
+    let constraints: Vec<Constraint> = (0..num_cols)
+        .map(|_| Constraint::Ratio(1, num_cols as u32))
+        .collect();
+
+    let col_areas = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(area);
+
+    for (col_idx, phase) in BOARD_COLUMNS.iter().enumerate() {
+        let items = &board_columns[col_idx];
+        let is_selected_col = col_idx == state.board_selected_col;
+        let phase_str = phase.as_str();
+        let color = phase_color(phase_str);
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+
+        for (row_idx, item) in items.iter().enumerate() {
+            let is_selected = is_selected_col && row_idx == state.board_selected_row;
+            let work_id_display =
+                truncate_str(&item.work_id, col_areas[col_idx].width as usize - 4);
+
+            if is_selected {
+                lines.push(Line::from(Span::styled(
+                    format!("> {work_id_display}"),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            } else {
+                lines.push(Line::from(Span::styled(
+                    format!("  {work_id_display}"),
+                    Style::default().fg(Color::White),
+                )));
+            }
+        }
+
+        if items.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  (empty)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        let border_color = if is_selected_col {
+            color
+        } else {
+            Color::DarkGray
+        };
+        let title = format!(" {} ({}) ", phase_str, items.len());
+
+        let paragraph = Paragraph::new(lines).block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color)),
+        );
+
+        frame.render_widget(paragraph, col_areas[col_idx]);
+    }
+}
+
+/// Truncate a string to fit within a given width.
+fn truncate_str(s: &str, max_width: usize) -> String {
+    if max_width < 4 {
+        return s.chars().take(max_width).collect();
+    }
+    if s.len() <= max_width {
+        s.to_string()
+    } else {
+        let mut result: String = s.chars().take(max_width - 2).collect();
+        result.push_str("..");
+        result
     }
 }
 
@@ -465,44 +843,6 @@ fn render_recent_items_stateful(
     )
 }
 
-/// Render the tab bar showing available tabs with the active one highlighted.
-fn render_tab_bar(active: DashboardTab) -> Paragraph<'static> {
-    let tabs = [
-        ("d", "Dashboard", DashboardTab::Dashboard),
-        ("w", "Workspace", DashboardTab::PerWorkspace),
-        ("s", "Spec", DashboardTab::Spec),
-    ];
-
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    for (i, (key, label, tab)) in tabs.iter().enumerate() {
-        if i > 0 {
-            spans.push(Span::raw("  "));
-        }
-        let style = if *tab == active {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-                .add_modifier(Modifier::UNDERLINED)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        spans.push(Span::styled(format!("[{key}] {label}"), style));
-    }
-
-    spans.push(Span::raw("    "));
-    spans.push(Span::styled(
-        "[h] Help",
-        Style::default().fg(Color::DarkGray),
-    ));
-
-    Paragraph::new(Line::from(spans)).block(
-        Block::default()
-            .title(" Belt TUI ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
-    )
-}
-
 /// Render the main dashboard tab content (phase summary + running/recent items).
 fn render_dashboard_tab(
     frame: &mut ratatui::Frame,
@@ -524,17 +864,20 @@ fn render_dashboard_tab(
     let summary = render_phase_summary(db);
     frame.render_widget(summary, chunks[0]);
 
+    let tab_state = state.current_tab_state();
+    let active_panel = tab_state.active_panel.unwrap_or(ActivePanel::Running);
+
     let running_table = render_running_items_stateful(
         running_items,
-        state.active_panel == ActivePanel::Running,
-        state.selected_index,
+        active_panel == ActivePanel::Running,
+        tab_state.selected_index,
     );
     frame.render_widget(running_table, chunks[1]);
 
     let recent_table = render_recent_items_stateful(
         recent_items,
-        state.active_panel == ActivePanel::Recent,
-        state.selected_index,
+        active_panel == ActivePanel::Recent,
+        tab_state.selected_index,
     );
     frame.render_widget(recent_table, chunks[2]);
 }
@@ -594,6 +937,7 @@ fn render_per_workspace_tab(
     // Items for the selected workspace.
     let selected_ws = &workspaces[state.selected_workspace].0;
     let ws_items = db.list_items(None, Some(selected_ws)).unwrap_or_default();
+    let selected_index = state.current_tab_state().selected_index;
 
     let rows: Vec<Row<'static>> = ws_items
         .iter()
@@ -607,7 +951,7 @@ fn render_per_workspace_tab(
                 Cell::from(item.state.clone()),
                 Cell::from(item.updated_at.clone()),
             ]);
-            if i == state.selected_index {
+            if i == selected_index {
                 row.style(
                     Style::default()
                         .bg(Color::DarkGray)
@@ -852,6 +1196,10 @@ fn render_help_overlay(frame: &mut ratatui::Frame) {
             Span::raw("Switch to Spec progress tab"),
         ]),
         Line::from(vec![
+            Span::styled("  b       ", Style::default().fg(Color::Yellow)),
+            Span::raw("Switch to Board (kanban) tab"),
+        ]),
+        Line::from(vec![
             Span::styled("  h       ", Style::default().fg(Color::Yellow)),
             Span::raw("Show this help"),
         ]),
@@ -874,7 +1222,7 @@ fn render_help_overlay(frame: &mut ratatui::Frame) {
         ]),
         Line::from(vec![
             Span::styled("  Tab     ", Style::default().fg(Color::Cyan)),
-            Span::raw("Switch panel (Dashboard tab)"),
+            Span::raw("Cycle to next tab (Shift+Tab: previous)"),
         ]),
         Line::from(vec![
             Span::styled("  Enter   ", Style::default().fg(Color::Cyan)),
@@ -1201,7 +1549,6 @@ mod tests {
 
     #[test]
     fn render_runtime_panel_does_not_panic_with_empty_stats() {
-        use std::collections::HashMap;
         let stats = RuntimeStats {
             total_tokens_input: 0,
             total_tokens_output: 0,
@@ -1216,7 +1563,6 @@ mod tests {
 
     #[test]
     fn render_runtime_panel_does_not_panic_with_avg_duration() {
-        use std::collections::HashMap;
         let stats = RuntimeStats {
             total_tokens_input: 500,
             total_tokens_output: 300,
@@ -1230,8 +1576,6 @@ mod tests {
 
     #[test]
     fn render_runtime_panel_does_not_panic_with_multiple_models() {
-        use std::collections::HashMap;
-
         use belt_infra::db::ModelStats;
 
         let mut by_model = HashMap::new();
@@ -1272,8 +1616,6 @@ mod tests {
 
     #[test]
     fn model_stats_sorted_by_total_tokens_descending() {
-        use std::collections::HashMap;
-
         use belt_infra::db::ModelStats;
 
         let mut by_model = HashMap::new();
@@ -1458,13 +1800,14 @@ mod tests {
         assert!(text.contains("item not found"));
     }
 
-    // ---- collect_recent_items ----
+    // ---- DashboardState ----
 
     #[test]
     fn active_panel_default_is_running() {
         let state = DashboardState::new();
-        assert_eq!(state.active_panel, ActivePanel::Running);
-        assert_eq!(state.selected_index, 0);
+        let ts = state.current_tab_state();
+        assert_eq!(ts.active_panel, Some(ActivePanel::Running));
+        assert_eq!(ts.selected_index, 0);
         assert!(state.overlay_item.is_none());
     }
 
@@ -1649,6 +1992,62 @@ mod tests {
         assert_eq!(state.active_tab, DashboardTab::Dashboard);
         assert!(!state.show_help);
         assert_eq!(state.selected_workspace, 0);
+        assert_eq!(state.board_selected_col, 0);
+        assert_eq!(state.board_selected_row, 0);
+    }
+
+    // ---- DashboardTab cycling ----
+
+    #[test]
+    fn tab_cycle_forward() {
+        assert_eq!(DashboardTab::Dashboard.next(), DashboardTab::PerWorkspace);
+        assert_eq!(DashboardTab::PerWorkspace.next(), DashboardTab::Spec);
+        assert_eq!(DashboardTab::Spec.next(), DashboardTab::Board);
+        assert_eq!(DashboardTab::Board.next(), DashboardTab::Dashboard);
+    }
+
+    #[test]
+    fn tab_cycle_backward() {
+        assert_eq!(DashboardTab::Dashboard.prev(), DashboardTab::Board);
+        assert_eq!(DashboardTab::Board.prev(), DashboardTab::Spec);
+        assert_eq!(DashboardTab::Spec.prev(), DashboardTab::PerWorkspace);
+        assert_eq!(DashboardTab::PerWorkspace.prev(), DashboardTab::Dashboard);
+    }
+
+    // ---- BOARD_COLUMNS ----
+
+    #[test]
+    fn board_columns_count_is_seven() {
+        assert_eq!(BOARD_COLUMNS.len(), 7);
+    }
+
+    #[test]
+    fn board_columns_match_expected_phases() {
+        let expected = [
+            QueuePhase::Pending,
+            QueuePhase::Ready,
+            QueuePhase::Running,
+            QueuePhase::Completed,
+            QueuePhase::Done,
+            QueuePhase::Hitl,
+            QueuePhase::Failed,
+        ];
+        assert_eq!(BOARD_COLUMNS, expected);
+    }
+
+    // ---- tab_state_preserved ----
+
+    #[test]
+    fn tab_state_preserved_across_switches() {
+        let mut state = DashboardState::new();
+        // Modify Dashboard tab state.
+        state.current_tab_state_mut().selected_index = 5;
+        // Switch to Board tab.
+        state.active_tab = DashboardTab::Board;
+        assert_eq!(state.current_tab_state().selected_index, 0);
+        // Switch back to Dashboard.
+        state.active_tab = DashboardTab::Dashboard;
+        assert_eq!(state.current_tab_state().selected_index, 5);
     }
 
     // ---- spec_status_color ----
@@ -1717,5 +2116,28 @@ mod tests {
         assert_eq!(DashboardTab::Dashboard, DashboardTab::Dashboard);
         assert_ne!(DashboardTab::Dashboard, DashboardTab::Spec);
         assert_ne!(DashboardTab::Spec, DashboardTab::PerWorkspace);
+        assert_ne!(DashboardTab::Board, DashboardTab::Dashboard);
+    }
+
+    // ---- truncate_str ----
+
+    #[test]
+    fn truncate_str_short_string() {
+        assert_eq!(truncate_str("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_str_exact_length() {
+        assert_eq!(truncate_str("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_long_string() {
+        assert_eq!(truncate_str("hello world", 7), "hello..");
+    }
+
+    #[test]
+    fn truncate_str_very_small_max() {
+        assert_eq!(truncate_str("hello", 3), "hel");
     }
 }
