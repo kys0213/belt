@@ -6,7 +6,7 @@
 //! pending count, recent transition events, and per-workspace statistics)
 //! and displayed to the user.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 
 use super::ClawWorkspace;
@@ -62,15 +62,33 @@ pub struct WorkspaceStats {
     pub recent_hitl_events: Vec<RecentEvent>,
 }
 
+/// Open the default Belt database at `~/.belt/belt.db`.
+///
+/// Returns `None` if the home directory cannot be determined or the
+/// database cannot be opened.
+fn open_default_db() -> Option<belt_infra::db::Database> {
+    let belt_home = dirs::home_dir()?.join(".belt");
+    let db_path = belt_home.join("belt.db");
+    belt_infra::db::Database::open(db_path.to_str()?).ok()
+}
+
+/// Convert an infra transition event into a [`RecentEvent`].
+fn into_recent_event(e: belt_infra::db::TransitionEvent) -> RecentEvent {
+    RecentEvent {
+        item_id: e.item_id,
+        from_state: e.from_state,
+        to_state: e.to_state,
+        timestamp: e.timestamp,
+    }
+}
+
 /// Collect system status from the Belt database.
 ///
 /// Opens the default `~/.belt/belt.db` database and gathers queue item
 /// counts by phase, the HITL pending count, and the 5 most recent
 /// transition events. Returns `None` if the database is unavailable.
 pub fn collect_status() -> Option<StatusSummary> {
-    let belt_home = dirs::home_dir()?.join(".belt");
-    let db_path = belt_home.join("belt.db");
-    let db = belt_infra::db::Database::open(db_path.to_str()?).ok()?;
+    let db = open_default_db()?;
     collect_status_from_db(&db)
 }
 
@@ -87,15 +105,7 @@ fn collect_status_from_db(db: &belt_infra::db::Database) -> Option<StatusSummary
         .unwrap_or(0);
 
     let events = db.list_recent_transition_events(5).ok()?;
-    let recent_events = events
-        .into_iter()
-        .map(|e| RecentEvent {
-            item_id: e.item_id,
-            from_state: e.from_state,
-            to_state: e.to_state,
-            timestamp: e.timestamp,
-        })
-        .collect();
+    let recent_events = events.into_iter().map(into_recent_event).collect();
 
     Some(StatusSummary {
         total_items,
@@ -112,9 +122,7 @@ fn collect_status_from_db(db: &belt_infra::db::Database) -> Option<StatusSummary
 /// Returns `None` if the database is unavailable or the workspace name is absent.
 pub fn collect_workspace_stats(workspace: Option<&str>) -> Option<WorkspaceStats> {
     let ws_name = workspace?;
-    let belt_home = dirs::home_dir()?.join(".belt");
-    let db_path = belt_home.join("belt.db");
-    let db = belt_infra::db::Database::open(db_path.to_str()?).ok()?;
+    let db = open_default_db()?;
     collect_workspace_stats_from_db(&db, ws_name)
 }
 
@@ -129,35 +137,29 @@ fn collect_workspace_stats_from_db(
 
     // Count specs by status for this workspace.
     let specs = db.list_specs(Some(workspace), None).ok()?;
-    let mut spec_status_counts: HashMap<SpecStatus, u32> = HashMap::new();
+    let mut active_spec_count: u32 = 0;
+    let mut completing_count: u32 = 0;
+    let mut completed_count: u32 = 0;
     for spec in &specs {
-        *spec_status_counts.entry(spec.status).or_insert(0) += 1;
+        match spec.status {
+            SpecStatus::Active => active_spec_count += 1,
+            SpecStatus::Completing => completing_count += 1,
+            SpecStatus::Completed => completed_count += 1,
+            _ => {}
+        }
     }
-
-    let active_spec_count = spec_status_counts
-        .get(&SpecStatus::Active)
-        .copied()
-        .unwrap_or(0);
-    let completing_count = spec_status_counts
-        .get(&SpecStatus::Completing)
-        .copied()
-        .unwrap_or(0);
-    let completed_count = spec_status_counts
-        .get(&SpecStatus::Completed)
-        .copied()
-        .unwrap_or(0);
 
     // Count queue items by phase for this workspace.
     let items = db.list_items(None, Some(workspace)).ok()?;
     let mut pending_items_count: u32 = 0;
     let mut running_items_count: u32 = 0;
-    let mut hitl_item_ids: Vec<String> = Vec::new();
+    let mut hitl_item_ids: HashSet<String> = HashSet::new();
     for item in &items {
         match item.phase {
             belt_core::phase::QueuePhase::Pending => pending_items_count += 1,
             belt_core::phase::QueuePhase::Running => running_items_count += 1,
             belt_core::phase::QueuePhase::Hitl => {
-                hitl_item_ids.push(item.work_id.clone());
+                hitl_item_ids.insert(item.work_id.clone());
             }
             _ => {}
         }
@@ -170,12 +172,7 @@ fn collect_workspace_stats_from_db(
             .into_iter()
             .filter(|e| e.to_state == "hitl" && hitl_item_ids.contains(&e.item_id))
             .take(5)
-            .map(|e| RecentEvent {
-                item_id: e.item_id,
-                from_state: e.from_state,
-                to_state: e.to_state,
-                timestamp: e.timestamp,
-            })
+            .map(into_recent_event)
             .collect()
     } else {
         Vec::new()
