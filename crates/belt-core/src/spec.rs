@@ -314,6 +314,61 @@ impl fmt::Display for OverlapType {
     }
 }
 
+/// Required sections that a spec content must contain.
+///
+/// Each entry is a pair of `(section_id, display_name)` where `section_id` is
+/// the canonical lowercase identifier used for matching and `display_name` is
+/// the human-readable label shown in error messages.
+pub const REQUIRED_SECTIONS: &[(&str, &str)] = &[
+    ("overview", "Overview"),
+    ("requirements", "Requirements"),
+    ("architecture", "Architecture"),
+    ("tests", "Tests"),
+    ("acceptance criteria", "Acceptance Criteria"),
+];
+
+/// Validate that spec content contains all required sections.
+///
+/// Sections are detected as markdown level-2 headings (`## SectionName`).
+/// Matching is case-insensitive, and the following aliases are recognized:
+/// - "acceptance criteria" matches `## Acceptance Criteria` or `## AC`
+/// - "tests" matches `## Tests` or `## Test`
+///
+/// Returns `Ok(())` if all required sections are present, or `Err` with a list
+/// of missing section names.
+pub fn validate_required_sections(content: &str) -> Result<(), Vec<&'static str>> {
+    let headers: Vec<String> = content
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            trimmed.strip_prefix("## ").map(|h| h.trim().to_lowercase())
+        })
+        .collect();
+
+    let mut missing = Vec::new();
+
+    for &(section_id, display_name) in REQUIRED_SECTIONS {
+        let found = headers.iter().any(|h| {
+            if section_id == "acceptance criteria" {
+                h == "acceptance criteria" || h == "ac"
+            } else if section_id == "tests" {
+                h == "tests" || h == "test"
+            } else {
+                h == section_id
+            }
+        });
+        if !found {
+            missing.push(display_name);
+        }
+    }
+
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(missing)
+    }
+}
+
 /// Extract acceptance criteria from markdown content.
 ///
 /// Looks for a section headed by `## Acceptance Criteria` or `## AC`
@@ -930,5 +985,66 @@ mod tests {
         let json = serde_json::to_string(&spec).unwrap();
         let parsed: Spec = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.decomposed_issues, Some("10,20,30".to_string()));
+    }
+
+    #[test]
+    fn validate_all_sections_present() {
+        let content = "\
+## Overview\nSome overview.\n\
+## Requirements\nSome requirements.\n\
+## Architecture\nSome architecture.\n\
+## Tests\nSome tests.\n\
+## Acceptance Criteria\n- Criterion 1\n";
+        assert!(validate_required_sections(content).is_ok());
+    }
+
+    #[test]
+    fn validate_missing_sections() {
+        let content = "## Overview\nSome overview.\n## Architecture\nSome arch.\n";
+        let err = validate_required_sections(content).unwrap_err();
+        assert!(err.contains(&"Requirements"));
+        assert!(err.contains(&"Tests"));
+        assert!(err.contains(&"Acceptance Criteria"));
+        assert!(!err.contains(&"Overview"));
+        assert!(!err.contains(&"Architecture"));
+    }
+
+    #[test]
+    fn validate_empty_content() {
+        let err = validate_required_sections("").unwrap_err();
+        assert_eq!(err.len(), 5);
+    }
+
+    #[test]
+    fn validate_case_insensitive() {
+        let content = "\
+## overview\ntext\n\
+## REQUIREMENTS\ntext\n\
+## Architecture\ntext\n\
+## tests\ntext\n\
+## acceptance criteria\ntext\n";
+        assert!(validate_required_sections(content).is_ok());
+    }
+
+    #[test]
+    fn validate_ac_alias() {
+        let content = "\
+## Overview\ntext\n\
+## Requirements\ntext\n\
+## Architecture\ntext\n\
+## Tests\ntext\n\
+## AC\n- Criterion\n";
+        assert!(validate_required_sections(content).is_ok());
+    }
+
+    #[test]
+    fn validate_test_alias() {
+        let content = "\
+## Overview\ntext\n\
+## Requirements\ntext\n\
+## Architecture\ntext\n\
+## Test\ntext\n\
+## AC\ntext\n";
+        assert!(validate_required_sections(content).is_ok());
     }
 }
