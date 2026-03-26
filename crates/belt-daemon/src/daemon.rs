@@ -86,6 +86,8 @@ struct ExecutionResult {
     on_fail_actions: Vec<Action>,
     /// worktree path for on_fail script execution.
     worktree: Option<PathBuf>,
+    /// Token usage from on_enter execution, recorded separately from handler result.
+    on_enter_result: Option<ActionResult>,
 }
 
 enum ExecutionOutcome {
@@ -471,6 +473,7 @@ impl Daemon {
                     ws_name,
                     on_fail_actions: Vec::new(),
                     worktree: None,
+                    on_enter_result: None,
                 };
             }
         };
@@ -507,6 +510,7 @@ impl Daemon {
                         ws_name,
                         on_fail_actions: Vec::new(),
                         worktree: None,
+                        on_enter_result: None,
                     };
                 }
             }
@@ -516,7 +520,7 @@ impl Daemon {
 
         // on_enter
         let on_enter: Vec<Action> = state_config.on_enter.iter().map(Action::from).collect();
-        match executor.execute_all(&on_enter, &env).await {
+        let on_enter_ok = match executor.execute_all(&on_enter, &env).await {
             Ok(Some(r)) if !r.success() => {
                 item.phase = QueuePhase::Failed;
                 return ExecutionResult {
@@ -528,6 +532,7 @@ impl Daemon {
                     ws_name,
                     on_fail_actions,
                     worktree: Some(worktree),
+                    on_enter_result: Some(r),
                 };
             }
             Err(e) => {
@@ -542,12 +547,11 @@ impl Daemon {
                     ws_name,
                     on_fail_actions,
                     worktree: Some(worktree),
+                    on_enter_result: None,
                 };
             }
-            _ => {
-                // 성공 → handler 진행
-            }
-        }
+            Ok(on_enter_res) => on_enter_res,
+        };
 
         // handler chain
         let handlers: Vec<Action> = state_config.handlers.iter().map(Action::from).collect();
@@ -563,6 +567,7 @@ impl Daemon {
                 ws_name,
                 on_fail_actions,
                 worktree: Some(worktree),
+                on_enter_result: on_enter_ok,
             },
             Ok(r) => {
                 item.phase = QueuePhase::Completed;
@@ -572,6 +577,7 @@ impl Daemon {
                     ws_name,
                     on_fail_actions: Vec::new(),
                     worktree: Some(worktree),
+                    on_enter_result: on_enter_ok,
                 }
             }
             Err(e) => {
@@ -585,6 +591,7 @@ impl Daemon {
                     ws_name,
                     on_fail_actions,
                     worktree: Some(worktree),
+                    on_enter_result: on_enter_ok,
                 }
             }
         }
@@ -601,7 +608,13 @@ impl Daemon {
             ws_name,
             on_fail_actions,
             worktree,
+            on_enter_result,
         } = exec_result;
+
+        // Record token usage from on_enter execution if present.
+        if let Some(ref r) = on_enter_result {
+            self.try_record_token_usage(&item, r);
+        }
 
         match outcome {
             ExecutionOutcome::Skipped => ItemOutcome::Skipped(item),
@@ -642,11 +655,17 @@ impl Daemon {
                 if escalation.should_run_on_fail() {
                     if let Some(ref wt) = worktree {
                         let env = ActionEnv::new(&item.work_id, wt);
-                        if let Err(e) = self.executor.execute_all(&on_fail_actions, &env).await {
-                            tracing::warn!(
-                                work_id = %item.work_id,
-                                "on_fail script execution error: {e}"
-                            );
+                        match self.executor.execute_all(&on_fail_actions, &env).await {
+                            Ok(Some(ref r)) => {
+                                self.try_record_token_usage(&item, r);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    work_id = %item.work_id,
+                                    "on_fail script execution error: {e}"
+                                );
+                            }
+                            _ => {}
                         }
                     }
                 } else {
@@ -3591,5 +3610,159 @@ sources:
         // Spec should remain in Completing.
         let updated_spec = daemon.db.as_ref().unwrap().get_spec("spec-43").unwrap();
         assert_eq!(updated_spec.status, belt_core::spec::SpecStatus::Completing);
+    }
+
+    // ---------------------------------------------------------------
+    // Token usage auto-save tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn try_record_token_usage_saves_to_db() {
+        use belt_core::runtime::TokenUsage;
+        use belt_infra::db::Database;
+
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let db = Database::open_in_memory().unwrap();
+        let daemon = setup_daemon(&tmp, source, vec![]).with_db(db);
+
+        let item = test_item("github:org/repo#1", "analyze");
+        let result = ActionResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration: std::time::Duration::from_millis(500),
+            token_usage: Some(TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: Some(10),
+                cache_write_tokens: None,
+            }),
+            runtime_name: Some("mock".to_string()),
+            model: Some("gpt-4".to_string()),
+        };
+
+        daemon.try_record_token_usage(&item, &result);
+
+        // Verify the record was inserted into the DB.
+        let rows = daemon
+            .db
+            .as_ref()
+            .unwrap()
+            .get_token_usage_by_work_id("github:org/repo#1:analyze")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].input_tokens, 100);
+        assert_eq!(rows[0].output_tokens, 50);
+        assert_eq!(rows[0].model, "gpt-4");
+        assert_eq!(rows[0].runtime, "mock");
+    }
+
+    #[test]
+    fn try_record_token_usage_skips_when_no_usage() {
+        use belt_infra::db::Database;
+
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let db = Database::open_in_memory().unwrap();
+        let daemon = setup_daemon(&tmp, source, vec![]).with_db(db);
+
+        let item = test_item("github:org/repo#2", "analyze");
+        let result = ActionResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration: std::time::Duration::from_millis(100),
+            token_usage: None,
+            runtime_name: Some("mock".to_string()),
+            model: None,
+        };
+
+        daemon.try_record_token_usage(&item, &result);
+
+        // No records should be inserted when token_usage is None.
+        let rows = daemon
+            .db
+            .as_ref()
+            .unwrap()
+            .get_token_usage_by_work_id("github:org/repo#2:analyze")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn try_record_token_usage_skips_when_no_runtime_name() {
+        use belt_core::runtime::TokenUsage;
+        use belt_infra::db::Database;
+
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let db = Database::open_in_memory().unwrap();
+        let daemon = setup_daemon(&tmp, source, vec![]).with_db(db);
+
+        let item = test_item("github:org/repo#3", "analyze");
+        let result = ActionResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration: std::time::Duration::from_millis(100),
+            token_usage: Some(TokenUsage {
+                input_tokens: 200,
+                output_tokens: 100,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            }),
+            runtime_name: None, // script actions have no runtime name
+            model: None,
+        };
+
+        daemon.try_record_token_usage(&item, &result);
+
+        // No records should be inserted when runtime_name is None.
+        let rows = daemon
+            .db
+            .as_ref()
+            .unwrap()
+            .get_token_usage_by_work_id("github:org/repo#3:analyze")
+            .unwrap();
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn try_record_token_usage_uses_unknown_model_when_absent() {
+        use belt_core::runtime::TokenUsage;
+        use belt_infra::db::Database;
+
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let db = Database::open_in_memory().unwrap();
+        let daemon = setup_daemon(&tmp, source, vec![]).with_db(db);
+
+        let item = test_item("github:org/repo#4", "analyze");
+        let result = ActionResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration: std::time::Duration::from_millis(200),
+            token_usage: Some(TokenUsage {
+                input_tokens: 50,
+                output_tokens: 25,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            }),
+            runtime_name: Some("claude".to_string()),
+            model: None, // model not provided
+        };
+
+        daemon.try_record_token_usage(&item, &result);
+
+        let rows = daemon
+            .db
+            .as_ref()
+            .unwrap()
+            .get_token_usage_by_work_id("github:org/repo#4:analyze")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "unknown");
     }
 }
