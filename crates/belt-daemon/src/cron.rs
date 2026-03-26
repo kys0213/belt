@@ -1654,17 +1654,24 @@ impl CronHandler for GapDetectionJob {
     }
 }
 
-/// Extracts knowledge from completed (Done) queue items (CR-08).
+/// Maximum number of merged PRs to process per execution cycle.
+const KNOWLEDGE_PR_LIMIT: usize = 20;
+
+/// Maximum length of diff content to include in LLM prompt (characters).
+const KNOWLEDGE_DIFF_MAX_CHARS: usize = 8000;
+
+/// Extracts knowledge from merged PRs and completed queue items (CR-08).
 ///
-/// Runs every hour. Queries items in the `Done` phase, checks whether
-/// knowledge has already been extracted for each item (via `source_ref`
-/// deduplication), and persists new [`KnowledgeEntry`] rows to the
-/// `knowledge_base` table.
+/// Runs every hour. Scans registered workspaces for recently merged PRs
+/// via the `gh` CLI, fetches PR title, body, and diff summary, then calls
+/// `belt agent` to extract structured knowledge. Falls back to simple
+/// keyword-based extraction for Done queue items without PR data.
 ///
 /// Knowledge is categorised into:
 /// - **decision**: items whose title or state suggests a decision was made
 /// - **pattern**: items related to implementation patterns
 /// - **domain**: general domain knowledge from the item context
+/// - **review_feedback**: insights extracted from PR review comments
 ///
 /// [`KnowledgeEntry`]: belt_infra::db::KnowledgeEntry
 pub struct KnowledgeExtractionJob {
@@ -1676,6 +1683,306 @@ impl KnowledgeExtractionJob {
     pub fn new(db: Arc<Database>) -> Self {
         Self { db }
     }
+
+    /// Fetch recently merged PRs for a repository via `gh pr list`.
+    ///
+    /// Returns a list of `(pr_number, title, body)` tuples for merged PRs
+    /// that have not yet been extracted (checked via `source_ref` dedup).
+    fn fetch_merged_prs(repo: &str) -> Result<Vec<(i64, String, Option<String>)>, BeltError> {
+        let output = std::process::Command::new("gh")
+            .args([
+                "pr",
+                "list",
+                "--repo",
+                repo,
+                "--state",
+                "merged",
+                "--json",
+                "number,title,body",
+                "--limit",
+                &KNOWLEDGE_PR_LIMIT.to_string(),
+            ])
+            .output()
+            .map_err(|e| BeltError::Runtime(format!("failed to invoke gh CLI: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!(
+                repo = %repo,
+                stderr = %stderr,
+                "gh pr list failed"
+            );
+            return Ok(Vec::new());
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let prs: Vec<serde_json::Value> = serde_json::from_str(&stdout)
+            .map_err(|e| BeltError::Runtime(format!("failed to parse gh pr list output: {e}")))?;
+
+        let mut result = Vec::new();
+        for pr in prs {
+            let number = match pr["number"].as_i64() {
+                Some(n) => n,
+                None => continue,
+            };
+            let title = pr["title"].as_str().unwrap_or("").to_string();
+            let body = pr["body"].as_str().and_then(|s| {
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_string())
+                }
+            });
+            result.push((number, title, body));
+        }
+
+        Ok(result)
+    }
+
+    /// Fetch the diff summary for a specific PR via `gh pr diff`.
+    ///
+    /// Returns the diff content truncated to [`KNOWLEDGE_DIFF_MAX_CHARS`].
+    fn fetch_pr_diff(repo: &str, pr_number: i64) -> Option<String> {
+        let output = std::process::Command::new("gh")
+            .args(["pr", "diff", &pr_number.to_string(), "--repo", repo])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let diff = String::from_utf8_lossy(&output.stdout).to_string();
+        if diff.len() > KNOWLEDGE_DIFF_MAX_CHARS {
+            // Find a safe truncation point at a char boundary.
+            let truncate_at = diff
+                .char_indices()
+                .take_while(|(i, _)| *i < KNOWLEDGE_DIFF_MAX_CHARS)
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            Some(format!(
+                "{}...\n[truncated, {} total chars]",
+                &diff[..truncate_at],
+                diff.len()
+            ))
+        } else {
+            Some(diff)
+        }
+    }
+
+    /// Call `belt agent` to extract structured knowledge from a merged PR.
+    ///
+    /// Spawns `belt agent -p <prompt> --json` as a subprocess and parses
+    /// the JSON output to extract `category` and `content` fields.
+    ///
+    /// Returns `(category, content)` on success.
+    fn extract_knowledge_via_llm(
+        title: &str,
+        body: Option<&str>,
+        diff: Option<&str>,
+    ) -> Option<(String, String)> {
+        let body_text = body.unwrap_or("(no description)");
+        let diff_text = diff.unwrap_or("(no diff available)");
+
+        let prompt = format!(
+            r#"You are a knowledge extraction agent. Analyze this merged PR and extract the key knowledge.
+
+PR Title: {title}
+PR Description: {body_text}
+Diff summary:
+{diff_text}
+
+Respond with ONLY a JSON object (no markdown, no explanation):
+{{
+  "category": "<one of: decision, pattern, domain, review_feedback>",
+  "content": "<2-4 sentence summary of the key knowledge, decisions, or patterns from this PR>"
+}}"#
+        );
+
+        let output = std::process::Command::new("belt")
+            .args(["agent", "-p", &prompt, "--json"])
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            tracing::warn!(
+                "belt agent knowledge extraction failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return None;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Try to parse the JSON response — the output may contain extra text
+        // around the JSON object, so find the first `{` and last `}`.
+        let json_str = extract_json_object(&stdout)?;
+        let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
+
+        let category = val["category"].as_str().unwrap_or("domain").to_string();
+        let content = val["content"].as_str()?.to_string();
+
+        Some((category, content))
+    }
+
+    /// Extract knowledge from merged PRs for all registered workspaces.
+    fn extract_from_merged_prs(&self, ctx: &CronContext) -> Result<(u32, u32), BeltError> {
+        let workspaces = self.db.list_workspaces()?;
+        let mut extracted_count = 0u32;
+        let mut skipped_count = 0u32;
+
+        for (name, config_path, _created_at) in &workspaces {
+            let workspace_config = match belt_infra::workspace_loader::load_workspace_config(
+                std::path::Path::new(config_path),
+            ) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %name,
+                        error = %e,
+                        "KnowledgeExtractionJob: failed to load workspace config, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            let source_url = match workspace_config.sources.get("github") {
+                Some(cfg) => &cfg.url,
+                None => continue,
+            };
+
+            let repo = match belt_infra::sources::github::GitHubDataSource::extract_repo_name(
+                source_url,
+            ) {
+                Some(r) => r,
+                None => {
+                    tracing::warn!(
+                        workspace = %name,
+                        url = %source_url,
+                        "KnowledgeExtractionJob: could not extract repo name"
+                    );
+                    continue;
+                }
+            };
+
+            tracing::info!(
+                workspace = %name,
+                repo = %repo,
+                "KnowledgeExtractionJob: scanning merged PRs"
+            );
+
+            let merged_prs = match Self::fetch_merged_prs(&repo) {
+                Ok(prs) => prs,
+                Err(e) => {
+                    tracing::warn!(
+                        workspace = %name,
+                        error = %e,
+                        "KnowledgeExtractionJob: failed to fetch merged PRs"
+                    );
+                    continue;
+                }
+            };
+
+            for (pr_number, title, body) in &merged_prs {
+                let source_ref = format!("gh:{repo}#{pr_number}");
+
+                // Deduplicate.
+                let existing = self.db.get_knowledge_by_source(&source_ref)?;
+                if !existing.is_empty() {
+                    skipped_count += 1;
+                    continue;
+                }
+
+                // Fetch diff.
+                let diff = Self::fetch_pr_diff(&repo, *pr_number);
+
+                // Try LLM extraction first, fall back to keyword-based.
+                let (category, content) = match Self::extract_knowledge_via_llm(
+                    title,
+                    body.as_deref(),
+                    diff.as_deref(),
+                ) {
+                    Some((cat, cont)) => (cat, cont),
+                    None => {
+                        // Fallback: keyword-based classification with structured content.
+                        let category = classify_knowledge_category(title, "merged");
+                        let body_summary = body
+                            .as_deref()
+                            .map(|b| {
+                                if b.len() > 500 {
+                                    // Safe char-boundary truncation.
+                                    let end = b
+                                        .char_indices()
+                                        .take_while(|(i, _)| *i < 500)
+                                        .last()
+                                        .map(|(i, c)| i + c.len_utf8())
+                                        .unwrap_or(0);
+                                    format!("{}...", &b[..end])
+                                } else {
+                                    b.to_string()
+                                }
+                            })
+                            .unwrap_or_default();
+                        let content =
+                            format!("Merged PR #{}: {}. {}", pr_number, title, body_summary);
+                        (category.to_string(), content)
+                    }
+                };
+
+                let entry = belt_infra::db::KnowledgeEntry {
+                    id: None,
+                    workspace: name.clone(),
+                    source_ref: source_ref.clone(),
+                    category,
+                    content,
+                    created_at: ctx.now.to_rfc3339(),
+                };
+
+                match self.db.insert_knowledge(&entry) {
+                    Ok(()) => {
+                        extracted_count += 1;
+                        tracing::info!(
+                            source_ref = %source_ref,
+                            category = %entry.category,
+                            "KnowledgeExtractionJob: extracted knowledge from merged PR"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            source_ref = %source_ref,
+                            error = %e,
+                            "KnowledgeExtractionJob: failed to persist PR knowledge entry"
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok((extracted_count, skipped_count))
+    }
+}
+
+/// Extract the first JSON object from a string that may contain surrounding text.
+///
+/// Finds the first `{` and its matching `}` (handling nesting) and returns
+/// the substring. Returns `None` if no valid braces are found.
+fn extract_json_object(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let mut depth = 0i32;
+    for (i, ch) in s[start..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..start + i + 1]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Keywords that signal a "decision" category.
@@ -1710,34 +2017,36 @@ fn classify_knowledge_category(title: &str, state: &str) -> &'static str {
 
 impl CronHandler for KnowledgeExtractionJob {
     fn execute(&self, ctx: &CronContext) -> Result<(), BeltError> {
-        tracing::info!("KnowledgeExtractionJob: scanning completed items for knowledge");
+        tracing::info!("KnowledgeExtractionJob: scanning merged PRs and completed items");
 
-        // Step 1: Query all Done items.
+        // Phase 1: Extract knowledge from merged PRs via GitHub API + LLM.
+        let (pr_extracted, pr_skipped) = match self.extract_from_merged_prs(ctx) {
+            Ok(counts) => counts,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "KnowledgeExtractionJob: merged PR extraction failed, continuing with Done items"
+                );
+                (0, 0)
+            }
+        };
+
+        // Phase 2: Fallback — extract from Done queue items (keyword-based).
         let done_items = self.db.list_items(Some(QueuePhase::Done), None)?;
 
-        if done_items.is_empty() {
-            tracing::info!("KnowledgeExtractionJob: no Done items found, nothing to extract");
-            return Ok(());
-        }
-
-        tracing::info!(
-            count = done_items.len(),
-            "KnowledgeExtractionJob: found Done items"
-        );
-
-        let mut extracted_count = 0u32;
-        let mut skipped_count = 0u32;
+        let mut item_extracted = 0u32;
+        let mut item_skipped = 0u32;
 
         for item in &done_items {
-            // Step 2: Deduplicate — skip items whose source_ref already exists.
+            // Deduplicate — skip items whose source_ref already exists.
             let source_ref = &item.source_id;
             let existing = self.db.get_knowledge_by_source(source_ref)?;
             if !existing.is_empty() {
-                skipped_count += 1;
+                item_skipped += 1;
                 continue;
             }
 
-            // Step 3: Classify and extract knowledge content.
+            // Classify and extract knowledge content.
             let title = item.title.as_deref().unwrap_or(&item.work_id);
             let category = classify_knowledge_category(title, &item.state);
             let content = format!(
@@ -1754,10 +2063,9 @@ impl CronHandler for KnowledgeExtractionJob {
                 created_at: ctx.now.to_rfc3339(),
             };
 
-            // Step 4: Persist.
             match self.db.insert_knowledge(&entry) {
                 Ok(()) => {
-                    extracted_count += 1;
+                    item_extracted += 1;
                     tracing::info!(
                         source_ref = %source_ref,
                         category = %category,
@@ -1775,9 +2083,10 @@ impl CronHandler for KnowledgeExtractionJob {
         }
 
         tracing::info!(
-            total_done = done_items.len(),
-            extracted = extracted_count,
-            skipped = skipped_count,
+            pr_extracted = pr_extracted,
+            pr_skipped = pr_skipped,
+            item_extracted = item_extracted,
+            item_skipped = item_skipped,
             "KnowledgeExtractionJob: completed knowledge extraction"
         );
         Ok(())
@@ -2735,6 +3044,66 @@ mod tests {
             CronSchedule::Interval(d) => assert_eq!(d.as_secs(), 3600),
             _ => panic!("expected Interval schedule"),
         }
+    }
+
+    #[test]
+    fn extract_json_object_simple() {
+        let input = r#"{"category":"domain","content":"some knowledge"}"#;
+        assert_eq!(extract_json_object(input), Some(input));
+    }
+
+    #[test]
+    fn extract_json_object_with_surrounding_text() {
+        let input = r#"Here is the result: {"category":"decision","content":"chose JWT"} done."#;
+        assert_eq!(
+            extract_json_object(input),
+            Some(r#"{"category":"decision","content":"chose JWT"}"#)
+        );
+    }
+
+    #[test]
+    fn extract_json_object_nested_braces() {
+        let input = r#"{"outer":{"inner":"value"}}"#;
+        assert_eq!(extract_json_object(input), Some(input));
+    }
+
+    #[test]
+    fn extract_json_object_no_braces() {
+        assert_eq!(extract_json_object("no json here"), None);
+    }
+
+    #[test]
+    fn extract_json_object_unclosed_brace() {
+        assert_eq!(extract_json_object("{incomplete"), None);
+    }
+
+    #[test]
+    fn knowledge_extraction_pr_limit_is_reasonable() {
+        assert!(KNOWLEDGE_PR_LIMIT > 0);
+        assert!(KNOWLEDGE_PR_LIMIT <= 100);
+    }
+
+    #[test]
+    fn knowledge_extraction_diff_max_chars_is_reasonable() {
+        assert!(KNOWLEDGE_DIFF_MAX_CHARS > 0);
+        assert!(KNOWLEDGE_DIFF_MAX_CHARS <= 50_000);
+    }
+
+    #[test]
+    fn classify_knowledge_category_merged_state() {
+        // The "merged" state alone should not trigger decision/pattern.
+        assert_eq!(
+            classify_knowledge_category("add feature X", "merged"),
+            "domain"
+        );
+        assert_eq!(
+            classify_knowledge_category("decided to use Redis", "merged"),
+            "decision"
+        );
+        assert_eq!(
+            classify_knowledge_category("refactor auth module", "merged"),
+            "pattern"
+        );
     }
 
     // -- Built-in job logic tests --

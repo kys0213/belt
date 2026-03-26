@@ -25,7 +25,7 @@ impl GitHubDataSource {
     }
 
     /// URL에서 `owner/repo` 형태의 레포 이름을 추출한다.
-    fn extract_repo_name(url: &str) -> Option<String> {
+    pub fn extract_repo_name(url: &str) -> Option<String> {
         let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
         let parts: Vec<&str> = trimmed.split('/').collect();
         if parts.len() >= 2 {
