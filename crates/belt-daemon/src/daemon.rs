@@ -3113,4 +3113,327 @@ sources:
             QueuePhase::Done
         );
     }
+
+    // ---------------------------------------------------------------
+    // collect() additional tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn collect_returns_zero_when_source_empty() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let collected = daemon.collect().await.unwrap();
+        assert_eq!(collected, 0);
+        assert_eq!(daemon.queue_items().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn collect_is_idempotent_for_existing_items() {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let first = daemon.collect().await.unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(daemon.queue_items().len(), 1);
+
+        // Second collect with an empty source should add nothing.
+        let second = daemon.collect().await.unwrap();
+        assert_eq!(second, 0);
+        assert_eq!(daemon.queue_items().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn collect_skips_items_already_in_queue() {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Pre-populate the queue with the same work_id.
+        daemon.push_item(test_item("github:org/repo#1", "analyze"));
+        assert_eq!(daemon.queue_items().len(), 1);
+
+        // collect() should report 1 collected but not add a duplicate.
+        let collected = daemon.collect().await.unwrap();
+        assert_eq!(collected, 1);
+        assert_eq!(daemon.queue_items().len(), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // execute_running() additional tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn execute_running_returns_empty_when_no_running_items() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Push a Pending item -- not Running.
+        daemon.push_item(test_item("s1", "analyze"));
+
+        let outcomes = daemon.execute_running().await;
+        assert!(outcomes.is_empty());
+        // The Pending item should remain untouched.
+        assert_eq!(daemon.queue_items().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_running_mixed_success_and_failure() {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+        source.add_item(test_item("github:org/repo#2", "analyze"));
+
+        // First handler succeeds (exit 0), second fails (exit 1).
+        let mut daemon = setup_daemon(&tmp, source, vec![0, 1]);
+        daemon.collect().await.unwrap();
+        daemon.advance();
+
+        let outcomes = daemon.execute_running().await;
+        assert_eq!(outcomes.len(), 2);
+
+        let completed = outcomes
+            .iter()
+            .filter(|o| matches!(o, ItemOutcome::Completed(_)))
+            .count();
+        let failed = outcomes
+            .iter()
+            .filter(|o| matches!(o, ItemOutcome::Failed { .. }))
+            .count();
+        assert_eq!(completed, 1);
+        assert_eq!(failed, 1);
+    }
+
+    #[tokio::test]
+    async fn execute_running_records_history_on_completion() {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+
+        let mut daemon = setup_daemon(&tmp, source, vec![0]);
+        daemon.collect().await.unwrap();
+        daemon.advance();
+
+        let outcomes = daemon.execute_running().await;
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], ItemOutcome::Completed(_)));
+
+        // History events should record a "completed" entry.
+        assert!(
+            daemon
+                .history_events()
+                .iter()
+                .any(|e| e.status == "completed")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_running_releases_concurrency_on_failure() {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+
+        let mut daemon = setup_daemon(&tmp, source, vec![1]);
+        daemon.collect().await.unwrap();
+        daemon.advance();
+
+        assert_eq!(daemon.running_count(), 1);
+
+        let outcomes = daemon.execute_running().await;
+        assert!(matches!(outcomes[0], ItemOutcome::Failed { .. }));
+
+        // After failure, concurrency slot should be released so new items can run.
+        // Verify by adding a new item and advancing it.
+        daemon.push_item(test_item("github:org/repo#2", "analyze"));
+        daemon.advance();
+        assert!(daemon.items_in_phase(QueuePhase::Running).len() >= 1);
+    }
+
+    // ---------------------------------------------------------------
+    // execute_on_done() additional tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn execute_on_done_transitions_to_done_when_no_state_config() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Use a state that has no matching state config.
+        let mut item = test_item("github:org/repo#1", "unknown_state");
+        item.phase = QueuePhase::Completed;
+
+        let success = daemon.execute_on_done(&mut item).await.unwrap();
+        assert!(success);
+        assert_eq!(item.phase, QueuePhase::Done);
+    }
+
+    #[tokio::test]
+    async fn execute_on_done_with_empty_on_done_transitions_to_done() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+
+        // Use a custom config with a state that has empty on_done.
+        let yaml = r#"
+name: test-ws
+concurrency: 2
+sources:
+  github:
+    url: https://github.com/org/repo
+    states:
+      no_done:
+        trigger:
+          label: "belt:no_done"
+        handlers:
+          - script: "echo handler"
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(MockRuntime::new("mock", vec![])));
+        let worktree_mgr = MockWorktreeManager::new(tmp.path().to_path_buf());
+        let mut daemon = Daemon::new(
+            config,
+            vec![Box::new(source)],
+            Arc::new(registry),
+            Box::new(worktree_mgr),
+            4,
+        );
+
+        let mut item = test_item("github:org/repo#1", "no_done");
+        item.phase = QueuePhase::Completed;
+
+        let success = daemon.execute_on_done(&mut item).await.unwrap();
+        assert!(success);
+        assert_eq!(item.phase, QueuePhase::Done);
+    }
+
+    #[tokio::test]
+    async fn execute_on_done_records_history_entry() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("github:org/repo#1", "analyze");
+        item.phase = QueuePhase::Completed;
+
+        assert_eq!(daemon.history().len(), 0);
+
+        let success = daemon.execute_on_done(&mut item).await.unwrap();
+        assert!(success);
+
+        // History should have a "done" entry.
+        assert!(
+            daemon
+                .history()
+                .iter()
+                .any(|h| h.status == belt_core::context::HistoryStatus::Done)
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // tick() main loop tests
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn tick_full_pipeline_collect_advance_execute() {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+
+        let mut daemon = setup_daemon(&tmp, source, vec![0]);
+
+        // Before tick: queue should be empty.
+        assert_eq!(daemon.queue_items().len(), 0);
+        assert_eq!(daemon.history_events().len(), 0);
+
+        // After tick: item is collected, advanced, executed, then evaluated.
+        // The evaluator runs on_done which transitions to Done and may remove
+        // items from the queue, so we verify via history_events instead.
+        daemon.tick().await.unwrap();
+
+        // A "completed" history event proves the pipeline ran successfully.
+        assert!(
+            daemon
+                .history_events()
+                .iter()
+                .any(|e| e.status == "completed"),
+            "tick should produce at least one completed history event"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_with_empty_source_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // tick() with no items should succeed without errors.
+        daemon.tick().await.unwrap();
+        assert_eq!(daemon.queue_items().len(), 0);
+        assert_eq!(daemon.history_events().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tick_processes_multiple_items() {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+        source.add_item(test_item("github:org/repo#2", "analyze"));
+
+        // Both handlers succeed.
+        let mut daemon = setup_daemon(&tmp, source, vec![0, 0]);
+
+        daemon.tick().await.unwrap();
+
+        // Both items should have produced "completed" history events.
+        let completed_events = daemon
+            .history_events()
+            .iter()
+            .filter(|e| e.status == "completed")
+            .count();
+        assert_eq!(completed_events, 2);
+    }
+
+    #[tokio::test]
+    async fn tick_shutdown_mode_only_executes_running() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![0]);
+
+        // Put an item directly in Running to simulate pre-existing work.
+        let mut item = test_item("github:org/repo#1", "analyze");
+        item.phase = QueuePhase::Running;
+        item.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(item);
+
+        daemon.request_shutdown();
+
+        // tick() should not collect new items but should execute Running ones.
+        daemon.tick().await.unwrap();
+
+        // The Running item should have been processed.
+        assert!(daemon.items_in_phase(QueuePhase::Running).is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_does_not_collect_after_shutdown() {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+        daemon.request_shutdown();
+
+        daemon.tick().await.unwrap();
+
+        // collect() should have been skipped due to shutdown.
+        assert_eq!(daemon.queue_items().len(), 0);
+    }
 }
