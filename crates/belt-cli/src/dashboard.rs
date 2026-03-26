@@ -38,7 +38,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::spec::SpecStatus;
-use belt_infra::db::{Database, HistoryEvent, RuntimeStats, ScriptExecStats, TransitionEvent};
+use belt_infra::db::{Database, HistoryEvent, ScriptExecStats, TransitionEvent};
 use belt_infra::workspace_loader::load_workspace_config;
 
 /// Connection status of a DataSource (internal dashboard representation).
