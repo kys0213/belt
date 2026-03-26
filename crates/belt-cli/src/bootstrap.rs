@@ -3,9 +3,29 @@
 //! Creates a set of opinionated rule files (project, coding, commit, testing)
 //! under `.claude/rules/` in the target directory. Existing files are preserved
 //! unless `--force` is specified.
+//!
+//! When `--llm` is specified, the bootstrap process uses an [`AgentRuntime`] to
+//! analyze the project and generate tailored convention files instead of using
+//! static templates.
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use belt_core::runtime::{AgentRuntime, RuntimeRequest};
+
+/// Project information collected for LLM-based convention generation.
+#[derive(Debug, Clone)]
+pub struct ProjectInfo {
+    /// Human-readable project name.
+    pub name: String,
+    /// Primary programming language (e.g., "Rust", "TypeScript").
+    pub language: String,
+    /// Framework or runtime (e.g., "tokio", "Next.js").
+    pub framework: String,
+    /// Brief description of the project purpose.
+    pub description: String,
+}
 
 /// Result of a bootstrap operation.
 pub struct BootstrapResult {
@@ -15,6 +35,8 @@ pub struct BootstrapResult {
     pub written: Vec<PathBuf>,
     /// Files that were skipped (already existed).
     pub skipped: Vec<PathBuf>,
+    /// Whether LLM-based generation was used.
+    pub llm_generated: bool,
 }
 
 /// Run the bootstrap process for the given workspace root directory.
@@ -58,7 +80,215 @@ pub fn run_in_dir(rules_dir: &Path, force: bool) -> anyhow::Result<BootstrapResu
         rules_dir: rules_dir.to_path_buf(),
         written,
         skipped,
+        llm_generated: false,
     })
+}
+
+/// Run the bootstrap process using an LLM to generate tailored convention files.
+///
+/// The LLM is prompted with the provided [`ProjectInfo`] and asked to produce
+/// customized project, coding, commit, and testing rule files. The generated
+/// content is written to `.claude/rules/` in the workspace root. Existing files
+/// are preserved unless `force` is `true`.
+///
+/// If the LLM invocation fails (non-zero exit code or empty output), the
+/// function falls back to the static template approach.
+pub async fn run_with_llm(
+    workspace_root: &Path,
+    force: bool,
+    runtime: Arc<dyn AgentRuntime>,
+    project_info: &ProjectInfo,
+) -> anyhow::Result<BootstrapResult> {
+    let rules_dir = workspace_root.join(".claude/rules");
+    run_in_dir_with_llm(&rules_dir, force, runtime, project_info, workspace_root).await
+}
+
+/// Run the LLM-based bootstrap writing rule files directly into `rules_dir`.
+///
+/// The directory is created if it does not exist. Existing files are preserved
+/// unless `force` is `true`.
+async fn run_in_dir_with_llm(
+    rules_dir: &Path,
+    force: bool,
+    runtime: Arc<dyn AgentRuntime>,
+    project_info: &ProjectInfo,
+    working_dir: &Path,
+) -> anyhow::Result<BootstrapResult> {
+    fs::create_dir_all(rules_dir)?;
+
+    let prompt = build_llm_prompt(project_info);
+    let system_prompt = build_system_prompt();
+
+    let request = RuntimeRequest {
+        working_dir: working_dir.to_path_buf(),
+        prompt,
+        model: None,
+        system_prompt: Some(system_prompt),
+        session_id: None,
+        structured_output: None,
+    };
+
+    let response = runtime.invoke(request).await;
+
+    if !response.success() || response.stdout.trim().is_empty() {
+        tracing::warn!(
+            exit_code = response.exit_code,
+            "LLM invocation failed, falling back to static templates"
+        );
+        return run_in_dir(rules_dir, force);
+    }
+
+    let generated = parse_llm_response(&response.stdout);
+
+    let mut written = Vec::new();
+    let mut skipped = Vec::new();
+
+    for (filename, contents) in &generated {
+        let path = rules_dir.join(filename);
+        if force || !path.exists() {
+            fs::write(&path, contents)?;
+            written.push(path);
+        } else {
+            tracing::info!(path = %path.display(), "file already exists, skipping");
+            skipped.push(path);
+        }
+    }
+
+    Ok(BootstrapResult {
+        rules_dir: rules_dir.to_path_buf(),
+        written,
+        skipped,
+        llm_generated: true,
+    })
+}
+
+/// Build the user prompt for convention generation.
+fn build_llm_prompt(info: &ProjectInfo) -> String {
+    format!(
+        r#"Generate convention rule files for the following project:
+
+- Project name: {name}
+- Language: {language}
+- Framework: {framework}
+- Description: {description}
+
+Generate four Markdown files with project-specific conventions. Output each file using the following delimiter format:
+
+--- FILE: project.md ---
+(project rules content here)
+
+--- FILE: coding.md ---
+(coding style guide content here)
+
+--- FILE: commit.md ---
+(commit convention content here)
+
+--- FILE: testing.md ---
+(testing rules content here)
+
+Requirements:
+- Each file must start with a level-1 heading.
+- Tailor the content to the specific language, framework, and project type.
+- Include concrete examples and tool commands relevant to the stack.
+- For project.md: describe the language, stack, architecture patterns, and dependency policy.
+- For coding.md: describe formatting tools, naming conventions, error handling, and SOLID principles.
+- For commit.md: describe conventional commit format, types, and rules.
+- For testing.md: describe unit/integration test structure, quality guidelines, and how to run tests."#,
+        name = info.name,
+        language = info.language,
+        framework = info.framework,
+        description = info.description,
+    )
+}
+
+/// Build the system prompt for convention generation.
+fn build_system_prompt() -> String {
+    "You are a software engineering conventions expert. \
+     Generate clear, actionable convention documents in Markdown format. \
+     Use the exact delimiter format requested. \
+     Do not include any text outside the file delimiters."
+        .to_string()
+}
+
+/// Parse the LLM response into a list of (filename, content) pairs.
+///
+/// Expects the format:
+/// ```text
+/// --- FILE: <filename> ---
+/// <content>
+/// ```
+///
+/// Falls back to assigning the entire response to `project.md` if no
+/// delimiters are found, then fills missing files with static templates.
+pub fn parse_llm_response(response: &str) -> Vec<(String, String)> {
+    let expected_files = ["project.md", "coding.md", "commit.md", "testing.md"];
+    let mut files: Vec<(String, String)> = Vec::new();
+
+    // Split by the delimiter pattern.
+    let delimiter_prefix = "--- FILE: ";
+    let delimiter_suffix = " ---";
+
+    let mut current_file: Option<String> = None;
+    let mut current_content = String::new();
+
+    for line in response.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with(delimiter_prefix) && trimmed.ends_with(delimiter_suffix) {
+            // Save previous file if any.
+            if let Some(ref name) = current_file {
+                files.push((name.clone(), current_content.trim().to_string()));
+            }
+            // Extract filename from delimiter.
+            let name = &trimmed[delimiter_prefix.len()..trimmed.len() - delimiter_suffix.len()];
+            current_file = Some(name.trim().to_string());
+            current_content = String::new();
+        } else if current_file.is_some() {
+            if !current_content.is_empty() {
+                current_content.push('\n');
+            }
+            current_content.push_str(line);
+        }
+    }
+
+    // Save the last file.
+    if let Some(ref name) = current_file {
+        let content = current_content.trim().to_string();
+        if !content.is_empty() {
+            files.push((name.clone(), content));
+        }
+    }
+
+    // If no delimiters were found, assign the whole response to project.md.
+    if files.is_empty() && !response.trim().is_empty() {
+        files.push(("project.md".to_string(), response.trim().to_string()));
+    }
+
+    // Fill missing expected files with static templates.
+    let defaults: Vec<(&str, String)> = vec![
+        ("project.md", default_project_md().to_string()),
+        ("coding.md", default_coding_md().to_string()),
+        ("commit.md", default_commit_md().to_string()),
+        ("testing.md", default_testing_md().to_string()),
+    ];
+
+    for (name, content) in defaults {
+        let already_exists = files.iter().any(|(n, _)| n == name);
+        if !already_exists {
+            files.push((name.to_string(), content));
+        }
+    }
+
+    // Keep only expected files in the correct order.
+    let mut ordered = Vec::new();
+    for name in &expected_files {
+        if let Some(pos) = files.iter().position(|(n, _)| n == name) {
+            ordered.push(files.remove(pos));
+        }
+    }
+    // Append any extra files the LLM may have generated.
+    ordered.extend(files);
+
+    ordered
 }
 
 /// Returns the default project rules template.
@@ -173,6 +403,68 @@ pub fn default_testing_md() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use belt_core::runtime::{RuntimeCapabilities, RuntimeResponse, TokenUsage};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+
+    /// Test-local mock runtime that returns configurable stdout.
+    struct StubRuntime {
+        response_stdout: String,
+        exit_code: i32,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl StubRuntime {
+        fn with_stdout(stdout: &str) -> Self {
+            Self {
+                response_stdout: stdout.to_string(),
+                exit_code: 0,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                response_stdout: String::new(),
+                exit_code: 1,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl AgentRuntime for StubRuntime {
+        fn name(&self) -> &str {
+            "stub"
+        }
+
+        async fn invoke(&self, request: RuntimeRequest) -> RuntimeResponse {
+            self.calls.lock().unwrap().push(request.prompt.clone());
+            RuntimeResponse {
+                exit_code: self.exit_code,
+                stdout: self.response_stdout.clone(),
+                stderr: String::new(),
+                duration: Duration::from_millis(10),
+                token_usage: Some(TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 200,
+                    cache_read_tokens: None,
+                    cache_write_tokens: None,
+                }),
+                session_id: None,
+            }
+        }
+
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities::default()
+        }
+    }
 
     #[test]
     fn bootstrap_creates_rules_directory_and_files() {
@@ -186,6 +478,7 @@ mod tests {
         assert!(result.rules_dir.join("testing.md").is_file());
         assert_eq!(result.written.len(), 4);
         assert!(result.skipped.is_empty());
+        assert!(!result.llm_generated);
     }
 
     #[test]
@@ -241,5 +534,291 @@ mod tests {
         assert!(!default_coding_md().is_empty());
         assert!(!default_commit_md().is_empty());
         assert!(!default_testing_md().is_empty());
+    }
+
+    // ── parse_llm_response tests ───────────────────────────────────────
+
+    #[test]
+    fn parse_response_with_all_delimiters() {
+        let response = "\
+--- FILE: project.md ---
+# My Project Rules
+- Rust project
+
+--- FILE: coding.md ---
+# Coding Guide
+- Use cargo fmt
+
+--- FILE: commit.md ---
+# Commit Rules
+- Conventional commits
+
+--- FILE: testing.md ---
+# Test Rules
+- cargo test";
+
+        let files = parse_llm_response(response);
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0].0, "project.md");
+        assert!(files[0].1.contains("My Project Rules"));
+        assert_eq!(files[1].0, "coding.md");
+        assert!(files[1].1.contains("cargo fmt"));
+        assert_eq!(files[2].0, "commit.md");
+        assert!(files[2].1.contains("Conventional commits"));
+        assert_eq!(files[3].0, "testing.md");
+        assert!(files[3].1.contains("cargo test"));
+    }
+
+    #[test]
+    fn parse_response_fills_missing_files_with_defaults() {
+        let response = "\
+--- FILE: project.md ---
+# Custom Project
+- Custom content";
+
+        let files = parse_llm_response(response);
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0].0, "project.md");
+        assert!(files[0].1.contains("Custom Project"));
+        // Missing files should use defaults.
+        assert_eq!(files[1].0, "coding.md");
+        assert_eq!(files[1].1, default_coding_md());
+        assert_eq!(files[2].0, "commit.md");
+        assert_eq!(files[2].1, default_commit_md());
+        assert_eq!(files[3].0, "testing.md");
+        assert_eq!(files[3].1, default_testing_md());
+    }
+
+    #[test]
+    fn parse_response_no_delimiters_assigns_to_project() {
+        let response = "# Some freeform content\n- bullet point";
+        let files = parse_llm_response(response);
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0].0, "project.md");
+        assert!(files[0].1.contains("Some freeform content"));
+    }
+
+    #[test]
+    fn parse_response_empty_input() {
+        let files = parse_llm_response("");
+        // All four defaults should be present.
+        assert_eq!(files.len(), 4);
+        assert_eq!(files[0].0, "project.md");
+        assert_eq!(files[0].1, default_project_md());
+    }
+
+    #[test]
+    fn parse_response_preserves_order() {
+        // Even if the LLM produces files in a different order, output is normalized.
+        let response = "\
+--- FILE: testing.md ---
+# Tests first
+
+--- FILE: project.md ---
+# Project second";
+
+        let files = parse_llm_response(response);
+        assert_eq!(files[0].0, "project.md");
+        assert_eq!(files[1].0, "coding.md"); // default
+        assert_eq!(files[2].0, "commit.md"); // default
+        assert_eq!(files[3].0, "testing.md");
+    }
+
+    // ── build_llm_prompt tests ─────────────────────────────────────────
+
+    #[test]
+    fn build_prompt_includes_project_info() {
+        let info = ProjectInfo {
+            name: "MyApp".to_string(),
+            language: "Rust".to_string(),
+            framework: "axum".to_string(),
+            description: "A web service".to_string(),
+        };
+        let prompt = build_llm_prompt(&info);
+        assert!(prompt.contains("MyApp"));
+        assert!(prompt.contains("Rust"));
+        assert!(prompt.contains("axum"));
+        assert!(prompt.contains("A web service"));
+        assert!(prompt.contains("project.md"));
+        assert!(prompt.contains("coding.md"));
+        assert!(prompt.contains("commit.md"));
+        assert!(prompt.contains("testing.md"));
+    }
+
+    // ── LLM-based bootstrap integration tests ──────────────────────────
+
+    #[tokio::test]
+    async fn llm_bootstrap_writes_generated_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let llm_response = "\
+--- FILE: project.md ---
+# LLM Project Rules
+- Generated by LLM
+
+--- FILE: coding.md ---
+# LLM Coding Guide
+- LLM suggestions
+
+--- FILE: commit.md ---
+# LLM Commit Convention
+- LLM format
+
+--- FILE: testing.md ---
+# LLM Testing Rules
+- LLM test approach";
+
+        let runtime = Arc::new(StubRuntime::with_stdout(llm_response));
+        let info = ProjectInfo {
+            name: "test-project".to_string(),
+            language: "Rust".to_string(),
+            framework: "tokio".to_string(),
+            description: "test".to_string(),
+        };
+
+        let result = run_with_llm(tmp.path(), false, runtime.clone(), &info)
+            .await
+            .unwrap();
+
+        assert!(result.llm_generated);
+        assert_eq!(result.written.len(), 4);
+        assert!(result.skipped.is_empty());
+
+        let project_content =
+            fs::read_to_string(tmp.path().join(".claude/rules/project.md")).unwrap();
+        assert!(project_content.contains("LLM Project Rules"));
+
+        // Verify the runtime was called.
+        assert_eq!(runtime.calls().len(), 1);
+        assert!(runtime.calls()[0].contains("test-project"));
+    }
+
+    #[tokio::test]
+    async fn llm_bootstrap_falls_back_on_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(StubRuntime::failing());
+        let info = ProjectInfo {
+            name: "fail-project".to_string(),
+            language: "Go".to_string(),
+            framework: "gin".to_string(),
+            description: "test".to_string(),
+        };
+
+        let result = run_with_llm(tmp.path(), false, runtime, &info)
+            .await
+            .unwrap();
+
+        // Should fall back to static templates.
+        assert!(!result.llm_generated);
+        assert_eq!(result.written.len(), 4);
+
+        let project_content =
+            fs::read_to_string(tmp.path().join(".claude/rules/project.md")).unwrap();
+        assert_eq!(project_content, default_project_md());
+    }
+
+    #[tokio::test]
+    async fn llm_bootstrap_respects_force_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // First run with static templates.
+        run(tmp.path(), false).unwrap();
+
+        // Second run with LLM and force.
+        let llm_response = "\
+--- FILE: project.md ---
+# Overwritten by LLM
+
+--- FILE: coding.md ---
+# LLM Coding
+
+--- FILE: commit.md ---
+# LLM Commit
+
+--- FILE: testing.md ---
+# LLM Testing";
+
+        let runtime = Arc::new(StubRuntime::with_stdout(llm_response));
+        let info = ProjectInfo {
+            name: "force-test".to_string(),
+            language: "Python".to_string(),
+            framework: "FastAPI".to_string(),
+            description: "test".to_string(),
+        };
+
+        let result = run_with_llm(tmp.path(), true, runtime, &info)
+            .await
+            .unwrap();
+
+        assert!(result.llm_generated);
+        assert_eq!(result.written.len(), 4);
+        assert!(result.skipped.is_empty());
+
+        let content = fs::read_to_string(tmp.path().join(".claude/rules/project.md")).unwrap();
+        assert!(content.contains("Overwritten by LLM"));
+    }
+
+    #[tokio::test]
+    async fn llm_bootstrap_preserves_existing_without_force() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // First run with static templates.
+        run(tmp.path(), false).unwrap();
+
+        let llm_response = "\
+--- FILE: project.md ---
+# Should not overwrite
+
+--- FILE: coding.md ---
+# Should not overwrite
+
+--- FILE: commit.md ---
+# Should not overwrite
+
+--- FILE: testing.md ---
+# Should not overwrite";
+
+        let runtime = Arc::new(StubRuntime::with_stdout(llm_response));
+        let info = ProjectInfo {
+            name: "no-force".to_string(),
+            language: "Rust".to_string(),
+            framework: "tokio".to_string(),
+            description: "test".to_string(),
+        };
+
+        let result = run_with_llm(tmp.path(), false, runtime, &info)
+            .await
+            .unwrap();
+
+        assert!(result.llm_generated);
+        assert_eq!(result.skipped.len(), 4);
+        assert!(result.written.is_empty());
+
+        // Content should still be the original static template.
+        let content = fs::read_to_string(tmp.path().join(".claude/rules/project.md")).unwrap();
+        assert_eq!(content, default_project_md());
+    }
+
+    #[tokio::test]
+    async fn llm_bootstrap_prompt_contains_project_info() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(StubRuntime::with_stdout(""));
+        let info = ProjectInfo {
+            name: "belt".to_string(),
+            language: "Rust".to_string(),
+            framework: "tokio".to_string(),
+            description: "CI automation".to_string(),
+        };
+
+        // Even if LLM returns empty, we fall back gracefully.
+        let _result = run_with_llm(tmp.path(), false, runtime.clone(), &info)
+            .await
+            .unwrap();
+
+        let calls = runtime.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("belt"));
+        assert!(calls[0].contains("Rust"));
+        assert!(calls[0].contains("tokio"));
+        assert!(calls[0].contains("CI automation"));
     }
 }
