@@ -419,6 +419,78 @@ pub fn extract_acceptance_criteria(content: &str) -> Vec<String> {
     criteria
 }
 
+/// A proposed child issue generated from an acceptance criterion.
+///
+/// Used during `--decompose` to present issues to the user for confirmation
+/// before creating them on GitHub.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecomposedIssue {
+    /// Index of the acceptance criterion (1-based).
+    pub index: usize,
+    /// Proposed issue title.
+    pub title: String,
+    /// Proposed issue body (markdown).
+    pub body: String,
+    /// The original acceptance criterion text.
+    pub criterion: String,
+}
+
+/// Build [`DecomposedIssue`] proposals from raw acceptance criteria and optional
+/// LLM-refined descriptions.
+///
+/// When `refined` is `Some`, each entry is used as the issue body instead of
+/// the raw criterion text. The `refined` vec must have the same length as
+/// `criteria`; mismatched entries fall back to the raw text.
+///
+/// `parent_number` is the GitHub issue number of the parent spec issue (if
+/// available) and is embedded in titles and bodies for traceability.
+pub fn build_decomposed_issues(
+    criteria: &[String],
+    refined: Option<&[String]>,
+    parent_number: Option<&str>,
+) -> Vec<DecomposedIssue> {
+    criteria
+        .iter()
+        .enumerate()
+        .map(|(i, ac)| {
+            let idx = i + 1;
+            let parent_ref = parent_number.unwrap_or("?");
+            let title = format!("[sub] #{parent_ref} AC{idx}: {ac}");
+            let body_detail = refined
+                .and_then(|r| r.get(i))
+                .filter(|s| !s.is_empty())
+                .cloned()
+                .unwrap_or_else(|| ac.clone());
+            let parent_link = parent_number
+                .map(|n| format!("Parent: #{n}"))
+                .unwrap_or_else(|| "Parent: (pending)".to_string());
+            let body = format!("{parent_link}\n\n## Acceptance Criterion\n\n{body_detail}");
+            DecomposedIssue {
+                index: idx,
+                title,
+                body,
+                criterion: ac.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Format a decomposition preview for display to the user.
+///
+/// Returns a multi-line string summarizing the proposed child issues so
+/// the user can review before confirming.
+pub fn format_decomposition_preview(issues: &[DecomposedIssue]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Proposed {} child issue(s):\n", issues.len()));
+    for issue in issues {
+        out.push_str(&format!(
+            "\n  AC{}: {}\n       {}\n",
+            issue.index, issue.title, issue.criterion,
+        ));
+    }
+    out
+}
+
 /// Check whether all decomposed issues are closed, indicating the spec
 /// is ready to transition to `Completing`.
 ///
@@ -1046,5 +1118,62 @@ mod tests {
 ## Test\ntext\n\
 ## AC\ntext\n";
         assert!(validate_required_sections(content).is_ok());
+    }
+
+    #[test]
+    fn build_decomposed_issues_basic() {
+        let criteria = vec![
+            "First criterion".to_string(),
+            "Second criterion".to_string(),
+        ];
+        let issues = build_decomposed_issues(&criteria, None, Some("42"));
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].index, 1);
+        assert!(issues[0].title.contains("AC1"));
+        assert!(issues[0].title.contains("#42"));
+        assert!(issues[0].body.contains("Parent: #42"));
+        assert!(issues[0].body.contains("First criterion"));
+        assert_eq!(issues[1].index, 2);
+        assert!(issues[1].title.contains("AC2"));
+    }
+
+    #[test]
+    fn build_decomposed_issues_with_refined() {
+        let criteria = vec!["Raw AC".to_string()];
+        let refined = vec!["Detailed description from LLM".to_string()];
+        let issues = build_decomposed_issues(&criteria, Some(&refined), Some("10"));
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].body.contains("Detailed description from LLM"));
+        assert!(!issues[0].body.contains("Raw AC\n"));
+    }
+
+    #[test]
+    fn build_decomposed_issues_no_parent_number() {
+        let criteria = vec!["Criterion".to_string()];
+        let issues = build_decomposed_issues(&criteria, None, None);
+        assert!(issues[0].title.contains("#?"));
+        assert!(issues[0].body.contains("Parent: (pending)"));
+    }
+
+    #[test]
+    fn build_decomposed_issues_refined_fallback_on_empty() {
+        let criteria = vec!["Real AC".to_string()];
+        let refined = vec!["".to_string()];
+        let issues = build_decomposed_issues(&criteria, Some(&refined), Some("5"));
+        // Empty refined entry should fall back to raw criterion
+        assert!(issues[0].body.contains("Real AC"));
+    }
+
+    #[test]
+    fn format_decomposition_preview_output() {
+        let issues = build_decomposed_issues(
+            &["AC one".to_string(), "AC two".to_string()],
+            None,
+            Some("7"),
+        );
+        let preview = format_decomposition_preview(&issues);
+        assert!(preview.contains("Proposed 2 child issue(s):"));
+        assert!(preview.contains("AC1:"));
+        assert!(preview.contains("AC2:"));
     }
 }

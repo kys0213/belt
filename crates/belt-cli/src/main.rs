@@ -11,7 +11,7 @@ mod bootstrap;
 mod dashboard;
 mod status;
 
-use belt_core::runtime::RuntimeRegistry;
+use belt_core::runtime::{AgentRuntime, RuntimeRegistry};
 use belt_daemon::daemon::Daemon;
 use belt_infra::runtimes::claude::ClaudeRuntime;
 use belt_infra::runtimes::codex::CodexRuntime;
@@ -353,6 +353,9 @@ enum SpecCommands {
         /// Decompose spec into child issues based on acceptance criteria.
         #[arg(long)]
         decompose: bool,
+        /// Skip interactive confirmation when decomposing (auto-approve).
+        #[arg(long)]
+        yes: bool,
         /// Skip required-section validation for spec content.
         #[arg(long)]
         skip_validation: bool,
@@ -1550,6 +1553,100 @@ fn parse_github_issue_ref(target: &str) -> Option<(String, String)> {
     None
 }
 
+/// Prompt the user to confirm decomposition of acceptance criteria into issues.
+///
+/// Reads a single line from stdin and returns `true` if the user enters `y` or
+/// `yes` (case-insensitive). An empty input defaults to yes.
+fn confirm_decomposition() -> bool {
+    use std::io::Write;
+    print!("Create these issues? [Y/n]: ");
+    let _ = std::io::stdout().flush();
+    let mut input = String::new();
+    if std::io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    let trimmed = input.trim().to_lowercase();
+    trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
+}
+
+/// Attempt to refine acceptance criteria using an LLM runtime.
+///
+/// For each criterion, asks the LLM to produce a more detailed, actionable
+/// description suitable for a GitHub issue body. Returns `None` if the LLM is
+/// not available or fails, allowing the caller to fall back to the raw criteria.
+async fn refine_criteria_with_llm(
+    criteria: &[String],
+    spec_name: &str,
+    spec_content: &str,
+) -> Option<Vec<String>> {
+    // Build a minimal runtime to invoke the LLM.
+    let runtime = belt_infra::runtimes::claude::ClaudeRuntime::new(None);
+
+    // Check that the runtime is reachable (ANTHROPIC_API_KEY set, etc.) by
+    // verifying its name. If the environment is not configured the invocation
+    // will fail gracefully below.
+
+    let numbered_criteria: String = criteria
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{}. {}", i + 1, c))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prompt = format!(
+        "You are a technical project manager. Given the following spec and its acceptance criteria, \
+         produce a detailed, actionable issue description for each criterion. \
+         Each description should include context, implementation hints, and verification steps.\n\n\
+         Spec: {spec_name}\n\n\
+         Spec content (abbreviated):\n{spec_summary}\n\n\
+         Acceptance criteria:\n{numbered_criteria}\n\n\
+         Output ONLY a JSON array of strings, one per criterion, in the same order. \
+         Each string is the detailed issue body in markdown. No wrapping object, just the array.",
+        spec_summary = &spec_content[..spec_content.len().min(2000)],
+    );
+
+    let request = belt_core::runtime::RuntimeRequest {
+        working_dir: std::env::current_dir().unwrap_or_default(),
+        prompt,
+        model: None,
+        system_prompt: None,
+        session_id: None,
+        structured_output: None,
+    };
+
+    let response = runtime.invoke(request).await;
+    if !response.success() {
+        eprintln!("info: LLM refinement unavailable, using raw criteria");
+        return None;
+    }
+
+    // Parse the LLM output as a JSON array of strings.
+    let stdout = response.stdout.trim();
+    // The LLM might wrap the array in a markdown code block; strip it.
+    let json_str = stdout
+        .strip_prefix("```json")
+        .or_else(|| stdout.strip_prefix("```"))
+        .unwrap_or(stdout)
+        .strip_suffix("```")
+        .unwrap_or(stdout)
+        .trim();
+
+    match serde_json::from_str::<Vec<String>>(json_str) {
+        Ok(refined) if refined.len() == criteria.len() => {
+            eprintln!("info: LLM refined {} criteria", refined.len());
+            Some(refined)
+        }
+        Ok(_) => {
+            eprintln!("info: LLM returned mismatched count, using raw criteria");
+            None
+        }
+        Err(e) => {
+            eprintln!("info: could not parse LLM output ({e}), using raw criteria");
+            None
+        }
+    }
+}
+
 /// Create a GitHub issue via the `gh` CLI and return the issue URL on success.
 fn create_github_issue(title: &str, body: &str) -> Option<String> {
     create_github_issue_with_labels(title, body, &["autopilot:ready"])
@@ -2033,6 +2130,7 @@ async fn main() -> anyhow::Result<()> {
                     depends_on,
                     entry_point,
                     decompose,
+                    yes,
                     skip_validation,
                 } => {
                     // Validate required sections unless skipped
@@ -2179,73 +2277,96 @@ async fn main() -> anyhow::Result<()> {
                         && let Some(ref parent) = parent_url
                     {
                         let parent_number = extract_issue_number(parent);
-                        let mut child_urls: Vec<String> = Vec::new();
-                        let mut child_numbers: Vec<String> = Vec::new();
 
-                        for (i, ac) in criteria.iter().enumerate() {
-                            let child_title = format!(
-                                "[sub] #{} AC{}: {}",
-                                parent_number.as_deref().unwrap_or("?"),
-                                i + 1,
-                                ac
-                            );
-                            let child_body =
-                                format!("Parent: {}\n\n## Acceptance Criterion\n\n{}", parent, ac);
-                            // Child issues get autopilot:trigger label so autopilot picks them up.
-                            if let Some(url) = create_github_issue_with_labels(
-                                &child_title,
-                                &child_body,
-                                &["autopilot:ready", "autopilot:trigger"],
-                            ) {
-                                println!("  child issue created: {url}");
-                                if let Some(num) = extract_issue_number(&url) {
-                                    child_numbers.push(num);
+                        // Step 2: LLM refinement of acceptance criteria.
+                        // Attempt to use the default runtime to decompose each
+                        // criterion into a more detailed, actionable description.
+                        let refined =
+                            refine_criteria_with_llm(&criteria, &spec.name, &spec.content).await;
+
+                        // Build structured issue proposals.
+                        let proposed_issues = belt_core::spec::build_decomposed_issues(
+                            &criteria,
+                            refined.as_deref(),
+                            parent_number.as_deref(),
+                        );
+
+                        // Step 3: User confirmation (unless --yes).
+                        let confirmed = if yes {
+                            true
+                        } else {
+                            let preview =
+                                belt_core::spec::format_decomposition_preview(&proposed_issues);
+                            println!("{preview}");
+                            confirm_decomposition()
+                        };
+
+                        if !confirmed {
+                            println!("decomposition cancelled by user");
+                        } else {
+                            // Step 4: Create child issues on GitHub.
+                            let mut child_urls: Vec<String> = Vec::new();
+                            let mut child_numbers: Vec<String> = Vec::new();
+
+                            for issue in &proposed_issues {
+                                if let Some(url) = create_github_issue_with_labels(
+                                    &issue.title,
+                                    &issue.body,
+                                    &["autopilot:ready", "autopilot:trigger"],
+                                ) {
+                                    println!("  child issue created: {url}");
+                                    if let Some(num) = extract_issue_number(&url) {
+                                        child_numbers.push(num);
+                                    }
+                                    child_urls.push(url);
                                 }
-                                child_urls.push(url);
                             }
-                        }
 
-                        // Update parent issue body with child issue links.
-                        if !child_urls.is_empty()
-                            && let Some(ref num) = parent_number
-                        {
-                            let links = child_urls
-                                .iter()
-                                .enumerate()
-                                .map(|(i, url)| format!("- [ ] AC{}: {}", i + 1, url))
-                                .collect::<Vec<_>>()
-                                .join("\n");
-                            let updated_body =
-                                format!("{}\n\n## Sub-issues\n{}", spec.content, links);
-                            update_github_issue_body(num, &updated_body);
-                        }
-
-                        // Store child issue URLs as spec links for traceability.
-                        for url in &child_urls {
-                            let link_id = format!(
-                                "link-{}-{}",
-                                id,
-                                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-                            );
-                            let link =
-                                belt_core::spec::SpecLink::new(link_id, id.clone(), url.clone());
-                            if let Err(e) = db.insert_spec_link(&link) {
-                                eprintln!("warning: failed to store spec link for {url}: {e}");
+                            // Update parent issue body with child issue links.
+                            if !child_urls.is_empty()
+                                && let Some(ref num) = parent_number
+                            {
+                                let links = child_urls
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, url)| format!("- [ ] AC{}: {}", i + 1, url))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                let updated_body =
+                                    format!("{}\n\n## Sub-issues\n{}", spec.content, links);
+                                update_github_issue_body(num, &updated_body);
                             }
-                        }
 
-                        // Store decomposed issue numbers and transition spec to Active.
-                        if !child_numbers.is_empty() {
-                            spec.decomposed_issues = Some(child_numbers.join(","));
-                            db.update_spec(&spec)?;
-                            spec.transition_to(belt_core::spec::SpecStatus::Active)
-                                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                            db.update_spec_status(&spec.id, spec.status)?;
-                            println!(
-                                "spec {} decomposed into {} issues, status -> active",
-                                id,
-                                child_numbers.len()
-                            );
+                            // Step 5: Store child issue URLs as spec links.
+                            for url in &child_urls {
+                                let link_id = format!(
+                                    "link-{}-{}",
+                                    id,
+                                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+                                );
+                                let link = belt_core::spec::SpecLink::new(
+                                    link_id,
+                                    id.clone(),
+                                    url.clone(),
+                                );
+                                if let Err(e) = db.insert_spec_link(&link) {
+                                    eprintln!("warning: failed to store spec link for {url}: {e}");
+                                }
+                            }
+
+                            // Store decomposed issue numbers and transition spec to Active.
+                            if !child_numbers.is_empty() {
+                                spec.decomposed_issues = Some(child_numbers.join(","));
+                                db.update_spec(&spec)?;
+                                spec.transition_to(belt_core::spec::SpecStatus::Active)
+                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                                db.update_spec_status(&spec.id, spec.status)?;
+                                println!(
+                                    "spec {} decomposed into {} issues, status -> active",
+                                    id,
+                                    child_numbers.len()
+                                );
+                            }
                         }
                     }
                 }
