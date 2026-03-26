@@ -608,14 +608,17 @@ sources:
         let db = test_db();
 
         let first = seed_workspace_cron_jobs(&db, "dup-ws").unwrap();
-        assert_eq!(first, 6);
+        assert_eq!(first, WORKSPACE_CRON_SEEDS.len());
 
         // Second call should seed zero new jobs.
         let second = seed_workspace_cron_jobs(&db, "dup-ws").unwrap();
         assert_eq!(second, 0);
 
         // Total jobs unchanged.
-        assert_eq!(db.list_cron_jobs().unwrap().len(), 6);
+        assert_eq!(
+            db.list_cron_jobs().unwrap().len(),
+            WORKSPACE_CRON_SEEDS.len()
+        );
     }
 
     #[test]
@@ -625,14 +628,20 @@ sources:
         let seeded_a = seed_workspace_cron_jobs(&db, "ws-alpha").unwrap();
         let seeded_b = seed_workspace_cron_jobs(&db, "ws-beta").unwrap();
 
-        assert_eq!(seeded_a, 6);
-        assert_eq!(seeded_b, 6);
-        assert_eq!(db.list_cron_jobs().unwrap().len(), 12);
+        assert_eq!(seeded_a, WORKSPACE_CRON_SEEDS.len());
+        assert_eq!(seeded_b, WORKSPACE_CRON_SEEDS.len());
+        assert_eq!(
+            db.list_cron_jobs().unwrap().len(),
+            WORKSPACE_CRON_SEEDS.len() * 2
+        );
 
         // Re-seeding one workspace should not affect the other.
         let re_a = seed_workspace_cron_jobs(&db, "ws-alpha").unwrap();
         assert_eq!(re_a, 0);
-        assert_eq!(db.list_cron_jobs().unwrap().len(), 12);
+        assert_eq!(
+            db.list_cron_jobs().unwrap().len(),
+            WORKSPACE_CRON_SEEDS.len() * 2
+        );
     }
 
     #[test]

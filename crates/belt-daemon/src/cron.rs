@@ -301,6 +301,38 @@ impl CronEngine {
         }
     }
 
+    /// Synchronize in-memory `last_run_at` state from the database.
+    ///
+    /// For each registered job whose name appears in the DB `cron_jobs` table,
+    /// if the DB `last_run_at` is `NULL` (i.e. a trigger was requested via
+    /// `reset_cron_last_run`), the in-memory `last_run_at` is cleared so the
+    /// job fires on the next `tick()`.
+    pub fn sync_triggers_from_db(&mut self, db: &Database) {
+        let db_jobs = match db.list_cron_jobs() {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to read cron jobs from DB for trigger sync");
+                return;
+            }
+        };
+
+        let db_map: HashMap<&str, &belt_infra::db::CronJob> =
+            db_jobs.iter().map(|j| (j.name.as_str(), j)).collect();
+
+        for job in &mut self.jobs {
+            if let Some(db_job) = db_map.get(job.name.as_str())
+                && db_job.last_run_at.is_none()
+                && job.last_run_at.is_some()
+            {
+                tracing::info!(
+                    job = %job.name,
+                    "trigger sync: resetting last_run_at (trigger requested)"
+                );
+                job.last_run_at = None;
+            }
+        }
+    }
+
     /// Return the number of registered jobs.
     pub fn job_count(&self) -> usize {
         self.jobs.len()
