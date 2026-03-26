@@ -1244,6 +1244,329 @@ mod tests {
         let status = empty_spec_status();
         print_rich_spec_status(&status);
     }
+
+    // ---- WorkspaceSummary ----
+
+    #[test]
+    fn workspace_summary_serializes_to_json() {
+        let ws = WorkspaceSummary {
+            workspace: "my-ws".to_string(),
+            total: 5,
+            phase_counts: vec![
+                PhaseCount {
+                    phase: "pending".to_string(),
+                    count: 2,
+                },
+                PhaseCount {
+                    phase: "running".to_string(),
+                    count: 3,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&ws).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["workspace"], "my-ws");
+        assert_eq!(v["total"], 5);
+        assert!(v["phase_counts"].is_array());
+        assert_eq!(v["phase_counts"].as_array().unwrap().len(), 2);
+        assert_eq!(v["phase_counts"][0]["phase"], "pending");
+        assert_eq!(v["phase_counts"][0]["count"], 2);
+        assert_eq!(v["phase_counts"][1]["phase"], "running");
+        assert_eq!(v["phase_counts"][1]["count"], 3);
+    }
+
+    #[test]
+    fn workspace_summary_empty_phase_counts() {
+        let ws = WorkspaceSummary {
+            workspace: "empty-ws".to_string(),
+            total: 0,
+            phase_counts: vec![],
+        };
+        assert_eq!(ws.workspace, "empty-ws");
+        assert_eq!(ws.total, 0);
+        assert!(ws.phase_counts.is_empty());
+    }
+
+    // ---- per-workspace phase breakdown (gather_status) ----
+
+    #[test]
+    fn gather_status_workspace_summary_multiple_workspaces() {
+        let db = test_db();
+        db.add_workspace("ws-alpha", "/alpha.yaml").unwrap();
+        db.add_workspace("ws-beta", "/beta.yaml").unwrap();
+
+        // ws-alpha: 2 pending, 1 running
+        let a1 = make_item("a1:implement", "a1", "ws-alpha", QueuePhase::Pending);
+        let a2 = make_item("a2:implement", "a2", "ws-alpha", QueuePhase::Pending);
+        let a3 = make_item("a3:implement", "a3", "ws-alpha", QueuePhase::Running);
+        // ws-beta: 1 done, 1 failed
+        let b1 = make_item("b1:implement", "b1", "ws-beta", QueuePhase::Done);
+        let b2 = make_item("b2:implement", "b2", "ws-beta", QueuePhase::Failed);
+
+        db.insert_item(&a1).unwrap();
+        db.insert_item(&a2).unwrap();
+        db.insert_item(&a3).unwrap();
+        db.insert_item(&b1).unwrap();
+        db.insert_item(&b2).unwrap();
+
+        let status = gather_status(&db).unwrap();
+
+        assert_eq!(status.workspace_summary.len(), 2);
+
+        let alpha = status
+            .workspace_summary
+            .iter()
+            .find(|ws| ws.workspace == "ws-alpha")
+            .expect("ws-alpha should be present");
+        assert_eq!(alpha.total, 3);
+        let alpha_phases: std::collections::HashMap<&str, u32> = alpha
+            .phase_counts
+            .iter()
+            .map(|pc| (pc.phase.as_str(), pc.count))
+            .collect();
+        assert_eq!(alpha_phases.get("pending").copied(), Some(2));
+        assert_eq!(alpha_phases.get("running").copied(), Some(1));
+
+        let beta = status
+            .workspace_summary
+            .iter()
+            .find(|ws| ws.workspace == "ws-beta")
+            .expect("ws-beta should be present");
+        assert_eq!(beta.total, 2);
+        let beta_phases: std::collections::HashMap<&str, u32> = beta
+            .phase_counts
+            .iter()
+            .map(|pc| (pc.phase.as_str(), pc.count))
+            .collect();
+        assert_eq!(beta_phases.get("done").copied(), Some(1));
+        assert_eq!(beta_phases.get("failed").copied(), Some(1));
+    }
+
+    #[test]
+    fn gather_status_workspace_summary_skips_empty_workspaces() {
+        let db = test_db();
+        db.add_workspace("ws-active", "/active.yaml").unwrap();
+        db.add_workspace("ws-empty", "/empty.yaml").unwrap();
+
+        let item = make_item("x1:implement", "x1", "ws-active", QueuePhase::Pending);
+        db.insert_item(&item).unwrap();
+
+        let status = gather_status(&db).unwrap();
+
+        assert_eq!(status.workspace_summary.len(), 1);
+        assert_eq!(status.workspace_summary[0].workspace, "ws-active");
+    }
+
+    #[test]
+    fn gather_status_workspace_summary_phase_counts_sorted() {
+        let db = test_db();
+        db.add_workspace("ws-sort", "/sort.yaml").unwrap();
+
+        // Insert items in phases that would be out of alphabetical order
+        let items = vec![
+            make_item("s1:impl", "s1", "ws-sort", QueuePhase::Running),
+            make_item("s2:impl", "s2", "ws-sort", QueuePhase::Done),
+            make_item("s3:impl", "s3", "ws-sort", QueuePhase::Failed),
+            make_item("s4:impl", "s4", "ws-sort", QueuePhase::Pending),
+        ];
+        for item in &items {
+            db.insert_item(item).unwrap();
+        }
+
+        let status = gather_status(&db).unwrap();
+
+        assert_eq!(status.workspace_summary.len(), 1);
+        let ws = &status.workspace_summary[0];
+        let phases: Vec<&str> = ws.phase_counts.iter().map(|pc| pc.phase.as_str()).collect();
+        let mut sorted = phases.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            phases, sorted,
+            "workspace phase_counts must be sorted alphabetically"
+        );
+    }
+
+    // ---- error_items detail verification ----
+
+    #[test]
+    fn gather_status_error_items_fields_verified() {
+        let db = test_db();
+        db.add_workspace("ws-err", "/err.yaml").unwrap();
+
+        let f1 = make_item("fail1:implement", "fail1", "ws-err", QueuePhase::Failed);
+        let f2 = make_item("fail2:implement", "fail2", "ws-err", QueuePhase::Failed);
+        let ok = make_item("ok1:implement", "ok1", "ws-err", QueuePhase::Done);
+        db.insert_item(&f1).unwrap();
+        db.insert_item(&f2).unwrap();
+        db.insert_item(&ok).unwrap();
+
+        let status = gather_status(&db).unwrap();
+
+        assert_eq!(status.error_items.len(), 2);
+        for item in &status.error_items {
+            assert_eq!(item.phase, "failed");
+            assert_eq!(item.workspace, "ws-err");
+            assert!(
+                item.work_id.starts_with("fail"),
+                "unexpected work_id: {}",
+                item.work_id
+            );
+            assert!(!item.updated_at.is_empty());
+        }
+    }
+
+    #[test]
+    fn gather_status_error_items_empty_when_no_failures() {
+        let db = test_db();
+        db.add_workspace("ws-ok", "/ok.yaml").unwrap();
+
+        let p = make_item("p1:implement", "p1", "ws-ok", QueuePhase::Pending);
+        let d = make_item("d1:implement", "d1", "ws-ok", QueuePhase::Done);
+        db.insert_item(&p).unwrap();
+        db.insert_item(&d).unwrap();
+
+        let status = gather_status(&db).unwrap();
+
+        assert!(status.error_items.is_empty());
+    }
+
+    #[test]
+    fn gather_status_error_items_across_workspaces() {
+        let db = test_db();
+        db.add_workspace("ws-a", "/a.yaml").unwrap();
+        db.add_workspace("ws-b", "/b.yaml").unwrap();
+
+        let fa = make_item("fa:implement", "fa", "ws-a", QueuePhase::Failed);
+        let fb = make_item("fb:implement", "fb", "ws-b", QueuePhase::Failed);
+        db.insert_item(&fa).unwrap();
+        db.insert_item(&fb).unwrap();
+
+        let status = gather_status(&db).unwrap();
+
+        assert_eq!(status.error_items.len(), 2);
+        let workspaces: std::collections::HashSet<&str> = status
+            .error_items
+            .iter()
+            .map(|i| i.workspace.as_str())
+            .collect();
+        assert!(workspaces.contains("ws-a"));
+        assert!(workspaces.contains("ws-b"));
+    }
+
+    // ---- hitl_items detail verification ----
+
+    #[test]
+    fn gather_status_hitl_items_fields_verified() {
+        let db = test_db();
+        db.add_workspace("ws-hitl", "/hitl.yaml").unwrap();
+
+        let h1 = make_item("hitl1:implement", "hitl1", "ws-hitl", QueuePhase::Hitl);
+        let h2 = make_item("hitl2:implement", "hitl2", "ws-hitl", QueuePhase::Hitl);
+        let ok = make_item("ok1:implement", "ok1", "ws-hitl", QueuePhase::Running);
+        db.insert_item(&h1).unwrap();
+        db.insert_item(&h2).unwrap();
+        db.insert_item(&ok).unwrap();
+
+        let status = gather_status(&db).unwrap();
+
+        assert_eq!(status.hitl_items.len(), 2);
+        assert_eq!(status.hitl_count, 2);
+        for item in &status.hitl_items {
+            assert_eq!(item.phase, "hitl");
+            assert_eq!(item.workspace, "ws-hitl");
+            assert!(
+                item.work_id.starts_with("hitl"),
+                "unexpected work_id: {}",
+                item.work_id
+            );
+            assert!(!item.updated_at.is_empty());
+        }
+    }
+
+    #[test]
+    fn gather_status_hitl_items_empty_when_no_hitl() {
+        let db = test_db();
+        db.add_workspace("ws-clean", "/clean.yaml").unwrap();
+
+        let r = make_item("r1:implement", "r1", "ws-clean", QueuePhase::Running);
+        let d = make_item("d1:implement", "d1", "ws-clean", QueuePhase::Done);
+        db.insert_item(&r).unwrap();
+        db.insert_item(&d).unwrap();
+
+        let status = gather_status(&db).unwrap();
+
+        assert!(status.hitl_items.is_empty());
+        assert_eq!(status.hitl_count, 0);
+    }
+
+    #[test]
+    fn gather_status_hitl_items_across_workspaces() {
+        let db = test_db();
+        db.add_workspace("ws-a", "/a.yaml").unwrap();
+        db.add_workspace("ws-b", "/b.yaml").unwrap();
+
+        let ha = make_item("ha:implement", "ha", "ws-a", QueuePhase::Hitl);
+        let hb = make_item("hb:implement", "hb", "ws-b", QueuePhase::Hitl);
+        db.insert_item(&ha).unwrap();
+        db.insert_item(&hb).unwrap();
+
+        let status = gather_status(&db).unwrap();
+
+        assert_eq!(status.hitl_items.len(), 2);
+        assert_eq!(status.hitl_count, 2);
+        let workspaces: std::collections::HashSet<&str> = status
+            .hitl_items
+            .iter()
+            .map(|i| i.workspace.as_str())
+            .collect();
+        assert!(workspaces.contains("ws-a"));
+        assert!(workspaces.contains("ws-b"));
+    }
+
+    // ---- combined error + hitl + workspace breakdown ----
+
+    #[test]
+    fn gather_status_mixed_error_hitl_workspace_breakdown() {
+        let db = test_db();
+        db.add_workspace("ws-mix", "/mix.yaml").unwrap();
+
+        let items = vec![
+            make_item("p1:implement", "p1", "ws-mix", QueuePhase::Pending),
+            make_item("r1:implement", "r1", "ws-mix", QueuePhase::Running),
+            make_item("f1:implement", "f1", "ws-mix", QueuePhase::Failed),
+            make_item("h1:implement", "h1", "ws-mix", QueuePhase::Hitl),
+            make_item("d1:implement", "d1", "ws-mix", QueuePhase::Done),
+        ];
+        for item in &items {
+            db.insert_item(item).unwrap();
+        }
+
+        let status = gather_status(&db).unwrap();
+
+        assert_eq!(status.total_items, 5);
+        assert_eq!(status.error_items.len(), 1);
+        assert_eq!(status.error_items[0].work_id, "f1:implement");
+        assert_eq!(status.hitl_items.len(), 1);
+        assert_eq!(status.hitl_items[0].work_id, "h1:implement");
+        assert_eq!(status.hitl_count, 1);
+
+        // Workspace summary should contain all 5 items
+        assert_eq!(status.workspace_summary.len(), 1);
+        let ws = &status.workspace_summary[0];
+        assert_eq!(ws.workspace, "ws-mix");
+        assert_eq!(ws.total, 5);
+
+        let phase_map: std::collections::HashMap<&str, u32> = ws
+            .phase_counts
+            .iter()
+            .map(|pc| (pc.phase.as_str(), pc.count))
+            .collect();
+        assert_eq!(phase_map.get("pending").copied(), Some(1));
+        assert_eq!(phase_map.get("running").copied(), Some(1));
+        assert_eq!(phase_map.get("failed").copied(), Some(1));
+        assert_eq!(phase_map.get("hitl").copied(), Some(1));
+        assert_eq!(phase_map.get("done").copied(), Some(1));
+    }
 }
 
 fn print_text_status(status: &SystemStatus) {
