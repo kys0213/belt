@@ -107,6 +107,74 @@ enum ActivePanel {
     Recent,
 }
 
+/// PerWorkspace sub-view mode: flat table or kanban board.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PerWorkspaceView {
+    /// Flat table listing all items.
+    Table,
+    /// Kanban board with status columns.
+    Kanban,
+}
+
+/// Kanban column groupings for PerWorkspace kanban view.
+///
+/// Items are grouped into three logical columns:
+/// - Pending: `Pending` + `Ready` + `Hitl`
+/// - In-Progress: `Running`
+/// - Completed: `Completed` + `Done` + `Failed`
+const PER_WS_KANBAN_GROUPS: [&str; 3] = ["Pending", "In-Progress", "Completed"];
+
+/// Status filter options for the PerWorkspace tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusFilter {
+    /// Show all items (no filter).
+    All,
+    /// Show only pending/ready/hitl items.
+    Pending,
+    /// Show only running items.
+    Running,
+    /// Show only completed/done/failed items.
+    Completed,
+}
+
+impl StatusFilter {
+    /// Cycle to the next filter option.
+    fn next(self) -> Self {
+        match self {
+            StatusFilter::All => StatusFilter::Pending,
+            StatusFilter::Pending => StatusFilter::Running,
+            StatusFilter::Running => StatusFilter::Completed,
+            StatusFilter::Completed => StatusFilter::All,
+        }
+    }
+
+    /// Return a display label for the current filter.
+    fn label(self) -> &'static str {
+        match self {
+            StatusFilter::All => "All",
+            StatusFilter::Pending => "Pending",
+            StatusFilter::Running => "Running",
+            StatusFilter::Completed => "Completed",
+        }
+    }
+
+    /// Check if an item's phase passes this filter.
+    fn matches(self, phase: &QueuePhase) -> bool {
+        match self {
+            StatusFilter::All => true,
+            StatusFilter::Pending => matches!(
+                phase,
+                QueuePhase::Pending | QueuePhase::Ready | QueuePhase::Hitl
+            ),
+            StatusFilter::Running => matches!(phase, QueuePhase::Running),
+            StatusFilter::Completed => matches!(
+                phase,
+                QueuePhase::Completed | QueuePhase::Done | QueuePhase::Failed
+            ),
+        }
+    }
+}
+
 /// Which top-level tab is displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardTab {
@@ -186,6 +254,14 @@ struct DashboardState {
     board_selected_col: usize,
     /// Currently selected row within the selected Board column.
     board_selected_row: usize,
+    /// PerWorkspace sub-view mode (table vs kanban).
+    per_ws_view: PerWorkspaceView,
+    /// PerWorkspace kanban selected column index.
+    per_ws_kanban_col: usize,
+    /// PerWorkspace kanban selected row within the column.
+    per_ws_kanban_row: usize,
+    /// Status filter for PerWorkspace tab.
+    status_filter: StatusFilter,
 }
 
 impl DashboardState {
@@ -212,6 +288,10 @@ impl DashboardState {
             selected_workspace: 0,
             board_selected_col: 0,
             board_selected_row: 0,
+            per_ws_view: PerWorkspaceView::Table,
+            per_ws_kanban_col: 0,
+            per_ws_kanban_row: 0,
+            status_filter: StatusFilter::All,
         }
     }
 
@@ -290,9 +370,14 @@ fn run_loop(
                 }
             }
             DashboardTab::PerWorkspace => {
-                // Items filtered by selected workspace.
-                if let Some(ws) = workspaces.get(state.selected_workspace) {
-                    all_items.iter().filter(|i| i.workspace_id == ws.0).count()
+                // Items filtered by selected workspace and status filter.
+                if state.per_ws_view == PerWorkspaceView::Kanban {
+                    0 // Kanban uses column/row navigation, not a single list.
+                } else if let Some(ws) = workspaces.get(state.selected_workspace) {
+                    all_items
+                        .iter()
+                        .filter(|i| i.workspace_id == ws.0 && state.status_filter.matches(&i.phase))
+                        .count()
                 } else {
                     0
                 }
@@ -306,8 +391,11 @@ fn run_loop(
                 .unwrap_or(0),
         };
 
-        // Clamp selected_index for non-Board tabs.
-        if state.active_tab != DashboardTab::Board {
+        // Clamp selected_index for non-Board/non-kanban tabs.
+        let uses_list_nav = state.active_tab != DashboardTab::Board
+            && !(state.active_tab == DashboardTab::PerWorkspace
+                && state.per_ws_view == PerWorkspaceView::Kanban);
+        if uses_list_nav {
             let ts = state.current_tab_state_mut();
             if active_list_len == 0 {
                 ts.selected_index = 0;
@@ -340,6 +428,62 @@ fn run_loop(
             state.board_selected_row = col_len.saturating_sub(1);
         }
 
+        // Build per-workspace kanban columns (Pending / In-Progress / Completed).
+        let per_ws_kanban_columns: Vec<Vec<&QueueItem>> = {
+            let ws_items: Vec<&QueueItem> =
+                if let Some(ws) = workspaces.get(state.selected_workspace) {
+                    all_items
+                        .iter()
+                        .filter(|i| i.workspace_id == ws.0 && state.status_filter.matches(&i.phase))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            vec![
+                // Pending: Pending + Ready + Hitl
+                ws_items
+                    .iter()
+                    .filter(|i| {
+                        matches!(
+                            i.phase,
+                            QueuePhase::Pending | QueuePhase::Ready | QueuePhase::Hitl
+                        )
+                    })
+                    .copied()
+                    .collect(),
+                // In-Progress: Running
+                ws_items
+                    .iter()
+                    .filter(|i| i.phase == QueuePhase::Running)
+                    .copied()
+                    .collect(),
+                // Completed: Completed + Done + Failed
+                ws_items
+                    .iter()
+                    .filter(|i| {
+                        matches!(
+                            i.phase,
+                            QueuePhase::Completed | QueuePhase::Done | QueuePhase::Failed
+                        )
+                    })
+                    .copied()
+                    .collect(),
+            ]
+        };
+
+        // Clamp per-workspace kanban selection.
+        if state.per_ws_kanban_col >= PER_WS_KANBAN_GROUPS.len() {
+            state.per_ws_kanban_col = 0;
+        }
+        let ws_col_len = per_ws_kanban_columns
+            .get(state.per_ws_kanban_col)
+            .map_or(0, |v| v.len());
+        if ws_col_len == 0 {
+            state.per_ws_kanban_row = 0;
+        } else if state.per_ws_kanban_row >= ws_col_len {
+            state.per_ws_kanban_row = ws_col_len.saturating_sub(1);
+        }
+
         terminal.draw(|frame| {
             // Tab bar at top.
             let outer_chunks = Layout::default()
@@ -362,7 +506,14 @@ fn run_loop(
                     );
                 }
                 DashboardTab::PerWorkspace => {
-                    render_per_workspace_tab(frame, db, outer_chunks[1], &workspaces, &state);
+                    render_per_workspace_tab(
+                        frame,
+                        db,
+                        outer_chunks[1],
+                        &workspaces,
+                        &state,
+                        &per_ws_kanban_columns,
+                    );
                 }
                 DashboardTab::Spec => {
                     render_spec_tab(
@@ -445,6 +596,26 @@ fn run_loop(
                 KeyCode::Char('h') => {
                     state.show_help = true;
                 }
+                // Toggle PerWorkspace sub-view (table/kanban).
+                KeyCode::Char('v') => {
+                    if state.active_tab == DashboardTab::PerWorkspace {
+                        state.per_ws_view = match state.per_ws_view {
+                            PerWorkspaceView::Table => PerWorkspaceView::Kanban,
+                            PerWorkspaceView::Kanban => PerWorkspaceView::Table,
+                        };
+                        state.per_ws_kanban_col = 0;
+                        state.per_ws_kanban_row = 0;
+                    }
+                }
+                // Cycle status filter in PerWorkspace tab.
+                KeyCode::Char('f') => {
+                    if state.active_tab == DashboardTab::PerWorkspace {
+                        state.status_filter = state.status_filter.next();
+                        // Reset selection when filter changes.
+                        state.current_tab_state_mut().selected_index = 0;
+                        state.per_ws_kanban_row = 0;
+                    }
+                }
                 // Tab/Shift+Tab to cycle through tabs.
                 KeyCode::Tab => {
                     state.active_tab = state.active_tab.next();
@@ -457,7 +628,12 @@ fn run_loop(
                     handle_nav_up(&mut state, &board_columns);
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    handle_nav_down(&mut state, active_list_len, &board_columns);
+                    handle_nav_down(
+                        &mut state,
+                        active_list_len,
+                        &board_columns,
+                        &per_ws_kanban_columns,
+                    );
                 }
                 KeyCode::Left => {
                     handle_nav_left(&mut state, &workspaces);
@@ -475,6 +651,7 @@ fn run_loop(
                         &workspaces,
                         db,
                         &board_columns,
+                        &per_ws_kanban_columns,
                     );
                 }
                 _ => {}
@@ -489,6 +666,9 @@ fn handle_nav_up(state: &mut DashboardState, board_columns: &[Vec<&QueueItem>]) 
         DashboardTab::Board => {
             state.board_selected_row = state.board_selected_row.saturating_sub(1);
         }
+        DashboardTab::PerWorkspace if state.per_ws_view == PerWorkspaceView::Kanban => {
+            state.per_ws_kanban_row = state.per_ws_kanban_row.saturating_sub(1);
+        }
         _ => {
             let ts = state.current_tab_state_mut();
             ts.selected_index = ts.selected_index.saturating_sub(1);
@@ -502,6 +682,7 @@ fn handle_nav_down(
     state: &mut DashboardState,
     active_list_len: usize,
     board_columns: &[Vec<&QueueItem>],
+    per_ws_kanban_columns: &[Vec<&QueueItem>],
 ) {
     match state.active_tab {
         DashboardTab::Board => {
@@ -511,6 +692,15 @@ fn handle_nav_down(
             if col_len > 0 {
                 state.board_selected_row =
                     (state.board_selected_row + 1).min(col_len.saturating_sub(1));
+            }
+        }
+        DashboardTab::PerWorkspace if state.per_ws_view == PerWorkspaceView::Kanban => {
+            let col_len = per_ws_kanban_columns
+                .get(state.per_ws_kanban_col)
+                .map_or(0, |v| v.len());
+            if col_len > 0 {
+                state.per_ws_kanban_row =
+                    (state.per_ws_kanban_row + 1).min(col_len.saturating_sub(1));
             }
         }
         _ => {
@@ -531,7 +721,10 @@ fn handle_nav_left(state: &mut DashboardState, workspaces: &[(String, String, St
             ts.selected_index = 0;
         }
         DashboardTab::PerWorkspace => {
-            if state.selected_workspace > 0 {
+            if state.per_ws_view == PerWorkspaceView::Kanban {
+                state.per_ws_kanban_col = state.per_ws_kanban_col.saturating_sub(1);
+                state.per_ws_kanban_row = 0;
+            } else if state.selected_workspace > 0 {
                 state.selected_workspace -= 1;
                 state.current_tab_state_mut().selected_index = 0;
             }
@@ -558,7 +751,12 @@ fn handle_nav_right(
             ts.selected_index = 0;
         }
         DashboardTab::PerWorkspace => {
-            if !workspaces.is_empty() && state.selected_workspace < workspaces.len() - 1 {
+            if state.per_ws_view == PerWorkspaceView::Kanban {
+                if state.per_ws_kanban_col < PER_WS_KANBAN_GROUPS.len().saturating_sub(1) {
+                    state.per_ws_kanban_col += 1;
+                    state.per_ws_kanban_row = 0;
+                }
+            } else if !workspaces.is_empty() && state.selected_workspace < workspaces.len() - 1 {
                 state.selected_workspace += 1;
                 state.current_tab_state_mut().selected_index = 0;
             }
@@ -574,6 +772,7 @@ fn handle_nav_right(
 }
 
 /// Handle Enter key to open item detail overlay.
+#[allow(clippy::too_many_arguments)]
 fn handle_enter(
     state: &mut DashboardState,
     running_items: &[QueueItem],
@@ -582,6 +781,7 @@ fn handle_enter(
     workspaces: &[(String, String, String)],
     db: &Database,
     board_columns: &[Vec<&QueueItem>],
+    per_ws_kanban_columns: &[Vec<&QueueItem>],
 ) {
     match state.active_tab {
         DashboardTab::Dashboard => {
@@ -599,8 +799,19 @@ fn handle_enter(
             }
         }
         DashboardTab::PerWorkspace => {
-            if let Some(ws) = workspaces.get(state.selected_workspace) {
-                let ws_items = db.list_items(None, Some(&ws.0)).unwrap_or_default();
+            if state.per_ws_view == PerWorkspaceView::Kanban {
+                if let Some(col) = per_ws_kanban_columns.get(state.per_ws_kanban_col)
+                    && let Some(item) = col.get(state.per_ws_kanban_row)
+                {
+                    state.overlay_item = Some(item.work_id.clone());
+                }
+            } else if let Some(ws) = workspaces.get(state.selected_workspace) {
+                let ws_items: Vec<_> = db
+                    .list_items(None, Some(&ws.0))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|i| state.status_filter.matches(&i.phase))
+                    .collect();
                 let idx = state.current_tab_state().selected_index;
                 if let Some(item) = ws_items.get(idx) {
                     state.overlay_item = Some(item.work_id.clone());
@@ -1177,16 +1388,23 @@ fn render_dashboard_tab(
 
 /// Render the per-workspace tab showing items filtered by the selected workspace.
 ///
+/// Supports two sub-views:
+/// - **Table** (default): flat list with status filter
+/// - **Kanban**: items grouped into Pending / In-Progress / Completed columns
+///
+/// Toggle between views with `v`. Cycle status filter with `f`.
+///
 /// Layout:
-/// - Workspace selector bar (top)
+/// - Workspace selector bar + view/filter indicators (top)
 /// - Workspace phase summary + spec progress side by side (middle)
-/// - Items table for the selected workspace (bottom)
+/// - Items view: table or kanban (bottom)
 fn render_per_workspace_tab(
     frame: &mut ratatui::Frame,
     db: &Database,
     area: Rect,
     workspaces: &[(String, String, String)],
     state: &DashboardState,
+    per_ws_kanban_columns: &[Vec<&QueueItem>],
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1197,7 +1415,7 @@ fn render_per_workspace_tab(
         ])
         .split(area);
 
-    // Workspace selector bar.
+    // Workspace selector bar with view mode and filter indicators.
     if workspaces.is_empty() {
         let msg = Paragraph::new(Line::from(Span::styled(
             "(no workspaces registered)",
@@ -1228,9 +1446,31 @@ fn render_per_workspace_tab(
         ws_spans.push(Span::styled(ws.0.clone(), style));
     }
 
+    // Append view mode and filter indicators.
+    let view_label = match state.per_ws_view {
+        PerWorkspaceView::Table => "Table",
+        PerWorkspaceView::Kanban => "Kanban",
+    };
+    ws_spans.push(Span::raw("    "));
+    ws_spans.push(Span::styled(
+        format!("[v] {view_label}"),
+        Style::default().fg(Color::DarkGray),
+    ));
+    ws_spans.push(Span::raw("  "));
+    ws_spans.push(Span::styled(
+        format!("[f] Filter: {}", state.status_filter.label()),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    let nav_hint = if state.per_ws_view == PerWorkspaceView::Kanban {
+        " Workspace [<-/-> cols] "
+    } else {
+        " Workspaces [<-/->] "
+    };
+
     let ws_bar = Paragraph::new(Line::from(ws_spans)).block(
         Block::default()
-            .title(" Workspaces [<-/->] ")
+            .title(nav_hint)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
     );
@@ -1249,10 +1489,39 @@ fn render_per_workspace_tab(
     render_workspace_phase_summary(frame, summary_cols[0], &ws_items);
     render_workspace_spec_progress(frame, db, summary_cols[1], selected_ws);
 
-    // Item table.
+    // Render either table or kanban view.
+    match state.per_ws_view {
+        PerWorkspaceView::Table => {
+            render_per_workspace_table(frame, chunks[2], &ws_items, state, selected_ws);
+        }
+        PerWorkspaceView::Kanban => {
+            render_per_workspace_kanban(
+                frame,
+                chunks[2],
+                per_ws_kanban_columns,
+                state,
+                selected_ws,
+            );
+        }
+    }
+}
+
+/// Render the PerWorkspace flat table view with status filter applied.
+fn render_per_workspace_table(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    ws_items: &[QueueItem],
+    state: &DashboardState,
+    selected_ws: &str,
+) {
     let selected_index = state.current_tab_state().selected_index;
 
-    let rows: Vec<Row<'static>> = ws_items
+    let filtered_items: Vec<&QueueItem> = ws_items
+        .iter()
+        .filter(|i| state.status_filter.matches(&i.phase))
+        .collect();
+
+    let rows: Vec<Row<'static>> = filtered_items
         .iter()
         .enumerate()
         .map(|(i, item)| {
@@ -1284,6 +1553,12 @@ fn render_per_workspace_tab(
         )
         .bottom_margin(1);
 
+    let filter_label = state.status_filter.label();
+    let title = format!(
+        " Items [{selected_ws}] ({}) filter:{filter_label} ",
+        filtered_items.len()
+    );
+
     let table = Table::new(
         rows,
         [
@@ -1296,11 +1571,99 @@ fn render_per_workspace_tab(
     .header(header)
     .block(
         Block::default()
-            .title(format!(" Items [{selected_ws}] "))
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Green)),
     );
-    frame.render_widget(table, chunks[2]);
+    frame.render_widget(table, area);
+}
+
+/// Render the PerWorkspace kanban view with three columns.
+///
+/// Columns:
+/// - **Pending**: Pending + Ready + Hitl items
+/// - **In-Progress**: Running items
+/// - **Completed**: Completed + Done + Failed items
+fn render_per_workspace_kanban(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    kanban_columns: &[Vec<&QueueItem>],
+    state: &DashboardState,
+    selected_ws: &str,
+) {
+    let num_cols = PER_WS_KANBAN_GROUPS.len();
+    let constraints: Vec<Constraint> = (0..num_cols)
+        .map(|_| Constraint::Ratio(1, num_cols as u32))
+        .collect();
+
+    let col_areas = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .split(area);
+
+    let column_colors = [Color::Gray, Color::Green, Color::Cyan];
+
+    let empty_col: Vec<&QueueItem> = Vec::new();
+    for (col_idx, group_name) in PER_WS_KANBAN_GROUPS.iter().enumerate() {
+        let items = kanban_columns.get(col_idx).unwrap_or(&empty_col);
+        let is_selected_col = col_idx == state.per_ws_kanban_col;
+        let color = column_colors[col_idx];
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+
+        for (row_idx, item) in items.iter().enumerate() {
+            let is_selected = is_selected_col && row_idx == state.per_ws_kanban_row;
+            let col_width = col_areas[col_idx].width as usize;
+            let work_id_display = truncate_str(&item.work_id, col_width.saturating_sub(4));
+            let phase_str = item.phase.as_str();
+            let phase_clr = phase_color(phase_str);
+
+            if is_selected {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("> {work_id_display}"),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(phase_str.to_string(), Style::default().fg(phase_clr)),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {work_id_display}"),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(phase_str.to_string(), Style::default().fg(phase_clr)),
+                ]));
+            }
+        }
+
+        if items.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  (empty)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        let border_color = if is_selected_col {
+            color
+        } else {
+            Color::DarkGray
+        };
+        let title = format!(" {} ({}) [{selected_ws}] ", group_name, items.len());
+
+        let paragraph = Paragraph::new(lines).block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(border_color)),
+        );
+
+        frame.render_widget(paragraph, col_areas[col_idx]);
+    }
 }
 
 /// Render a compact phase summary for a single workspace's items.
@@ -1870,6 +2233,15 @@ fn render_help_overlay(frame: &mut ratatui::Frame) {
         ]),
         Line::from(""),
         Line::from(vec![
+            Span::styled("  v       ", Style::default().fg(Color::Green)),
+            Span::raw("Toggle table/kanban (Workspace tab)"),
+        ]),
+        Line::from(vec![
+            Span::styled("  f       ", Style::default().fg(Color::Green)),
+            Span::raw("Cycle status filter (Workspace tab)"),
+        ]),
+        Line::from(""),
+        Line::from(vec![
             Span::styled("  q/Esc   ", Style::default().fg(Color::Red)),
             Span::raw("Quit / close overlay"),
         ]),
@@ -1915,6 +2287,12 @@ fn render_item_detail_overlay(frame: &mut ratatui::Frame, db: &Database, work_id
 }
 
 /// Build the text lines for the item detail overlay.
+///
+/// Shows complete item metadata including:
+/// - ID, title, status (phase), state, workspace, source
+/// - Created/updated timestamps
+/// - HITL details (if in HITL phase or has HITL history)
+/// - Full transition timeline with event types
 fn build_detail_lines<'a>(
     work_id: &str,
     item: Option<&QueueItem>,
@@ -1931,6 +2309,14 @@ fn build_detail_lines<'a>(
                 Span::styled("ID: ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(item.work_id.clone()),
             ]));
+
+            if let Some(ref title) = item.title {
+                lines.push(Line::from(vec![
+                    Span::styled("Title: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(title.clone()),
+                ]));
+            }
+
             lines.push(Line::from(vec![
                 Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::styled(phase_str, Style::default().fg(color)),
@@ -1944,6 +2330,10 @@ fn build_detail_lines<'a>(
                 Span::raw(item.workspace_id.clone()),
             ]));
             lines.push(Line::from(vec![
+                Span::styled("Source: ", Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw(item.source_id.clone()),
+            ]));
+            lines.push(Line::from(vec![
                 Span::styled("Created: ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::raw(item.created_at.clone()),
             ]));
@@ -1952,11 +2342,51 @@ fn build_detail_lines<'a>(
                 Span::raw(item.updated_at.clone()),
             ]));
 
-            if let Some(ref title) = item.title {
-                lines.push(Line::from(vec![
-                    Span::styled("Title: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(title.clone()),
-                ]));
+            // HITL details (if present).
+            if item.hitl_created_at.is_some()
+                || item.hitl_reason.is_some()
+                || item.hitl_notes.is_some()
+            {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "HITL Details:",
+                    Style::default()
+                        .add_modifier(Modifier::BOLD)
+                        .fg(Color::Yellow),
+                )));
+                if let Some(ref hitl_at) = item.hitl_created_at {
+                    lines.push(Line::from(vec![
+                        Span::styled("  Entered: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(hitl_at.clone()),
+                    ]));
+                }
+                if let Some(ref reason) = item.hitl_reason {
+                    lines.push(Line::from(vec![
+                        Span::styled("  Reason: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(reason.to_string()),
+                    ]));
+                }
+                if let Some(ref respondent) = item.hitl_respondent {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            "  Respondent: ",
+                            Style::default().add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(respondent.clone()),
+                    ]));
+                }
+                if let Some(ref notes) = item.hitl_notes {
+                    lines.push(Line::from(vec![
+                        Span::styled("  Notes: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(notes.clone()),
+                    ]));
+                }
+                if let Some(ref timeout) = item.hitl_timeout_at {
+                    lines.push(Line::from(vec![
+                        Span::styled("  Timeout: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(timeout.clone()),
+                    ]));
+                }
             }
         }
         None => {
@@ -2000,13 +2430,20 @@ fn build_detail_lines<'a>(
                 Span::styled(" -> ", Style::default().fg(Color::Gray)),
                 Span::styled(to_str.to_string(), Style::default().fg(to_color)),
                 Span::raw("  "),
+                Span::styled(
+                    format!("[{}]", event.event_type),
+                    Style::default().fg(Color::Blue),
+                ),
+                Span::raw("  "),
                 Span::styled(time_display, Style::default().fg(Color::DarkGray)),
             ];
 
-            if let Some(ref detail) = event.detail {
+            if let Some(ref detail) = event.detail
+                && !detail.is_empty()
+            {
                 spans.push(Span::raw("  "));
                 spans.push(Span::styled(
-                    detail.clone(),
+                    truncate_str(detail, 30),
                     Style::default().fg(Color::DarkGray),
                 ));
             }
@@ -3711,5 +4148,180 @@ mod tests {
         assert!(text.contains("Status"));
         assert!(text.contains("Last Checked"));
         assert!(text.contains("Items"));
+    }
+
+    // ---- StatusFilter ----
+
+    #[test]
+    fn status_filter_all_matches_every_phase() {
+        let filter = StatusFilter::All;
+        assert!(filter.matches(&QueuePhase::Pending));
+        assert!(filter.matches(&QueuePhase::Ready));
+        assert!(filter.matches(&QueuePhase::Running));
+        assert!(filter.matches(&QueuePhase::Completed));
+        assert!(filter.matches(&QueuePhase::Done));
+        assert!(filter.matches(&QueuePhase::Failed));
+        assert!(filter.matches(&QueuePhase::Hitl));
+    }
+
+    #[test]
+    fn status_filter_pending_matches_pending_ready_hitl() {
+        let filter = StatusFilter::Pending;
+        assert!(filter.matches(&QueuePhase::Pending));
+        assert!(filter.matches(&QueuePhase::Ready));
+        assert!(filter.matches(&QueuePhase::Hitl));
+        assert!(!filter.matches(&QueuePhase::Running));
+        assert!(!filter.matches(&QueuePhase::Completed));
+        assert!(!filter.matches(&QueuePhase::Done));
+        assert!(!filter.matches(&QueuePhase::Failed));
+    }
+
+    #[test]
+    fn status_filter_running_matches_only_running() {
+        let filter = StatusFilter::Running;
+        assert!(filter.matches(&QueuePhase::Running));
+        assert!(!filter.matches(&QueuePhase::Pending));
+        assert!(!filter.matches(&QueuePhase::Completed));
+    }
+
+    #[test]
+    fn status_filter_completed_matches_completed_done_failed() {
+        let filter = StatusFilter::Completed;
+        assert!(filter.matches(&QueuePhase::Completed));
+        assert!(filter.matches(&QueuePhase::Done));
+        assert!(filter.matches(&QueuePhase::Failed));
+        assert!(!filter.matches(&QueuePhase::Pending));
+        assert!(!filter.matches(&QueuePhase::Running));
+    }
+
+    #[test]
+    fn status_filter_cycles_through_all_variants() {
+        let start = StatusFilter::All;
+        let next = start.next();
+        assert_eq!(next, StatusFilter::Pending);
+        let next = next.next();
+        assert_eq!(next, StatusFilter::Running);
+        let next = next.next();
+        assert_eq!(next, StatusFilter::Completed);
+        let next = next.next();
+        assert_eq!(next, StatusFilter::All);
+    }
+
+    #[test]
+    fn status_filter_labels() {
+        assert_eq!(StatusFilter::All.label(), "All");
+        assert_eq!(StatusFilter::Pending.label(), "Pending");
+        assert_eq!(StatusFilter::Running.label(), "Running");
+        assert_eq!(StatusFilter::Completed.label(), "Completed");
+    }
+
+    // ---- PerWorkspaceView ----
+
+    #[test]
+    fn per_ws_view_default_is_table() {
+        let state = DashboardState::new();
+        assert_eq!(state.per_ws_view, PerWorkspaceView::Table);
+    }
+
+    #[test]
+    fn per_ws_kanban_initial_selection() {
+        let state = DashboardState::new();
+        assert_eq!(state.per_ws_kanban_col, 0);
+        assert_eq!(state.per_ws_kanban_row, 0);
+    }
+
+    #[test]
+    fn per_ws_kanban_groups_has_three_columns() {
+        assert_eq!(PER_WS_KANBAN_GROUPS.len(), 3);
+        assert_eq!(PER_WS_KANBAN_GROUPS[0], "Pending");
+        assert_eq!(PER_WS_KANBAN_GROUPS[1], "In-Progress");
+        assert_eq!(PER_WS_KANBAN_GROUPS[2], "Completed");
+    }
+
+    // ---- build_detail_lines enhanced ----
+
+    #[test]
+    fn build_detail_lines_shows_source_id() {
+        let item = QueueItem::new(
+            "w1".to_string(),
+            "github:org/repo#42".to_string(),
+            "ws1".to_string(),
+            "analyze".to_string(),
+        );
+        let lines = build_detail_lines("w1", Some(&item), &[]);
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+        assert!(text.contains("github:org/repo#42"));
+        assert!(text.contains("Source:"));
+    }
+
+    #[test]
+    fn build_detail_lines_shows_hitl_details() {
+        let mut item = QueueItem::new(
+            "w1".to_string(),
+            "src1".to_string(),
+            "ws1".to_string(),
+            "analyze".to_string(),
+        );
+        item.hitl_created_at = Some("2026-03-25T10:00:00Z".to_string());
+        item.hitl_reason = Some(belt_core::queue::HitlReason::RetryMaxExceeded);
+        item.hitl_notes = Some("needs review".to_string());
+
+        let lines = build_detail_lines("w1", Some(&item), &[]);
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+        assert!(text.contains("HITL Details:"));
+        assert!(text.contains("Entered:"));
+        assert!(text.contains("Reason:"));
+        assert!(text.contains("Notes:"));
+        assert!(text.contains("needs review"));
+    }
+
+    #[test]
+    fn build_detail_lines_shows_transition_event_type() {
+        let item = QueueItem::new(
+            "w1".to_string(),
+            "src1".to_string(),
+            "ws1".to_string(),
+            "implement".to_string(),
+        );
+        let transitions = vec![TransitionEvent {
+            id: "e1".to_string(),
+            work_id: "w1".to_string(),
+            source_id: "src1".to_string(),
+            event_type: "auto".to_string(),
+            phase: Some("ready".to_string()),
+            from_phase: Some("pending".to_string()),
+            detail: Some("{\"trigger\":\"scan\"}".to_string()),
+            created_at: "2026-03-25T10:00:00Z".to_string(),
+        }];
+        let lines = build_detail_lines("w1", Some(&item), &transitions);
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+        assert!(text.contains("[auto]"));
+        assert!(text.contains("{\"trigger\":\"scan\"}"));
+    }
+
+    #[test]
+    fn build_detail_lines_title_shown_before_status() {
+        let mut item = QueueItem::new(
+            "w1".to_string(),
+            "src1".to_string(),
+            "ws1".to_string(),
+            "analyze".to_string(),
+        );
+        item.title = Some("My Important Task".to_string());
+        let lines = build_detail_lines("w1", Some(&item), &[]);
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+        assert!(text.contains("My Important Task"));
+        // Title should appear before Status
+        let title_pos = text.find("Title:").unwrap();
+        let status_pos = text.find("Status:").unwrap();
+        assert!(title_pos < status_pos);
+    }
+
+    // ---- DashboardState new fields ----
+
+    #[test]
+    fn dashboard_state_default_filter_is_all() {
+        let state = DashboardState::new();
+        assert_eq!(state.status_filter, StatusFilter::All);
     }
 }
