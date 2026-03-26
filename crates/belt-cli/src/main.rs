@@ -2818,4 +2818,138 @@ mod tests {
         let (action, _) = recommended_action(None);
         assert_eq!(action, "skip");
     }
+
+    // --- CLI flag parsing tests ---
+
+    #[test]
+    fn hitl_list_format_text() {
+        let cli = Cli::try_parse_from(["belt", "hitl", "list", "--format", "text"]).unwrap();
+        match cli.command {
+            Commands::Hitl {
+                command: HitlCommands::List { format, .. },
+            } => assert_eq!(format, "text"),
+            _ => panic!("expected Hitl List command"),
+        }
+    }
+
+    #[test]
+    fn hitl_list_format_json() {
+        let cli = Cli::try_parse_from(["belt", "hitl", "list", "--format", "json"]).unwrap();
+        match cli.command {
+            Commands::Hitl {
+                command: HitlCommands::List { format, .. },
+            } => assert_eq!(format, "json"),
+            _ => panic!("expected Hitl List command"),
+        }
+    }
+
+    #[test]
+    fn hitl_list_format_default_is_text() {
+        let cli = Cli::try_parse_from(["belt", "hitl", "list"]).unwrap();
+        match cli.command {
+            Commands::Hitl {
+                command: HitlCommands::List { format, .. },
+            } => assert_eq!(format, "text"),
+            _ => panic!("expected Hitl List command"),
+        }
+    }
+
+    #[test]
+    fn hitl_show_interactive_flag() {
+        let cli = Cli::try_parse_from(["belt", "hitl", "show", "item-1", "--interactive"]).unwrap();
+        match cli.command {
+            Commands::Hitl {
+                command:
+                    HitlCommands::Show {
+                        item_id,
+                        interactive,
+                        ..
+                    },
+            } => {
+                assert_eq!(item_id, "item-1");
+                assert!(interactive);
+            }
+            _ => panic!("expected Hitl Show command"),
+        }
+    }
+
+    #[test]
+    fn hitl_show_without_interactive_flag() {
+        let cli = Cli::try_parse_from(["belt", "hitl", "show", "item-1"]).unwrap();
+        match cli.command {
+            Commands::Hitl {
+                command: HitlCommands::Show { interactive, .. },
+            } => assert!(!interactive),
+            _ => panic!("expected Hitl Show command"),
+        }
+    }
+
+    #[test]
+    fn spec_add_skip_validation_flag() {
+        let cli = Cli::try_parse_from([
+            "belt",
+            "spec",
+            "add",
+            "--workspace",
+            "ws1",
+            "--name",
+            "my-spec",
+            "--content",
+            "some content",
+            "--skip-validation",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Spec {
+                command:
+                    SpecCommands::Add {
+                        skip_validation,
+                        workspace,
+                        name,
+                        ..
+                    },
+            } => {
+                assert!(skip_validation);
+                assert_eq!(workspace, "ws1");
+                assert_eq!(name, "my-spec");
+            }
+            _ => panic!("expected Spec Add command"),
+        }
+    }
+
+    #[test]
+    fn spec_add_without_skip_validation() {
+        let cli = Cli::try_parse_from([
+            "belt",
+            "spec",
+            "add",
+            "--workspace",
+            "ws1",
+            "--name",
+            "my-spec",
+            "--content",
+            "some content",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Spec {
+                command:
+                    SpecCommands::Add {
+                        skip_validation, ..
+                    },
+            } => assert!(!skip_validation),
+            _ => panic!("expected Spec Add command"),
+        }
+    }
+
+    #[test]
+    fn cron_trigger_parses_name() {
+        let cli = Cli::try_parse_from(["belt", "cron", "trigger", "daily-report"]).unwrap();
+        match cli.command {
+            Commands::Cron {
+                command: CronCommands::Trigger { name },
+            } => assert_eq!(name, "daily-report"),
+            _ => panic!("expected Cron Trigger command"),
+        }
+    }
 }
