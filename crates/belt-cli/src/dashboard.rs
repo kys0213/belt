@@ -41,9 +41,9 @@ use belt_core::spec::SpecStatus;
 use belt_infra::db::{Database, HistoryEvent, RuntimeStats, ScriptExecStats, TransitionEvent};
 use belt_infra::workspace_loader::load_workspace_config;
 
-/// Connection status of a DataSource.
+/// Connection status of a DataSource (internal dashboard representation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DataSourceConnectionStatus {
+enum SourceStatus {
     /// DataSource is connected and has recent activity.
     Connected,
     /// DataSource is configured but has no recent activity.
@@ -52,38 +52,38 @@ enum DataSourceConnectionStatus {
     Error,
 }
 
-impl DataSourceConnectionStatus {
+impl SourceStatus {
     /// Return a human-readable label for display.
     fn label(self) -> &'static str {
         match self {
-            DataSourceConnectionStatus::Connected => "Connected",
-            DataSourceConnectionStatus::Disconnected => "Disconnected",
-            DataSourceConnectionStatus::Error => "Error",
+            SourceStatus::Connected => "Connected",
+            SourceStatus::Disconnected => "Disconnected",
+            SourceStatus::Error => "Error",
         }
     }
 
     /// Return the display color for this status.
     fn color(self) -> Color {
         match self {
-            DataSourceConnectionStatus::Connected => Color::Green,
-            DataSourceConnectionStatus::Disconnected => Color::DarkGray,
-            DataSourceConnectionStatus::Error => Color::Red,
+            SourceStatus::Connected => Color::Green,
+            SourceStatus::Disconnected => Color::DarkGray,
+            SourceStatus::Error => Color::Red,
         }
     }
 
     /// Return a status indicator symbol.
     fn indicator(self) -> &'static str {
         match self {
-            DataSourceConnectionStatus::Connected => "●",
-            DataSourceConnectionStatus::Disconnected => "○",
-            DataSourceConnectionStatus::Error => "✗",
+            SourceStatus::Connected => "●",
+            SourceStatus::Disconnected => "○",
+            SourceStatus::Error => "✗",
         }
     }
 }
 
-/// Status information for a single DataSource.
+/// Status information for a single DataSource (internal dashboard representation).
 #[derive(Debug, Clone)]
-struct DataSourceStatusEntry {
+struct SourceStatusEntry {
     /// Workspace name this source belongs to.
     workspace: String,
     /// Source type name (e.g. "github").
@@ -95,7 +95,7 @@ struct DataSourceStatusEntry {
     /// Scan interval in seconds.
     scan_interval_secs: u64,
     /// Current connection status.
-    status: DataSourceConnectionStatus,
+    status: SourceStatus,
     /// Number of active (non-terminal) items from this source.
     active_item_count: usize,
 }
@@ -744,7 +744,7 @@ fn render_board_tab(
 fn collect_datasource_status(
     workspaces: &[(String, String, String)],
     all_items: &[QueueItem],
-) -> Vec<DataSourceStatusEntry> {
+) -> Vec<SourceStatusEntry> {
     let mut entries = Vec::new();
 
     for (ws_name, config_path, _created_at) in workspaces {
@@ -752,13 +752,13 @@ fn collect_datasource_status(
             Ok(c) => c,
             Err(_) => {
                 // Config could not be loaded — report error status.
-                entries.push(DataSourceStatusEntry {
+                entries.push(SourceStatusEntry {
                     workspace: ws_name.clone(),
                     source_name: "(unknown)".to_string(),
                     url: config_path.clone(),
                     state_count: 0,
                     scan_interval_secs: 0,
-                    status: DataSourceConnectionStatus::Error,
+                    status: SourceStatus::Error,
                     active_item_count: 0,
                 });
                 continue;
@@ -779,12 +779,12 @@ fn collect_datasource_status(
                 .count();
 
             let status = if active_count > 0 {
-                DataSourceConnectionStatus::Connected
+                SourceStatus::Connected
             } else {
-                DataSourceConnectionStatus::Disconnected
+                SourceStatus::Disconnected
             };
 
-            entries.push(DataSourceStatusEntry {
+            entries.push(SourceStatusEntry {
                 workspace: ws_name.clone(),
                 source_name: source_name.clone(),
                 url: source_config.url.clone(),
@@ -807,7 +807,7 @@ fn collect_datasource_status(
 fn render_datasource_tab(
     frame: &mut ratatui::Frame,
     area: Rect,
-    entries: &[DataSourceStatusEntry],
+    entries: &[SourceStatusEntry],
     selected_index: usize,
 ) {
     let chunks = Layout::default()
@@ -818,15 +818,15 @@ fn render_datasource_tab(
     // Summary bar.
     let connected = entries
         .iter()
-        .filter(|e| e.status == DataSourceConnectionStatus::Connected)
+        .filter(|e| e.status == SourceStatus::Connected)
         .count();
     let disconnected = entries
         .iter()
-        .filter(|e| e.status == DataSourceConnectionStatus::Disconnected)
+        .filter(|e| e.status == SourceStatus::Disconnected)
         .count();
     let error = entries
         .iter()
-        .filter(|e| e.status == DataSourceConnectionStatus::Error)
+        .filter(|e| e.status == SourceStatus::Error)
         .count();
 
     let summary_spans = vec![
@@ -2056,6 +2056,125 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(popup_layout[1])[1]
 }
 
+// ---------------------------------------------------------------------------
+// DataSource status types and rendering
+// ---------------------------------------------------------------------------
+
+/// Connection status for a DataSource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum DataSourceConnectionStatus {
+    /// The DataSource is connected and healthy.
+    Connected,
+    /// The DataSource is disconnected or unreachable.
+    Disconnected,
+    /// The connection status is unknown (e.g. never checked).
+    Unknown,
+}
+
+#[allow(dead_code)]
+impl DataSourceConnectionStatus {
+    /// Return a human-readable string representation.
+    pub fn as_str(&self) -> &str {
+        match self {
+            DataSourceConnectionStatus::Connected => "connected",
+            DataSourceConnectionStatus::Disconnected => "disconnected",
+            DataSourceConnectionStatus::Unknown => "unknown",
+        }
+    }
+}
+
+/// Entry representing the status of a single DataSource in the dashboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct DataSourceStatusEntry {
+    /// DataSource name (e.g. "github").
+    pub name: String,
+    /// Current connection status.
+    pub status: DataSourceConnectionStatus,
+    /// Last check timestamp (RFC 3339).
+    pub last_checked: Option<String>,
+    /// Number of items collected in the last scan.
+    pub items_collected: u32,
+}
+
+#[allow(dead_code)]
+impl DataSourceStatusEntry {
+    /// Create a new `DataSourceStatusEntry`.
+    pub fn new(name: String, status: DataSourceConnectionStatus) -> Self {
+        Self {
+            name,
+            status,
+            last_checked: None,
+            items_collected: 0,
+        }
+    }
+}
+
+/// Return the color associated with a [`DataSourceConnectionStatus`].
+#[allow(dead_code)]
+fn datasource_status_color(status: &DataSourceConnectionStatus) -> Color {
+    match status {
+        DataSourceConnectionStatus::Connected => Color::Green,
+        DataSourceConnectionStatus::Disconnected => Color::Red,
+        DataSourceConnectionStatus::Unknown => Color::DarkGray,
+    }
+}
+
+/// Render the DataSource status panel as a ratatui [`Table`] widget.
+///
+/// Displays each DataSource's name, connection status, last check time,
+/// and items collected count.
+#[allow(dead_code)]
+fn render_datasource_panel(entries: &[DataSourceStatusEntry]) -> Table<'static> {
+    let header = Row::new(vec![
+        Cell::from("DataSource"),
+        Cell::from("Status"),
+        Cell::from("Last Checked"),
+        Cell::from("Items"),
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )
+    .bottom_margin(1);
+
+    let rows: Vec<Row<'static>> = entries
+        .iter()
+        .map(|entry| {
+            let color = datasource_status_color(&entry.status);
+            let last_checked = entry
+                .last_checked
+                .clone()
+                .unwrap_or_else(|| "-".to_string());
+            Row::new(vec![
+                Cell::from(entry.name.clone()),
+                Cell::from(entry.status.as_str().to_string()).style(Style::default().fg(color)),
+                Cell::from(last_checked),
+                Cell::from(entry.items_collected.to_string()),
+            ])
+        })
+        .collect();
+
+    Table::new(
+        rows,
+        [
+            Constraint::Percentage(25),
+            Constraint::Percentage(20),
+            Constraint::Percentage(35),
+            Constraint::Percentage(20),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .title(" DataSource Status ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    )
+}
+
 /// Return the ratatui [`Color`] associated with a queue phase name.
 ///
 /// Used by the dashboard TUI and the `belt status --format rich` output.
@@ -3073,33 +3192,27 @@ mod tests {
         assert!(state.show_help);
     }
 
-    // ---- DataSource status ----
+    // ---- DataSource status (private API: SourceStatus / SourceStatusEntry) ----
 
     #[test]
     fn datasource_connection_status_labels() {
-        assert_eq!(DataSourceConnectionStatus::Connected.label(), "Connected");
-        assert_eq!(
-            DataSourceConnectionStatus::Disconnected.label(),
-            "Disconnected"
-        );
-        assert_eq!(DataSourceConnectionStatus::Error.label(), "Error");
+        assert_eq!(SourceStatus::Connected.label(), "Connected");
+        assert_eq!(SourceStatus::Disconnected.label(), "Disconnected");
+        assert_eq!(SourceStatus::Error.label(), "Error");
     }
 
     #[test]
     fn datasource_connection_status_colors() {
-        assert_eq!(DataSourceConnectionStatus::Connected.color(), Color::Green);
-        assert_eq!(
-            DataSourceConnectionStatus::Disconnected.color(),
-            Color::DarkGray
-        );
-        assert_eq!(DataSourceConnectionStatus::Error.color(), Color::Red);
+        assert_eq!(SourceStatus::Connected.color(), Color::Green);
+        assert_eq!(SourceStatus::Disconnected.color(), Color::DarkGray);
+        assert_eq!(SourceStatus::Error.color(), Color::Red);
     }
 
     #[test]
     fn datasource_connection_status_indicators() {
-        assert_eq!(DataSourceConnectionStatus::Connected.indicator(), "●");
-        assert_eq!(DataSourceConnectionStatus::Disconnected.indicator(), "○");
-        assert_eq!(DataSourceConnectionStatus::Error.indicator(), "✗");
+        assert_eq!(SourceStatus::Connected.indicator(), "●");
+        assert_eq!(SourceStatus::Disconnected.indicator(), "○");
+        assert_eq!(SourceStatus::Error.indicator(), "✗");
     }
 
     #[test]
@@ -3117,7 +3230,7 @@ mod tests {
         )];
         let entries = collect_datasource_status(&workspaces, &[]);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].status, DataSourceConnectionStatus::Error);
+        assert_eq!(entries[0].status, SourceStatus::Error);
         assert_eq!(entries[0].workspace, "test-ws");
     }
 
@@ -3140,13 +3253,13 @@ mod tests {
 
     #[test]
     fn datasource_status_entry_fields() {
-        let entry = DataSourceStatusEntry {
+        let entry = SourceStatusEntry {
             workspace: "my-ws".to_string(),
             source_name: "github".to_string(),
             url: "https://github.com/org/repo".to_string(),
             state_count: 3,
             scan_interval_secs: 300,
-            status: DataSourceConnectionStatus::Connected,
+            status: SourceStatus::Connected,
             active_item_count: 5,
         };
         assert_eq!(entry.workspace, "my-ws");
@@ -3154,7 +3267,7 @@ mod tests {
         assert_eq!(entry.state_count, 3);
         assert_eq!(entry.scan_interval_secs, 300);
         assert_eq!(entry.active_item_count, 5);
-        assert_eq!(entry.status, DataSourceConnectionStatus::Connected);
+        assert_eq!(entry.status, SourceStatus::Connected);
     }
 
     #[test]
@@ -3255,5 +3368,327 @@ mod tests {
             .collect();
         assert!(content.contains("analyze"));
         assert!(content.contains("Total Runs: 2"));
+    }
+
+    // ---- DataSourceConnectionStatus (public API) ----
+
+    #[test]
+    fn datasource_connection_status_as_str_connected() {
+        assert_eq!(DataSourceConnectionStatus::Connected.as_str(), "connected");
+    }
+
+    #[test]
+    fn datasource_connection_status_as_str_disconnected() {
+        assert_eq!(
+            DataSourceConnectionStatus::Disconnected.as_str(),
+            "disconnected"
+        );
+    }
+
+    #[test]
+    fn datasource_connection_status_as_str_unknown() {
+        assert_eq!(DataSourceConnectionStatus::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn datasource_connection_status_equality() {
+        assert_eq!(
+            DataSourceConnectionStatus::Connected,
+            DataSourceConnectionStatus::Connected
+        );
+        assert_ne!(
+            DataSourceConnectionStatus::Connected,
+            DataSourceConnectionStatus::Disconnected
+        );
+        assert_ne!(
+            DataSourceConnectionStatus::Disconnected,
+            DataSourceConnectionStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn datasource_connection_status_debug() {
+        let status = DataSourceConnectionStatus::Connected;
+        let debug_str = format!("{:?}", status);
+        assert!(debug_str.contains("Connected"));
+    }
+
+    #[test]
+    fn datasource_connection_status_clone() {
+        let original = DataSourceConnectionStatus::Disconnected;
+        let cloned = original;
+        assert_eq!(original, cloned);
+    }
+
+    // ---- DataSourceStatusEntry (public API) ----
+
+    #[test]
+    fn datasource_status_entry_new_defaults() {
+        let entry =
+            DataSourceStatusEntry::new("github".to_string(), DataSourceConnectionStatus::Connected);
+        assert_eq!(entry.name, "github");
+        assert_eq!(entry.status, DataSourceConnectionStatus::Connected);
+        assert!(entry.last_checked.is_none());
+        assert_eq!(entry.items_collected, 0);
+    }
+
+    #[test]
+    fn datasource_status_entry_with_last_checked() {
+        let mut entry = DataSourceStatusEntry::new(
+            "jira".to_string(),
+            DataSourceConnectionStatus::Disconnected,
+        );
+        entry.last_checked = Some("2026-03-27T10:00:00Z".to_string());
+        assert_eq!(entry.last_checked, Some("2026-03-27T10:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn datasource_status_entry_with_items_collected() {
+        let mut entry =
+            DataSourceStatusEntry::new("github".to_string(), DataSourceConnectionStatus::Connected);
+        entry.items_collected = 42;
+        assert_eq!(entry.items_collected, 42);
+    }
+
+    #[test]
+    fn datasource_status_entry_equality() {
+        let a =
+            DataSourceStatusEntry::new("github".to_string(), DataSourceConnectionStatus::Connected);
+        let b =
+            DataSourceStatusEntry::new("github".to_string(), DataSourceConnectionStatus::Connected);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn datasource_status_entry_inequality_name() {
+        let a =
+            DataSourceStatusEntry::new("github".to_string(), DataSourceConnectionStatus::Connected);
+        let b =
+            DataSourceStatusEntry::new("jira".to_string(), DataSourceConnectionStatus::Connected);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn datasource_status_entry_inequality_status() {
+        let a =
+            DataSourceStatusEntry::new("github".to_string(), DataSourceConnectionStatus::Connected);
+        let b = DataSourceStatusEntry::new(
+            "github".to_string(),
+            DataSourceConnectionStatus::Disconnected,
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn datasource_status_entry_debug() {
+        let entry =
+            DataSourceStatusEntry::new("github".to_string(), DataSourceConnectionStatus::Unknown);
+        let debug_str = format!("{:?}", entry);
+        assert!(debug_str.contains("github"));
+        assert!(debug_str.contains("Unknown"));
+    }
+
+    #[test]
+    fn datasource_status_entry_clone() {
+        let mut original =
+            DataSourceStatusEntry::new("github".to_string(), DataSourceConnectionStatus::Connected);
+        original.last_checked = Some("2026-03-27T12:00:00Z".to_string());
+        original.items_collected = 5;
+        let cloned = original.clone();
+        assert_eq!(original, cloned);
+    }
+
+    // ---- datasource_status_color ----
+
+    #[test]
+    fn datasource_status_color_connected() {
+        assert_eq!(
+            datasource_status_color(&DataSourceConnectionStatus::Connected),
+            Color::Green
+        );
+    }
+
+    #[test]
+    fn datasource_status_color_disconnected() {
+        assert_eq!(
+            datasource_status_color(&DataSourceConnectionStatus::Disconnected),
+            Color::Red
+        );
+    }
+
+    #[test]
+    fn datasource_status_color_unknown() {
+        assert_eq!(
+            datasource_status_color(&DataSourceConnectionStatus::Unknown),
+            Color::DarkGray
+        );
+    }
+
+    // ---- render_datasource_panel ----
+
+    #[test]
+    fn render_datasource_panel_no_panic_empty() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let table = render_datasource_panel(&[]);
+                frame.render_widget(table, frame.area());
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("DataSource Status"));
+    }
+
+    #[test]
+    fn render_datasource_panel_single_connected_entry() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let entry = DataSourceStatusEntry {
+            name: "github".to_string(),
+            status: DataSourceConnectionStatus::Connected,
+            last_checked: Some("2026-03-27T10:00:00Z".to_string()),
+            items_collected: 7,
+        };
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let table = render_datasource_panel(&[entry]);
+                frame.render_widget(table, frame.area());
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("github"));
+        assert!(text.contains("connected"));
+    }
+
+    #[test]
+    fn render_datasource_panel_multiple_entries() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let entries = vec![
+            DataSourceStatusEntry {
+                name: "github".to_string(),
+                status: DataSourceConnectionStatus::Connected,
+                last_checked: Some("2026-03-27T10:00:00Z".to_string()),
+                items_collected: 7,
+            },
+            DataSourceStatusEntry {
+                name: "jira".to_string(),
+                status: DataSourceConnectionStatus::Disconnected,
+                last_checked: Some("2026-03-27T09:30:00Z".to_string()),
+                items_collected: 0,
+            },
+            DataSourceStatusEntry::new("linear".to_string(), DataSourceConnectionStatus::Unknown),
+        ];
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let table = render_datasource_panel(&entries);
+                frame.render_widget(table, frame.area());
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("github"));
+        assert!(text.contains("jira"));
+        assert!(text.contains("linear"));
+    }
+
+    #[test]
+    fn render_datasource_panel_no_panic_small_terminal() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let entry =
+            DataSourceStatusEntry::new("github".to_string(), DataSourceConnectionStatus::Connected);
+
+        let backend = TestBackend::new(10, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let table = render_datasource_panel(&[entry]);
+                frame.render_widget(table, frame.area());
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn render_datasource_panel_shows_dash_for_no_last_checked() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let entry =
+            DataSourceStatusEntry::new("github".to_string(), DataSourceConnectionStatus::Unknown);
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let table = render_datasource_panel(&[entry]);
+                frame.render_widget(table, frame.area());
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        // When last_checked is None, the panel should show "-"
+        assert!(text.contains("-"));
+    }
+
+    #[test]
+    fn render_datasource_panel_header_contains_expected_columns() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(100, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let table = render_datasource_panel(&[]);
+                frame.render_widget(table, frame.area());
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("DataSource"));
+        assert!(text.contains("Status"));
+        assert!(text.contains("Last Checked"));
+        assert!(text.contains("Items"));
     }
 }
