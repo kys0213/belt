@@ -27,4 +27,6 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt"] }
