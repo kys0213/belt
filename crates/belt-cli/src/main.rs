@@ -596,6 +596,30 @@ fn open_db() -> anyhow::Result<Database> {
     Ok(db)
 }
 
+/// Resolve dynamic context by loading workspace config and calling
+/// `DataSource.get_context()` for live issue/PR/source data.
+async fn resolve_dynamic_context(
+    db: &Database,
+    item: &belt_core::queue::QueueItem,
+) -> anyhow::Result<belt_core::context::ItemContext> {
+    let (_name, config_path, _created_at) = db.get_workspace(&item.workspace_id)?;
+    let config =
+        belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))?;
+
+    // Find the first source whose URL matches or just use the first available source.
+    let source_url = config
+        .sources
+        .values()
+        .next()
+        .map(|s| s.url.clone())
+        .ok_or_else(|| anyhow::anyhow!("no sources configured in workspace"))?;
+
+    let ds = GitHubDataSource::new(&source_url);
+    use belt_core::source::DataSource;
+    let ctx = ds.get_context(item).await?;
+    Ok(ctx)
+}
+
 /// Read the daemon PID from the PID file.
 fn read_pid() -> anyhow::Result<u32> {
     let pid_path = belt_home()?.join("daemon.pid");
@@ -1718,23 +1742,35 @@ async fn main() -> anyhow::Result<()> {
                 })
                 .collect();
 
-            let ctx = belt_core::context::ItemContext {
-                work_id: item.work_id.clone(),
-                workspace: item.workspace_id.clone(),
-                queue: belt_core::context::QueueContext {
-                    phase: item.phase.as_str().to_string(),
-                    state: item.state.clone(),
-                    source_id: item.source_id.clone(),
-                },
-                source: belt_core::context::SourceContext {
-                    source_type: "github".to_string(),
-                    url: String::new(),
-                    default_branch: None,
-                },
-                issue: None,
-                pr: None,
-                history,
-                worktree: None,
+            // Try to load workspace config and use DataSource.get_context()
+            // for dynamic context (issue/PR details, source URL, etc.).
+            let ctx = match resolve_dynamic_context(&db, &item).await {
+                Ok(mut dynamic_ctx) => {
+                    // Merge DB history into dynamic context (DataSource returns empty history).
+                    dynamic_ctx.history = history;
+                    dynamic_ctx
+                }
+                Err(_) => {
+                    // Fallback to static context when workspace config is unavailable.
+                    belt_core::context::ItemContext {
+                        work_id: item.work_id.clone(),
+                        workspace: item.workspace_id.clone(),
+                        queue: belt_core::context::QueueContext {
+                            phase: item.phase.as_str().to_string(),
+                            state: item.state.clone(),
+                            source_id: item.source_id.clone(),
+                        },
+                        source: belt_core::context::SourceContext {
+                            source_type: "unknown".to_string(),
+                            url: String::new(),
+                            default_branch: None,
+                        },
+                        issue: None,
+                        pr: None,
+                        history,
+                        worktree: None,
+                    }
+                }
             };
 
             if let Some(ref field_path) = field {
@@ -1759,6 +1795,13 @@ async fn main() -> anyhow::Result<()> {
                 println!("phase:     {}", ctx.queue.phase);
                 println!("state:     {}", ctx.queue.state);
                 println!("source_id: {}", ctx.queue.source_id);
+                println!("source:    {} {}", ctx.source.source_type, ctx.source.url);
+                if let Some(ref issue) = ctx.issue {
+                    println!("issue:     #{} {}", issue.number, issue.title);
+                }
+                if let Some(ref pr) = ctx.pr {
+                    println!("pr:        #{}", pr.number);
+                }
                 if !ctx.history.is_empty() {
                     println!("history:   {} entries", ctx.history.len());
                 }
