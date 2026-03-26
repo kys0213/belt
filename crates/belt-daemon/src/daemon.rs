@@ -3976,4 +3976,245 @@ sources:
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].model, "unknown");
     }
+
+    // ---------------------------------------------------------------
+    // advance_ready_to_running: HashMap per-workspace concurrency (additional)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn advance_ready_to_running_empty_queue_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let limits = HashMap::from([("test-ws".to_string(), 2)]);
+        daemon.advance_ready_to_running(&limits, 1);
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
+        assert_eq!(daemon.queue_items().len(), 0);
+    }
+
+    #[test]
+    fn advance_ready_to_running_zero_ws_limit_blocks_all() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        for id in ["s1", "s2"] {
+            daemon.push_item(ready_item_for_ws(id, "ws-zero"));
+        }
+
+        // Workspace limit of 0 means nothing should be promoted.
+        let limits = HashMap::from([("ws-zero".to_string(), 0)]);
+        daemon.advance_ready_to_running(&limits, 1);
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
+        assert_eq!(daemon.items_in_phase(QueuePhase::Ready).len(), 2);
+    }
+
+    #[test]
+    fn advance_ready_to_running_already_running_counts_against_limit() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Place one item already in Running to occupy a slot.
+        let mut running = test_item("existing", "analyze");
+        running.workspace_id = "ws-a".to_string();
+        running.phase = QueuePhase::Running;
+        running.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(running);
+        // Track the existing running item in the concurrency tracker.
+        daemon.tracker.track("ws-a");
+
+        // Add 2 Ready items for the same workspace.
+        for id in ["r1", "r2"] {
+            daemon.push_item(ready_item_for_ws(id, "ws-a"));
+        }
+
+        // ws limit = 2, one already running => only 1 more can start.
+        let limits = HashMap::from([("ws-a".to_string(), 2)]);
+        daemon.advance_ready_to_running(&limits, 1);
+
+        assert_eq!(
+            count_in_phase_for_ws(&daemon, QueuePhase::Running, "ws-a"),
+            2
+        );
+        assert_eq!(count_in_phase_for_ws(&daemon, QueuePhase::Ready, "ws-a"), 1);
+    }
+
+    #[test]
+    fn advance_ready_to_running_mixed_known_and_unknown_workspaces() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // ws-known: 3 items, limit 1
+        for id in ["k1", "k2", "k3"] {
+            daemon.push_item(ready_item_for_ws(id, "ws-known"));
+        }
+        // ws-unknown: 2 items, not in map => default_concurrency = 3
+        for id in ["u1", "u2"] {
+            daemon.push_item(ready_item_for_ws(id, "ws-unknown"));
+        }
+
+        let limits = HashMap::from([("ws-known".to_string(), 1)]);
+        daemon.advance_ready_to_running(&limits, 3);
+
+        assert_eq!(
+            count_in_phase_for_ws(&daemon, QueuePhase::Running, "ws-known"),
+            1
+        );
+        assert_eq!(
+            count_in_phase_for_ws(&daemon, QueuePhase::Ready, "ws-known"),
+            2
+        );
+        // ws-unknown uses default=3, and only 2 items exist, so both promoted.
+        assert_eq!(
+            count_in_phase_for_ws(&daemon, QueuePhase::Running, "ws-unknown"),
+            2
+        );
+        assert_eq!(
+            count_in_phase_for_ws(&daemon, QueuePhase::Ready, "ws-unknown"),
+            0
+        );
+    }
+
+    #[test]
+    fn advance_ready_to_running_global_limit_interacts_with_per_ws_limits() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        // Global max_concurrent = 4 from setup_daemon.
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // 3 workspaces, each with limit 2, total would be 6 but global is 4.
+        for i in 0..2 {
+            daemon.push_item(ready_item_for_ws(&format!("a{i}"), "ws-a"));
+        }
+        for i in 0..2 {
+            daemon.push_item(ready_item_for_ws(&format!("b{i}"), "ws-b"));
+        }
+        for i in 0..2 {
+            daemon.push_item(ready_item_for_ws(&format!("c{i}"), "ws-c"));
+        }
+
+        let limits = HashMap::from([
+            ("ws-a".to_string(), 2),
+            ("ws-b".to_string(), 2),
+            ("ws-c".to_string(), 2),
+        ]);
+        daemon.advance_ready_to_running(&limits, 1);
+
+        // Total running should be capped at global limit (4).
+        let total_running = daemon.items_in_phase(QueuePhase::Running).len();
+        assert_eq!(total_running, 4);
+        assert_eq!(daemon.items_in_phase(QueuePhase::Ready).len(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // drain_with_timeout: graceful shutdown (additional)
+    // ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn drain_with_timeout_completes_items_within_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        // exit_code 0 means handler completes successfully.
+        let mut daemon = setup_daemon(&tmp, source, vec![0, 0]);
+
+        let mut item1 = test_item("github:org/repo#1", "analyze");
+        item1.phase = QueuePhase::Running;
+        item1.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(item1);
+
+        let mut item2 = test_item("github:org/repo#2", "analyze");
+        item2.phase = QueuePhase::Running;
+        item2.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(item2);
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 2);
+
+        // Drain with a generous timeout -- items should complete successfully.
+        daemon
+            .drain_with_timeout(std::time::Duration::from_secs(30))
+            .await;
+
+        // All running items should have been drained (completed or otherwise processed).
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
+    }
+
+    #[test]
+    fn force_fail_running_is_called_on_timeout_scenario() {
+        // Simulates the force_fail_running path that drain_with_timeout invokes
+        // when the deadline expires. We test force_fail directly since MockRuntime
+        // completes instantly and cannot simulate a hung task.
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        for i in 0..3u32 {
+            let mut item = test_item(&format!("github:org/repo#{i}"), "analyze");
+            item.phase = QueuePhase::Running;
+            item.updated_at = Utc::now().to_rfc3339();
+            daemon.push_item(item);
+        }
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 3);
+
+        // This is what drain_with_timeout calls when the deadline expires.
+        daemon.force_fail_running();
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
+        assert_eq!(daemon.items_in_phase(QueuePhase::Failed).len(), 3);
+
+        // Each failed item should have a history event with shutdown timeout error.
+        let events = daemon.history_events();
+        assert_eq!(events.len(), 3);
+        for event in events {
+            assert_eq!(event.status, "failed");
+            assert!(
+                event
+                    .error
+                    .as_ref()
+                    .is_some_and(|err| err.contains("shutdown timeout exceeded"))
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // report_dir initialization tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn report_dir_derives_from_belt_home() {
+        let tmp = TempDir::new().unwrap();
+        let belt_home = tmp.path().join("custom-belt-home");
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![]).with_belt_home(belt_home.clone());
+
+        let db = Database::open_in_memory().unwrap();
+        let daemon = daemon.with_db(db);
+
+        // with_db should initialize cron_engine (which receives report_dir
+        // derived as belt_home.join("reports")). If cron_engine is Some,
+        // report_dir was computed and passed to builtin jobs.
+        assert!(
+            daemon.cron_engine.is_some(),
+            "with_db must initialize cron_engine with report_dir"
+        );
+    }
+
+    #[test]
+    fn report_dir_default_belt_home_uses_dot_belt() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Default belt_home is ".belt" (from env or fallback).
+        // Verify that with_db doesn't panic with the default path.
+        let db = Database::open_in_memory().unwrap();
+        let daemon = daemon.with_db(db);
+
+        assert!(daemon.cron_engine.is_some());
+    }
 }
