@@ -147,17 +147,12 @@ belt agent --workspace "{ws}" -p \
         )
     }
 
-    /// Run the evaluate step as a subprocess via `belt agent`.
+    /// Build the `tokio::process::Command` for the evaluate subprocess.
     ///
-    /// Spawns `belt agent --workspace <config> -p <prompt> --json` with
-    /// workspace-isolated environment variables (`WORKSPACE`, `BELT_HOME`,
-    /// `BELT_DB`). The subprocess output is collected as JSON via stdout
-    /// (IPC) and parsed into an [`EvaluateResult`].
-    ///
-    /// A configurable timeout (default 5 minutes) guards against runaway
-    /// subprocesses. On timeout the child process is killed and an error
-    /// is returned so the caller can record the failure.
-    pub async fn run_evaluate(&self, belt_home: &Path) -> Result<EvaluateResult> {
+    /// Extracted for testability: callers can inspect the command's args and
+    /// environment without actually spawning a process.
+    #[doc(hidden)]
+    pub fn build_evaluate_command(&self, belt_home: &Path) -> tokio::process::Command {
         let belt_db = belt_home.join("belt.db");
         let prompt = self.build_evaluate_prompt();
 
@@ -176,6 +171,22 @@ belt agent --workspace "{ws}" -p \
         cmd.env("WORKSPACE", &self.workspace_name);
         cmd.env("BELT_HOME", belt_home.to_string_lossy().as_ref());
         cmd.env("BELT_DB", belt_db.to_string_lossy().as_ref());
+
+        cmd
+    }
+
+    /// Run the evaluate step as a subprocess via `belt agent`.
+    ///
+    /// Spawns `belt agent --workspace <config> -p <prompt> --json` with
+    /// workspace-isolated environment variables (`WORKSPACE`, `BELT_HOME`,
+    /// `BELT_DB`). The subprocess output is collected as JSON via stdout
+    /// (IPC) and parsed into an [`EvaluateResult`].
+    ///
+    /// A configurable timeout (default 5 minutes) guards against runaway
+    /// subprocesses. On timeout the child process is killed and an error
+    /// is returned so the caller can record the failure.
+    pub async fn run_evaluate(&self, belt_home: &Path) -> Result<EvaluateResult> {
+        let mut cmd = self.build_evaluate_command(belt_home);
 
         tracing::info!(
             workspace = %self.workspace_name,
@@ -576,5 +587,436 @@ mod tests {
 
         // Either times out or fails to spawn -- both are acceptable error paths.
         assert!(result.is_err(), "should error on timeout or spawn failure");
+    }
+
+    // --- New tests for subprocess invocation, JSON parsing, timeout, and env isolation ---
+
+    /// Helper: create a fake `belt` script in a temp directory and return
+    /// an evaluator whose command will resolve to that script via PATH override.
+    ///
+    /// The script writes its received env vars and arguments to files for
+    /// later assertion, then outputs the provided `stdout_content`.
+    #[cfg(unix)]
+    fn create_fake_belt_script(dir: &Path, stdout_content: &str, exit_code: i32) -> PathBuf {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let bin_dir = dir.join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let script_path = bin_dir.join("belt");
+
+        // The script dumps env vars and args to files, then echoes stdout_content.
+        let script = format!(
+            r#"#!/bin/sh
+echo "$WORKSPACE" > "{dir}/env_workspace"
+echo "$BELT_HOME" > "{dir}/env_belt_home"
+echo "$BELT_DB" > "{dir}/env_belt_db"
+echo "$@" > "{dir}/args"
+printf '%s' '{stdout}'
+exit {exit_code}
+"#,
+            dir = dir.to_string_lossy(),
+            stdout = stdout_content.replace('\'', "'\\''"),
+            exit_code = exit_code,
+        );
+
+        fs::write(&script_path, script).unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+        bin_dir
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_evaluate_subprocess_parses_json_stdout() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let json_output = r#"{"status":"done","items_processed":3}"#;
+        let bin_dir = create_fake_belt_script(tmp.path(), json_output, 0);
+
+        let evaluator = Evaluator::new("test-ws").with_evaluate_timeout(Duration::from_secs(10));
+
+        // Override PATH so that our fake `belt` script is found first.
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", bin_dir.display(), original_path);
+
+        // We need to modify the command's env directly, so use build_evaluate_command.
+        let belt_home = tmp.path().join("home");
+        fs::create_dir_all(&belt_home).unwrap();
+        let mut cmd = evaluator.build_evaluate_command(&belt_home);
+        cmd.env("PATH", &new_path);
+
+        let child_output = cmd.output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&child_output.stdout).to_string();
+        let exit_code = child_output.status.code().unwrap_or(-1);
+
+        assert_eq!(exit_code, 0, "fake belt script should exit successfully");
+
+        // Verify JSON parsing logic (same as run_evaluate's internal parsing).
+        let ipc_result = if !stdout.trim().is_empty() {
+            serde_json::from_str::<serde_json::Value>(stdout.trim()).ok()
+        } else {
+            None
+        };
+        let ipc = ipc_result.expect("should parse JSON IPC from subprocess stdout");
+        assert_eq!(ipc["status"], "done");
+        assert_eq!(ipc["items_processed"], 3);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_evaluate_subprocess_invalid_json_yields_none_ipc() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = create_fake_belt_script(tmp.path(), "not-json-output", 0);
+
+        let evaluator = Evaluator::new("test-ws").with_evaluate_timeout(Duration::from_secs(10));
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", bin_dir.display(), original_path);
+
+        let belt_home = tmp.path().join("home");
+        fs::create_dir_all(&belt_home).unwrap();
+        let mut cmd = evaluator.build_evaluate_command(&belt_home);
+        cmd.env("PATH", &new_path);
+
+        let child_output = cmd.output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&child_output.stdout).to_string();
+
+        // Non-JSON stdout should not parse to ipc_result.
+        let ipc_result = if !stdout.trim().is_empty() {
+            serde_json::from_str::<serde_json::Value>(stdout.trim()).ok()
+        } else {
+            None
+        };
+        assert!(
+            ipc_result.is_none(),
+            "non-JSON stdout should yield None ipc_result"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_evaluate_subprocess_env_isolation() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = create_fake_belt_script(tmp.path(), "{}", 0);
+
+        let evaluator =
+            Evaluator::new("my-workspace").with_evaluate_timeout(Duration::from_secs(10));
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", bin_dir.display(), original_path);
+
+        let belt_home = tmp.path().join("home");
+        fs::create_dir_all(&belt_home).unwrap();
+        let mut cmd = evaluator.build_evaluate_command(&belt_home);
+        cmd.env("PATH", &new_path);
+
+        let _output = cmd.output().await.unwrap();
+
+        // Read the environment variables captured by the fake script.
+        let env_workspace = fs::read_to_string(tmp.path().join("env_workspace"))
+            .unwrap()
+            .trim()
+            .to_string();
+        let env_belt_home = fs::read_to_string(tmp.path().join("env_belt_home"))
+            .unwrap()
+            .trim()
+            .to_string();
+        let env_belt_db = fs::read_to_string(tmp.path().join("env_belt_db"))
+            .unwrap()
+            .trim()
+            .to_string();
+
+        assert_eq!(
+            env_workspace, "my-workspace",
+            "WORKSPACE env should match workspace_name"
+        );
+        assert_eq!(
+            env_belt_home,
+            belt_home.to_string_lossy(),
+            "BELT_HOME env should match belt_home path"
+        );
+        assert_eq!(
+            env_belt_db,
+            belt_home.join("belt.db").to_string_lossy(),
+            "BELT_DB env should be belt_home/belt.db"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_evaluate_subprocess_passes_workspace_config_arg() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = create_fake_belt_script(tmp.path(), "{}", 0);
+
+        let config_path = PathBuf::from("/etc/belt/workspace.yaml");
+        let evaluator = Evaluator::new("test-ws")
+            .with_workspace_config_path(config_path.clone())
+            .with_evaluate_timeout(Duration::from_secs(10));
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", bin_dir.display(), original_path);
+
+        let belt_home = tmp.path().join("home");
+        fs::create_dir_all(&belt_home).unwrap();
+        let mut cmd = evaluator.build_evaluate_command(&belt_home);
+        cmd.env("PATH", &new_path);
+
+        let _output = cmd.output().await.unwrap();
+
+        // Read the captured arguments.
+        let args = fs::read_to_string(tmp.path().join("args"))
+            .unwrap()
+            .trim()
+            .to_string();
+
+        assert!(
+            args.contains("--workspace"),
+            "args should contain --workspace flag: {args}"
+        );
+        assert!(
+            args.contains("/etc/belt/workspace.yaml"),
+            "args should contain the workspace config path: {args}"
+        );
+        assert!(
+            args.contains("--json"),
+            "args should contain --json flag: {args}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_evaluate_subprocess_omits_workspace_flag_when_no_config() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = create_fake_belt_script(tmp.path(), "{}", 0);
+
+        // No workspace_config_path set.
+        let evaluator = Evaluator::new("test-ws").with_evaluate_timeout(Duration::from_secs(10));
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", bin_dir.display(), original_path);
+
+        let belt_home = tmp.path().join("home");
+        fs::create_dir_all(&belt_home).unwrap();
+        let mut cmd = evaluator.build_evaluate_command(&belt_home);
+        cmd.env("PATH", &new_path);
+
+        let _output = cmd.output().await.unwrap();
+
+        let args = fs::read_to_string(tmp.path().join("args"))
+            .unwrap()
+            .trim()
+            .to_string();
+
+        assert!(
+            !args.contains("--workspace"),
+            "args should NOT contain --workspace when config_path is None: {args}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_evaluate_subprocess_nonzero_exit_code() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let json_output = r#"{"error":"evaluation failed"}"#;
+        let bin_dir = create_fake_belt_script(tmp.path(), json_output, 1);
+
+        let evaluator = Evaluator::new("test-ws").with_evaluate_timeout(Duration::from_secs(10));
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", bin_dir.display(), original_path);
+
+        let belt_home = tmp.path().join("home");
+        fs::create_dir_all(&belt_home).unwrap();
+        let mut cmd = evaluator.build_evaluate_command(&belt_home);
+        cmd.env("PATH", &new_path);
+
+        let child_output = cmd.output().await.unwrap();
+        let exit_code = child_output.status.code().unwrap_or(-1);
+
+        assert_eq!(
+            exit_code, 1,
+            "should capture non-zero exit code from subprocess"
+        );
+
+        // Even with non-zero exit, JSON should still be parseable from stdout.
+        let stdout = String::from_utf8_lossy(&child_output.stdout).to_string();
+        let ipc_result = serde_json::from_str::<serde_json::Value>(stdout.trim()).ok();
+        let ipc = ipc_result.expect("JSON should parse even on non-zero exit");
+        assert_eq!(ipc["error"], "evaluation failed");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_evaluate_timeout_with_slow_subprocess() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let bin_dir = tmp.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let script_path = bin_dir.join("belt");
+
+        // Create a script that sleeps longer than the timeout.
+        let script = "#!/bin/sh\nsleep 60\n";
+        fs::write(&script_path, script).unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let evaluator = Evaluator::new("test-ws").with_evaluate_timeout(Duration::from_millis(100));
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", bin_dir.display(), original_path);
+
+        let belt_home = tmp.path().join("home");
+        fs::create_dir_all(&belt_home).unwrap();
+        let mut cmd = evaluator.build_evaluate_command(&belt_home);
+        cmd.env("PATH", &new_path);
+
+        // Apply the same timeout logic as run_evaluate.
+        let result = tokio::time::timeout(evaluator.evaluate_timeout, cmd.output()).await;
+
+        assert!(
+            result.is_err(),
+            "subprocess should time out when it runs longer than evaluate_timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_evaluate_normal_timeout_completes_within_limit() {
+        use std::fs;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Script that completes immediately.
+        let bin_dir = create_fake_belt_script(tmp.path(), r#"{"ok":true}"#, 0);
+
+        let evaluator = Evaluator::new("test-ws").with_evaluate_timeout(Duration::from_secs(30));
+
+        let original_path = std::env::var("PATH").unwrap_or_default();
+        let new_path = format!("{}:{}", bin_dir.display(), original_path);
+
+        let belt_home = tmp.path().join("home");
+        fs::create_dir_all(&belt_home).unwrap();
+        let mut cmd = evaluator.build_evaluate_command(&belt_home);
+        cmd.env("PATH", &new_path);
+
+        // Apply the same timeout logic as run_evaluate.
+        let result = tokio::time::timeout(evaluator.evaluate_timeout, cmd.output()).await;
+
+        assert!(
+            result.is_ok(),
+            "fast subprocess should complete within timeout"
+        );
+        let child_output = result.unwrap().unwrap();
+        assert_eq!(child_output.status.code().unwrap(), 0);
+    }
+
+    #[test]
+    fn evaluate_result_success_false_for_nonzero_exit() {
+        let result = EvaluateResult {
+            exit_code: 1,
+            stdout: String::new(),
+            stderr: "error".to_string(),
+            action_result: None,
+            ipc_result: None,
+        };
+        assert!(!result.success(), "exit_code 1 should not be success");
+    }
+
+    #[test]
+    fn evaluate_result_success_true_for_zero_exit() {
+        let result = EvaluateResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            action_result: None,
+            ipc_result: None,
+        };
+        assert!(result.success(), "exit_code 0 should be success");
+    }
+
+    #[test]
+    fn builder_pattern_chaining() {
+        let config_path = PathBuf::from("/opt/belt/ws.yaml");
+        let evaluator = Evaluator::new("chained-ws")
+            .with_max_eval_failures(5)
+            .with_workspace_config_path(config_path.clone())
+            .with_evaluate_timeout(Duration::from_secs(60));
+
+        assert_eq!(evaluator.workspace_name, "chained-ws");
+        assert_eq!(evaluator.max_eval_failures, 5);
+        assert_eq!(evaluator.workspace_config_path, Some(config_path));
+        assert_eq!(evaluator.evaluate_timeout, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn workspace_config_path_with_relative_path() {
+        let evaluator = Evaluator::new("test-ws")
+            .with_workspace_config_path(PathBuf::from("relative/path/ws.yaml"));
+        assert_eq!(
+            evaluator.workspace_config_path,
+            Some(PathBuf::from("relative/path/ws.yaml")),
+            "relative paths should be stored as-is"
+        );
+    }
+
+    #[test]
+    fn workspace_config_path_with_tilde_path() {
+        let evaluator = Evaluator::new("test-ws")
+            .with_workspace_config_path(PathBuf::from("~/belt/workspace.yaml"));
+        assert_eq!(
+            evaluator.workspace_config_path,
+            Some(PathBuf::from("~/belt/workspace.yaml")),
+            "tilde paths should be stored as-is (no expansion at config time)"
+        );
+    }
+
+    #[test]
+    fn evaluate_result_from_action_result_empty_stdout() {
+        let action_result = ActionResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            duration: std::time::Duration::from_millis(10),
+            token_usage: None,
+            runtime_name: None,
+            model: None,
+        };
+
+        let eval_result = EvaluateResult::from(action_result);
+        assert!(eval_result.success());
+        assert!(
+            eval_result.ipc_result.is_none(),
+            "empty stdout should yield None ipc_result"
+        );
+    }
+
+    #[test]
+    fn evaluate_result_from_action_result_whitespace_only_stdout() {
+        let action_result = ActionResult {
+            exit_code: 0,
+            stdout: "   \n  \t  ".to_string(),
+            stderr: String::new(),
+            duration: std::time::Duration::from_millis(10),
+            token_usage: None,
+            runtime_name: None,
+            model: None,
+        };
+
+        let eval_result = EvaluateResult::from(action_result);
+        assert!(
+            eval_result.ipc_result.is_none(),
+            "whitespace-only stdout should yield None ipc_result"
+        );
     }
 }
