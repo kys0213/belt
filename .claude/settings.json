@@ -20,6 +20,39 @@
             "statusMessage": "Pre-commit: cargo fmt + clippy check..."
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/pre-push-cargo-check.sh",
+            "timeout": 60,
+            "statusMessage": "Pre-push: cargo check..."
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/pre-pr-clippy-check.sh",
+            "timeout": 120,
+            "statusMessage": "Pre-PR: cargo clippy check..."
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/branch-freshness-check.sh",
+            "timeout": 15,
+            "statusMessage": "Checking branch freshness..."
+          }
+        ]
       }
     ],
     "PostToolUse": [
