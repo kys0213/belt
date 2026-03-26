@@ -748,6 +748,43 @@ mod tests {
         print_spec_status(&status, "rich").unwrap();
     }
 
+    #[test]
+    fn print_spec_status_rich_multi_model_aggregation() {
+        let status = SpecStatus {
+            workspace: "ws-multi".to_string(),
+            config_path: "/multi.yaml".to_string(),
+            item_count: 3,
+            phase_counts: vec![PhaseCount {
+                phase: "running".to_string(),
+                count: 3,
+            }],
+            token_usage: Some(TokenUsageSummary {
+                total_input: 15_000,
+                total_output: 7_500,
+                total_tokens: 22_500,
+                executions: 20,
+                by_model: vec![
+                    ModelTokenSummary {
+                        model: "sonnet".to_string(),
+                        input_tokens: 10_000,
+                        output_tokens: 5_000,
+                        total_tokens: 15_000,
+                        executions: 12,
+                    },
+                    ModelTokenSummary {
+                        model: "haiku".to_string(),
+                        input_tokens: 5_000,
+                        output_tokens: 2_500,
+                        total_tokens: 7_500,
+                        executions: 8,
+                    },
+                ],
+            }),
+        };
+        // Must not panic; exercises the aggregation totals row.
+        print_spec_status(&status, "rich").unwrap();
+    }
+
     // ---- render_progress_bar ----
 
     #[test]
@@ -1310,6 +1347,19 @@ fn print_rich_spec_status(status: &SpecStatus) {
                     fmt_num(m.output_tokens),
                     fmt_num(m.total_tokens),
                     m.executions,
+                );
+            }
+            // Aggregation totals row
+            if usage.by_model.len() > 1 {
+                let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(59).dark_grey(),);
+                let _ = writeln!(
+                    stdout,
+                    "  {:<20} {:>10} {:>10} {:>10} {:>5}",
+                    "Total".bold(),
+                    fmt_num(usage.total_input),
+                    fmt_num(usage.total_output),
+                    fmt_num(usage.total_tokens),
+                    usage.executions,
                 );
             }
         }
