@@ -3,8 +3,10 @@
 //! Provides a simple command loop that reads user input, dispatches slash
 //! commands, and prints responses. On session entry a status banner is
 //! collected from the Belt database (queue item counts by phase, HITL
-//! pending count, and recent transition events) and displayed to the user.
+//! pending count, recent transition events, and per-workspace statistics)
+//! and displayed to the user.
 
+use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
 
 use super::ClawWorkspace;
@@ -53,15 +55,55 @@ pub struct RecentEvent {
     pub timestamp: String,
 }
 
+/// Per-workspace statistics displayed alongside the system-wide status banner.
+///
+/// Provides a breakdown of spec lifecycle counts and queue item counts
+/// scoped to a single workspace.
+#[derive(Debug, Default)]
+pub struct WorkspaceStats {
+    /// Name of the workspace these stats belong to.
+    pub workspace_name: String,
+    /// Number of specs in `active` status.
+    pub active_spec_count: u32,
+    /// Number of specs in `completing` status.
+    pub completing_count: u32,
+    /// Number of specs in `completed` status.
+    pub completed_count: u32,
+    /// Number of queue items in `pending` phase for this workspace.
+    pub pending_items_count: u32,
+    /// Number of queue items in `running` phase for this workspace.
+    pub running_items_count: u32,
+    /// Recent HITL events scoped to this workspace (up to 5).
+    pub recent_hitl_events: Vec<RecentEvent>,
+}
+
+/// Open the default Belt database at `~/.belt/belt.db`.
+///
+/// Returns `None` if the home directory cannot be determined or the
+/// database cannot be opened.
+fn open_default_db() -> Option<belt_infra::db::Database> {
+    let belt_home = dirs::home_dir()?.join(".belt");
+    let db_path = belt_home.join("belt.db");
+    belt_infra::db::Database::open(db_path.to_str()?).ok()
+}
+
+/// Convert an infra transition event into a [`RecentEvent`].
+fn into_recent_event(e: belt_infra::db::TransitionEvent) -> RecentEvent {
+    RecentEvent {
+        item_id: e.item_id,
+        from_state: e.from_state,
+        to_state: e.to_state,
+        timestamp: e.timestamp,
+    }
+}
+
 /// Collect system status from the Belt database.
 ///
 /// Opens the default `~/.belt/belt.db` database and gathers queue item
 /// counts by phase, the HITL pending count, and the 5 most recent
 /// transition events. Returns `None` if the database is unavailable.
 pub fn collect_status() -> Option<StatusSummary> {
-    let belt_home = dirs::home_dir()?.join(".belt");
-    let db_path = belt_home.join("belt.db");
-    let db = belt_infra::db::Database::open(db_path.to_str()?).ok()?;
+    let db = open_default_db()?;
     collect_status_from_db(&db)
 }
 
@@ -78,15 +120,7 @@ fn collect_status_from_db(db: &belt_infra::db::Database) -> Option<StatusSummary
         .unwrap_or(0);
 
     let events = db.list_recent_transition_events(5).ok()?;
-    let recent_events = events
-        .into_iter()
-        .map(|e| RecentEvent {
-            item_id: e.item_id,
-            from_state: e.from_state,
-            to_state: e.to_state,
-            timestamp: e.timestamp,
-        })
-        .collect();
+    let recent_events = events.into_iter().map(into_recent_event).collect();
 
     let hitl_items = db
         .list_items(Some(belt_core::phase::QueuePhase::Hitl), None)
@@ -110,6 +144,80 @@ fn collect_status_from_db(db: &belt_infra::db::Database) -> Option<StatusSummary
         hitl_pending,
         recent_events,
         hitl_items,
+    })
+}
+
+/// Collect workspace-level statistics from the Belt database.
+///
+/// Opens the default `~/.belt/belt.db` database and gathers spec counts by
+/// status and queue item counts by phase for the given workspace.
+/// Returns `None` if the database is unavailable or the workspace name is absent.
+pub fn collect_workspace_stats(workspace: Option<&str>) -> Option<WorkspaceStats> {
+    let ws_name = workspace?;
+    let db = open_default_db()?;
+    collect_workspace_stats_from_db(&db, ws_name)
+}
+
+/// Collect workspace-level statistics from a given database handle.
+///
+/// Separated from [`collect_workspace_stats`] so tests can inject an in-memory DB.
+fn collect_workspace_stats_from_db(
+    db: &belt_infra::db::Database,
+    workspace: &str,
+) -> Option<WorkspaceStats> {
+    use belt_core::spec::SpecStatus;
+
+    // Count specs by status for this workspace.
+    let specs = db.list_specs(Some(workspace), None).ok()?;
+    let mut active_spec_count: u32 = 0;
+    let mut completing_count: u32 = 0;
+    let mut completed_count: u32 = 0;
+    for spec in &specs {
+        match spec.status {
+            SpecStatus::Active => active_spec_count += 1,
+            SpecStatus::Completing => completing_count += 1,
+            SpecStatus::Completed => completed_count += 1,
+            _ => {}
+        }
+    }
+
+    // Count queue items by phase for this workspace.
+    let items = db.list_items(None, Some(workspace)).ok()?;
+    let mut pending_items_count: u32 = 0;
+    let mut running_items_count: u32 = 0;
+    let mut hitl_item_ids: HashSet<String> = HashSet::new();
+    for item in &items {
+        match item.phase {
+            belt_core::phase::QueuePhase::Pending => pending_items_count += 1,
+            belt_core::phase::QueuePhase::Running => running_items_count += 1,
+            belt_core::phase::QueuePhase::Hitl => {
+                hitl_item_ids.insert(item.work_id.clone());
+            }
+            _ => {}
+        }
+    }
+
+    // Gather recent HITL transition events for this workspace's items.
+    let recent_hitl_events = if !hitl_item_ids.is_empty() {
+        let all_events = db.list_recent_transition_events(50).ok()?;
+        all_events
+            .into_iter()
+            .filter(|e| e.to_state == "hitl" && hitl_item_ids.contains(&e.item_id))
+            .take(5)
+            .map(into_recent_event)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Some(WorkspaceStats {
+        workspace_name: workspace.to_string(),
+        active_spec_count,
+        completing_count,
+        completed_count,
+        pending_items_count,
+        running_items_count,
+        recent_hitl_events,
     })
 }
 
@@ -216,6 +324,38 @@ fn write_hitl_list<W: Write>(output: &mut W, items: &[HitlItemSummary]) -> io::R
     Ok(())
 }
 
+/// Write the workspace stats banner to the given output stream.
+fn write_workspace_stats_banner<W: Write>(
+    output: &mut W,
+    stats: &WorkspaceStats,
+) -> io::Result<()> {
+    writeln!(output, "--- Workspace: {} ---", stats.workspace_name)?;
+    writeln!(
+        output,
+        "Specs: active={}, completing={}, completed={}",
+        stats.active_spec_count, stats.completing_count, stats.completed_count
+    )?;
+    writeln!(
+        output,
+        "Items: pending={}, running={}",
+        stats.pending_items_count, stats.running_items_count
+    )?;
+
+    if !stats.recent_hitl_events.is_empty() {
+        writeln!(output, "  Recent HITL events:")?;
+        for ev in &stats.recent_hitl_events {
+            writeln!(
+                output,
+                "    {} : {} -> {} ({})",
+                ev.item_id, ev.from_state, ev.to_state, ev.timestamp
+            )?;
+        }
+    }
+
+    writeln!(output, "---------------------")?;
+    Ok(())
+}
+
 /// Interactive session configuration.
 pub struct SessionConfig {
     /// Workspace name context (if running inside a specific workspace).
@@ -229,7 +369,8 @@ pub struct SessionConfig {
 /// Reads lines from `input`, writes prompts/responses to `output`.
 /// An optional [`StatusSummary`] is displayed as a banner at the top of
 /// the session.  Pass `None` to skip the status banner (e.g. when the DB
-/// is unavailable).
+/// is unavailable).  An optional [`WorkspaceStats`] adds per-workspace
+/// statistics below the system-wide banner.
 ///
 /// This signature allows testing without real stdio.
 pub fn run_session<R: BufRead, W: Write>(
@@ -237,6 +378,7 @@ pub fn run_session<R: BufRead, W: Write>(
     input: &mut R,
     output: &mut W,
     status: Option<&StatusSummary>,
+    workspace_stats: Option<&WorkspaceStats>,
 ) -> anyhow::Result<()> {
     let dispatcher = SlashDispatcher::new(config.workspace.clone());
 
@@ -254,6 +396,12 @@ pub fn run_session<R: BufRead, W: Write>(
     if let Some(summary) = status {
         writeln!(output)?;
         write_status_banner(output, summary)?;
+    }
+
+    // Display per-workspace stats when available.
+    if let Some(ws_stats) = workspace_stats {
+        writeln!(output)?;
+        write_workspace_stats_banner(output, ws_stats)?;
     }
 
     writeln!(output, "Type /help for available commands, /quit to exit.")?;
@@ -299,16 +447,23 @@ pub fn run_session<R: BufRead, W: Write>(
 
 /// Run the interactive session using real stdin/stdout.
 ///
-/// Automatically collects system status from the Belt database and
-/// displays it as a banner.  If the database is unavailable the session
-/// starts without the banner.
+/// Automatically collects system status and per-workspace statistics from
+/// the Belt database and displays them as banners.  If the database is
+/// unavailable the session starts without banners.
 pub fn run_interactive(config: SessionConfig) -> anyhow::Result<()> {
     let status = collect_status();
+    let ws_stats = collect_workspace_stats(config.workspace.as_deref());
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = stdin.lock();
     let mut writer = stdout.lock();
-    run_session(&config, &mut reader, &mut writer, status.as_ref())
+    run_session(
+        &config,
+        &mut reader,
+        &mut writer,
+        status.as_ref(),
+        ws_stats.as_ref(),
+    )
 }
 
 #[cfg(test)]
@@ -330,7 +485,7 @@ mod tests {
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None).unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("Goodbye."));
     }
@@ -341,7 +496,7 @@ mod tests {
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None).unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("Belt Claw interactive session"));
     }
@@ -352,7 +507,7 @@ mod tests {
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/help\n/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None).unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("/auto"));
         assert!(out.contains("/spec"));
@@ -365,7 +520,7 @@ mod tests {
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"hello world\n/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None).unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains(">> hello world"));
     }
@@ -376,7 +531,7 @@ mod tests {
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None).unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("Context: test-ws"));
     }
@@ -404,7 +559,7 @@ mod tests {
         };
         let mut input = Cursor::new(b"/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, Some(&summary)).unwrap();
+        run_session(&config, &mut input, &mut output, Some(&summary), None).unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("System Status"));
         assert!(out.contains("Queue: 12 items"));
@@ -421,7 +576,7 @@ mod tests {
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/quit\n" as &[u8]);
         let mut output = Vec::new();
-        run_session(&config, &mut input, &mut output, None).unwrap();
+        run_session(&config, &mut input, &mut output, None, None).unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(!out.contains("System Status"));
     }
@@ -605,5 +760,211 @@ mod tests {
             failure_pos < other_pos,
             "failure should appear before other"
         );
+    }
+
+    #[test]
+    fn workspace_stats_banner_displays_counts() {
+        let stats = WorkspaceStats {
+            workspace_name: "my-project".to_string(),
+            active_spec_count: 3,
+            completing_count: 1,
+            completed_count: 5,
+            pending_items_count: 4,
+            running_items_count: 2,
+            recent_hitl_events: vec![],
+        };
+        let mut output = Vec::new();
+        write_workspace_stats_banner(&mut output, &stats).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Workspace: my-project"));
+        assert!(out.contains("active=3"));
+        assert!(out.contains("completing=1"));
+        assert!(out.contains("completed=5"));
+        assert!(out.contains("pending=4"));
+        assert!(out.contains("running=2"));
+    }
+
+    #[test]
+    fn workspace_stats_banner_shows_hitl_events() {
+        let stats = WorkspaceStats {
+            workspace_name: "ws".to_string(),
+            active_spec_count: 0,
+            completing_count: 0,
+            completed_count: 0,
+            pending_items_count: 0,
+            running_items_count: 0,
+            recent_hitl_events: vec![RecentEvent {
+                item_id: "hitl-item".to_string(),
+                from_state: "running".to_string(),
+                to_state: "hitl".to_string(),
+                timestamp: "2026-03-25T12:00:00Z".to_string(),
+            }],
+        };
+        let mut output = Vec::new();
+        write_workspace_stats_banner(&mut output, &stats).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Recent HITL events"));
+        assert!(out.contains("hitl-item"));
+        assert!(out.contains("running -> hitl"));
+    }
+
+    #[test]
+    fn workspace_stats_banner_omits_hitl_when_empty() {
+        let stats = WorkspaceStats {
+            workspace_name: "ws".to_string(),
+            recent_hitl_events: vec![],
+            ..WorkspaceStats::default()
+        };
+        let mut output = Vec::new();
+        write_workspace_stats_banner(&mut output, &stats).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(!out.contains("Recent HITL events"));
+    }
+
+    #[test]
+    fn session_displays_workspace_stats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_config(&tmp);
+        let stats = WorkspaceStats {
+            workspace_name: "test-ws".to_string(),
+            active_spec_count: 2,
+            completing_count: 0,
+            completed_count: 1,
+            pending_items_count: 3,
+            running_items_count: 1,
+            recent_hitl_events: vec![],
+        };
+        let mut input = Cursor::new(b"/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, Some(&stats)).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("Workspace: test-ws ---"));
+        assert!(out.contains("active=2"));
+        assert!(out.contains("pending=3"));
+    }
+
+    #[test]
+    fn session_no_workspace_stats_when_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = make_config(&tmp);
+        let mut input = Cursor::new(b"/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(!out.contains("Specs:"));
+        assert!(!out.contains("Items:"));
+    }
+
+    #[test]
+    fn collect_workspace_stats_from_empty_db() {
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+        let stats = collect_workspace_stats_from_db(&db, "ws1").unwrap();
+        assert_eq!(stats.workspace_name, "ws1");
+        assert_eq!(stats.active_spec_count, 0);
+        assert_eq!(stats.completing_count, 0);
+        assert_eq!(stats.completed_count, 0);
+        assert_eq!(stats.pending_items_count, 0);
+        assert_eq!(stats.running_items_count, 0);
+        assert!(stats.recent_hitl_events.is_empty());
+    }
+
+    #[test]
+    fn collect_workspace_stats_from_populated_db() {
+        use belt_core::phase::QueuePhase;
+        use belt_core::queue::QueueItem;
+        use belt_core::spec::{Spec, SpecStatus};
+
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+
+        // Insert specs.
+        let mut spec1 = Spec::new(
+            "sp1".to_string(),
+            "ws1".to_string(),
+            "Spec 1".to_string(),
+            "content".to_string(),
+        );
+        spec1.status = SpecStatus::Active;
+        db.insert_spec(&spec1).unwrap();
+
+        let mut spec2 = Spec::new(
+            "sp2".to_string(),
+            "ws1".to_string(),
+            "Spec 2".to_string(),
+            "content".to_string(),
+        );
+        spec2.status = SpecStatus::Completing;
+        db.insert_spec(&spec2).unwrap();
+
+        // Insert queue items.
+        let item1 = QueueItem::new(
+            "w1".to_string(),
+            "s1".to_string(),
+            "ws1".to_string(),
+            "analyze".to_string(),
+        );
+        db.insert_item(&item1).unwrap();
+
+        let item2 = QueueItem::new(
+            "w2".to_string(),
+            "s2".to_string(),
+            "ws1".to_string(),
+            "implement".to_string(),
+        );
+        db.insert_item(&item2).unwrap();
+        db.update_phase("w2", QueuePhase::Running).unwrap();
+
+        let stats = collect_workspace_stats_from_db(&db, "ws1").unwrap();
+        assert_eq!(stats.active_spec_count, 1);
+        assert_eq!(stats.completing_count, 1);
+        assert_eq!(stats.completed_count, 0);
+        assert_eq!(stats.pending_items_count, 1);
+        assert_eq!(stats.running_items_count, 1);
+    }
+
+    #[test]
+    fn collect_workspace_stats_filters_by_workspace() {
+        use belt_core::queue::QueueItem;
+        use belt_core::spec::{Spec, SpecStatus};
+
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+
+        // Insert spec in ws1.
+        let mut spec = Spec::new(
+            "sp1".to_string(),
+            "ws1".to_string(),
+            "Spec".to_string(),
+            "content".to_string(),
+        );
+        spec.status = SpecStatus::Active;
+        db.insert_spec(&spec).unwrap();
+
+        // Insert spec in ws2.
+        let mut spec2 = Spec::new(
+            "sp2".to_string(),
+            "ws2".to_string(),
+            "Other".to_string(),
+            "content".to_string(),
+        );
+        spec2.status = SpecStatus::Active;
+        db.insert_spec(&spec2).unwrap();
+
+        // Insert item in ws2.
+        let item = QueueItem::new(
+            "w1".to_string(),
+            "s1".to_string(),
+            "ws2".to_string(),
+            "analyze".to_string(),
+        );
+        db.insert_item(&item).unwrap();
+
+        // Stats for ws1 should not include ws2 data.
+        let stats = collect_workspace_stats_from_db(&db, "ws1").unwrap();
+        assert_eq!(stats.active_spec_count, 1);
+        assert_eq!(stats.pending_items_count, 0);
+
+        // Stats for ws2 should not include ws1 data.
+        let stats2 = collect_workspace_stats_from_db(&db, "ws2").unwrap();
+        assert_eq!(stats2.active_spec_count, 1);
+        assert_eq!(stats2.pending_items_count, 1);
     }
 }
