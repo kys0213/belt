@@ -139,6 +139,23 @@ pub struct ModelStats {
     pub avg_duration_ms: Option<f64>,
 }
 
+/// Per-script (state) execution statistics aggregated from the `history` table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScriptExecStats {
+    /// Script/state name (e.g. "analyze", "implement").
+    pub state: String,
+    /// Total number of executions for this state.
+    pub total_runs: u64,
+    /// Number of successful executions.
+    pub success_count: u64,
+    /// Number of failed executions.
+    pub fail_count: u64,
+    /// Success rate as a percentage (0.0 - 100.0).
+    pub success_rate: f64,
+    /// Average duration in milliseconds (from `token_usage`), if available.
+    pub avg_duration_ms: Option<f64>,
+}
+
 /// Aggregated runtime statistics across all models.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeStats {
@@ -1766,6 +1783,131 @@ impl Database {
             by_model,
         })
     }
+
+    /// Aggregate script execution statistics from the `history` table, grouped by state.
+    ///
+    /// Returns per-state (script) totals for success/failure counts and rates.
+    /// Average duration is joined from the `token_usage` table when available.
+    /// Results are ordered by total runs descending.
+    pub fn get_script_execution_stats(&self) -> Result<Vec<ScriptExecStats>, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        // Aggregate success/fail counts per state from history.
+        let mut stmt = conn
+            .prepare(
+                "SELECT state,
+                        COUNT(*)                                    AS total,
+                        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS successes,
+                        SUM(CASE WHEN status = 'failed'  THEN 1 ELSE 0 END) AS failures
+                 FROM history
+                 GROUP BY state
+                 ORDER BY total DESC",
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let state: String = row.get(0)?;
+                let total: i64 = row.get(1)?;
+                let successes: i64 = row.get(2)?;
+                let failures: i64 = row.get(3)?;
+                Ok((state, total, successes, failures))
+            })
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        // Look up average duration per work_id's state from token_usage.
+        // We join on work_id since history and token_usage both reference the same work_id.
+        let avg_dur_by_state: HashMap<String, f64> = {
+            let mut dur_stmt = conn
+                .prepare(
+                    "SELECT h.state, AVG(t.duration_ms)
+                     FROM history h
+                     JOIN token_usage t ON h.work_id = t.work_id
+                     WHERE t.duration_ms IS NOT NULL
+                     GROUP BY h.state",
+                )
+                .map_err(|e| BeltError::Database(e.to_string()))?;
+
+            dur_stmt
+                .query_map([], |row| {
+                    let state: String = row.get(0)?;
+                    let avg_dur: f64 = row.get(1)?;
+                    Ok((state, avg_dur))
+                })
+                .map_err(|e| BeltError::Database(e.to_string()))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+
+        let stats = rows
+            .into_iter()
+            .map(|(state, total, successes, failures)| {
+                let total_u = total as u64;
+                let success_u = successes as u64;
+                let fail_u = failures as u64;
+                let rate = if total_u > 0 {
+                    (success_u as f64 / total_u as f64) * 100.0
+                } else {
+                    0.0
+                };
+                ScriptExecStats {
+                    avg_duration_ms: avg_dur_by_state.get(&state).copied(),
+                    state,
+                    total_runs: total_u,
+                    success_count: success_u,
+                    fail_count: fail_u,
+                    success_rate: rate,
+                }
+            })
+            .collect();
+
+        Ok(stats)
+    }
+
+    /// Retrieve the most recent history events across all scripts, ordered by
+    /// `created_at` descending.
+    ///
+    /// Returns at most `limit` entries.
+    pub fn get_recent_script_executions(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<HistoryEvent>, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT work_id, source_id, state, status, attempt, summary, error, created_at
+                 FROM history
+                 ORDER BY created_at DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let events = stmt
+            .query_map(params![limit as i64], |row| {
+                Ok(HistoryEvent {
+                    work_id: row.get(0)?,
+                    source_id: row.get(1)?,
+                    state: row.get(2)?,
+                    status: row.get(3)?,
+                    attempt: row.get(4)?,
+                    summary: row.get(5)?,
+                    error: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(events)
+    }
 }
 
 // ---- Helpers ---------------------------------------------------------------
@@ -2965,5 +3107,74 @@ mod tests {
         let db = test_db();
         let deps = db.list_queue_dependencies("item-a").unwrap();
         assert!(deps.is_empty());
+    }
+
+    // ---- Script Execution Stats ---------------------------------------------
+
+    fn insert_history(db: &Database, work_id: &str, state: &str, status: &str, time: &str) {
+        db.append_history(&HistoryEvent {
+            work_id: work_id.to_string(),
+            source_id: format!("src-{work_id}"),
+            state: state.to_string(),
+            status: status.to_string(),
+            attempt: 1,
+            summary: None,
+            error: None,
+            created_at: time.to_string(),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn get_script_execution_stats_empty() {
+        let db = test_db();
+        let stats = db.get_script_execution_stats().unwrap();
+        assert!(stats.is_empty());
+    }
+
+    #[test]
+    fn get_script_execution_stats_aggregates_by_state() {
+        let db = test_db();
+        insert_history(&db, "w1", "analyze", "success", "2026-03-25T01:00:00Z");
+        insert_history(&db, "w2", "analyze", "success", "2026-03-25T02:00:00Z");
+        insert_history(&db, "w3", "analyze", "failed", "2026-03-25T03:00:00Z");
+        insert_history(&db, "w4", "implement", "success", "2026-03-25T04:00:00Z");
+
+        let stats = db.get_script_execution_stats().unwrap();
+        assert_eq!(stats.len(), 2);
+
+        // Ordered by total_runs descending: analyze(3) > implement(1).
+        assert_eq!(stats[0].state, "analyze");
+        assert_eq!(stats[0].total_runs, 3);
+        assert_eq!(stats[0].success_count, 2);
+        assert_eq!(stats[0].fail_count, 1);
+        assert!((stats[0].success_rate - 66.666).abs() < 1.0);
+
+        assert_eq!(stats[1].state, "implement");
+        assert_eq!(stats[1].total_runs, 1);
+        assert_eq!(stats[1].success_count, 1);
+        assert_eq!(stats[1].fail_count, 0);
+        assert!((stats[1].success_rate - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn get_recent_script_executions_returns_most_recent() {
+        let db = test_db();
+        insert_history(&db, "w1", "analyze", "success", "2026-03-25T01:00:00Z");
+        insert_history(&db, "w2", "implement", "failed", "2026-03-25T02:00:00Z");
+        insert_history(&db, "w3", "review", "success", "2026-03-25T03:00:00Z");
+
+        let recent = db.get_recent_script_executions(2).unwrap();
+        assert_eq!(recent.len(), 2);
+        // Most recent first.
+        assert_eq!(recent[0].work_id, "w3");
+        assert_eq!(recent[1].work_id, "w2");
+    }
+
+    #[test]
+    fn get_recent_script_executions_empty() {
+        let db = test_db();
+        let recent = db.get_recent_script_executions(10).unwrap();
+        assert!(recent.is_empty());
     }
 }
