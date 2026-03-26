@@ -3362,4 +3362,280 @@ mod tests {
         let ctx = CronContext { now: Utc::now() };
         assert!(job.execute(&ctx).is_ok());
     }
+
+    // -- CronSchedule::parse_expression tests --
+
+    #[test]
+    fn parse_expression_valid_five_fields() {
+        let result = CronSchedule::parse_expression("*/5 * * * *");
+        assert!(result.is_ok());
+        match result.unwrap() {
+            CronSchedule::Expression(expr) => assert_eq!(expr, "*/5 * * * *"),
+            _ => panic!("expected Expression variant"),
+        }
+    }
+
+    #[test]
+    fn parse_expression_valid_complex() {
+        let result = CronSchedule::parse_expression("0 6 1-15 1,6,12 0-4");
+        assert!(result.is_ok());
+        match result.unwrap() {
+            CronSchedule::Expression(expr) => assert_eq!(expr, "0 6 1-15 1,6,12 0-4"),
+            _ => panic!("expected Expression variant"),
+        }
+    }
+
+    #[test]
+    fn parse_expression_all_wildcards() {
+        let result = CronSchedule::parse_expression("* * * * *");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn parse_expression_too_few_fields() {
+        let result = CronSchedule::parse_expression("*/5 * *");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            BeltError::Runtime(msg) => assert!(msg.contains("expected 5 fields, got 3")),
+            _ => panic!("expected Runtime error"),
+        }
+    }
+
+    #[test]
+    fn parse_expression_too_many_fields() {
+        let result = CronSchedule::parse_expression("* * * * * *");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            BeltError::Runtime(msg) => assert!(msg.contains("expected 5 fields, got 6")),
+            _ => panic!("expected Runtime error"),
+        }
+    }
+
+    #[test]
+    fn parse_expression_empty_string() {
+        let result = CronSchedule::parse_expression("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn parse_expression_invalid_characters() {
+        let result = CronSchedule::parse_expression("*/5 * * * MON");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        match err {
+            BeltError::Runtime(msg) => assert!(msg.contains("invalid cron expression field")),
+            _ => panic!("expected Runtime error"),
+        }
+    }
+
+    #[test]
+    fn parse_expression_invalid_special_chars() {
+        let result = CronSchedule::parse_expression("0 0 ? * *");
+        assert!(result.is_err());
+    }
+
+    // -- CronEngine::sync_triggers_from_db tests --
+
+    #[test]
+    fn sync_triggers_resets_last_run_when_db_null() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let mut engine = CronEngine::new();
+
+        // Register a job that has been run (last_run_at is Some).
+        let (mut job, _count) = make_counting_job(
+            "sync-test",
+            CronSchedule::Interval(Duration::from_secs(3600)),
+        );
+        job.last_run_at = Some(Utc::now());
+        engine.register(job);
+
+        // Add the job in DB and reset its last_run_at to NULL (trigger request).
+        db.add_cron_job("sync-test", "*/5 * * * *", "/bin/test.sh", None)
+            .unwrap();
+        db.reset_cron_last_run("sync-test").unwrap();
+
+        // Verify DB has NULL last_run_at.
+        let db_jobs = db.list_cron_jobs().unwrap();
+        let db_job = db_jobs.iter().find(|j| j.name == "sync-test").unwrap();
+        assert!(db_job.last_run_at.is_none());
+
+        // Sync should reset in-memory last_run_at.
+        engine.sync_triggers_from_db(&db);
+        assert!(engine.jobs[0].last_run_at.is_none());
+    }
+
+    #[test]
+    fn sync_triggers_no_reset_when_db_has_last_run() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let mut engine = CronEngine::new();
+
+        let now = Utc::now();
+        let (mut job, _count) = make_counting_job(
+            "keep-test",
+            CronSchedule::Interval(Duration::from_secs(3600)),
+        );
+        job.last_run_at = Some(now);
+        engine.register(job);
+
+        // Add the job in DB with last_run_at set (not NULL).
+        db.add_cron_job("keep-test", "*/5 * * * *", "/bin/test.sh", None)
+            .unwrap();
+        db.update_cron_last_run("keep-test").unwrap();
+
+        // Sync should NOT reset in-memory last_run_at.
+        engine.sync_triggers_from_db(&db);
+        assert!(engine.jobs[0].last_run_at.is_some());
+    }
+
+    #[test]
+    fn sync_triggers_no_reset_when_memory_already_none() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let mut engine = CronEngine::new();
+
+        // Job with last_run_at already None.
+        let (job, _count) = make_counting_job(
+            "none-test",
+            CronSchedule::Interval(Duration::from_secs(3600)),
+        );
+        engine.register(job);
+
+        // DB also has NULL last_run_at.
+        db.add_cron_job("none-test", "*/5 * * * *", "/bin/test.sh", None)
+            .unwrap();
+        db.reset_cron_last_run("none-test").unwrap();
+
+        // Should be a no-op (condition requires job.last_run_at.is_some()).
+        engine.sync_triggers_from_db(&db);
+        assert!(engine.jobs[0].last_run_at.is_none());
+    }
+
+    #[test]
+    fn sync_triggers_ignores_jobs_not_in_db() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let mut engine = CronEngine::new();
+
+        let now = Utc::now();
+        let (mut job, _count) =
+            make_counting_job("orphan", CronSchedule::Interval(Duration::from_secs(3600)));
+        job.last_run_at = Some(now);
+        engine.register(job);
+
+        // No matching job in DB — sync should not touch in-memory state.
+        engine.sync_triggers_from_db(&db);
+        assert!(engine.jobs[0].last_run_at.is_some());
+    }
+
+    // -- load_custom_jobs tests --
+
+    #[test]
+    fn load_custom_jobs_registers_custom_job() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        db.add_cron_job("my_custom_job", "*/10 * * * *", "/usr/bin/custom.sh", None)
+            .unwrap();
+
+        let mut engine = CronEngine::new();
+        load_custom_jobs(&mut engine, &db);
+
+        assert_eq!(engine.job_count(), 1);
+        assert_eq!(engine.jobs[0].name, "my_custom_job");
+    }
+
+    #[test]
+    fn load_custom_jobs_skips_builtin_names() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        // Add jobs with builtin names — should be skipped.
+        db.add_cron_job("hitl_timeout", "*/5 * * * *", "/bin/noop.sh", None)
+            .unwrap();
+        db.add_cron_job("daily_report", "0 6 * * *", "/bin/noop.sh", None)
+            .unwrap();
+        db.add_cron_job("log_cleanup", "0 */6 * * *", "/bin/noop.sh", None)
+            .unwrap();
+        db.add_cron_job("evaluate", "* * * * *", "/bin/noop.sh", None)
+            .unwrap();
+        db.add_cron_job("pr_review_scan", "*/30 * * * *", "/bin/noop.sh", None)
+            .unwrap();
+        db.add_cron_job("gap_detection", "0 * * * *", "/bin/noop.sh", None)
+            .unwrap();
+        db.add_cron_job("knowledge_extraction", "0 * * * *", "/bin/noop.sh", None)
+            .unwrap();
+
+        let mut engine = CronEngine::new();
+        load_custom_jobs(&mut engine, &db);
+
+        // All builtin names should be skipped.
+        assert_eq!(engine.job_count(), 0);
+    }
+
+    #[test]
+    fn load_custom_jobs_skips_workspace_scoped_builtins() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        db.add_cron_job(
+            "billing:hitl_timeout",
+            "*/5 * * * *",
+            "/bin/noop.sh",
+            Some("billing"),
+        )
+        .unwrap();
+        db.add_cron_job(
+            "auth:daily_report",
+            "0 6 * * *",
+            "/bin/noop.sh",
+            Some("auth"),
+        )
+        .unwrap();
+
+        let mut engine = CronEngine::new();
+        load_custom_jobs(&mut engine, &db);
+
+        // Workspace-scoped builtin names should be skipped.
+        assert_eq!(engine.job_count(), 0);
+    }
+
+    #[test]
+    fn load_custom_jobs_skips_invalid_schedule() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        // Invalid schedule expression (3 fields instead of 5).
+        db.add_cron_job("bad_schedule", "*/5 *", "/bin/bad.sh", None)
+            .unwrap();
+        // Valid custom job.
+        db.add_cron_job("good_job", "*/10 * * * *", "/bin/good.sh", None)
+            .unwrap();
+
+        let mut engine = CronEngine::new();
+        load_custom_jobs(&mut engine, &db);
+
+        // Only the valid job should be registered.
+        assert_eq!(engine.job_count(), 1);
+        assert_eq!(engine.jobs[0].name, "good_job");
+    }
+
+    #[test]
+    fn load_custom_jobs_empty_db() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let mut engine = CronEngine::new();
+        load_custom_jobs(&mut engine, &db);
+        assert_eq!(engine.job_count(), 0);
+    }
+
+    #[test]
+    fn load_custom_jobs_mixed_builtin_and_custom() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        db.add_cron_job("hitl_timeout", "*/5 * * * *", "/bin/noop.sh", None)
+            .unwrap();
+        db.add_cron_job("my_backup", "0 2 * * *", "/bin/backup.sh", None)
+            .unwrap();
+        db.add_cron_job("my_sync", "*/15 * * * *", "/bin/sync.sh", None)
+            .unwrap();
+
+        let mut engine = CronEngine::new();
+        load_custom_jobs(&mut engine, &db);
+
+        // Only custom jobs should be registered.
+        assert_eq!(engine.job_count(), 2);
+        let names: Vec<&str> = engine.jobs.iter().map(|j| j.name.as_str()).collect();
+        assert!(names.contains(&"my_backup"));
+        assert!(names.contains(&"my_sync"));
+    }
 }
