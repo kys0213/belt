@@ -406,6 +406,69 @@ impl Database {
         Ok(())
     }
 
+    /// Escalate an item to HITL phase with metadata.
+    ///
+    /// Sets `phase` to `Hitl`, records `hitl_created_at`, `hitl_reason`, and
+    /// `hitl_notes`, and refreshes `updated_at`.
+    ///
+    /// # Errors
+    /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
+    pub fn escalate_to_hitl(
+        &self,
+        work_id: &str,
+        reason: &str,
+        notes: &str,
+    ) -> Result<(), BeltError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "UPDATE queue_items SET phase = 'hitl', updated_at = ?1, hitl_created_at = ?2, hitl_reason = ?3, hitl_notes = ?4 WHERE work_id = ?5",
+                params![now, now, reason, notes, work_id],
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        if rows == 0 {
+            return Err(BeltError::ItemNotFound(work_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Increment the `replan_count` for a queue item.
+    ///
+    /// Used by `EvaluateJob` to track per-item evaluate failure counts.
+    /// Also refreshes `updated_at`.
+    ///
+    /// # Errors
+    /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
+    pub fn increment_replan_count(&self, work_id: &str) -> Result<u32, BeltError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "UPDATE queue_items SET replan_count = replan_count + 1, updated_at = ?1 WHERE work_id = ?2",
+                params![now, work_id],
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        if rows == 0 {
+            return Err(BeltError::ItemNotFound(work_id.to_string()));
+        }
+        // Return updated count.
+        let count: u32 = conn
+            .query_row(
+                "SELECT replan_count FROM queue_items WHERE work_id = ?1",
+                params![work_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(count)
+    }
+
     /// Update HITL metadata when responding to a HITL item.
     ///
     /// Sets `hitl_respondent`, `hitl_notes`, phase, and refreshes `updated_at`.
@@ -2099,6 +2162,53 @@ mod tests {
         let err = db
             .update_phase("nonexistent", QueuePhase::Ready)
             .unwrap_err();
+        assert!(matches!(err, BeltError::ItemNotFound(_)));
+    }
+
+    #[test]
+    fn escalate_to_hitl_sets_metadata() {
+        let db = test_db();
+        let item = sample_item();
+        db.insert_item(&item).unwrap();
+
+        db.escalate_to_hitl(&item.work_id, "evaluate_failure", "failed 3 times")
+            .unwrap();
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert_eq!(fetched.phase, QueuePhase::Hitl);
+        assert!(fetched.hitl_created_at.is_some());
+        assert_eq!(fetched.hitl_notes.as_deref(), Some("failed 3 times"));
+    }
+
+    #[test]
+    fn escalate_to_hitl_not_found() {
+        let db = test_db();
+        let err = db
+            .escalate_to_hitl("nonexistent", "evaluate_failure", "error")
+            .unwrap_err();
+        assert!(matches!(err, BeltError::ItemNotFound(_)));
+    }
+
+    #[test]
+    fn increment_replan_count_returns_new_value() {
+        let db = test_db();
+        let item = sample_item();
+        db.insert_item(&item).unwrap();
+
+        let count = db.increment_replan_count(&item.work_id).unwrap();
+        assert_eq!(count, 1);
+
+        let count = db.increment_replan_count(&item.work_id).unwrap();
+        assert_eq!(count, 2);
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert_eq!(fetched.replan_count, 2);
+    }
+
+    #[test]
+    fn increment_replan_count_not_found() {
+        let db = test_db();
+        let err = db.increment_replan_count("nonexistent").unwrap_err();
         assert!(matches!(err, BeltError::ItemNotFound(_)));
     }
 
