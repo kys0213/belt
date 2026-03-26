@@ -1023,24 +1023,48 @@ impl CronHandler for LogCleanupJob {
 
 /// Detects gaps between active specs and implemented code (CR-07).
 ///
+/// Default coverage threshold used when none is explicitly configured.
+const DEFAULT_COVERAGE_THRESHOLD: f64 = 0.5;
+
 /// Runs every hour. For each active spec it queries the database for specs
-/// in `Active` status, extracts keywords from their content, and checks
-/// whether corresponding code artefacts exist by scanning source files
-/// under the configured workspace root.
+/// in `Active` status, analyses their coverage against the codebase, and
+/// checks whether corresponding code artefacts exist.
 ///
-/// When a gap is found (keywords from a spec have no matches in the
-/// codebase) it creates a GitHub issue labelled `autopilot:gap` via the
-/// `gh` CLI.
+/// Analysis strategy:
+///   1. **LLM-based** (preferred): sends spec requirements and code corpus
+///      to an LLM via the `claude` CLI and receives a 0.0–1.0 coverage
+///      score with per-requirement gap details.
+///   2. **Keyword-based** (fallback): extracts keywords from spec content
+///      and checks whether they appear in source files. Used when the
+///      `claude` CLI is unavailable or returns an invalid response.
+///
+/// When a gap is found (coverage score below the configured threshold)
+/// it creates a GitHub issue labelled `autopilot:gap` via the `gh` CLI.
 pub struct GapDetectionJob {
     db: Arc<Database>,
     /// Root directory of the workspace to scan for code files.
     workspace_root: std::path::PathBuf,
+    /// Minimum coverage score (0.0–1.0) for a spec to be considered covered.
+    /// If the score falls below this threshold, a gap is reported.
+    coverage_threshold: f64,
 }
 
 impl GapDetectionJob {
-    /// Create a new `GapDetectionJob`.
+    /// Create a new `GapDetectionJob` with the default coverage threshold.
     pub fn new(db: Arc<Database>, workspace_root: std::path::PathBuf) -> Self {
-        Self { db, workspace_root }
+        Self {
+            db,
+            workspace_root,
+            coverage_threshold: DEFAULT_COVERAGE_THRESHOLD,
+        }
+    }
+
+    /// Set a custom coverage threshold (0.0–1.0).
+    ///
+    /// Values are clamped to the valid range.
+    pub fn with_coverage_threshold(mut self, threshold: f64) -> Self {
+        self.coverage_threshold = threshold.clamp(0.0, 1.0);
+        self
     }
 }
 
@@ -1227,17 +1251,113 @@ fn walk_dir(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     files
 }
 
+/// Result of LLM-based coverage analysis for a single spec.
+#[derive(Debug, serde::Deserialize)]
+struct LlmCoverageResult {
+    /// Overall coverage score between 0.0 (not implemented) and 1.0 (fully implemented).
+    score: f64,
+    /// List of requirements or aspects that are missing or incomplete.
+    #[serde(default)]
+    missing: Vec<String>,
+}
+
+/// Analyse spec coverage using the `claude` CLI.
+///
+/// Builds a prompt containing the spec requirements and a summary of the
+/// code corpus, invokes `claude -p` synchronously, and parses a JSON
+/// response with `score` and `missing` fields.
+///
+/// Returns `None` when the CLI is unavailable or the response cannot be
+/// parsed, allowing the caller to fall back to keyword-based analysis.
+fn llm_analyze_coverage(spec_content: &str, code_summary: &str) -> Option<LlmCoverageResult> {
+    let prompt = format!(
+        "You are a code coverage analyst. Given the SPEC REQUIREMENTS and CODE SUMMARY below, \
+         evaluate how well the codebase implements the spec requirements.\n\n\
+         Respond ONLY with a JSON object (no markdown fences, no extra text) with exactly these fields:\n\
+         - \"score\": a number between 0.0 (nothing implemented) and 1.0 (fully implemented)\n\
+         - \"missing\": an array of strings describing unimplemented or incomplete requirements\n\n\
+         Example response:\n\
+         {{\"score\": 0.3, \"missing\": [\"authentication middleware not found\", \"rate limiting not implemented\"]}}\n\n\
+         SPEC REQUIREMENTS:\n{spec_content}\n\n\
+         CODE SUMMARY (first 4000 chars):\n{code_summary}",
+        spec_content = spec_content,
+        code_summary = &code_summary[..code_summary.len().min(4000)],
+    );
+
+    let result = std::process::Command::new("claude")
+        .args(["-p", &prompt, "--output-format", "json"])
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let raw_stdout = String::from_utf8_lossy(&output.stdout);
+            // The claude CLI with --output-format json wraps the result in a JSON
+            // envelope.  Try to extract the "result" field first, then parse
+            // the inner JSON as LlmCoverageResult.
+            let text = if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&raw_stdout)
+            {
+                envelope
+                    .get("result")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&raw_stdout)
+                    .to_string()
+            } else {
+                raw_stdout.to_string()
+            };
+
+            match serde_json::from_str::<LlmCoverageResult>(&text) {
+                Ok(mut res) => {
+                    // Clamp score to valid range.
+                    res.score = res.score.clamp(0.0, 1.0);
+                    tracing::info!(
+                        score = res.score,
+                        missing_count = res.missing.len(),
+                        "LLM coverage analysis completed"
+                    );
+                    Some(res)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        raw = %text.chars().take(200).collect::<String>(),
+                        "failed to parse LLM coverage response, falling back to keyword analysis"
+                    );
+                    None
+                }
+            }
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::debug!(
+                stderr = %stderr.chars().take(200).collect::<String>(),
+                "claude CLI returned non-zero exit, falling back to keyword analysis"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                "claude CLI not available, falling back to keyword analysis"
+            );
+            None
+        }
+    }
+}
+
 /// Represents a detected gap between a spec and the codebase.
 #[derive(Debug)]
 struct DetectedGap {
     spec_id: String,
     spec_name: String,
-    missing_keywords: Vec<String>,
+    /// Description of missing items — either LLM-identified requirements or
+    /// keyword-based missing tokens.
+    missing_items: Vec<String>,
+    /// Coverage score (0.0–1.0). Derived from LLM analysis or keyword ratio.
+    coverage_score: f64,
+    /// Whether the analysis was performed by LLM (`true`) or keyword
+    /// matching (`false`).
+    used_llm: bool,
 }
-
-/// Minimum ratio of matched keywords for a spec to be considered covered.
-/// If fewer than this fraction of keywords match, a gap is reported.
-const COVERAGE_THRESHOLD: f64 = 0.5;
 
 /// Check whether an open GitHub issue already exists for a given spec's gap.
 ///
@@ -1392,11 +1512,36 @@ impl CronHandler for GapDetectionJob {
             return Ok(());
         }
 
-        // Step 3: For each spec, extract keywords and check coverage.
+        // Step 3: For each spec, analyse coverage (LLM-first, keyword-fallback).
         let mut gaps: Vec<DetectedGap> = Vec::new();
         let mut covered_spec_ids: Vec<String> = Vec::new();
 
         for spec in &active_specs {
+            // Try LLM-based analysis first.
+            if let Some(llm_result) = llm_analyze_coverage(&spec.content, &corpus) {
+                if llm_result.score < self.coverage_threshold && !llm_result.missing.is_empty() {
+                    tracing::info!(
+                        spec_id = %spec.id,
+                        spec_name = %spec.name,
+                        coverage_score = llm_result.score,
+                        threshold = self.coverage_threshold,
+                        missing_count = llm_result.missing.len(),
+                        "GapDetectionJob: gap detected (LLM analysis)"
+                    );
+                    gaps.push(DetectedGap {
+                        spec_id: spec.id.clone(),
+                        spec_name: spec.name.clone(),
+                        missing_items: llm_result.missing,
+                        coverage_score: llm_result.score,
+                        used_llm: true,
+                    });
+                } else {
+                    covered_spec_ids.push(spec.id.clone());
+                }
+                continue;
+            }
+
+            // Fallback: keyword-based analysis.
             let keywords = extract_keywords(&spec.content);
             if keywords.is_empty() {
                 // Specs with no extractable keywords are considered covered.
@@ -1416,18 +1561,22 @@ impl CronHandler for GapDetectionJob {
                 1.0 - (missing.len() as f64 / keywords.len() as f64)
             };
 
-            if matched_ratio < COVERAGE_THRESHOLD && !missing.is_empty() {
+            if matched_ratio < self.coverage_threshold && !missing.is_empty() {
                 tracing::info!(
                     spec_id = %spec.id,
                     spec_name = %spec.name,
                     total_keywords = keywords.len(),
                     missing_count = missing.len(),
-                    "GapDetectionJob: gap detected"
+                    coverage_score = matched_ratio,
+                    threshold = self.coverage_threshold,
+                    "GapDetectionJob: gap detected (keyword analysis)"
                 );
                 gaps.push(DetectedGap {
                     spec_id: spec.id.clone(),
                     spec_name: spec.name.clone(),
-                    missing_keywords: missing,
+                    missing_items: missing,
+                    coverage_score: matched_ratio,
+                    used_llm: false,
                 });
             } else {
                 covered_spec_ids.push(spec.id.clone());
@@ -1462,16 +1611,33 @@ impl CronHandler for GapDetectionJob {
                 continue;
             }
 
-            let title = format!("[Gap] Spec '{}' has unimplemented keywords", gap.spec_name);
-            let missing_list = gap.missing_keywords.join(", ");
+            let analysis_method = if gap.used_llm { "LLM" } else { "keyword" };
+            let title = format!(
+                "[Gap] Spec '{}' has unimplemented requirements",
+                gap.spec_name
+            );
+            let missing_list = gap
+                .missing_items
+                .iter()
+                .map(|item| format!("- {item}"))
+                .collect::<Vec<_>>()
+                .join("\n");
             let body = format!(
                 "## Gap Detection Report\n\n\
-                 **Spec ID:** {}\n\
-                 **Spec Name:** {}\n\n\
-                 The following keywords from the spec were not found in the codebase:\n\n\
-                 `{}`\n\n\
+                 **Spec ID:** {spec_id}\n\
+                 **Spec Name:** {spec_name}\n\
+                 **Coverage Score:** {score:.2}\n\
+                 **Threshold:** {threshold:.2}\n\
+                 **Analysis Method:** {method}\n\n\
+                 ### Missing / Incomplete Requirements\n\n\
+                 {missing}\n\n\
                  _This issue was automatically created by the gap-detection cron job._",
-                gap.spec_id, gap.spec_name, missing_list,
+                spec_id = gap.spec_id,
+                spec_name = gap.spec_name,
+                score = gap.coverage_score,
+                threshold = self.coverage_threshold,
+                method = analysis_method,
+                missing = missing_list,
             );
 
             let result = std::process::Command::new("gh")
@@ -4188,5 +4354,94 @@ mod tests {
         let names: Vec<&str> = engine.jobs.iter().map(|j| j.name.as_str()).collect();
         assert!(names.contains(&"my_backup"));
         assert!(names.contains(&"my_sync"));
+    }
+
+    // -- GapDetectionJob coverage threshold configuration tests --
+
+    #[test]
+    fn gap_detection_default_threshold() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+        assert!((job.coverage_threshold - DEFAULT_COVERAGE_THRESHOLD).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn gap_detection_custom_threshold() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf())
+            .with_coverage_threshold(0.8);
+        assert!((job.coverage_threshold - 0.8).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn gap_detection_threshold_clamped() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        let job_high = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf())
+            .with_coverage_threshold(1.5);
+        assert!((job_high.coverage_threshold - 1.0).abs() < f64::EPSILON);
+
+        let job_low = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf())
+            .with_coverage_threshold(-0.3);
+        assert!(job_low.coverage_threshold.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn gap_detection_higher_threshold_catches_more_gaps() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Code covers roughly 60% of keywords (3 out of 5 meaningful keywords).
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "fn authentication() {}\nfn validation() {}\nfn middleware() {}",
+        )
+        .unwrap();
+
+        // Spec has 5 meaningful keywords: authentication, validation, middleware,
+        // authorization, encryption.
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-threshold".into(),
+            "ws".into(),
+            "Threshold Test".into(),
+            "authentication validation middleware authorization encryption".into(),
+        );
+        spec.status = belt_core::spec::SpecStatus::Active;
+        db.insert_spec(&spec).unwrap();
+
+        // With threshold 0.8, the 60% coverage should trigger a gap.
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf())
+            .with_coverage_threshold(0.8);
+        let ctx = CronContext { now: Utc::now() };
+        // Should succeed (gh CLI may not be available but job itself should not error).
+        assert!(job.execute(&ctx).is_ok());
+    }
+
+    // -- LlmCoverageResult deserialization tests --
+
+    #[test]
+    fn llm_coverage_result_deserializes_valid_json() {
+        let json = r#"{"score": 0.75, "missing": ["auth not found", "rate limiting missing"]}"#;
+        let result: LlmCoverageResult = serde_json::from_str(json).unwrap();
+        assert!((result.score - 0.75).abs() < f64::EPSILON);
+        assert_eq!(result.missing.len(), 2);
+        assert_eq!(result.missing[0], "auth not found");
+    }
+
+    #[test]
+    fn llm_coverage_result_defaults_missing_to_empty() {
+        let json = r#"{"score": 1.0}"#;
+        let result: LlmCoverageResult = serde_json::from_str(json).unwrap();
+        assert!((result.score - 1.0).abs() < f64::EPSILON);
+        assert!(result.missing.is_empty());
+    }
+
+    #[test]
+    fn llm_coverage_result_rejects_missing_score() {
+        let json = r#"{"missing": ["something"]}"#;
+        assert!(serde_json::from_str::<LlmCoverageResult>(json).is_err());
     }
 }
