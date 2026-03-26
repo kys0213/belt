@@ -43,6 +43,12 @@ pub struct ClawConfig {
     /// as context into the agent runtime's system prompt.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rules_path: Option<String>,
+    /// Maximum number of conversation turns allowed per session.
+    ///
+    /// Defaults to 10 when not set. Injected into the system prompt
+    /// to guide the LLM's behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_conversation_turns: Option<u32>,
 }
 
 /// DataSource별 설정.
@@ -348,5 +354,35 @@ claw_config:
         let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
         let claw = config.claw_config.unwrap();
         assert!(claw.rules_path.is_none());
+    }
+
+    #[test]
+    fn claw_config_parses_max_conversation_turns() {
+        let yaml = r#"
+name: with-turns
+sources:
+  github:
+    url: https://github.com/org/repo
+claw_config:
+  max_conversation_turns: 25
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let claw = config.claw_config.unwrap();
+        assert_eq!(claw.max_conversation_turns, Some(25));
+    }
+
+    #[test]
+    fn claw_config_max_conversation_turns_defaults_to_none() {
+        let yaml = r#"
+name: no-turns
+sources:
+  github:
+    url: https://github.com/org/repo
+claw_config:
+  auto_approve: false
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let claw = config.claw_config.unwrap();
+        assert!(claw.max_conversation_turns.is_none());
     }
 }

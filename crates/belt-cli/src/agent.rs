@@ -65,6 +65,42 @@ fn resolve_rules_dir(config: &WorkspaceConfig) -> Option<PathBuf> {
     None
 }
 
+/// Default maximum conversation turns per session.
+const DEFAULT_MAX_CONVERSATION_TURNS: u32 = 10;
+
+/// Build the built-in Claw rules system prompt.
+///
+/// Generates a system prompt section containing core agent behavioral rules:
+/// - Conversation turn limit
+/// - Response format guidelines (JSON/markdown)
+/// - Error handling and retry strategy
+///
+/// The `max_turns` parameter overrides the default turn limit when provided
+/// via `ClawConfig.max_conversation_turns`.
+fn build_claw_rules_prompt(max_turns: Option<u32>) -> String {
+    let turns = max_turns.unwrap_or(DEFAULT_MAX_CONVERSATION_TURNS);
+    format!(
+        r#"# Claw Agent Rules
+
+## Conversation Turn Limit
+- Maximum conversation turns per session: {turns}
+- If the task cannot be completed within the turn limit, summarize progress and remaining steps before stopping.
+- Each prompt-response pair counts as one turn.
+
+## Response Format
+- Use JSON for structured data output (status reports, action results, diagnostics).
+- Use Markdown for human-readable explanations, plans, and summaries.
+- When both are appropriate, prefer JSON wrapped in a markdown code block.
+- Always include a top-level "status" field in JSON responses ("success", "error", "partial").
+
+## Error Handling
+- On transient errors (network, timeout), retry up to 3 times with exponential backoff.
+- On permanent errors (invalid input, missing resource), report immediately without retry.
+- Always include error context: what was attempted, what failed, and suggested next steps.
+- Never silently swallow errors; surface them in the response."#
+    )
+}
+
 /// Load all `.md` rule files from a directory into a single system prompt.
 ///
 /// Files are sorted by name for deterministic ordering and concatenated
@@ -777,6 +813,121 @@ runtime:
         assert!(prompt.find("Safety first").unwrap() < prompt.find("Use Rust idioms").unwrap());
     }
 
+    // ---- build_claw_rules_prompt ----
+
+    #[test]
+    fn build_claw_rules_prompt_uses_default_turn_limit() {
+        let prompt = build_claw_rules_prompt(None);
+        assert!(prompt.contains("Maximum conversation turns per session: 10"));
+    }
+
+    #[test]
+    fn build_claw_rules_prompt_uses_custom_turn_limit() {
+        let prompt = build_claw_rules_prompt(Some(25));
+        assert!(prompt.contains("Maximum conversation turns per session: 25"));
+        assert!(!prompt.contains("session: 10"));
+    }
+
+    #[test]
+    fn build_claw_rules_prompt_contains_response_format_section() {
+        let prompt = build_claw_rules_prompt(None);
+        assert!(prompt.contains("## Response Format"));
+        assert!(prompt.contains("JSON"));
+        assert!(prompt.contains("Markdown"));
+    }
+
+    #[test]
+    fn build_claw_rules_prompt_contains_error_handling_section() {
+        let prompt = build_claw_rules_prompt(None);
+        assert!(prompt.contains("## Error Handling"));
+        assert!(prompt.contains("retry up to 3 times"));
+        assert!(prompt.contains("exponential backoff"));
+    }
+
+    #[test]
+    fn build_claw_rules_prompt_contains_all_sections() {
+        let prompt = build_claw_rules_prompt(None);
+        assert!(prompt.contains("# Claw Agent Rules"));
+        assert!(prompt.contains("## Conversation Turn Limit"));
+        assert!(prompt.contains("## Response Format"));
+        assert!(prompt.contains("## Error Handling"));
+    }
+
+    // ---- claw rules integration with system prompt ----
+
+    #[test]
+    fn claw_rules_injected_without_file_rules() {
+        let config = empty_workspace();
+
+        // Simulate run_agent logic: no rules dir, so only built-in claw rules.
+        let max_turns = config
+            .claw_config
+            .as_ref()
+            .and_then(|c| c.max_conversation_turns);
+        let claw_rules = build_claw_rules_prompt(max_turns);
+
+        let working_dir = std::env::current_dir().unwrap();
+        let env = ActionEnv::new("test-agent", &working_dir).with_system_prompt(claw_rules);
+
+        let prompt = env.system_prompt.unwrap();
+        assert!(prompt.contains("# Claw Agent Rules"));
+        assert!(prompt.contains("Maximum conversation turns per session: 10"));
+    }
+
+    #[test]
+    fn claw_rules_combined_with_file_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rules_dir = tmp.path().join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(rules_dir.join("custom.md"), "Custom workspace rule").unwrap();
+
+        let mut config = empty_workspace();
+        config.claw_config = Some(belt_core::workspace::ClawConfig {
+            rules_path: Some(rules_dir.to_string_lossy().to_string()),
+            max_conversation_turns: Some(5),
+            ..Default::default()
+        });
+
+        // Simulate the same combination logic as run_agent.
+        let max_turns = config
+            .claw_config
+            .as_ref()
+            .and_then(|c| c.max_conversation_turns);
+        let claw_rules = build_claw_rules_prompt(max_turns);
+
+        let resolved = resolve_rules_dir(&config).expect("should resolve rules dir");
+        let file_rules = load_rules_from_dir(&resolved).unwrap();
+
+        let system_prompt = match file_rules {
+            Some(file_prompt) => format!("{claw_rules}\n\n---\n\n{file_prompt}"),
+            None => claw_rules,
+        };
+
+        // Claw rules come first.
+        assert!(system_prompt.contains("# Claw Agent Rules"));
+        assert!(system_prompt.contains("Maximum conversation turns per session: 5"));
+        // File rules follow after separator.
+        assert!(system_prompt.contains("---"));
+        assert!(system_prompt.contains("Custom workspace rule"));
+        // Verify ordering: claw rules before file rules.
+        let claw_pos = system_prompt.find("# Claw Agent Rules").unwrap();
+        let file_pos = system_prompt.find("Custom workspace rule").unwrap();
+        assert!(claw_pos < file_pos);
+    }
+
+    #[test]
+    fn claw_config_max_turns_defaults_to_none() {
+        let config = empty_workspace();
+        let max_turns = config
+            .claw_config
+            .as_ref()
+            .and_then(|c| c.max_conversation_turns);
+        assert!(max_turns.is_none());
+        // Which results in the default of 10.
+        let prompt = build_claw_rules_prompt(max_turns);
+        assert!(prompt.contains("session: 10"));
+    }
+
     /// RAII guard for setting environment variables in tests.
     /// Restores (or removes) the variable on drop.
     struct EnvGuard {
@@ -845,22 +996,31 @@ pub async fn run_agent(
     // Use current directory as working directory.
     let working_dir = std::env::current_dir().context("failed to determine current directory")?;
 
-    // Resolve workspace rules and inject as system prompt.
+    // Build the system prompt by combining built-in Claw rules with
+    // workspace-specific rules loaded from the rules directory.
     let mut env = ActionEnv::new("cli-agent", &working_dir);
-    if let Some(rules_dir) = resolve_rules_dir(&config) {
+
+    let max_turns = config
+        .claw_config
+        .as_ref()
+        .and_then(|c| c.max_conversation_turns);
+    let claw_rules = build_claw_rules_prompt(max_turns);
+
+    let file_rules = if let Some(rules_dir) = resolve_rules_dir(&config) {
         match load_rules_from_dir(&rules_dir) {
-            Ok(Some(system_prompt)) => {
+            Ok(Some(rules)) => {
                 tracing::info!(
                     rules_dir = %rules_dir.display(),
-                    "loaded workspace rules as system prompt"
+                    "loaded workspace rules from directory"
                 );
-                env = env.with_system_prompt(system_prompt);
+                Some(rules)
             }
             Ok(None) => {
                 tracing::debug!(
                     rules_dir = %rules_dir.display(),
                     "rules directory exists but contains no .md files"
                 );
+                None
             }
             Err(e) => {
                 tracing::warn!(
@@ -868,9 +1028,18 @@ pub async fn run_agent(
                     error = %e,
                     "failed to load workspace rules, continuing without"
                 );
+                None
             }
         }
-    }
+    } else {
+        None
+    };
+
+    let system_prompt = match file_rules {
+        Some(file_prompt) => format!("{claw_rules}\n\n---\n\n{file_prompt}"),
+        None => claw_rules,
+    };
+    env = env.with_system_prompt(system_prompt);
 
     tracing::info!(
         workspace = config.name,
