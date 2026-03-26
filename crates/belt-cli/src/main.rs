@@ -167,6 +167,14 @@ enum ClawCommands {
     },
     /// Open interactive session.
     Session,
+    /// Install /claw slash command plugin for Claude Code.
+    Plugin {
+        /// Custom installation directory (defaults to ~/.claude/commands/).
+        #[arg(long)]
+        install_dir: Option<String>,
+    },
+    /// Collect system context (status, HITL, queue) for agent injection.
+    Context,
 }
 
 #[derive(Subcommand)]
@@ -2882,6 +2890,23 @@ async fn main() -> anyhow::Result<()> {
                     runtime: Some(runtime),
                 };
                 claw::session::run_interactive(config).await?;
+            }
+            ClawCommands::Plugin { install_dir } => {
+                let dir = if let Some(ref custom) = install_dir {
+                    std::path::PathBuf::from(custom)
+                } else {
+                    claw::plugin::default_install_dir()?
+                };
+                let plugin_path = claw::plugin::install_plugin(&dir)?;
+                println!(
+                    "Installed /claw slash command plugin to: {}",
+                    plugin_path.display()
+                );
+                println!("Restart Claude Code to activate the /claw command.");
+            }
+            ClawCommands::Context => {
+                let context = claw::plugin::collect_cli_context();
+                println!("{context}");
             }
         },
     }
