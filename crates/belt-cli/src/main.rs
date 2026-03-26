@@ -3175,4 +3175,364 @@ mod tests {
             _ => panic!("expected Cron Trigger command"),
         }
     }
+
+    // --- Spec decomposition workflow integration tests ---
+
+    #[test]
+    fn spec_add_decompose_flag_parsing() {
+        let cli = Cli::try_parse_from([
+            "belt",
+            "spec",
+            "add",
+            "--workspace",
+            "ws1",
+            "--name",
+            "my-spec",
+            "--content",
+            "some content",
+            "--decompose",
+            "--skip-validation",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Spec {
+                command:
+                    SpecCommands::Add {
+                        decompose,
+                        yes,
+                        name,
+                        ..
+                    },
+            } => {
+                assert!(decompose);
+                assert!(!yes);
+                assert_eq!(name, "my-spec");
+            }
+            _ => panic!("expected Spec Add command"),
+        }
+    }
+
+    #[test]
+    fn spec_add_decompose_with_yes_flag() {
+        let cli = Cli::try_parse_from([
+            "belt",
+            "spec",
+            "add",
+            "--workspace",
+            "ws1",
+            "--name",
+            "decompose-test",
+            "--content",
+            "test content",
+            "--decompose",
+            "--yes",
+            "--skip-validation",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Spec {
+                command: SpecCommands::Add { decompose, yes, .. },
+            } => {
+                assert!(decompose);
+                assert!(yes);
+            }
+            _ => panic!("expected Spec Add command"),
+        }
+    }
+
+    #[test]
+    fn spec_add_decompose_defaults_to_false() {
+        let cli = Cli::try_parse_from([
+            "belt",
+            "spec",
+            "add",
+            "--workspace",
+            "ws1",
+            "--name",
+            "no-decompose",
+            "--content",
+            "test",
+            "--skip-validation",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Spec {
+                command: SpecCommands::Add { decompose, .. },
+            } => assert!(!decompose),
+            _ => panic!("expected Spec Add command"),
+        }
+    }
+
+    /// Integration test: spec insert -> extract AC -> build decomposed issues -> update DB.
+    ///
+    /// Simulates the decomposition workflow as performed by the CLI handler,
+    /// verifying that the DB state is updated correctly when child issues are
+    /// recorded in the spec.
+    #[test]
+    fn decompose_workflow_updates_spec_decomposed_issues_in_db() {
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+
+        let content = "\
+## Overview\nSome feature.\n\n\
+## Acceptance Criteria\n\
+- Users can sign up with email\n\
+- Users receive a verification email\n\
+- Admin can view all users\n\n\
+## Implementation\nDetails here.";
+
+        let id = "spec-test-decompose-1";
+        let spec = belt_core::spec::Spec::new(
+            id.to_string(),
+            "ws-test".to_string(),
+            "Auth Feature".to_string(),
+            content.to_string(),
+        );
+
+        db.insert_spec(&spec).unwrap();
+
+        // Extract acceptance criteria (as the CLI handler does).
+        let criteria = belt_core::spec::extract_acceptance_criteria(&spec.content);
+        assert_eq!(criteria.len(), 3);
+
+        // Build decomposed issues (no LLM refinement, with parent number).
+        let proposed = belt_core::spec::build_decomposed_issues(&criteria, None, Some("100"));
+        assert_eq!(proposed.len(), 3);
+        assert!(proposed[0].title.contains("AC1"));
+        assert!(proposed[0].title.contains("#100"));
+
+        // Simulate child issue creation by assigning mock issue numbers.
+        let child_numbers: Vec<String> = vec!["101".into(), "102".into(), "103".into()];
+
+        // Update the spec's decomposed_issues field (as the CLI handler does).
+        let mut spec = db.get_spec(id).unwrap();
+        spec.decomposed_issues = Some(child_numbers.join(","));
+        db.update_spec(&spec).unwrap();
+
+        // Transition Draft -> Active (as the CLI handler does after decomposition).
+        spec.transition_to(belt_core::spec::SpecStatus::Active)
+            .unwrap();
+        db.update_spec_status(&spec.id, spec.status).unwrap();
+
+        // Verify DB state reflects the decomposition.
+        let stored = db.get_spec(id).unwrap();
+        assert_eq!(stored.decomposed_issues, Some("101,102,103".to_string()));
+        assert_eq!(stored.status, belt_core::spec::SpecStatus::Active);
+
+        // Verify parsed issue numbers.
+        assert_eq!(stored.decomposed_issue_numbers(), vec!["101", "102", "103"]);
+    }
+
+    /// Integration test: verify spec links are stored for child issues
+    /// during the decomposition workflow.
+    #[test]
+    fn decompose_workflow_stores_spec_links_for_child_issues() {
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+
+        let spec_id = "spec-test-links-1";
+        let spec = belt_core::spec::Spec::new(
+            spec_id.to_string(),
+            "ws-test".to_string(),
+            "Link Test".to_string(),
+            "## Acceptance Criteria\n- AC one\n- AC two".to_string(),
+        );
+        db.insert_spec(&spec).unwrap();
+
+        // Store parent issue link (as the CLI handler does).
+        let parent_link = belt_core::spec::SpecLink::new(
+            format!("link-{spec_id}-parent"),
+            spec_id.to_string(),
+            "https://github.com/owner/repo/issues/200".to_string(),
+        );
+        db.insert_spec_link(&parent_link).unwrap();
+
+        // Store child issue links (as the CLI handler does).
+        let child_urls = vec![
+            "https://github.com/owner/repo/issues/201",
+            "https://github.com/owner/repo/issues/202",
+        ];
+        for (i, url) in child_urls.iter().enumerate() {
+            let link = belt_core::spec::SpecLink::new(
+                format!("link-{spec_id}-child-{i}"),
+                spec_id.to_string(),
+                url.to_string(),
+            );
+            db.insert_spec_link(&link).unwrap();
+        }
+
+        // Verify all links are stored.
+        let links = db.list_spec_links(spec_id).unwrap();
+        assert_eq!(links.len(), 3);
+        assert!(links[0].target.contains("200")); // parent
+        assert!(links[1].target.contains("201")); // child 1
+        assert!(links[2].target.contains("202")); // child 2
+    }
+
+    /// Integration test: decomposition with LLM-refined criteria produces
+    /// enriched issue bodies.
+    #[test]
+    fn decompose_workflow_with_llm_refined_criteria() {
+        let criteria = vec![
+            "Login works with email".to_string(),
+            "Logout clears session".to_string(),
+        ];
+        let refined = vec![
+            "## Login\n\nImplement email-based login with validation.".to_string(),
+            "## Logout\n\nClear session tokens and redirect.".to_string(),
+        ];
+
+        let issues =
+            belt_core::spec::build_decomposed_issues(&criteria, Some(&refined), Some("50"));
+
+        assert_eq!(issues.len(), 2);
+        // When refined text is available, it should appear in the body.
+        assert!(issues[0].body.contains("email-based login"));
+        assert!(issues[1].body.contains("Clear session tokens"));
+        // Parent reference is embedded.
+        assert!(issues[0].body.contains("Parent: #50"));
+    }
+
+    /// Integration test: when LLM refinement returns mismatched count,
+    /// raw criteria are used as fallback. Simulates the CLI handler's
+    /// fallback behavior.
+    #[test]
+    fn decompose_workflow_llm_mismatch_falls_back_to_raw() {
+        let criteria = vec![
+            "Feature A".to_string(),
+            "Feature B".to_string(),
+            "Feature C".to_string(),
+        ];
+        // Simulate LLM returning wrong count (2 instead of 3).
+        let refined = vec!["Refined A".to_string(), "Refined B".to_string()];
+
+        // The build_decomposed_issues function with mismatched refined vec
+        // falls back per-item (items without a refined entry use raw criterion).
+        let issues =
+            belt_core::spec::build_decomposed_issues(&criteria, Some(&refined), Some("10"));
+
+        assert_eq!(issues.len(), 3);
+        // First two use refined text.
+        assert!(issues[0].body.contains("Refined A"));
+        assert!(issues[1].body.contains("Refined B"));
+        // Third falls back to raw criterion.
+        assert!(issues[2].body.contains("Feature C"));
+    }
+
+    /// Integration test: full decomposition workflow from spec insert through
+    /// decomposed_issues DB update, verifying the spec transitions correctly.
+    #[test]
+    fn decompose_full_workflow_spec_status_transitions() {
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+
+        let content = "\
+## Overview\nTask manager.\n\n\
+## Acceptance Criteria\n\
+- Create tasks\n\
+- Delete tasks\n\n\
+## Notes\nEnd.";
+
+        let id = "spec-full-flow-1";
+        let mut spec = belt_core::spec::Spec::new(
+            id.to_string(),
+            "ws-flow".to_string(),
+            "Task Manager".to_string(),
+            content.to_string(),
+        );
+        db.insert_spec(&spec).unwrap();
+
+        // Spec starts in Draft.
+        assert_eq!(spec.status, belt_core::spec::SpecStatus::Draft);
+
+        // Extract criteria and build proposals.
+        let criteria = belt_core::spec::extract_acceptance_criteria(&spec.content);
+        assert_eq!(criteria.len(), 2);
+
+        let proposed = belt_core::spec::build_decomposed_issues(&criteria, None, Some("300"));
+        assert_eq!(proposed.len(), 2);
+
+        // Preview should list both issues.
+        let preview = belt_core::spec::format_decomposition_preview(&proposed);
+        assert!(preview.contains("2 child issue(s)"));
+        assert!(preview.contains("AC1"));
+        assert!(preview.contains("AC2"));
+
+        // Simulate issue creation and store decomposed_issues.
+        let child_nums = vec!["301".to_string(), "302".to_string()];
+        spec.decomposed_issues = Some(child_nums.join(","));
+        db.update_spec(&spec).unwrap();
+
+        // Transition Draft -> Active.
+        spec.transition_to(belt_core::spec::SpecStatus::Active)
+            .unwrap();
+        db.update_spec_status(&spec.id, spec.status).unwrap();
+
+        let stored = db.get_spec(id).unwrap();
+        assert_eq!(stored.status, belt_core::spec::SpecStatus::Active);
+        assert_eq!(stored.decomposed_issues, Some("301,302".to_string()));
+
+        // Verify that the spec recognizes it has been decomposed.
+        assert!(stored.is_decomposed());
+    }
+
+    /// Integration test: spec without acceptance criteria section should
+    /// result in empty criteria list, skipping decomposition.
+    #[test]
+    fn decompose_workflow_no_criteria_skips_decomposition() {
+        let content = "## Overview\nA spec with no AC section.\n\n## Notes\nDone.";
+        let criteria = belt_core::spec::extract_acceptance_criteria(content);
+        assert!(criteria.is_empty());
+
+        // With empty criteria, build_decomposed_issues returns empty vec.
+        let proposed = belt_core::spec::build_decomposed_issues(&criteria, None, Some("1"));
+        assert!(proposed.is_empty());
+    }
+
+    /// Integration test: parent issue body update includes sub-issue links
+    /// in the expected format.
+    #[test]
+    fn decompose_workflow_parent_body_update_format() {
+        let spec_content = "## Overview\nFeature spec.\n\n## Acceptance Criteria\n- A\n- B";
+        let child_urls = vec![
+            "https://github.com/owner/repo/issues/501".to_string(),
+            "https://github.com/owner/repo/issues/502".to_string(),
+        ];
+
+        // Build the updated parent body as the CLI handler does.
+        let links = child_urls
+            .iter()
+            .enumerate()
+            .map(|(i, url)| format!("- [ ] AC{}: {}", i + 1, url))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let updated_body = format!("{}\n\n## Sub-issues\n{}", spec_content, links);
+
+        assert!(updated_body.contains("## Sub-issues"));
+        assert!(updated_body.contains("- [ ] AC1: https://github.com/owner/repo/issues/501"));
+        assert!(updated_body.contains("- [ ] AC2: https://github.com/owner/repo/issues/502"));
+        // Original content is preserved.
+        assert!(updated_body.starts_with("## Overview"));
+    }
+
+    /// Integration test: extract_issue_number works with URLs produced during
+    /// decomposition (used for parent_number and child_numbers).
+    #[test]
+    fn decompose_workflow_issue_number_extraction() {
+        // Parent issue URL.
+        let parent = "https://github.com/owner/repo/issues/42";
+        assert_eq!(extract_issue_number(parent), Some("42".to_string()));
+
+        // Child issue URLs.
+        let child1 = "https://github.com/owner/repo/issues/43";
+        let child2 = "https://github.com/owner/repo/issues/44";
+        assert_eq!(extract_issue_number(child1), Some("43".to_string()));
+        assert_eq!(extract_issue_number(child2), Some("44".to_string()));
+
+        // The parent_number is used in build_decomposed_issues.
+        let criteria = vec!["Test criterion".to_string()];
+        let issues = belt_core::spec::build_decomposed_issues(
+            &criteria,
+            None,
+            extract_issue_number(parent).as_deref(),
+        );
+        assert!(issues[0].title.contains("#42"));
+    }
 }
