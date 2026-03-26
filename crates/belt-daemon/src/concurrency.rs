@@ -37,6 +37,8 @@ impl ConcurrencyTracker {
         current < workspace_limit as usize
     }
 
+    /// Returns the number of additional items that can be spawned in this workspace,
+    /// respecting both per-workspace and global limits.
     pub fn available_slots(&self, workspace_id: &str, workspace_limit: u32) -> usize {
         if !self.can_spawn() {
             return 0;
