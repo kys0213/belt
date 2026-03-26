@@ -210,15 +210,16 @@ impl Daemon {
         let Some(db) = db.as_ref() else {
             return;
         };
+        let now = Utc::now();
         let event = TransitionEvent {
-            id: format!("te-{}-{}", work_id, Utc::now().timestamp_millis()),
+            id: format!("te-{}-{}", work_id, now.timestamp_millis()),
             work_id: work_id.to_string(),
             source_id: source_id.to_string(),
             event_type: event_type.to_string(),
             phase: Some(to.as_str().to_string()),
             from_phase: Some(from.as_str().to_string()),
             detail,
-            created_at: Utc::now().to_rfc3339(),
+            created_at: now.to_rfc3339(),
         };
         if let Err(e) = db.insert_transition_event(&event) {
             tracing::warn!(
