@@ -1039,7 +1039,7 @@ const DEFAULT_COVERAGE_THRESHOLD: f64 = 0.5;
 ///      `claude` CLI is unavailable or returns an invalid response.
 ///
 /// When a gap is found (coverage score below the configured threshold)
-/// it creates a GitHub issue labelled `autopilot:gap` via the `gh` CLI.
+/// it creates a GitHub issue labelled `autopilot:gap,autopilot:ready` via the `gh` CLI.
 pub struct GapDetectionJob {
     db: Arc<Database>,
     /// Root directory of the workspace to scan for code files.
@@ -1649,7 +1649,7 @@ impl CronHandler for GapDetectionJob {
                     "--body",
                     &body,
                     "--label",
-                    "autopilot:gap",
+                    "autopilot:gap,autopilot:ready",
                 ])
                 .output();
 
