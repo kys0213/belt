@@ -156,6 +156,16 @@ pub struct RuntimeStats {
     pub by_model: HashMap<String, ModelStats>,
 }
 
+/// Column list shared by all `queue_items` SELECT and INSERT statements.
+///
+/// Keeping this in one place avoids drift when columns are added or reordered.
+const QUEUE_ITEM_COLUMNS: &str = "work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action, replan_count, worktree_preserved";
+
+/// Shorthand for extracting a column value and mapping the error to `BeltError::Database`.
+fn col<T: rusqlite::types::FromSql>(row: &rusqlite::Row<'_>, idx: usize) -> Result<T, BeltError> {
+    row.get(idx).map_err(|e| BeltError::Database(e.to_string()))
+}
+
 /// SQLite-backed persistence for Belt state.
 ///
 /// The inner connection is wrapped in a [`Mutex`] so that `Database` is
@@ -214,7 +224,8 @@ impl Database {
                 hitl_reason          TEXT,
                 hitl_timeout_at      TEXT,
                 hitl_terminal_action TEXT,
-                replan_count         INTEGER NOT NULL DEFAULT 0
+                replan_count         INTEGER NOT NULL DEFAULT 0,
+                worktree_preserved   INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS history (
@@ -328,8 +339,9 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.execute(
-            "INSERT INTO queue_items (work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action, replan_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            &format!(
+                "INSERT INTO queue_items ({QUEUE_ITEM_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
+            ),
             params![
                 item.work_id,
                 item.source_id,
@@ -346,6 +358,7 @@ impl Database {
                 item.hitl_timeout_at,
                 item.hitl_terminal_action,
                 item.replan_count,
+                item.worktree_preserved,
             ],
         )
         .map_err(|e| BeltError::Database(e.to_string()))?;
@@ -469,7 +482,7 @@ impl Database {
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let mut stmt = conn
             .prepare(
-                "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action, replan_count FROM queue_items WHERE phase = 'hitl' AND hitl_timeout_at IS NOT NULL",
+                &format!("SELECT {QUEUE_ITEM_COLUMNS} FROM queue_items WHERE phase = 'hitl' AND hitl_timeout_at IS NOT NULL"),
             )
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let items = stmt
@@ -490,8 +503,7 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.query_row(
-            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action, replan_count
-                 FROM queue_items WHERE work_id = ?1",
+            &format!("SELECT {QUEUE_ITEM_COLUMNS} FROM queue_items WHERE work_id = ?1"),
             params![work_id],
             |row| Ok(row_to_queue_item(row)),
         )
@@ -513,9 +525,7 @@ impl Database {
             .conn
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
-        let mut sql = String::from(
-            "SELECT work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action, replan_count FROM queue_items WHERE 1=1",
-        );
+        let mut sql = format!("SELECT {QUEUE_ITEM_COLUMNS} FROM queue_items WHERE 1=1");
         let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
         if let Some(p) = phase {
@@ -1816,41 +1826,31 @@ fn str_to_spec_status(s: &str) -> Result<SpecStatus, BeltError> {
 /// Column order must match:
 /// `id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, test_commands, created_at, updated_at`
 fn row_to_spec(row: &rusqlite::Row<'_>) -> Result<Spec, BeltError> {
-    let status_str: String = row.get(3).map_err(|e| BeltError::Database(e.to_string()))?;
+    let status_str: String = col(row, 3)?;
 
     Ok(Spec {
-        id: row.get(0).map_err(|e| BeltError::Database(e.to_string()))?,
-        workspace_id: row.get(1).map_err(|e| BeltError::Database(e.to_string()))?,
-        name: row.get(2).map_err(|e| BeltError::Database(e.to_string()))?,
+        id: col(row, 0)?,
+        workspace_id: col(row, 1)?,
+        name: col(row, 2)?,
         status: str_to_spec_status(&status_str)?,
-        content: row.get(4).map_err(|e| BeltError::Database(e.to_string()))?,
-        priority: row.get(5).map_err(|e| BeltError::Database(e.to_string()))?,
-        labels: row.get(6).map_err(|e| BeltError::Database(e.to_string()))?,
-        depends_on: row.get(7).map_err(|e| BeltError::Database(e.to_string()))?,
-        entry_point: row.get(8).map_err(|e| BeltError::Database(e.to_string()))?,
-        decomposed_issues: row.get(9).map_err(|e| BeltError::Database(e.to_string()))?,
-        test_commands: row
-            .get(10)
-            .map_err(|e| BeltError::Database(e.to_string()))?,
-        created_at: row
-            .get(11)
-            .map_err(|e| BeltError::Database(e.to_string()))?,
-        updated_at: row
-            .get(12)
-            .map_err(|e| BeltError::Database(e.to_string()))?,
+        content: col(row, 4)?,
+        priority: col(row, 5)?,
+        labels: col(row, 6)?,
+        depends_on: col(row, 7)?,
+        entry_point: col(row, 8)?,
+        decomposed_issues: col(row, 9)?,
+        test_commands: col(row, 10)?,
+        created_at: col(row, 11)?,
+        updated_at: col(row, 12)?,
     })
 }
 
 /// Extract a `QueueItem` from a rusqlite `Row`.
 ///
-/// Column order must match:
-/// `work_id, source_id, workspace_id, state, phase, title, created_at, updated_at,
-///  hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action`
+/// Column order must match [`QUEUE_ITEM_COLUMNS`].
 fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
-    let phase_str: String = row.get(4).map_err(|e| BeltError::Database(e.to_string()))?;
-    let hitl_reason_str: Option<String> = row
-        .get(11)
-        .map_err(|e| BeltError::Database(e.to_string()))?;
+    let phase_str: String = col(row, 4)?;
+    let hitl_reason_str: Option<String> = col(row, 11)?;
     let hitl_reason = hitl_reason_str
         .as_deref()
         .map(|s| match s {
@@ -1868,30 +1868,24 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
         .transpose()?;
 
     Ok(QueueItem {
-        work_id: row.get(0).map_err(|e| BeltError::Database(e.to_string()))?,
-        source_id: row.get(1).map_err(|e| BeltError::Database(e.to_string()))?,
-        workspace_id: row.get(2).map_err(|e| BeltError::Database(e.to_string()))?,
-        state: row.get(3).map_err(|e| BeltError::Database(e.to_string()))?,
+        work_id: col(row, 0)?,
+        source_id: col(row, 1)?,
+        workspace_id: col(row, 2)?,
+        state: col(row, 3)?,
         phase: str_to_phase(&phase_str)?,
-        title: row.get(5).map_err(|e| BeltError::Database(e.to_string()))?,
-        created_at: row.get(6).map_err(|e| BeltError::Database(e.to_string()))?,
-        updated_at: row.get(7).map_err(|e| BeltError::Database(e.to_string()))?,
-        hitl_created_at: row.get(8).map_err(|e| BeltError::Database(e.to_string()))?,
-        hitl_respondent: row.get(9).map_err(|e| BeltError::Database(e.to_string()))?,
-        hitl_notes: row
-            .get(10)
-            .map_err(|e| BeltError::Database(e.to_string()))?,
+        title: col(row, 5)?,
+        created_at: col(row, 6)?,
+        updated_at: col(row, 7)?,
+        hitl_created_at: col(row, 8)?,
+        hitl_respondent: col(row, 9)?,
+        hitl_notes: col(row, 10)?,
         hitl_reason,
-        hitl_timeout_at: row
-            .get(12)
-            .map_err(|e| BeltError::Database(e.to_string()))?,
-        hitl_terminal_action: row
-            .get(13)
-            .map_err(|e| BeltError::Database(e.to_string()))?,
-        worktree_preserved: false,
+        hitl_timeout_at: col(row, 12)?,
+        hitl_terminal_action: col(row, 13)?,
+        replan_count: row.get::<_, u32>(14).unwrap_or(0),
+        worktree_preserved: col(row, 15)?,
         // previous_worktree_path is transient (in-memory only, not persisted to DB).
         previous_worktree_path: None,
-        replan_count: row.get::<_, u32>(14).unwrap_or(0),
     })
 }
 
