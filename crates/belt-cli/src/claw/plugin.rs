@@ -153,42 +153,36 @@ pub fn default_install_dir() -> anyhow::Result<PathBuf> {
     Ok(home.join(".claude").join("commands"))
 }
 
+/// Run a belt CLI command and return its stdout if successful.
+fn run_belt_cmd(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("belt")
+        .args(args)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
+    }
+}
+
 /// Collect system context by running belt CLI commands.
 ///
 /// Returns a formatted context string with status, HITL items, and queue list.
 /// This is used by the /claw slash command for auto-context injection.
 pub fn collect_cli_context() -> String {
-    let mut sections = Vec::new();
+    let commands: &[(&[&str], &str)] = &[
+        (&["status", "--format", "json"], "System Status"),
+        (&["hitl", "list", "--format", "json"], "HITL Items"),
+        (&["queue", "list", "--format", "json"], "Queue Items"),
+    ];
 
-    // Collect belt status.
-    if let Ok(output) = std::process::Command::new("belt")
-        .args(["status", "--format", "json"])
-        .output()
-        && output.status.success()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        sections.push(format!("## System Status\n```json\n{}\n```", stdout.trim()));
-    }
-
-    // Collect HITL items.
-    if let Ok(output) = std::process::Command::new("belt")
-        .args(["hitl", "list", "--format", "json"])
-        .output()
-        && output.status.success()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        sections.push(format!("## HITL Items\n```json\n{}\n```", stdout.trim()));
-    }
-
-    // Collect queue list.
-    if let Ok(output) = std::process::Command::new("belt")
-        .args(["queue", "list", "--format", "json"])
-        .output()
-        && output.status.success()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        sections.push(format!("## Queue Items\n```json\n{}\n```", stdout.trim()));
-    }
+    let sections: Vec<String> = commands
+        .iter()
+        .filter_map(|(args, label)| {
+            run_belt_cmd(args).map(|out| format!("## {label}\n```json\n{out}\n```"))
+        })
+        .collect();
 
     if sections.is_empty() {
         "No belt context available (belt CLI not found or database unavailable).".to_string()
