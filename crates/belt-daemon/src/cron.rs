@@ -333,6 +333,187 @@ impl CronEngine {
         }
     }
 
+    /// Fully synchronize custom (user-defined) cron jobs from the database.
+    ///
+    /// Performs a three-way reconciliation between the in-memory job list and
+    /// the DB `cron_jobs` table:
+    ///
+    /// 1. **New jobs** in the DB that are not yet registered are added.
+    /// 2. **Removed jobs** that no longer exist in the DB are unregistered.
+    /// 3. **Updated jobs** have their `enabled` state and `last_run_at`
+    ///    synchronized. Schedule and script changes cause re-registration so
+    ///    the handler picks up the new values.
+    ///
+    /// Built-in jobs (identified by a static name list) are never touched.
+    pub fn sync_custom_jobs_from_db(&mut self, db: &Arc<Database>) {
+        let db_jobs = match db.list_cron_jobs() {
+            Ok(jobs) => jobs,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to read cron jobs from DB for full sync");
+                return;
+            }
+        };
+
+        let builtin_names: &[&str] = &[
+            "hitl_timeout",
+            "daily_report",
+            "log_cleanup",
+            "evaluate",
+            "pr_review_scan",
+            "gap_detection",
+            "knowledge_extraction",
+        ];
+
+        // Filter to only custom jobs (skip built-in names and workspace-scoped built-ins).
+        let custom_db_jobs: Vec<&belt_infra::db::CronJob> = db_jobs
+            .iter()
+            .filter(|j| {
+                if builtin_names.contains(&j.name.as_str()) {
+                    return false;
+                }
+                if j.name.contains(':')
+                    && builtin_names
+                        .iter()
+                        .any(|b| j.name.ends_with(&format!(":{b}")))
+                {
+                    return false;
+                }
+                true
+            })
+            .collect();
+
+        let db_map: HashMap<&str, &&belt_infra::db::CronJob> = custom_db_jobs
+            .iter()
+            .map(|j| (j.name.as_str(), j))
+            .collect();
+
+        // Collect names of current in-memory custom jobs (non-builtin).
+        let in_memory_custom: Vec<String> = self
+            .jobs
+            .iter()
+            .filter(|j| {
+                let name = j.name.as_str();
+                if builtin_names.contains(&name) {
+                    return false;
+                }
+                if name.contains(':')
+                    && builtin_names
+                        .iter()
+                        .any(|b| name.ends_with(&format!(":{b}")))
+                {
+                    return false;
+                }
+                true
+            })
+            .map(|j| j.name.clone())
+            .collect();
+
+        // 1. Remove in-memory custom jobs that no longer exist in DB.
+        for name in &in_memory_custom {
+            if !db_map.contains_key(name.as_str()) {
+                tracing::info!(job = %name, "sync: removing custom job (deleted from DB)");
+                self.unregister(name);
+            }
+        }
+
+        // 2. For each DB custom job, add new or sync existing.
+        for db_job in &custom_db_jobs {
+            if let Some(mem_job) = self.jobs.iter_mut().find(|j| j.name == db_job.name) {
+                // Sync enabled state.
+                if mem_job.enabled != db_job.enabled {
+                    tracing::info!(
+                        job = %db_job.name,
+                        enabled = db_job.enabled,
+                        "sync: updating enabled state"
+                    );
+                    mem_job.enabled = db_job.enabled;
+                }
+
+                // Sync last_run_at (trigger detection).
+                if db_job.last_run_at.is_none() && mem_job.last_run_at.is_some() {
+                    tracing::info!(
+                        job = %db_job.name,
+                        "sync: resetting last_run_at (trigger requested)"
+                    );
+                    mem_job.last_run_at = None;
+                }
+
+                // Check if schedule or script changed; if so, re-register.
+                let schedule_str = match &mem_job.schedule {
+                    CronSchedule::Expression(expr) => Some(expr.as_str()),
+                    _ => None,
+                };
+                let schedule_changed = schedule_str != Some(&db_job.schedule);
+                // We cannot inspect the script from CronJobDef directly, so
+                // re-register on schedule change to be safe.
+                if schedule_changed {
+                    tracing::info!(
+                        job = %db_job.name,
+                        new_schedule = %db_job.schedule,
+                        "sync: re-registering custom job (schedule changed)"
+                    );
+                    let schedule = match CronSchedule::parse_expression(&db_job.schedule) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                job = %db_job.name,
+                                error = %e,
+                                "sync: skipping re-register due to invalid schedule"
+                            );
+                            continue;
+                        }
+                    };
+                    self.register(CronJobDef {
+                        name: db_job.name.clone(),
+                        schedule,
+                        workspace: db_job.workspace.clone(),
+                        enabled: db_job.enabled,
+                        last_run_at: None,
+                        handler: Box::new(CustomScriptJob {
+                            script: db_job.script.clone(),
+                            job_name: db_job.name.clone(),
+                            db: Arc::clone(db),
+                        }),
+                    });
+                }
+            } else {
+                // New job: register it.
+                let schedule = match CronSchedule::parse_expression(&db_job.schedule) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(
+                            job = %db_job.name,
+                            schedule = %db_job.schedule,
+                            error = %e,
+                            "sync: skipping new custom job with invalid schedule"
+                        );
+                        continue;
+                    }
+                };
+
+                tracing::info!(
+                    job = %db_job.name,
+                    schedule = %db_job.schedule,
+                    enabled = db_job.enabled,
+                    "sync: registering new custom job from DB"
+                );
+
+                self.register(CronJobDef {
+                    name: db_job.name.clone(),
+                    schedule,
+                    workspace: db_job.workspace.clone(),
+                    enabled: db_job.enabled,
+                    last_run_at: None,
+                    handler: Box::new(CustomScriptJob {
+                        script: db_job.script.clone(),
+                        job_name: db_job.name.clone(),
+                        db: Arc::clone(db),
+                    }),
+                });
+            }
+        }
+    }
+
     /// Return the number of registered jobs.
     pub fn job_count(&self) -> usize {
         self.jobs.len()

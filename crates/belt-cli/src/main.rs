@@ -1010,6 +1010,7 @@ fn cmd_cron_add(
     let db = open_db()?;
     db.add_cron_job(name, schedule, script, workspace)?;
     println!("Cron job '{name}' added.");
+    notify_daemon_cron_sync();
     Ok(())
 }
 
@@ -1037,6 +1038,7 @@ fn cmd_cron_update(name: &str, schedule: Option<&str>, script: Option<&str>) -> 
     }
 
     println!("Cron job '{name}' updated.");
+    notify_daemon_cron_sync();
     Ok(())
 }
 
@@ -1045,6 +1047,7 @@ fn cmd_cron_pause(name: &str) -> anyhow::Result<()> {
     let db = open_db()?;
     db.toggle_cron_job(name, false)?;
     println!("Cron job '{name}' paused.");
+    notify_daemon_cron_sync();
     Ok(())
 }
 
@@ -1053,6 +1056,7 @@ fn cmd_cron_resume(name: &str) -> anyhow::Result<()> {
     let db = open_db()?;
     db.toggle_cron_job(name, true)?;
     println!("Cron job '{name}' resumed.");
+    notify_daemon_cron_sync();
     Ok(())
 }
 
@@ -1061,6 +1065,7 @@ fn cmd_cron_remove(name: &str) -> anyhow::Result<()> {
     let db = open_db()?;
     db.remove_cron_job(name)?;
     println!("Cron job '{name}' removed.");
+    notify_daemon_cron_sync();
     Ok(())
 }
 
@@ -1158,6 +1163,22 @@ fn cmd_cron_trigger(name: &str) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Best-effort notification to the daemon to sync cron jobs.
+///
+/// Sends SIGUSR1 to the running daemon so it picks up cron job changes
+/// (add/remove/pause/resume/update) from the database. Silently ignores
+/// any errors (e.g. daemon not running).
+fn notify_daemon_cron_sync() {
+    match signal_daemon() {
+        Ok(()) => {
+            println!("Daemon notified to sync cron jobs.");
+        }
+        Err(_) => {
+            // Daemon may not be running; changes will be picked up on next start.
+        }
+    }
 }
 
 /// Send SIGUSR1 to the running daemon process to trigger a cron sync.

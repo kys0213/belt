@@ -1296,12 +1296,13 @@ impl Daemon {
         tracing::info!("belt daemon stopped");
     }
 
-    /// Handle SIGUSR1 by syncing cron triggers from DB and running an
-    /// immediate tick.
+    /// Handle SIGUSR1 by performing a full sync of custom cron jobs from
+    /// the database (including new/removed/paused/resumed/triggered jobs)
+    /// and running an immediate tick.
     async fn handle_cron_trigger_signal(&mut self) {
-        tracing::info!("received SIGUSR1, syncing cron triggers from DB...");
+        tracing::info!("received SIGUSR1, syncing custom cron jobs from DB...");
         if let (Some(engine), Some(db)) = (&mut self.cron_engine, &self.db) {
-            engine.sync_triggers_from_db(db);
+            engine.sync_custom_jobs_from_db(db);
         }
         // Run an immediate tick so the triggered job executes now.
         if let Err(e) = self.tick().await {
