@@ -38,7 +38,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::spec::SpecStatus;
-use belt_infra::db::{Database, HistoryEvent, RuntimeStats, ScriptExecStats, TransitionEvent};
+use belt_infra::db::{Database, HistoryEvent, ScriptExecStats, TransitionEvent};
 use belt_infra::workspace_loader::load_workspace_config;
 
 /// Connection status of a DataSource (internal dashboard representation).
@@ -2287,7 +2287,12 @@ fn render_runtime_panel_tui(db: &Database) -> Table<'static> {
 ///
 /// Displays overall token totals, execution count, average duration,
 /// and a per-model breakdown table.
-pub fn render_runtime_panel(stats: &RuntimeStats) {
+///
+/// Production callers should use [`crate::status::print_rich_runtime`] instead
+/// which applies crossterm colours.  This plain-text variant is retained for
+/// unit tests in this module.
+#[cfg(test)]
+fn render_runtime_panel(stats: &belt_infra::db::RuntimeStats) {
     println!("=== Runtime Stats (last 24h) ===");
     println!();
     println!(
@@ -2350,6 +2355,8 @@ fn format_number(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use belt_infra::db::RuntimeStats;
+
     use super::*;
 
     #[test]

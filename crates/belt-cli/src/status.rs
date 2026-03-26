@@ -9,9 +9,32 @@ use std::io::{self, Write};
 use belt_core::phase::QueuePhase;
 use belt_infra::db::{Database, RuntimeStats};
 use crossterm::style::{self, Stylize};
+use crossterm::terminal;
 use serde::Serialize;
 
 use crate::dashboard;
+
+/// Minimum box width for rich output (characters inside borders).
+const MIN_BOX_WIDTH: usize = 38;
+
+/// Maximum box width for rich output.
+const MAX_BOX_WIDTH: usize = 100;
+
+/// Query the terminal width, falling back to 80 columns when unavailable.
+fn terminal_width() -> usize {
+    terminal::size().map(|(w, _)| w as usize).unwrap_or(80)
+}
+
+/// Compute the inner box width (content area between border characters).
+///
+/// Leaves a 2-column margin on each side of the terminal and clamps the
+/// result between [`MIN_BOX_WIDTH`] and [`MAX_BOX_WIDTH`].
+fn box_content_width() -> usize {
+    let tw = terminal_width();
+    // outer width = tw - 4 (2 margin each side), inner = outer - 2 (borders)
+    let inner = tw.saturating_sub(6);
+    inner.clamp(MIN_BOX_WIDTH, MAX_BOX_WIDTH)
+}
 
 /// System status summary returned by `belt status`.
 #[derive(Debug, Serialize)]
@@ -279,15 +302,22 @@ fn gather_workspace_token_usage(db: &Database, workspace: &str) -> Option<TokenU
 }
 
 /// Print system status in the requested format.
-pub fn print_status(status: &SystemStatus, format: &str) -> anyhow::Result<()> {
+///
+/// When `daemon_running` is `Some`, the daemon status indicator is included
+/// in the rich header box.  Pass `None` to omit it (useful in tests).
+pub fn print_status(
+    status: &SystemStatus,
+    format: &str,
+    daemon_running: Option<bool>,
+) -> anyhow::Result<()> {
     match format {
         "json" => {
             println!("{}", serde_json::to_string_pretty(status)?);
         }
         "rich" => {
-            print_rich_status(status);
+            print_rich_status(status, daemon_running);
             if let Some(ref s) = status.runtime_stats {
-                dashboard::render_runtime_panel(s);
+                print_rich_runtime(s);
             }
         }
         _ => {
@@ -796,7 +826,7 @@ mod tests {
             hitl_items: vec![],
         };
         // Should not panic
-        super::print_rich_status(&status);
+        super::print_rich_status(&status, None);
     }
 
     // ---- print_rich_spec_status output ----
@@ -938,7 +968,7 @@ mod tests {
             hitl_items: vec![],
         };
         // Calling print_status with "rich" should not panic.
-        super::print_status(&status, "rich").unwrap();
+        super::print_status(&status, "rich", None).unwrap();
     }
 
     // ---- formatter test helpers ----
@@ -1039,7 +1069,7 @@ mod tests {
     #[test]
     fn print_status_json_format_returns_ok() {
         let status = sample_system_status();
-        let result = print_status(&status, "json");
+        let result = print_status(&status, "json", None);
         assert!(result.is_ok());
     }
 
@@ -1059,14 +1089,14 @@ mod tests {
     #[test]
     fn print_status_text_format_returns_ok() {
         let status = sample_system_status();
-        let result = print_status(&status, "text");
+        let result = print_status(&status, "text", None);
         assert!(result.is_ok());
     }
 
     #[test]
     fn print_status_rich_format_returns_ok() {
         let status = sample_system_status();
-        let result = print_status(&status, "rich");
+        let result = print_status(&status, "rich", None);
         assert!(result.is_ok());
     }
 
@@ -1074,7 +1104,7 @@ mod tests {
     fn print_status_unknown_format_falls_back_to_text() {
         let status = sample_system_status();
         // Unknown format should not error — falls back to text.
-        let result = print_status(&status, "unknown");
+        let result = print_status(&status, "unknown", None);
         assert!(result.is_ok());
     }
 
@@ -1141,13 +1171,13 @@ mod tests {
     #[test]
     fn print_rich_status_with_data_does_not_panic() {
         let status = sample_system_status();
-        print_rich_status(&status);
+        print_rich_status(&status, None);
     }
 
     #[test]
     fn print_rich_status_empty_does_not_panic() {
         let status = empty_system_status();
-        print_rich_status(&status);
+        print_rich_status(&status, None);
     }
 
     #[test]
@@ -1215,7 +1245,89 @@ mod tests {
             }],
         };
         // Exercises workspace summary, error items, and HITL items branches.
-        print_rich_status(&status);
+        print_rich_status(&status, None);
+    }
+
+    #[test]
+    fn print_rich_status_with_daemon_running_does_not_panic() {
+        let status = sample_system_status();
+        print_rich_status(&status, Some(true));
+    }
+
+    #[test]
+    fn print_rich_status_with_daemon_stopped_does_not_panic() {
+        let status = empty_system_status();
+        print_rich_status(&status, Some(false));
+    }
+
+    // ---- terminal width helpers ----
+
+    #[test]
+    fn box_content_width_within_bounds() {
+        let w = super::box_content_width();
+        assert!(
+            w >= super::MIN_BOX_WIDTH,
+            "box width {w} below minimum {}",
+            super::MIN_BOX_WIDTH
+        );
+        assert!(
+            w <= super::MAX_BOX_WIDTH,
+            "box width {w} above maximum {}",
+            super::MAX_BOX_WIDTH
+        );
+    }
+
+    #[test]
+    fn terminal_width_returns_positive() {
+        let tw = super::terminal_width();
+        assert!(tw > 0);
+    }
+
+    // ---- print_rich_runtime ----
+
+    #[test]
+    fn print_rich_runtime_does_not_panic() {
+        let stats = sample_stats();
+        super::print_rich_runtime(&stats);
+    }
+
+    #[test]
+    fn print_rich_runtime_with_models_does_not_panic() {
+        use belt_infra::db::ModelStats;
+        use std::collections::HashMap;
+
+        let mut by_model = HashMap::new();
+        by_model.insert(
+            "sonnet".to_string(),
+            ModelStats {
+                model: "sonnet".to_string(),
+                input_tokens: 800,
+                output_tokens: 400,
+                total_tokens: 1_200,
+                executions: 5,
+                avg_duration_ms: Some(150.0),
+            },
+        );
+        by_model.insert(
+            "haiku".to_string(),
+            ModelStats {
+                model: "haiku".to_string(),
+                input_tokens: 200,
+                output_tokens: 100,
+                total_tokens: 300,
+                executions: 2,
+                avg_duration_ms: None,
+            },
+        );
+        let stats = RuntimeStats {
+            total_tokens_input: 1_000,
+            total_tokens_output: 500,
+            total_tokens: 1_500,
+            executions: 7,
+            avg_duration_ms: Some(250.0),
+            by_model,
+        };
+        super::print_rich_runtime(&stats);
     }
 
     // ---- print_text_spec_status ----
@@ -1638,33 +1750,62 @@ fn to_crossterm_color(c: ratatui::style::Color) -> crossterm::style::Color {
     }
 }
 
-fn print_rich_status(status: &SystemStatus) {
+fn print_rich_status(status: &SystemStatus, daemon_running: Option<bool>) {
     let mut stdout = io::stdout();
+    let w = box_content_width();
 
-    // Header
+    // Header box
+    let border_h = "\u{2500}".repeat(w);
+    let _ = writeln!(stdout, "\u{250c}{border_h}\u{2510}");
+    let title = format!("{:^width$}", "Belt System Status", width = w - 2);
+    let _ = writeln!(stdout, "\u{2502} {} \u{2502}", title.bold());
+    let _ = writeln!(stdout, "\u{251c}{border_h}\u{2524}");
+
+    // Daemon status row (when provided)
+    if let Some(running) = daemon_running {
+        let (label, indicator) = if running {
+            ("running", "\u{25cf} running".green())
+        } else {
+            ("stopped", "\u{25cb} stopped".red())
+        };
+        let pad = w - 2 - "Daemon: ".len() - label.len();
+        let _ = writeln!(
+            stdout,
+            "\u{2502} Daemon: {indicator}{:pad$} \u{2502}",
+            "",
+            pad = pad,
+        );
+    }
+
+    let items_str = format!("{}", status.total_items);
+    let pad = w - 2 - "Total items: ".len() - items_str.len();
     let _ = writeln!(
         stdout,
-        "\u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}"
+        "\u{2502} Total items: {items_str}{:pad$} \u{2502}",
+        "",
+        pad = pad,
     );
-    let title = format!("{:^36}", "Belt System Status").bold();
-    let _ = writeln!(stdout, "\u{2502} {title}  \u{2502}");
-    let _ = writeln!(
-        stdout,
-        "\u{251c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2524}"
-    );
-    let _ = writeln!(
-        stdout,
-        "\u{2502} Total items: {:<23} \u{2502}",
-        status.total_items
-    );
-    let _ = writeln!(
-        stdout,
-        "\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}"
-    );
+
+    if status.hitl_count > 0 {
+        let hitl_str = format!("{}", status.hitl_count);
+        let hpad = w - 2 - "HITL items:  ".len() - hitl_str.len();
+        let _ = writeln!(
+            stdout,
+            "\u{2502} HITL items:  {}{:hpad$} \u{2502}",
+            hitl_str.yellow(),
+            "",
+            hpad = hpad,
+        );
+    }
+
+    let _ = writeln!(stdout, "\u{2514}{border_h}\u{2518}");
 
     // Phase table with colours and progress bar
     if !status.phase_counts.is_empty() {
         let total = status.total_items.max(1);
+        // Adaptive progress bar width: use remaining space after phase (16) + count (10) + separators
+        let bar_width = (w.saturating_sub(32)).max(8);
+
         let _ = writeln!(stdout);
         let _ = writeln!(
             stdout,
@@ -1678,16 +1819,18 @@ fn print_rich_status(status: &SystemStatus) {
         );
         let _ = writeln!(
             stdout,
-            "  {}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "  {}{}{}{}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
             "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(16),
             "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(9),
             "\u{253c}".dark_grey(),
         );
         for pc in &status.phase_counts {
             let color = to_crossterm_color(dashboard::phase_color(&pc.phase));
             let phase_styled = style::style(format!("{:<14}", pc.phase)).with(color);
             let pct = (pc.count as f64 / total as f64 * 100.0) as u32;
-            let bar = render_progress_bar(pct, 12);
+            let bar = render_progress_bar(pct, bar_width);
             let _ = writeln!(
                 stdout,
                 "  {} {phase_styled} {} {:<8} {} {} {:>3}%",
@@ -1703,13 +1846,17 @@ fn print_rich_status(status: &SystemStatus) {
 
     // Per-workspace breakdown
     if !status.workspace_summary.is_empty() {
+        let phases_col_width = w.saturating_sub(26).max(10);
+
         let _ = writeln!(stdout);
         let _ = writeln!(stdout, "  {}", "Per-Workspace Status".bold().cyan());
         let _ = writeln!(
             stdout,
-            "  {}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "  {}{}{}{}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
             "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(16),
             "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(7),
             "\u{253c}".dark_grey(),
         );
         let _ = writeln!(
@@ -1724,9 +1871,11 @@ fn print_rich_status(status: &SystemStatus) {
         );
         let _ = writeln!(
             stdout,
-            "  {}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "  {}{}{}{}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
             "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(16),
             "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(7),
             "\u{253c}".dark_grey(),
         );
         for ws in &status.workspace_summary {
@@ -1736,6 +1885,12 @@ fn print_rich_status(status: &SystemStatus) {
                 .map(|pc| format!("{}:{}", pc.phase, pc.count))
                 .collect::<Vec<_>>()
                 .join(", ");
+            // Truncate phases string if it exceeds available width.
+            let display_phases = if phases_str.len() > phases_col_width {
+                format!("{}\u{2026}", &phases_str[..phases_col_width - 1])
+            } else {
+                phases_str
+            };
             let _ = writeln!(
                 stdout,
                 "  {} {:<14} {} {:<5} {} {}",
@@ -1744,7 +1899,7 @@ fn print_rich_status(status: &SystemStatus) {
                 "\u{2502}".dark_grey(),
                 ws.total,
                 "\u{2502}".dark_grey(),
-                phases_str.dark_grey(),
+                display_phases.dark_grey(),
             );
         }
     }
@@ -1835,6 +1990,88 @@ fn print_rich_status(status: &SystemStatus) {
     }
 }
 
+/// Render runtime statistics with crossterm colours for the rich format.
+fn print_rich_runtime(stats: &RuntimeStats) {
+    let mut stdout = io::stdout();
+
+    let _ = writeln!(stdout);
+    let _ = writeln!(stdout, "  {}", "Runtime Stats (last 24h)".bold().cyan());
+    let _ = writeln!(
+        stdout,
+        "  {}",
+        "\u{2500}".repeat(box_content_width().min(60)).dark_grey()
+    );
+    let _ = writeln!(
+        stdout,
+        "  Total tokens:  {} (in: {} / out: {})",
+        fmt_num(stats.total_tokens).bold(),
+        fmt_num(stats.total_tokens_input),
+        fmt_num(stats.total_tokens_output),
+    );
+    let _ = writeln!(
+        stdout,
+        "  Executions:    {}",
+        stats.executions.to_string().bold()
+    );
+    match stats.avg_duration_ms {
+        Some(d) => {
+            let _ = writeln!(stdout, "  Avg duration:  {:.0}ms", d);
+        }
+        None => {
+            let _ = writeln!(stdout, "  Avg duration:  -");
+        }
+    }
+
+    if !stats.by_model.is_empty() {
+        let _ = writeln!(stdout);
+        let _ = writeln!(
+            stdout,
+            "  {:<20} {:>10} {:>10} {:>10} {:>6} {:>10}",
+            "Model".bold().underlined(),
+            "Input".bold().underlined(),
+            "Output".bold().underlined(),
+            "Total".bold().underlined(),
+            "Runs".bold().underlined(),
+            "Avg ms".bold().underlined(),
+        );
+        let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(70).dark_grey(),);
+
+        let mut models: Vec<_> = stats.by_model.values().collect();
+        models.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+
+        for m in &models {
+            let avg = m
+                .avg_duration_ms
+                .map_or_else(|| "-".to_string(), |d| format!("{d:.0}"));
+            let _ = writeln!(
+                stdout,
+                "  {:<20} {:>10} {:>10} {:>10} {:>6} {:>10}",
+                m.model.as_str().cyan(),
+                fmt_num(m.input_tokens),
+                fmt_num(m.output_tokens),
+                fmt_num(m.total_tokens),
+                m.executions,
+                avg,
+            );
+        }
+
+        // Aggregation totals row when multiple models present
+        if models.len() > 1 {
+            let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(70).dark_grey());
+            let _ = writeln!(
+                stdout,
+                "  {:<20} {:>10} {:>10} {:>10} {:>6}",
+                "Total".bold(),
+                fmt_num(stats.total_tokens_input),
+                fmt_num(stats.total_tokens_output),
+                fmt_num(stats.total_tokens),
+                stats.executions,
+            );
+        }
+    }
+    let _ = writeln!(stdout);
+}
+
 fn print_text_spec_status(status: &SpecStatus) {
     println!("Workspace: {}", status.workspace);
     println!("Config:    {}", status.config_path);
@@ -1852,29 +2089,47 @@ fn print_text_spec_status(status: &SpecStatus) {
 
 fn print_rich_spec_status(status: &SpecStatus) {
     let mut stdout = io::stdout();
+    let w = box_content_width();
 
+    let border_h = "\u{2500}".repeat(w);
+    let _ = writeln!(stdout, "\u{250c}{border_h}\u{2510}");
+
+    // Workspace name (bold) with padding
+    let ws_label = "Workspace: ";
+    let ws_pad = w.saturating_sub(2 + ws_label.len() + status.workspace.len());
     let _ = writeln!(
         stdout,
-        "\u{250c}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2510}"
+        "\u{2502} {ws_label}{}{:ws_pad$} \u{2502}",
+        status.workspace.clone().bold(),
+        "",
+        ws_pad = ws_pad,
     );
-    let ws_name = status.workspace.clone().bold();
-    let _ = writeln!(stdout, "\u{2502} Workspace: {ws_name:<25} \u{2502}");
+
+    let cfg_label = "Config:    ";
+    let cfg_val = &status.config_path;
+    let cfg_pad = w.saturating_sub(2 + cfg_label.len() + cfg_val.len());
     let _ = writeln!(
         stdout,
-        "\u{2502} Config:    {:<25} \u{2502}",
-        status.config_path
+        "\u{2502} {cfg_label}{cfg_val}{:cfg_pad$} \u{2502}",
+        "",
+        cfg_pad = cfg_pad,
     );
+
+    let items_label = "Items:     ";
+    let items_val = status.item_count.to_string();
+    let items_pad = w.saturating_sub(2 + items_label.len() + items_val.len());
     let _ = writeln!(
         stdout,
-        "\u{2502} Items:     {:<25} \u{2502}",
-        status.item_count
+        "\u{2502} {items_label}{items_val}{:items_pad$} \u{2502}",
+        "",
+        items_pad = items_pad,
     );
-    let _ = writeln!(
-        stdout,
-        "\u{2514}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2518}"
-    );
+
+    let _ = writeln!(stdout, "\u{2514}{border_h}\u{2518}");
 
     if !status.phase_counts.is_empty() {
+        let bar_width = (w.saturating_sub(32)).max(8);
+
         let _ = writeln!(stdout);
         let _ = writeln!(
             stdout,
@@ -1888,9 +2143,11 @@ fn print_rich_spec_status(status: &SpecStatus) {
         );
         let _ = writeln!(
             stdout,
-            "  {}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "  {}{}{}{}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
             "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(16),
             "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(9),
             "\u{253c}".dark_grey(),
         );
         let total = status.item_count.max(1);
@@ -1898,7 +2155,7 @@ fn print_rich_spec_status(status: &SpecStatus) {
             let color = to_crossterm_color(dashboard::phase_color(&pc.phase));
             let phase_styled = style::style(format!("{:<14}", pc.phase)).with(color);
             let pct = (pc.count as f64 / total as f64 * 100.0) as u32;
-            let bar = render_progress_bar(pct, 12);
+            let bar = render_progress_bar(pct, bar_width);
             let _ = writeln!(
                 stdout,
                 "  {} {phase_styled} {} {:<8} {} {} {:>3}%",
@@ -1919,7 +2176,8 @@ fn print_rich_spec_status(status: &SpecStatus) {
             .map(|pc| pc.count)
             .sum();
         let overall_pct = (finished as f64 / total as f64 * 100.0) as u32;
-        let overall_bar = render_progress_bar(overall_pct, 28);
+        let overall_bar_width = (w.saturating_sub(22)).max(10);
+        let overall_bar = render_progress_bar(overall_pct, overall_bar_width);
         let _ = writeln!(stdout);
         let _ = writeln!(
             stdout,
@@ -1931,15 +2189,20 @@ fn print_rich_spec_status(status: &SpecStatus) {
     // Token usage analysis
     if let Some(ref usage) = status.token_usage {
         let _ = writeln!(stdout);
-        let _ = writeln!(stdout, "  {}", "Token Usage".bold());
+        let _ = writeln!(stdout, "  {}", "Token Usage".bold().cyan());
+        let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(w.min(60)).dark_grey());
         let _ = writeln!(
             stdout,
             "  Total:  {} (in: {} / out: {})",
-            fmt_num(usage.total_tokens),
+            fmt_num(usage.total_tokens).bold(),
             fmt_num(usage.total_input),
             fmt_num(usage.total_output),
         );
-        let _ = writeln!(stdout, "  Executions: {}", usage.executions);
+        let _ = writeln!(
+            stdout,
+            "  Executions: {}",
+            usage.executions.to_string().bold()
+        );
         if !usage.by_model.is_empty() {
             let _ = writeln!(stdout);
             let _ = writeln!(
@@ -1951,11 +2214,12 @@ fn print_rich_spec_status(status: &SpecStatus) {
                 "Total".bold().underlined(),
                 "Runs".bold().underlined(),
             );
+            let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(59).dark_grey(),);
             for m in &usage.by_model {
                 let _ = writeln!(
                     stdout,
                     "  {:<20} {:>10} {:>10} {:>10} {:>5}",
-                    m.model,
+                    m.model.as_str().cyan(),
                     fmt_num(m.input_tokens),
                     fmt_num(m.output_tokens),
                     fmt_num(m.total_tokens),
@@ -1964,7 +2228,7 @@ fn print_rich_spec_status(status: &SpecStatus) {
             }
             // Aggregation totals row
             if usage.by_model.len() > 1 {
-                let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(59).dark_grey(),);
+                let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(59).dark_grey());
                 let _ = writeln!(
                     stdout,
                     "  {:<20} {:>10} {:>10} {:>10} {:>5}",

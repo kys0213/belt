@@ -746,14 +746,15 @@ fn cmd_status(format: &str) -> anyhow::Result<()> {
     let daemon_running = read_pid().is_ok();
     let sys_status = status::gather_status(&db)?;
 
-    if format != "json" {
+    // For non-rich formats, print daemon status as plain text (rich embeds it in the header box).
+    if format != "json" && format != "rich" {
         println!(
             "Daemon: {}",
             if daemon_running { "running" } else { "stopped" }
         );
     }
 
-    status::print_status(&sys_status, format)
+    status::print_status(&sys_status, format, Some(daemon_running))
 }
 
 /// `belt queue list` -- list queue items with optional filters.
