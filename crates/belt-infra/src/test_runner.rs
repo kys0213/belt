@@ -1,32 +1,38 @@
 //! Test runner for spec verification commands.
 //!
-//! Executes a list of shell commands and reports the aggregate result.
-//! Used by the gap-detection cron job to verify that a spec's test suite
-//! passes before advancing it from Completing to Completed.
+//! Implements the [`belt_core::test_runner::TestRunner`] trait by executing
+//! shell commands via `sh -c`. Used by the gap-detection cron job to verify
+//! that a spec's test suite passes before advancing from Completing to Completed.
 
 use std::path::Path;
 use std::process::Command;
 
 use belt_core::error::BeltError;
+use belt_core::test_runner::{TestCommandResult, TestRunResult, TestRunner};
 
-/// Result of executing a single test command.
-#[derive(Debug, Clone)]
-pub struct TestCommandResult {
-    /// The command that was executed.
-    pub command: String,
-    /// Whether the command exited successfully (exit code 0).
-    pub success: bool,
-    /// Combined stdout/stderr output (truncated if very large).
-    pub output: String,
+/// Shell-based test runner that executes commands via `sh -c`.
+///
+/// Each command is spawned as a child process in the given working directory.
+/// Pipes, redirects, and other shell features work as expected.
+#[derive(Debug, Default)]
+pub struct ShellTestRunner;
+
+impl ShellTestRunner {
+    /// Create a new `ShellTestRunner`.
+    pub fn new() -> Self {
+        Self
+    }
 }
 
-/// Aggregate result of running all test commands for a spec.
-#[derive(Debug, Clone)]
-pub struct TestRunResult {
-    /// Individual command results.
-    pub results: Vec<TestCommandResult>,
-    /// `true` only when every command succeeded.
-    pub all_passed: bool,
+impl TestRunner for ShellTestRunner {
+    fn run(
+        &self,
+        commands: &[&str],
+        working_dir: &Path,
+        fail_fast: bool,
+    ) -> Result<TestRunResult, BeltError> {
+        run_test_commands(commands, working_dir, fail_fast)
+    }
 }
 
 /// Run a list of shell commands sequentially in the given working directory.
@@ -154,5 +160,23 @@ mod tests {
         let result = run_test_commands(&["true", "true", "true"], tmp.path(), false).unwrap();
         assert!(result.all_passed);
         assert_eq!(result.results.len(), 3);
+    }
+
+    #[test]
+    fn shell_test_runner_trait_impl() {
+        let runner = ShellTestRunner::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let result = runner.run(&["true", "echo ok"], tmp.path(), false).unwrap();
+        assert!(result.all_passed);
+        assert_eq!(result.results.len(), 2);
+    }
+
+    #[test]
+    fn shell_test_runner_fail_fast() {
+        let runner = ShellTestRunner::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let result = runner.run(&["false", "true"], tmp.path(), true).unwrap();
+        assert!(!result.all_passed);
+        assert_eq!(result.results.len(), 1);
     }
 }

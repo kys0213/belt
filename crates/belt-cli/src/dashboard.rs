@@ -216,10 +216,7 @@ fn run_loop(
             DashboardTab::PerWorkspace => {
                 // Items filtered by selected workspace.
                 if let Some(ws) = workspaces.get(state.selected_workspace) {
-                    all_items
-                        .iter()
-                        .filter(|i| i.workspace_id == ws.0)
-                        .count()
+                    all_items.iter().filter(|i| i.workspace_id == ws.0).count()
                 } else {
                     0
                 }
@@ -423,10 +420,7 @@ fn handle_nav_down(
 }
 
 /// Handle Left arrow navigation.
-fn handle_nav_left(
-    state: &mut DashboardState,
-    workspaces: &[(String, String, String)],
-) {
+fn handle_nav_left(state: &mut DashboardState, workspaces: &[(String, String, String)]) {
     match state.active_tab {
         DashboardTab::Dashboard => {
             let ts = state.current_tab_state_mut();
