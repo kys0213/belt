@@ -795,10 +795,29 @@ impl Daemon {
             item.hitl_notes = Some(n);
         }
 
+        // Capture spec-completion metadata before match borrows item.
+        let is_spec_completion = item.state == "spec_completion";
+        let spec_id = item.source_id.clone();
+
         match action {
-            HitlRespondAction::Done => transit(item, QueuePhase::Done),
+            HitlRespondAction::Done => {
+                let result = transit(item, QueuePhase::Done);
+                if result.is_ok() && is_spec_completion {
+                    self.apply_spec_completion_transition(&spec_id);
+                }
+                result
+            }
             HitlRespondAction::Retry => transit(item, QueuePhase::Pending),
-            HitlRespondAction::Skip => transit(item, QueuePhase::Skipped),
+            HitlRespondAction::Skip => {
+                let result = transit(item, QueuePhase::Skipped);
+                if result.is_ok() && is_spec_completion {
+                    tracing::info!(
+                        spec_id = %spec_id,
+                        "spec completion HITL rejected — spec remains in Completing"
+                    );
+                }
+                result
+            }
             HitlRespondAction::Replan => {
                 let new_replan_count = item.replan_count + 1;
 
@@ -854,6 +873,36 @@ impl Daemon {
 
                 Ok(())
             }
+        }
+    }
+
+    /// Transition a spec from Completing to Completed in the database.
+    ///
+    /// Called when a `spec_completion` HITL item is approved (Done).
+    /// Logs a warning and continues if the database is unavailable or the
+    /// transition fails -- the queue item has already moved to Done.
+    fn apply_spec_completion_transition(&self, spec_id: &str) {
+        if let Some(db) = &self.db {
+            match db.update_spec_status(spec_id, belt_core::spec::SpecStatus::Completed) {
+                Ok(()) => {
+                    tracing::info!(
+                        spec_id = %spec_id,
+                        "spec transitioned from Completing to Completed via HITL approval"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        spec_id = %spec_id,
+                        error = %e,
+                        "failed to transition spec to Completed after HITL approval"
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                spec_id = %spec_id,
+                "no database configured — cannot transition spec to Completed"
+            );
         }
     }
 
@@ -3435,5 +3484,111 @@ sources:
 
         // collect() should have been skipped due to shutdown.
         assert_eq!(daemon.queue_items().len(), 0);
+    }
+
+    // --- spec completion HITL response tests ---
+
+    #[test]
+    fn respond_hitl_done_spec_completion_transitions_spec_to_completed() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Set up an in-memory database with a spec in Completing status.
+        let db = Database::open_in_memory().unwrap();
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-42".to_string(),
+            "test-ws".to_string(),
+            "Test Spec".to_string(),
+            "content".to_string(),
+        );
+        spec.status = belt_core::spec::SpecStatus::Completing;
+        db.insert_spec(&spec).unwrap();
+
+        let mut daemon = daemon.with_db(db);
+
+        // Create a spec_completion HITL item.
+        let mut item = QueueItem::new(
+            "spec-completion:spec-42:hitl".to_string(),
+            "spec-42".to_string(),
+            "test-ws".to_string(),
+            "spec_completion".to_string(),
+        );
+        item.phase = QueuePhase::Hitl;
+        item.hitl_reason = Some(HitlReason::SpecCompletionReview);
+        daemon.push_item(item);
+
+        // Approve (Done) the HITL item.
+        let result = daemon.respond_hitl(
+            "spec-completion:spec-42:hitl",
+            HitlRespondAction::Done,
+            Some("reviewer".into()),
+            None,
+        );
+        assert!(result.is_ok());
+
+        // Queue item should be Done.
+        assert_eq!(
+            daemon
+                .get_item("spec-completion:spec-42:hitl")
+                .unwrap()
+                .phase,
+            QueuePhase::Done
+        );
+
+        // Spec should have transitioned to Completed.
+        let updated_spec = daemon.db.as_ref().unwrap().get_spec("spec-42").unwrap();
+        assert_eq!(updated_spec.status, belt_core::spec::SpecStatus::Completed);
+    }
+
+    #[test]
+    fn respond_hitl_skip_spec_completion_keeps_spec_in_completing() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![]);
+
+        let db = Database::open_in_memory().unwrap();
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-43".to_string(),
+            "test-ws".to_string(),
+            "Test Spec".to_string(),
+            "content".to_string(),
+        );
+        spec.status = belt_core::spec::SpecStatus::Completing;
+        db.insert_spec(&spec).unwrap();
+
+        let mut daemon = daemon.with_db(db);
+
+        let mut item = QueueItem::new(
+            "spec-completion:spec-43:hitl".to_string(),
+            "spec-43".to_string(),
+            "test-ws".to_string(),
+            "spec_completion".to_string(),
+        );
+        item.phase = QueuePhase::Hitl;
+        item.hitl_reason = Some(HitlReason::SpecCompletionReview);
+        daemon.push_item(item);
+
+        // Reject (Skip) the HITL item.
+        let result = daemon.respond_hitl(
+            "spec-completion:spec-43:hitl",
+            HitlRespondAction::Skip,
+            Some("reviewer".into()),
+            None,
+        );
+        assert!(result.is_ok());
+
+        // Queue item should be Skipped.
+        assert_eq!(
+            daemon
+                .get_item("spec-completion:spec-43:hitl")
+                .unwrap()
+                .phase,
+            QueuePhase::Skipped
+        );
+
+        // Spec should remain in Completing.
+        let updated_spec = daemon.db.as_ref().unwrap().get_spec("spec-43").unwrap();
+        assert_eq!(updated_spec.status, belt_core::spec::SpecStatus::Completing);
     }
 }

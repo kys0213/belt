@@ -1109,6 +1109,7 @@ fn create_spec_completion_hitl(db: &Database, spec: &belt_core::spec::Spec, deta
     item.phase = QueuePhase::Hitl;
     item.title = Some(format!("Spec '{}' ready for final review", spec.name));
     item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
+    item.hitl_reason = Some(belt_core::queue::HitlReason::SpecCompletionReview);
     item.hitl_notes = Some(format!(
         "Spec '{}' has no gaps and all linked issues are done. {}. \
          Approve to advance from Completing to Completed.",
