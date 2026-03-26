@@ -133,11 +133,11 @@ pub fn gather_status(db: &Database) -> anyhow::Result<SystemStatus> {
     let recent_events = events
         .into_iter()
         .map(|e| EventSummary {
-            item_id: e.item_id,
-            from_state: e.from_state,
-            to_state: e.to_state,
+            item_id: e.work_id,
+            from_state: e.from_phase.unwrap_or_default(),
+            to_state: e.phase.unwrap_or_default(),
             event_type: e.event_type,
-            timestamp: e.timestamp,
+            timestamp: e.created_at,
         })
         .collect();
 
@@ -483,12 +483,13 @@ mod tests {
 
         let ev = TransitionEvent {
             id: "ev-1".to_string(),
-            item_id: "w1:implement".to_string(),
-            from_state: "pending".to_string(),
-            to_state: "running".to_string(),
-            event_type: "phase_change".to_string(),
-            timestamp: chrono::Utc::now().to_rfc3339(),
-            metadata: None,
+            work_id: "w1:implement".to_string(),
+            source_id: "github:org/repo#1".to_string(),
+            event_type: "phase_enter".to_string(),
+            phase: Some("running".to_string()),
+            from_phase: Some("pending".to_string()),
+            detail: None,
+            created_at: chrono::Utc::now().to_rfc3339(),
         };
         db.insert_transition_event(&ev).unwrap();
 
@@ -498,7 +499,7 @@ mod tests {
         assert_eq!(status.recent_events[0].item_id, "w1:implement");
         assert_eq!(status.recent_events[0].from_state, "pending");
         assert_eq!(status.recent_events[0].to_state, "running");
-        assert_eq!(status.recent_events[0].event_type, "phase_change");
+        assert_eq!(status.recent_events[0].event_type, "phase_enter");
     }
 
     #[test]
@@ -508,12 +509,13 @@ mod tests {
         for i in 0..15u32 {
             let ev = TransitionEvent {
                 id: format!("ev-{i}"),
-                item_id: format!("w{i}:implement"),
-                from_state: "pending".to_string(),
-                to_state: "running".to_string(),
-                event_type: "phase_change".to_string(),
-                timestamp: chrono::Utc::now().to_rfc3339(),
-                metadata: None,
+                work_id: format!("w{i}:implement"),
+                source_id: format!("github:org/repo#{i}"),
+                event_type: "phase_enter".to_string(),
+                phase: Some("running".to_string()),
+                from_phase: Some("pending".to_string()),
+                detail: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
             };
             db.insert_transition_event(&ev).unwrap();
         }

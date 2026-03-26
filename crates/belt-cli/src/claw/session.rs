@@ -136,10 +136,10 @@ fn open_default_db() -> Option<belt_infra::db::Database> {
 /// Convert an infra transition event into a [`RecentEvent`].
 fn into_recent_event(e: belt_infra::db::TransitionEvent) -> RecentEvent {
     RecentEvent {
-        item_id: e.item_id,
-        from_state: e.from_state,
-        to_state: e.to_state,
-        timestamp: e.timestamp,
+        item_id: e.work_id,
+        from_state: e.from_phase.unwrap_or_default(),
+        to_state: e.phase.unwrap_or_default(),
+        timestamp: e.created_at,
     }
 }
 
@@ -248,7 +248,7 @@ fn collect_workspace_stats_from_db(
         let all_events = db.list_recent_transition_events(50).ok()?;
         all_events
             .into_iter()
-            .filter(|e| e.to_state == "hitl" && hitl_item_ids.contains(&e.item_id))
+            .filter(|e| e.phase.as_deref() == Some("hitl") && hitl_item_ids.contains(&e.work_id))
             .take(5)
             .map(into_recent_event)
             .collect()

@@ -17,7 +17,7 @@ use belt_core::runtime::RuntimeRegistry;
 use belt_core::source::DataSource;
 use belt_core::state_machine;
 use belt_core::workspace::{StateConfig, WorkspaceConfig};
-use belt_infra::db::Database;
+use belt_infra::db::{Database, TransitionEvent};
 use belt_infra::worktree::WorktreeManager;
 
 use crate::concurrency::ConcurrencyTracker;
@@ -31,16 +31,15 @@ use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
 ///
 /// All phase mutations **must** go through this function so that
 /// [`QueuePhase::can_transition_to`] is always checked.
-fn transit(item: &mut QueueItem, to: QueuePhase) -> Result<(), BeltError> {
-    if !item.phase.can_transition_to(&to) {
-        return Err(BeltError::InvalidTransition {
-            from: item.phase,
-            to,
-        });
+/// Returns the previous phase on success for transition event recording.
+fn transit(item: &mut QueueItem, to: QueuePhase) -> Result<QueuePhase, BeltError> {
+    let from = item.phase;
+    if !from.can_transition_to(&to) {
+        return Err(BeltError::InvalidTransition { from, to });
     }
     item.phase = to;
     item.updated_at = Utc::now().to_rfc3339();
-    Ok(())
+    Ok(from)
 }
 
 /// Daemon -- state machine + yaml prompt/script executor.
@@ -192,6 +191,45 @@ impl Daemon {
     }
 
     // ---------------------------------------------------------------
+    // Transition event recording
+    // ---------------------------------------------------------------
+
+    /// Record a phase transition event to the database.
+    ///
+    /// Silently logs a warning on failure — transition recording must not
+    /// block the state machine.
+    fn record_transition(
+        db: &Option<Arc<Database>>,
+        work_id: &str,
+        source_id: &str,
+        from: QueuePhase,
+        to: QueuePhase,
+        event_type: &str,
+        detail: Option<String>,
+    ) {
+        let Some(db) = db.as_ref() else {
+            return;
+        };
+        let event = TransitionEvent {
+            id: format!("te-{}-{}", work_id, Utc::now().timestamp_millis()),
+            work_id: work_id.to_string(),
+            source_id: source_id.to_string(),
+            event_type: event_type.to_string(),
+            phase: Some(to.as_str().to_string()),
+            from_phase: Some(from.as_str().to_string()),
+            detail,
+            created_at: Utc::now().to_rfc3339(),
+        };
+        if let Err(e) = db.insert_transition_event(&event) {
+            tracing::warn!(
+                work_id = %work_id,
+                error = %e,
+                "failed to record transition event"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
     // Phase 1: Collect items from DataSources
     // ---------------------------------------------------------------
 
@@ -245,6 +283,15 @@ impl Daemon {
 
             if transit(&mut self.queue[idx], QueuePhase::Ready).is_ok() {
                 advanced += 1;
+                Self::record_transition(
+                    &self.db,
+                    &self.queue[idx].work_id,
+                    &self.queue[idx].source_id,
+                    QueuePhase::Pending,
+                    QueuePhase::Ready,
+                    "phase_enter",
+                    None,
+                );
 
                 // Conflict detection: after transitioning to Ready, check if spec
                 // entry_points overlap with other active specs. If so, escalate to HITL.
@@ -256,6 +303,15 @@ impl Daemon {
                     );
                     let now = Utc::now().to_rfc3339();
                     let _ = transit(&mut self.queue[idx], QueuePhase::Hitl);
+                    Self::record_transition(
+                        &self.db,
+                        &self.queue[idx].work_id,
+                        &self.queue[idx].source_id,
+                        QueuePhase::Ready,
+                        QueuePhase::Hitl,
+                        "phase_enter",
+                        Some(notes.clone()),
+                    );
                     self.queue[idx].hitl_created_at = Some(now);
                     self.queue[idx].hitl_reason = Some(HitlReason::SpecConflict);
                     self.queue[idx].hitl_notes = Some(notes);
@@ -272,6 +328,15 @@ impl Daemon {
                 && self.tracker.can_spawn_in_workspace(ws_id, ws_concurrency)
                 && transit(item, QueuePhase::Running).is_ok()
             {
+                Self::record_transition(
+                    &self.db,
+                    &item.work_id,
+                    &item.source_id,
+                    QueuePhase::Ready,
+                    QueuePhase::Running,
+                    "phase_enter",
+                    None,
+                );
                 self.tracker.track(ws_id);
                 advanced += 1;
             }
@@ -604,8 +669,28 @@ impl Daemon {
         } = exec_result;
 
         match outcome {
-            ExecutionOutcome::Skipped => ItemOutcome::Skipped(item),
+            ExecutionOutcome::Skipped => {
+                Self::record_transition(
+                    &self.db,
+                    &item.work_id,
+                    &item.source_id,
+                    QueuePhase::Running,
+                    QueuePhase::Skipped,
+                    "handler",
+                    Some("no state config".to_string()),
+                );
+                ItemOutcome::Skipped(item)
+            }
             ExecutionOutcome::WorktreeError { error } => {
+                Self::record_transition(
+                    &self.db,
+                    &item.work_id,
+                    &item.source_id,
+                    QueuePhase::Running,
+                    QueuePhase::Failed,
+                    "on_fail",
+                    Some(error.clone()),
+                );
                 self.tracker.release(&ws_name);
                 ItemOutcome::Failed {
                     item,
@@ -617,6 +702,15 @@ impl Daemon {
                 if let Some(ref r) = result {
                     self.try_record_token_usage(&item, r);
                 }
+                Self::record_transition(
+                    &self.db,
+                    &item.work_id,
+                    &item.source_id,
+                    QueuePhase::Running,
+                    QueuePhase::Completed,
+                    "handler",
+                    None,
+                );
                 self.record_history(&item, "completed", None);
                 self.record_history_event(&item, "completed", None);
                 self.tracker.release(&ws_name);
@@ -634,6 +728,15 @@ impl Daemon {
                 if let Some(ref r) = result {
                     self.try_record_token_usage(&item, r);
                 }
+                Self::record_transition(
+                    &self.db,
+                    &item.work_id,
+                    &item.source_id,
+                    QueuePhase::Running,
+                    QueuePhase::Failed,
+                    "on_fail",
+                    Some(error.clone()),
+                );
 
                 let failure_count = self.count_failures(&item.source_id, &item.state);
                 let escalation = self.resolve_escalation(&item.state, failure_count + 1);
@@ -698,7 +801,17 @@ impl Daemon {
             .iter_mut()
             .find(|it| it.work_id == work_id)
             .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-        transit(item, QueuePhase::Completed)
+        let from = transit(item, QueuePhase::Completed)?;
+        Self::record_transition(
+            &self.db,
+            work_id,
+            &item.source_id,
+            from,
+            QueuePhase::Completed,
+            "phase_enter",
+            None,
+        );
+        Ok(())
     }
 
     /// Mark a Completed item as Done.
@@ -711,7 +824,16 @@ impl Daemon {
             .iter_mut()
             .find(|it| it.work_id == work_id)
             .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-        transit(item, QueuePhase::Done)?;
+        let from = transit(item, QueuePhase::Done)?;
+        Self::record_transition(
+            &self.db,
+            work_id,
+            &item.source_id,
+            from,
+            QueuePhase::Done,
+            "phase_enter",
+            None,
+        );
 
         if let Err(e) = self.worktree_mgr.cleanup(work_id) {
             tracing::warn!(work_id, error = %e, "worktree cleanup failed on mark_done, continuing");
@@ -732,10 +854,19 @@ impl Daemon {
             .iter_mut()
             .find(|it| it.work_id == work_id)
             .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-        transit(item, QueuePhase::Hitl)?;
+        let from = transit(item, QueuePhase::Hitl)?;
         item.hitl_created_at = Some(Utc::now().to_rfc3339());
         item.hitl_reason = Some(reason);
-        item.hitl_notes = notes;
+        item.hitl_notes = notes.clone();
+        Self::record_transition(
+            &self.db,
+            work_id,
+            &item.source_id,
+            from,
+            QueuePhase::Hitl,
+            "phase_enter",
+            Some(format!("reason: {reason}")),
+        );
         Ok(())
     }
 
@@ -746,7 +877,17 @@ impl Daemon {
             .iter_mut()
             .find(|it| it.work_id == work_id)
             .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-        transit(item, QueuePhase::Skipped)
+        let from = transit(item, QueuePhase::Skipped)?;
+        Self::record_transition(
+            &self.db,
+            work_id,
+            &item.source_id,
+            from,
+            QueuePhase::Skipped,
+            "phase_enter",
+            None,
+        );
+        Ok(())
     }
 
     /// Retry a Hitl item by sending it back to Pending.
@@ -756,7 +897,17 @@ impl Daemon {
             .iter_mut()
             .find(|it| it.work_id == work_id)
             .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-        transit(item, QueuePhase::Pending)
+        let from = transit(item, QueuePhase::Pending)?;
+        Self::record_transition(
+            &self.db,
+            work_id,
+            &item.source_id,
+            from,
+            QueuePhase::Pending,
+            "phase_enter",
+            Some("retry from hitl".to_string()),
+        );
+        Ok(())
     }
 
     /// Maximum number of replan attempts before failing permanently.
@@ -798,25 +949,56 @@ impl Daemon {
         // Capture spec-completion metadata before match borrows item.
         let is_spec_completion = item.state == "spec_completion";
         let spec_id = item.source_id.clone();
+        let source_id_clone = spec_id.clone();
 
         match action {
             HitlRespondAction::Done => {
-                let result = transit(item, QueuePhase::Done);
-                if result.is_ok() && is_spec_completion {
+                let from = transit(item, QueuePhase::Done)?;
+                Self::record_transition(
+                    &self.db,
+                    work_id,
+                    &source_id_clone,
+                    from,
+                    QueuePhase::Done,
+                    "handler",
+                    Some("hitl respond: done".to_string()),
+                );
+                if is_spec_completion {
                     self.apply_spec_completion_transition(&spec_id);
                 }
-                result
+                Ok(())
             }
-            HitlRespondAction::Retry => transit(item, QueuePhase::Pending),
+            HitlRespondAction::Retry => {
+                let from = transit(item, QueuePhase::Pending)?;
+                Self::record_transition(
+                    &self.db,
+                    work_id,
+                    &source_id_clone,
+                    from,
+                    QueuePhase::Pending,
+                    "handler",
+                    Some("hitl respond: retry".to_string()),
+                );
+                Ok(())
+            }
             HitlRespondAction::Skip => {
-                let result = transit(item, QueuePhase::Skipped);
-                if result.is_ok() && is_spec_completion {
+                let from = transit(item, QueuePhase::Skipped)?;
+                Self::record_transition(
+                    &self.db,
+                    work_id,
+                    &source_id_clone,
+                    from,
+                    QueuePhase::Skipped,
+                    "handler",
+                    Some("hitl respond: skip".to_string()),
+                );
+                if is_spec_completion {
                     tracing::info!(
                         spec_id = %spec_id,
                         "spec completion HITL rejected — spec remains in Completing"
                     );
                 }
-                result
+                Ok(())
             }
             HitlRespondAction::Replan => {
                 let new_replan_count = item.replan_count + 1;
@@ -829,7 +1011,17 @@ impl Daemon {
                         "replan limit exceeded, transitioning to Failed"
                     );
                     item.replan_count = new_replan_count;
-                    return transit(item, QueuePhase::Failed);
+                    let from = transit(item, QueuePhase::Failed)?;
+                    Self::record_transition(
+                        &self.db,
+                        work_id,
+                        &source_id_clone,
+                        from,
+                        QueuePhase::Failed,
+                        "handler",
+                        Some("replan limit exceeded".to_string()),
+                    );
+                    return Ok(());
                 }
 
                 // Capture metadata before mutating the item for the new HITL item.
@@ -843,7 +1035,16 @@ impl Daemon {
 
                 // Roll back item to Pending with incremented replan_count.
                 item.replan_count = new_replan_count;
-                transit(item, QueuePhase::Pending)?;
+                let from = transit(item, QueuePhase::Pending)?;
+                Self::record_transition(
+                    &self.db,
+                    work_id,
+                    &source_id_clone,
+                    from,
+                    QueuePhase::Pending,
+                    "handler",
+                    Some(format!("replan attempt {new_replan_count}")),
+                );
 
                 // Create a new HITL item for spec modification proposal.
                 let replan_work_id = format!("{work_id}:replan-{new_replan_count}");
@@ -919,8 +1120,17 @@ impl Daemon {
         let source_id = item.source_id.clone();
         let state = item.state.clone();
 
-        transit(item, QueuePhase::Failed)?;
+        let from = transit(item, QueuePhase::Failed)?;
         item.mark_worktree_preserved();
+        Self::record_transition(
+            &self.db,
+            work_id,
+            &source_id,
+            from,
+            QueuePhase::Failed,
+            "on_fail",
+            Some(error.clone()),
+        );
 
         // Register preserved worktree by source_id for potential reuse.
         let ws_name = &self.config.name;

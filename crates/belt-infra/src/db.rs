@@ -104,22 +104,26 @@ pub struct TokenUsageRow {
 }
 
 /// A transition event recording a state change for a queue item.
+///
+/// Schema aligned with spec `05-monitoring.md` section 6.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionEvent {
     /// Unique event identifier.
     pub id: String,
-    /// The queue item this transition belongs to.
-    pub item_id: String,
-    /// Phase before the transition.
-    pub from_state: String,
-    /// Phase after the transition.
-    pub to_state: String,
-    /// Type of event (e.g. "phase_change", "manual", "auto").
+    /// The queue item this transition belongs to (spec: `work_id`).
+    pub work_id: String,
+    /// External source entity identifier for lineage tracking (spec: `source_id`).
+    pub source_id: String,
+    /// Type of event (e.g. "phase_enter", "handler", "evaluate", "on_done", "on_fail").
     pub event_type: String,
-    /// When this transition occurred (RFC 3339).
-    pub timestamp: String,
-    /// Optional JSON metadata.
-    pub metadata: Option<String>,
+    /// The phase entered (spec: `phase`).
+    pub phase: Option<String>,
+    /// The phase before the transition, for timeline rendering.
+    pub from_phase: Option<String>,
+    /// Human-readable detail: script exit code, prompt result, error message (spec: `detail`).
+    pub detail: Option<String>,
+    /// When this transition occurred (RFC 3339) (spec: `created_at`).
+    pub created_at: String,
 }
 
 /// Per-model aggregated statistics from the `token_usage` table.
@@ -324,12 +328,13 @@ impl Database {
 
             CREATE TABLE IF NOT EXISTS transition_events (
                 id         TEXT PRIMARY KEY,
-                item_id    TEXT NOT NULL,
-                from_state TEXT NOT NULL,
-                to_state   TEXT NOT NULL,
+                work_id    TEXT NOT NULL,
+                source_id  TEXT NOT NULL,
                 event_type TEXT NOT NULL,
-                timestamp  TEXT NOT NULL,
-                metadata   TEXT
+                phase      TEXT,
+                from_phase TEXT,
+                detail     TEXT,
+                created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS queue_dependencies (
@@ -1382,45 +1387,47 @@ impl Database {
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.execute(
-            "INSERT INTO transition_events (id, item_id, from_state, to_state, event_type, timestamp, metadata)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO transition_events (id, work_id, source_id, event_type, phase, from_phase, detail, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 event.id,
-                event.item_id,
-                event.from_state,
-                event.to_state,
+                event.work_id,
+                event.source_id,
                 event.event_type,
-                event.timestamp,
-                event.metadata,
+                event.phase,
+                event.from_phase,
+                event.detail,
+                event.created_at,
             ],
         )
         .map_err(|e| BeltError::Database(e.to_string()))?;
         Ok(())
     }
 
-    /// List transition events for a given item, ordered by timestamp ascending.
-    pub fn list_transition_events(&self, item_id: &str) -> Result<Vec<TransitionEvent>, BeltError> {
+    /// List transition events for a given item, ordered by created_at ascending.
+    pub fn list_transition_events(&self, work_id: &str) -> Result<Vec<TransitionEvent>, BeltError> {
         let conn = self
             .conn
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, item_id, from_state, to_state, event_type, timestamp, metadata
-                 FROM transition_events WHERE item_id = ?1 ORDER BY timestamp ASC",
+                "SELECT id, work_id, source_id, event_type, phase, from_phase, detail, created_at
+                 FROM transition_events WHERE work_id = ?1 ORDER BY created_at ASC",
             )
             .map_err(|e| BeltError::Database(e.to_string()))?;
 
         let events = stmt
-            .query_map(params![item_id], |row| {
+            .query_map(params![work_id], |row| {
                 Ok(TransitionEvent {
                     id: row.get(0)?,
-                    item_id: row.get(1)?,
-                    from_state: row.get(2)?,
-                    to_state: row.get(3)?,
-                    event_type: row.get(4)?,
-                    timestamp: row.get(5)?,
-                    metadata: row.get(6)?,
+                    work_id: row.get(1)?,
+                    source_id: row.get(2)?,
+                    event_type: row.get(3)?,
+                    phase: row.get(4)?,
+                    from_phase: row.get(5)?,
+                    detail: row.get(6)?,
+                    created_at: row.get(7)?,
                 })
             })
             .map_err(|e| BeltError::Database(e.to_string()))?
@@ -1431,7 +1438,7 @@ impl Database {
 
     /// List the most recent transition events across all items.
     ///
-    /// Returns up to `limit` events ordered by timestamp descending.
+    /// Returns up to `limit` events ordered by created_at descending.
     pub fn list_recent_transition_events(
         &self,
         limit: u32,
@@ -1442,8 +1449,8 @@ impl Database {
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, item_id, from_state, to_state, event_type, timestamp, metadata
-                 FROM transition_events ORDER BY timestamp DESC LIMIT ?1",
+                "SELECT id, work_id, source_id, event_type, phase, from_phase, detail, created_at
+                 FROM transition_events ORDER BY created_at DESC LIMIT ?1",
             )
             .map_err(|e| BeltError::Database(e.to_string()))?;
 
@@ -1451,12 +1458,13 @@ impl Database {
             .query_map(params![limit], |row| {
                 Ok(TransitionEvent {
                     id: row.get(0)?,
-                    item_id: row.get(1)?,
-                    from_state: row.get(2)?,
-                    to_state: row.get(3)?,
-                    event_type: row.get(4)?,
-                    timestamp: row.get(5)?,
-                    metadata: row.get(6)?,
+                    work_id: row.get(1)?,
+                    source_id: row.get(2)?,
+                    event_type: row.get(3)?,
+                    phase: row.get(4)?,
+                    from_phase: row.get(5)?,
+                    detail: row.get(6)?,
+                    created_at: row.get(7)?,
                 })
             })
             .map_err(|e| BeltError::Database(e.to_string()))?
@@ -2991,20 +2999,23 @@ mod tests {
         let db = test_db();
         let ev = TransitionEvent {
             id: "ev1".to_string(),
-            item_id: "w1".to_string(),
-            from_state: "pending".to_string(),
-            to_state: "running".to_string(),
-            event_type: "phase_change".to_string(),
-            timestamp: Utc::now().to_rfc3339(),
-            metadata: None,
+            work_id: "w1".to_string(),
+            source_id: "github:org/repo#1".to_string(),
+            event_type: "phase_enter".to_string(),
+            phase: Some("running".to_string()),
+            from_phase: Some("pending".to_string()),
+            detail: None,
+            created_at: Utc::now().to_rfc3339(),
         };
         db.insert_transition_event(&ev).unwrap();
 
         let events = db.list_transition_events("w1").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].id, "ev1");
-        assert_eq!(events[0].from_state, "pending");
-        assert_eq!(events[0].to_state, "running");
+        assert_eq!(events[0].work_id, "w1");
+        assert_eq!(events[0].source_id, "github:org/repo#1");
+        assert_eq!(events[0].from_phase.as_deref(), Some("pending"));
+        assert_eq!(events[0].phase.as_deref(), Some("running"));
     }
 
     #[test]
@@ -3013,12 +3024,13 @@ mod tests {
         for i in 0..5 {
             let ev = TransitionEvent {
                 id: format!("ev{i}"),
-                item_id: format!("w{i}"),
-                from_state: "pending".to_string(),
-                to_state: "running".to_string(),
-                event_type: "phase_change".to_string(),
-                timestamp: Utc::now().to_rfc3339(),
-                metadata: None,
+                work_id: format!("w{i}"),
+                source_id: format!("github:org/repo#{i}"),
+                event_type: "phase_enter".to_string(),
+                phase: Some("running".to_string()),
+                from_phase: Some("pending".to_string()),
+                detail: None,
+                created_at: Utc::now().to_rfc3339(),
             };
             db.insert_transition_event(&ev).unwrap();
         }
