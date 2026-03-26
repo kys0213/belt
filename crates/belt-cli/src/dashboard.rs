@@ -877,6 +877,11 @@ fn render_dashboard_tab(
 }
 
 /// Render the per-workspace tab showing items filtered by the selected workspace.
+///
+/// Layout:
+/// - Workspace selector bar (top)
+/// - Workspace phase summary + spec progress side by side (middle)
+/// - Items table for the selected workspace (bottom)
 fn render_per_workspace_tab(
     frame: &mut ratatui::Frame,
     db: &Database,
@@ -886,7 +891,11 @@ fn render_per_workspace_tab(
 ) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Length(5),
+            Constraint::Min(5),
+        ])
         .split(area);
 
     // Workspace selector bar.
@@ -931,6 +940,17 @@ fn render_per_workspace_tab(
     // Items for the selected workspace.
     let selected_ws = &workspaces[state.selected_workspace].0;
     let ws_items = db.list_items(None, Some(selected_ws)).unwrap_or_default();
+
+    // Workspace summary: phase counts + spec progress side by side.
+    let summary_cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+
+    render_workspace_phase_summary(frame, summary_cols[0], &ws_items);
+    render_workspace_spec_progress(frame, db, summary_cols[1], selected_ws);
+
+    // Item table.
     let selected_index = state.current_tab_state().selected_index;
 
     let rows: Vec<Row<'static>> = ws_items
@@ -981,7 +1001,119 @@ fn render_per_workspace_tab(
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Green)),
     );
-    frame.render_widget(table, chunks[1]);
+    frame.render_widget(table, chunks[2]);
+}
+
+/// Render a compact phase summary for a single workspace's items.
+fn render_workspace_phase_summary(frame: &mut ratatui::Frame, area: Rect, ws_items: &[QueueItem]) {
+    let mut phase_counts: HashMap<String, usize> = HashMap::new();
+    for item in ws_items {
+        *phase_counts
+            .entry(item.phase.as_str().to_string())
+            .or_insert(0) += 1;
+    }
+
+    let all_phases = [
+        "pending",
+        "ready",
+        "running",
+        "completed",
+        "done",
+        "hitl",
+        "failed",
+    ];
+
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (i, phase) in all_phases.iter().enumerate() {
+        let count = phase_counts.get(*phase).copied().unwrap_or(0);
+        let color = phase_color(phase);
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            format!("{phase}:{count}"),
+            Style::default().fg(color),
+        ));
+    }
+
+    let total = ws_items.len();
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        format!("total:{total}"),
+        Style::default().add_modifier(Modifier::BOLD),
+    ));
+
+    let summary = Paragraph::new(Line::from(spans)).block(
+        Block::default()
+            .title(" Phase Summary ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(summary, area);
+}
+
+/// Render spec progress for a single workspace.
+fn render_workspace_spec_progress(
+    frame: &mut ratatui::Frame,
+    db: &Database,
+    area: Rect,
+    workspace_id: &str,
+) {
+    let specs = db.list_specs(Some(workspace_id), None).unwrap_or_default();
+    let total = specs.len();
+    let completed = specs
+        .iter()
+        .filter(|s| s.status == SpecStatus::Completed)
+        .count();
+    let active = specs
+        .iter()
+        .filter(|s| s.status == SpecStatus::Active)
+        .count();
+    let progress_pct = if total > 0 {
+        (completed as f64 / total as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let bar_width = 15usize;
+    let filled = if total > 0 {
+        (completed * bar_width) / total
+    } else {
+        0
+    };
+    let empty = bar_width.saturating_sub(filled);
+
+    let line = Line::from(vec![
+        Span::styled(
+            format!("{total} specs"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(format!("active:{active}"), Style::default().fg(Color::Blue)),
+        Span::raw(" "),
+        Span::styled(
+            format!("done:{completed}"),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw("  ["),
+        Span::styled("#".repeat(filled), Style::default().fg(Color::Green)),
+        Span::styled("-".repeat(empty), Style::default().fg(Color::DarkGray)),
+        Span::raw("]"),
+        Span::styled(
+            format!(" {progress_pct:.0}%"),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]);
+
+    let paragraph = Paragraph::new(line).block(
+        Block::default()
+            .title(" Spec Progress ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta)),
+    );
+    frame.render_widget(paragraph, area);
 }
 
 /// Render the spec progress tab showing all specs with status and progress.
