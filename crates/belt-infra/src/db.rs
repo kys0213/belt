@@ -3189,4 +3189,151 @@ mod tests {
         let recent = db.get_recent_script_executions(10).unwrap();
         assert!(recent.is_empty());
     }
+
+    // ---- worktree_preserved ------------------------------------------------
+
+    #[test]
+    fn insert_item_with_worktree_preserved_true() {
+        let db = test_db();
+        let mut item = sample_item();
+        item.worktree_preserved = true;
+        db.insert_item(&item).unwrap();
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert!(fetched.worktree_preserved);
+    }
+
+    #[test]
+    fn insert_item_worktree_preserved_defaults_to_false() {
+        let db = test_db();
+        let item = sample_item();
+        assert!(!item.worktree_preserved);
+        db.insert_item(&item).unwrap();
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert!(!fetched.worktree_preserved);
+    }
+
+    #[test]
+    fn worktree_preserved_survives_phase_update() {
+        let db = test_db();
+        let mut item = sample_item();
+        item.worktree_preserved = true;
+        db.insert_item(&item).unwrap();
+
+        db.update_phase(&item.work_id, QueuePhase::Running).unwrap();
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert!(fetched.worktree_preserved);
+        assert_eq!(fetched.phase, QueuePhase::Running);
+    }
+
+    #[test]
+    fn worktree_preserved_visible_in_list_items() {
+        let db = test_db();
+
+        let mut item1 = sample_item();
+        item1.work_id = "w-preserved".to_string();
+        item1.worktree_preserved = true;
+        db.insert_item(&item1).unwrap();
+
+        let mut item2 = sample_item();
+        item2.work_id = "w-not-preserved".to_string();
+        item2.worktree_preserved = false;
+        db.insert_item(&item2).unwrap();
+
+        let items = db.list_items(None, None).unwrap();
+        assert_eq!(items.len(), 2);
+
+        let preserved: Vec<_> = items.iter().filter(|i| i.worktree_preserved).collect();
+        assert_eq!(preserved.len(), 1);
+        assert_eq!(preserved[0].work_id, "w-preserved");
+    }
+
+    // ---- reset_cron_last_run (additional) ----------------------------------
+
+    #[test]
+    fn reset_cron_last_run_idempotent_on_null() {
+        let db = test_db();
+        db.add_cron_job("idem-job", "*/5 * * * *", "/bin/run.sh", None)
+            .unwrap();
+
+        // last_run_at is already NULL after creation.
+        let job = db.get_cron_job("idem-job").unwrap();
+        assert!(job.last_run_at.is_none());
+
+        // Resetting again should succeed without error.
+        db.reset_cron_last_run("idem-job").unwrap();
+        let job = db.get_cron_job("idem-job").unwrap();
+        assert!(job.last_run_at.is_none());
+    }
+
+    #[test]
+    fn reset_cron_last_run_does_not_affect_other_fields() {
+        let db = test_db();
+        db.add_cron_job("field-job", "*/10 * * * *", "/bin/check.sh", Some("ws1"))
+            .unwrap();
+        db.update_cron_last_run("field-job").unwrap();
+
+        db.reset_cron_last_run("field-job").unwrap();
+
+        let job = db.get_cron_job("field-job").unwrap();
+        assert!(job.last_run_at.is_none());
+        // Other fields remain intact.
+        assert_eq!(job.schedule, "*/10 * * * *");
+        assert_eq!(job.script, "/bin/check.sh");
+        assert_eq!(job.workspace.as_deref(), Some("ws1"));
+        assert!(job.enabled);
+    }
+
+    // ---- QUEUE_ITEM_COLUMNS consistency ------------------------------------
+
+    #[test]
+    fn queue_item_columns_count_matches_schema() {
+        let col_count = QUEUE_ITEM_COLUMNS.split(',').count();
+        // The queue_items table has exactly 16 columns:
+        // work_id, source_id, workspace_id, state, phase, title,
+        // created_at, updated_at, hitl_created_at, hitl_respondent,
+        // hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action,
+        // replan_count, worktree_preserved
+        assert_eq!(col_count, 16);
+    }
+
+    #[test]
+    fn queue_item_columns_contains_worktree_preserved() {
+        assert!(
+            QUEUE_ITEM_COLUMNS.contains("worktree_preserved"),
+            "QUEUE_ITEM_COLUMNS must include the worktree_preserved column"
+        );
+    }
+
+    #[test]
+    fn queue_item_columns_all_expected_columns_present() {
+        let expected = [
+            "work_id",
+            "source_id",
+            "workspace_id",
+            "state",
+            "phase",
+            "title",
+            "created_at",
+            "updated_at",
+            "hitl_created_at",
+            "hitl_respondent",
+            "hitl_notes",
+            "hitl_reason",
+            "hitl_timeout_at",
+            "hitl_terminal_action",
+            "replan_count",
+            "worktree_preserved",
+        ];
+        let columns: Vec<&str> = QUEUE_ITEM_COLUMNS.split(',').map(|s| s.trim()).collect();
+        for col_name in &expected {
+            assert!(
+                columns.contains(col_name),
+                "QUEUE_ITEM_COLUMNS is missing column: {col_name}"
+            );
+        }
+        assert_eq!(columns.len(), expected.len());
+    }
 }
