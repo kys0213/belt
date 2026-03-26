@@ -4,11 +4,12 @@
 //! - `run()`: interactive ratatui-based real-time TUI dashboard with multiple tabs
 //! - `render_runtime_panel()`: text-based runtime statistics panel for non-TUI output
 //!
-//! The dashboard supports four tabs:
+//! The dashboard supports five tabs:
 //! - **Dashboard** (`d`): phase summary + running/recent items
 //! - **PerWorkspace** (`w`): items filtered by a selected workspace
 //! - **Spec** (`s`): spec progress view
 //! - **Board** (`b`): kanban-style board with columns per queue phase
+//! - **DataSource** (`n`): real-time DataSource connection status panel
 //!
 //! Tab switching: `d/w/s/b` to jump, or `Tab`/`Shift+Tab` to cycle.
 //! Item selection with arrow keys and item detail overlay (Enter).
@@ -17,6 +18,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -36,6 +38,66 @@ use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::spec::SpecStatus;
 use belt_infra::db::{Database, RuntimeStats, TransitionEvent};
+use belt_infra::workspace_loader::load_workspace_config;
+
+/// Connection status of a DataSource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DataSourceConnectionStatus {
+    /// DataSource is connected and has recent activity.
+    Connected,
+    /// DataSource is configured but has no recent activity.
+    Disconnected,
+    /// DataSource configuration could not be loaded.
+    Error,
+}
+
+impl DataSourceConnectionStatus {
+    /// Return a human-readable label for display.
+    fn label(self) -> &'static str {
+        match self {
+            DataSourceConnectionStatus::Connected => "Connected",
+            DataSourceConnectionStatus::Disconnected => "Disconnected",
+            DataSourceConnectionStatus::Error => "Error",
+        }
+    }
+
+    /// Return the display color for this status.
+    fn color(self) -> Color {
+        match self {
+            DataSourceConnectionStatus::Connected => Color::Green,
+            DataSourceConnectionStatus::Disconnected => Color::DarkGray,
+            DataSourceConnectionStatus::Error => Color::Red,
+        }
+    }
+
+    /// Return a status indicator symbol.
+    fn indicator(self) -> &'static str {
+        match self {
+            DataSourceConnectionStatus::Connected => "●",
+            DataSourceConnectionStatus::Disconnected => "○",
+            DataSourceConnectionStatus::Error => "✗",
+        }
+    }
+}
+
+/// Status information for a single DataSource.
+#[derive(Debug, Clone)]
+struct DataSourceStatusEntry {
+    /// Workspace name this source belongs to.
+    workspace: String,
+    /// Source type name (e.g. "github").
+    source_name: String,
+    /// Source URL.
+    url: String,
+    /// Number of configured states/triggers.
+    state_count: usize,
+    /// Scan interval in seconds.
+    scan_interval_secs: u64,
+    /// Current connection status.
+    status: DataSourceConnectionStatus,
+    /// Number of active (non-terminal) items from this source.
+    active_item_count: usize,
+}
 
 /// Which panel is currently focused for item selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,6 +117,8 @@ enum DashboardTab {
     Spec,
     /// Kanban board with columns per queue phase.
     Board,
+    /// DataSource connection status panel.
+    DataSource,
 }
 
 impl DashboardTab {
@@ -64,17 +128,19 @@ impl DashboardTab {
             DashboardTab::Dashboard => DashboardTab::PerWorkspace,
             DashboardTab::PerWorkspace => DashboardTab::Spec,
             DashboardTab::Spec => DashboardTab::Board,
-            DashboardTab::Board => DashboardTab::Dashboard,
+            DashboardTab::Board => DashboardTab::DataSource,
+            DashboardTab::DataSource => DashboardTab::Dashboard,
         }
     }
 
     /// Return the previous tab in reverse order (Shift+Tab).
     fn prev(self) -> Self {
         match self {
-            DashboardTab::Dashboard => DashboardTab::Board,
+            DashboardTab::Dashboard => DashboardTab::DataSource,
             DashboardTab::PerWorkspace => DashboardTab::Dashboard,
             DashboardTab::Spec => DashboardTab::PerWorkspace,
             DashboardTab::Board => DashboardTab::Spec,
+            DashboardTab::DataSource => DashboardTab::Board,
         }
     }
 }
@@ -130,6 +196,7 @@ impl DashboardState {
         tab_states.insert(1, TabState::default());
         tab_states.insert(2, TabState::default());
         tab_states.insert(3, TabState::default());
+        tab_states.insert(4, TabState::default());
 
         Self {
             active_tab: DashboardTab::Dashboard,
@@ -148,6 +215,7 @@ impl DashboardState {
             DashboardTab::PerWorkspace => 1,
             DashboardTab::Spec => 2,
             DashboardTab::Board => 3,
+            DashboardTab::DataSource => 4,
         }
     }
 
@@ -200,6 +268,7 @@ fn run_loop(
         let recent_items = collect_recent_items(db);
         let workspaces = db.list_workspaces().unwrap_or_default();
         let specs = db.list_specs(None, None).unwrap_or_default();
+        let datasource_entries = collect_datasource_status(&workspaces, &all_items);
 
         // Compute list length for navigation clamping.
         let active_list_len = match state.active_tab {
@@ -223,6 +292,7 @@ fn run_loop(
             }
             DashboardTab::Spec => specs.len(),
             DashboardTab::Board => 0, // Board uses column/row navigation, not a single list.
+            DashboardTab::DataSource => datasource_entries.len(),
         };
 
         // Clamp selected_index for non-Board tabs.
@@ -294,6 +364,14 @@ fn run_loop(
                 DashboardTab::Board => {
                     render_board_tab(frame, outer_chunks[1], &board_columns, &state);
                 }
+                DashboardTab::DataSource => {
+                    render_datasource_tab(
+                        frame,
+                        outer_chunks[1],
+                        &datasource_entries,
+                        state.current_tab_state().selected_index,
+                    );
+                }
             }
 
             // Overlays (rendered on top of everything).
@@ -338,6 +416,9 @@ fn run_loop(
                 }
                 KeyCode::Char('b') => {
                     state.active_tab = DashboardTab::Board;
+                }
+                KeyCode::Char('n') => {
+                    state.active_tab = DashboardTab::DataSource;
                 }
                 KeyCode::Char('h') => {
                     state.show_help = true;
@@ -437,7 +518,7 @@ fn handle_nav_left(state: &mut DashboardState, workspaces: &[(String, String, St
             state.board_selected_col = state.board_selected_col.saturating_sub(1);
             state.board_selected_row = 0;
         }
-        DashboardTab::Spec => {}
+        DashboardTab::Spec | DashboardTab::DataSource => {}
     }
     let _ = workspaces;
 }
@@ -466,7 +547,7 @@ fn handle_nav_right(
                 state.board_selected_row = 0;
             }
         }
-        DashboardTab::Spec => {}
+        DashboardTab::Spec | DashboardTab::DataSource => {}
     }
 }
 
@@ -504,8 +585,8 @@ fn handle_enter(
                 }
             }
         }
-        DashboardTab::Spec => {
-            // Spec tab: no overlay on Enter (could be extended in future).
+        DashboardTab::Spec | DashboardTab::DataSource => {
+            // Spec/DataSource tabs: no overlay on Enter.
         }
         DashboardTab::Board => {
             if let Some(col) = board_columns.get(state.board_selected_col)
@@ -529,6 +610,7 @@ fn render_tab_bar(active: DashboardTab) -> Paragraph<'static> {
         ("w", "Workspace", DashboardTab::PerWorkspace),
         ("s", "Spec", DashboardTab::Spec),
         ("b", "Board", DashboardTab::Board),
+        ("n", "DataSource", DashboardTab::DataSource),
     ];
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -629,6 +711,196 @@ fn render_board_tab(
 
         frame.render_widget(paragraph, col_areas[col_idx]);
     }
+}
+
+/// Collect DataSource status entries from workspace configurations.
+///
+/// For each workspace, loads its config file and extracts configured data sources.
+/// Determines connection status based on whether the workspace has active queue items
+/// from that source.
+fn collect_datasource_status(
+    workspaces: &[(String, String, String)],
+    all_items: &[QueueItem],
+) -> Vec<DataSourceStatusEntry> {
+    let mut entries = Vec::new();
+
+    for (ws_name, config_path, _created_at) in workspaces {
+        let config = match load_workspace_config(Path::new(config_path)) {
+            Ok(c) => c,
+            Err(_) => {
+                // Config could not be loaded — report error status.
+                entries.push(DataSourceStatusEntry {
+                    workspace: ws_name.clone(),
+                    source_name: "(unknown)".to_string(),
+                    url: config_path.clone(),
+                    state_count: 0,
+                    scan_interval_secs: 0,
+                    status: DataSourceConnectionStatus::Error,
+                    active_item_count: 0,
+                });
+                continue;
+            }
+        };
+
+        for (source_name, source_config) in &config.sources {
+            // Count active (non-terminal) items from this workspace.
+            let active_count = all_items
+                .iter()
+                .filter(|item| {
+                    item.workspace_id == *ws_name
+                        && !matches!(
+                            item.phase,
+                            QueuePhase::Done | QueuePhase::Failed | QueuePhase::Completed
+                        )
+                })
+                .count();
+
+            let status = if active_count > 0 {
+                DataSourceConnectionStatus::Connected
+            } else {
+                DataSourceConnectionStatus::Disconnected
+            };
+
+            entries.push(DataSourceStatusEntry {
+                workspace: ws_name.clone(),
+                source_name: source_name.clone(),
+                url: source_config.url.clone(),
+                state_count: source_config.states.len(),
+                scan_interval_secs: source_config.scan_interval_secs,
+                status,
+                active_item_count: active_count,
+            });
+        }
+    }
+
+    entries
+}
+
+/// Render the DataSource status tab showing connection status for all configured sources.
+///
+/// Layout:
+/// - Summary bar (top): count of connected/disconnected/error sources
+/// - DataSource table (bottom): detailed per-source status
+fn render_datasource_tab(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    entries: &[DataSourceStatusEntry],
+    selected_index: usize,
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(5), Constraint::Min(8)])
+        .split(area);
+
+    // Summary bar.
+    let connected = entries
+        .iter()
+        .filter(|e| e.status == DataSourceConnectionStatus::Connected)
+        .count();
+    let disconnected = entries
+        .iter()
+        .filter(|e| e.status == DataSourceConnectionStatus::Disconnected)
+        .count();
+    let error = entries
+        .iter()
+        .filter(|e| e.status == DataSourceConnectionStatus::Error)
+        .count();
+
+    let summary_spans = vec![
+        Span::styled(
+            format!(" {} Connected  ", connected),
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled(
+            format!(" {} Disconnected  ", disconnected),
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(
+            format!(" {} Error ", error),
+            Style::default().fg(Color::Red),
+        ),
+    ];
+
+    let summary = Paragraph::new(Line::from(summary_spans)).block(
+        Block::default()
+            .title(" DataSource Status Summary ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(summary, chunks[0]);
+
+    // DataSource table.
+    let header = Row::new(vec![
+        Cell::from("Status"),
+        Cell::from("Workspace"),
+        Cell::from("Source"),
+        Cell::from("URL"),
+        Cell::from("States"),
+        Cell::from("Interval"),
+        Cell::from("Active"),
+    ])
+    .style(
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let rows: Vec<Row> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let is_selected = i == selected_index;
+            let style = if is_selected {
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .bg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+
+            let status_style = Style::default().fg(entry.status.color());
+            let indicator = format!("{} {}", entry.status.indicator(), entry.status.label());
+
+            let interval_display = if entry.scan_interval_secs >= 60 {
+                format!("{}m", entry.scan_interval_secs / 60)
+            } else {
+                format!("{}s", entry.scan_interval_secs)
+            };
+
+            Row::new(vec![
+                Cell::from(indicator).style(status_style),
+                Cell::from(entry.workspace.clone()),
+                Cell::from(entry.source_name.clone()),
+                Cell::from(truncate_str(&entry.url, 40)),
+                Cell::from(entry.state_count.to_string()),
+                Cell::from(interval_display),
+                Cell::from(entry.active_item_count.to_string()),
+            ])
+            .style(style)
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(16),
+            Constraint::Length(18),
+            Constraint::Length(12),
+            Constraint::Min(20),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(8),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .title(format!(" DataSource ({}) ", entries.len()))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+
+    frame.render_widget(table, chunks[1]);
 }
 
 /// Truncate a string to fit within a given width.
@@ -1328,6 +1600,10 @@ fn render_help_overlay(frame: &mut ratatui::Frame) {
         Line::from(vec![
             Span::styled("  b       ", Style::default().fg(Color::Yellow)),
             Span::raw("Switch to Board (kanban) tab"),
+        ]),
+        Line::from(vec![
+            Span::styled("  n       ", Style::default().fg(Color::Yellow)),
+            Span::raw("Switch to DataSource status tab"),
         ]),
         Line::from(vec![
             Span::styled("  h       ", Style::default().fg(Color::Yellow)),
@@ -2212,12 +2488,14 @@ mod tests {
         assert_eq!(DashboardTab::Dashboard.next(), DashboardTab::PerWorkspace);
         assert_eq!(DashboardTab::PerWorkspace.next(), DashboardTab::Spec);
         assert_eq!(DashboardTab::Spec.next(), DashboardTab::Board);
-        assert_eq!(DashboardTab::Board.next(), DashboardTab::Dashboard);
+        assert_eq!(DashboardTab::Board.next(), DashboardTab::DataSource);
+        assert_eq!(DashboardTab::DataSource.next(), DashboardTab::Dashboard);
     }
 
     #[test]
     fn tab_cycle_backward() {
-        assert_eq!(DashboardTab::Dashboard.prev(), DashboardTab::Board);
+        assert_eq!(DashboardTab::Dashboard.prev(), DashboardTab::DataSource);
+        assert_eq!(DashboardTab::DataSource.prev(), DashboardTab::Board);
         assert_eq!(DashboardTab::Board.prev(), DashboardTab::Spec);
         assert_eq!(DashboardTab::Spec.prev(), DashboardTab::PerWorkspace);
         assert_eq!(DashboardTab::PerWorkspace.prev(), DashboardTab::Dashboard);
@@ -2355,14 +2633,14 @@ mod tests {
     #[test]
     fn tab_next_full_cycle_returns_to_start() {
         let start = DashboardTab::Dashboard;
-        let result = start.next().next().next().next();
+        let result = start.next().next().next().next().next();
         assert_eq!(result, start);
     }
 
     #[test]
     fn tab_prev_full_cycle_returns_to_start() {
         let start = DashboardTab::Dashboard;
-        let result = start.prev().prev().prev().prev();
+        let result = start.prev().prev().prev().prev().prev();
         assert_eq!(result, start);
     }
 
@@ -2373,8 +2651,9 @@ mod tests {
             DashboardTab::PerWorkspace,
             DashboardTab::Spec,
             DashboardTab::Board,
+            DashboardTab::DataSource,
         ] {
-            assert_eq!(tab.next().next().next().next(), tab);
+            assert_eq!(tab.next().next().next().next().next(), tab);
         }
     }
 
@@ -2385,8 +2664,9 @@ mod tests {
             DashboardTab::PerWorkspace,
             DashboardTab::Spec,
             DashboardTab::Board,
+            DashboardTab::DataSource,
         ] {
-            assert_eq!(tab.prev().prev().prev().prev(), tab);
+            assert_eq!(tab.prev().prev().prev().prev().prev(), tab);
         }
     }
 
@@ -2397,6 +2677,7 @@ mod tests {
             DashboardTab::PerWorkspace,
             DashboardTab::Spec,
             DashboardTab::Board,
+            DashboardTab::DataSource,
         ] {
             assert_eq!(tab.next().prev(), tab);
         }
@@ -2409,6 +2690,7 @@ mod tests {
             DashboardTab::PerWorkspace,
             DashboardTab::Spec,
             DashboardTab::Board,
+            DashboardTab::DataSource,
         ] {
             assert_eq!(tab.prev().next(), tab);
         }
@@ -2431,6 +2713,9 @@ mod tests {
 
         state.active_tab = DashboardTab::Board;
         assert_eq!(state.tab_key(), 3);
+
+        state.active_tab = DashboardTab::DataSource;
+        assert_eq!(state.tab_key(), 4);
     }
 
     // ---- Board view state ----
@@ -2473,8 +2758,8 @@ mod tests {
     #[test]
     fn tab_states_initialized_for_all_tabs() {
         let state = DashboardState::new();
-        // All four tab states (keys 0..=3) should exist.
-        for key in 0..=3u8 {
+        // All five tab states (keys 0..=4) should exist.
+        for key in 0..=4u8 {
             assert!(
                 state.tab_states.contains_key(&key),
                 "tab_states should contain key {key}"
@@ -2499,7 +2784,7 @@ mod tests {
     #[test]
     fn non_dashboard_tab_states_have_no_active_panel() {
         let state = DashboardState::new();
-        for key in 1..=3u8 {
+        for key in 1..=4u8 {
             let ts = state.tab_states.get(&key).unwrap();
             assert_eq!(
                 ts.active_panel, None,
@@ -2543,5 +2828,96 @@ mod tests {
         state.active_tab = DashboardTab::Dashboard;
         assert_eq!(state.overlay_item, Some("w-123".to_string()));
         assert!(state.show_help);
+    }
+
+    // ---- DataSource status ----
+
+    #[test]
+    fn datasource_connection_status_labels() {
+        assert_eq!(DataSourceConnectionStatus::Connected.label(), "Connected");
+        assert_eq!(
+            DataSourceConnectionStatus::Disconnected.label(),
+            "Disconnected"
+        );
+        assert_eq!(DataSourceConnectionStatus::Error.label(), "Error");
+    }
+
+    #[test]
+    fn datasource_connection_status_colors() {
+        assert_eq!(DataSourceConnectionStatus::Connected.color(), Color::Green);
+        assert_eq!(
+            DataSourceConnectionStatus::Disconnected.color(),
+            Color::DarkGray
+        );
+        assert_eq!(DataSourceConnectionStatus::Error.color(), Color::Red);
+    }
+
+    #[test]
+    fn datasource_connection_status_indicators() {
+        assert_eq!(DataSourceConnectionStatus::Connected.indicator(), "●");
+        assert_eq!(DataSourceConnectionStatus::Disconnected.indicator(), "○");
+        assert_eq!(DataSourceConnectionStatus::Error.indicator(), "✗");
+    }
+
+    #[test]
+    fn collect_datasource_status_empty_workspaces() {
+        let entries = collect_datasource_status(&[], &[]);
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn collect_datasource_status_error_on_missing_config() {
+        let workspaces = vec![(
+            "test-ws".to_string(),
+            "/nonexistent/path.yml".to_string(),
+            "2026-03-25T00:00:00Z".to_string(),
+        )];
+        let entries = collect_datasource_status(&workspaces, &[]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, DataSourceConnectionStatus::Error);
+        assert_eq!(entries[0].workspace, "test-ws");
+    }
+
+    #[test]
+    fn datasource_tab_key_is_four() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::DataSource;
+        assert_eq!(state.tab_key(), 4);
+    }
+
+    #[test]
+    fn datasource_tab_state_preserved() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::DataSource;
+        state.current_tab_state_mut().selected_index = 7;
+        state.active_tab = DashboardTab::Dashboard;
+        state.active_tab = DashboardTab::DataSource;
+        assert_eq!(state.current_tab_state().selected_index, 7);
+    }
+
+    #[test]
+    fn datasource_status_entry_fields() {
+        let entry = DataSourceStatusEntry {
+            workspace: "my-ws".to_string(),
+            source_name: "github".to_string(),
+            url: "https://github.com/org/repo".to_string(),
+            state_count: 3,
+            scan_interval_secs: 300,
+            status: DataSourceConnectionStatus::Connected,
+            active_item_count: 5,
+        };
+        assert_eq!(entry.workspace, "my-ws");
+        assert_eq!(entry.source_name, "github");
+        assert_eq!(entry.state_count, 3);
+        assert_eq!(entry.scan_interval_secs, 300);
+        assert_eq!(entry.active_item_count, 5);
+        assert_eq!(entry.status, DataSourceConnectionStatus::Connected);
+    }
+
+    #[test]
+    fn datasource_tab_equality() {
+        assert_eq!(DashboardTab::DataSource, DashboardTab::DataSource);
+        assert_ne!(DashboardTab::DataSource, DashboardTab::Dashboard);
+        assert_ne!(DashboardTab::DataSource, DashboardTab::Board);
     }
 }
