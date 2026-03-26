@@ -7,6 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod plugin;
 pub mod session;
 pub mod slash;
 
