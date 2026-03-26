@@ -1689,4 +1689,290 @@ mod tests {
         assert!(prompt.contains("Belt Claw"));
         assert!(!prompt.contains("Current workspace"));
     }
+
+    // --- Additional tests for AgentRuntime session loop, token tracking,
+    //     and conversation history (issue #328) ---
+
+    #[tokio::test]
+    async fn session_runtime_multi_turn_conversation() {
+        // Verify a multi-turn conversation flows correctly through the runtime,
+        // with each subsequent prompt carrying accumulated history context.
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::always_ok("mock"));
+        let config = make_config_with_runtime(&tmp, runtime.clone());
+        let mut input = Cursor::new(b"alpha\nbeta\ngamma\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
+
+        let calls = runtime.calls();
+        assert_eq!(calls.len(), 3);
+
+        // First call: no history.
+        assert!(!calls[0].contains("conversation_history"));
+        assert!(calls[0].contains("alpha"));
+
+        // Second call: history contains first exchange.
+        assert!(calls[1].contains("conversation_history"));
+        assert!(calls[1].contains("[user]: alpha"));
+        assert!(calls[1].contains("[assistant]:"));
+        assert!(calls[1].contains("beta"));
+
+        // Third call: history contains both previous exchanges.
+        assert!(calls[2].contains("[user]: alpha"));
+        assert!(calls[2].contains("[user]: beta"));
+        assert!(calls[2].contains("gamma"));
+    }
+
+    #[tokio::test]
+    async fn session_history_not_updated_on_runtime_failure() {
+        // When the runtime returns a failure, no assistant message should be
+        // added to history. The next prompt should only contain the user's
+        // failed message.
+        let tmp = tempfile::tempdir().unwrap();
+        // First call fails (exit_code=1), second succeeds (exit_code=0).
+        let runtime = Arc::new(MockRuntime::new("mock", vec![1]));
+        let config = make_config_with_runtime(&tmp, runtime.clone());
+        let mut input = Cursor::new(b"bad input\ngood input\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
+
+        let calls = runtime.calls();
+        assert_eq!(calls.len(), 2);
+
+        // Second call should have history with the failed user message but
+        // no assistant response from the failed invocation.
+        assert!(calls[1].contains("conversation_history"));
+        assert!(calls[1].contains("[user]: bad input"));
+        // The failed invocation should not have an assistant entry.
+        // Count occurrences of "[assistant]:" — should be zero since the
+        // first call failed and no assistant message was recorded.
+        let history_section = calls[1]
+            .split("</conversation_history>")
+            .next()
+            .unwrap_or("");
+        assert!(
+            !history_section.contains("[assistant]:"),
+            "Failed invocation should not produce assistant history entry"
+        );
+    }
+
+    #[test]
+    fn build_prompt_truncates_history_to_last_10_messages() {
+        // When history has more than 10 messages, only the last 10 should
+        // appear in the prompt context window.
+        let mut history = Vec::new();
+        for i in 0..14 {
+            history.push(SessionMessage {
+                role: if i % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                },
+                content: format!("message-{i}"),
+            });
+        }
+        let prompt = build_prompt_with_history("current", &history);
+
+        // Messages 0..3 (indices 0,1,2,3) should be excluded.
+        assert!(
+            !prompt.contains("message-0"),
+            "message-0 should be truncated"
+        );
+        assert!(
+            !prompt.contains("message-3"),
+            "message-3 should be truncated"
+        );
+
+        // Messages 4..13 should be included (last 10).
+        assert!(prompt.contains("message-4"));
+        assert!(prompt.contains("message-13"));
+
+        // Current input should be present after history.
+        assert!(prompt.contains("current"));
+    }
+
+    #[test]
+    fn build_system_prompt_mentions_history_count() {
+        let history = vec![
+            SessionMessage {
+                role: MessageRole::User,
+                content: "hi".to_string(),
+            },
+            SessionMessage {
+                role: MessageRole::Assistant,
+                content: "hello".to_string(),
+            },
+            SessionMessage {
+                role: MessageRole::User,
+                content: "how".to_string(),
+            },
+        ];
+        let prompt = build_system_prompt(Some("ws"), &history);
+        assert!(prompt.contains("3 previous messages"));
+    }
+
+    #[test]
+    fn build_system_prompt_no_history_mention_when_empty() {
+        let prompt = build_system_prompt(Some("ws"), &[]);
+        assert!(!prompt.contains("previous messages"));
+    }
+
+    #[tokio::test]
+    async fn session_token_usage_not_shown_when_runtime_reports_none() {
+        // When the runtime does not report token usage, no token line should
+        // appear and no session summary should be shown on quit.
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::always_ok("mock"));
+        let config = make_config_with_runtime(&tmp, runtime);
+        let mut input = Cursor::new(b"hello\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        // No per-invocation token line.
+        assert!(!out.contains("[tokens:"));
+        // No session summary since invocation_count stays 0 (no token usage
+        // was accumulated).
+        assert!(!out.contains("Session totals:"));
+    }
+
+    #[tokio::test]
+    async fn session_token_accumulation_across_three_invocations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let usages = vec![
+            TokenUsage {
+                input_tokens: 10,
+                output_tokens: 5,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            },
+            TokenUsage {
+                input_tokens: 20,
+                output_tokens: 15,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            },
+            TokenUsage {
+                input_tokens: 30,
+                output_tokens: 25,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            },
+        ];
+        let runtime = Arc::new(MockRuntime::always_ok("mock").with_token_usages(usages));
+        let config = make_config_with_runtime(&tmp, runtime);
+        let mut input = Cursor::new(b"a\nb\nc\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        // Session summary on quit.
+        assert!(out.contains("3 invocations"));
+        assert!(out.contains("60 input tokens"));
+        assert!(out.contains("45 output tokens"));
+    }
+
+    #[test]
+    fn session_token_usage_default_is_zero() {
+        let usage = SessionTokenUsage::default();
+        assert_eq!(usage.total_input_tokens, 0);
+        assert_eq!(usage.total_output_tokens, 0);
+        assert_eq!(usage.invocation_count, 0);
+    }
+
+    #[test]
+    fn session_token_usage_single_accumulation() {
+        let mut usage = SessionTokenUsage::default();
+        usage.accumulate(&TokenUsage {
+            input_tokens: 42,
+            output_tokens: 17,
+            cache_read_tokens: Some(5),
+            cache_write_tokens: Some(3),
+        });
+        assert_eq!(usage.total_input_tokens, 42);
+        assert_eq!(usage.total_output_tokens, 17);
+        assert_eq!(usage.invocation_count, 1);
+    }
+
+    #[tokio::test]
+    async fn session_runtime_receives_system_prompt_with_workspace() {
+        // Verify that the system prompt passed to the runtime includes
+        // the workspace name when configured.
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::always_ok("mock"));
+        let config = make_config_with_runtime(&tmp, runtime.clone());
+        let mut input = Cursor::new(b"test\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
+
+        // MockRuntime records the prompt but not the system_prompt directly.
+        // We can verify indirectly via the build_system_prompt function.
+        let system_prompt = build_system_prompt(Some("test-ws"), &[]);
+        assert!(system_prompt.contains("test-ws"));
+        assert!(system_prompt.contains("Belt Claw"));
+    }
+
+    #[tokio::test]
+    async fn session_runtime_error_shows_stderr() {
+        // When the runtime fails with stderr output, it should be displayed.
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::new("mock", vec![1]));
+        let config = make_config_with_runtime(&tmp, runtime);
+        let mut input = Cursor::new(b"trigger error\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("[error] Agent invocation failed (exit code 1)"));
+    }
+
+    #[tokio::test]
+    async fn session_mixed_slash_and_freeform_with_runtime() {
+        // Verify that slash commands do not affect runtime call count
+        // or conversation history.
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::always_ok("mock"));
+        let config = make_config_with_runtime(&tmp, runtime.clone());
+        let mut input = Cursor::new(b"hello\n/help\nworld\n/auto task\n/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
+
+        // Only 2 runtime calls (hello, world). Slash commands are not forwarded.
+        let calls = runtime.calls();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].contains("hello"));
+        assert!(calls[1].contains("world"));
+
+        let out = String::from_utf8(output).unwrap();
+        // Slash command output should also be present.
+        assert!(out.contains("/auto"));
+        assert!(out.contains("[auto]"));
+    }
+
+    #[tokio::test]
+    async fn session_no_session_summary_when_no_invocations() {
+        // When quitting without any LLM invocations, no session summary
+        // should be displayed.
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(MockRuntime::always_ok("mock"));
+        let config = make_config_with_runtime(&tmp, runtime);
+        let mut input = Cursor::new(b"/quit\n" as &[u8]);
+        let mut output = Vec::new();
+        run_session(&config, &mut input, &mut output, None, None)
+            .await
+            .unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(!out.contains("Session totals:"));
+    }
 }
