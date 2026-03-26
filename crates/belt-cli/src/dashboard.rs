@@ -1986,20 +1986,32 @@ fn build_detail_lines<'a>(
         )));
     } else {
         for event in transitions {
-            let from_color = phase_color(&event.from_state);
-            let to_color = phase_color(&event.to_state);
+            let from_str = event.from_phase.as_deref().unwrap_or("-");
+            let to_str = event.phase.as_deref().unwrap_or("-");
+            let from_color = phase_color(from_str);
+            let to_color = phase_color(to_str);
 
             // Format timestamp: show only the time portion if possible.
-            let time_display = format_transition_time(&event.timestamp);
+            let time_display = format_transition_time(&event.created_at);
 
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::raw("  "),
-                Span::styled(event.from_state.clone(), Style::default().fg(from_color)),
+                Span::styled(from_str.to_string(), Style::default().fg(from_color)),
                 Span::styled(" -> ", Style::default().fg(Color::Gray)),
-                Span::styled(event.to_state.clone(), Style::default().fg(to_color)),
+                Span::styled(to_str.to_string(), Style::default().fg(to_color)),
                 Span::raw("  "),
                 Span::styled(time_display, Style::default().fg(Color::DarkGray)),
-            ]));
+            ];
+
+            if let Some(ref detail) = event.detail {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    detail.clone(),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+
+            lines.push(Line::from(spans));
         }
     }
 
@@ -2485,21 +2497,23 @@ mod tests {
         let transitions = vec![
             TransitionEvent {
                 id: "e1".to_string(),
-                item_id: "w1".to_string(),
-                from_state: "pending".to_string(),
-                to_state: "ready".to_string(),
-                event_type: "phase_change".to_string(),
-                timestamp: "2026-03-25T10:00:00Z".to_string(),
-                metadata: None,
+                work_id: "w1".to_string(),
+                source_id: "src1".to_string(),
+                event_type: "phase_enter".to_string(),
+                phase: Some("ready".to_string()),
+                from_phase: Some("pending".to_string()),
+                detail: None,
+                created_at: "2026-03-25T10:00:00Z".to_string(),
             },
             TransitionEvent {
                 id: "e2".to_string(),
-                item_id: "w1".to_string(),
-                from_state: "ready".to_string(),
-                to_state: "running".to_string(),
-                event_type: "phase_change".to_string(),
-                timestamp: "2026-03-25T10:05:00Z".to_string(),
-                metadata: None,
+                work_id: "w1".to_string(),
+                source_id: "src1".to_string(),
+                event_type: "phase_enter".to_string(),
+                phase: Some("running".to_string()),
+                from_phase: Some("ready".to_string()),
+                detail: None,
+                created_at: "2026-03-25T10:05:00Z".to_string(),
             },
         ];
         let lines = build_detail_lines("w1", Some(&item), &transitions);
