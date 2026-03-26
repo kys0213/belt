@@ -1820,24 +1820,437 @@ impl CronHandler for GapDetectionJob {
     }
 }
 
-/// Maximum number of merged PRs to process per execution cycle.
-const KNOWLEDGE_PR_LIMIT: usize = 20;
+// ---------------------------------------------------------------------------
+// Merged PR scanning helpers
+// ---------------------------------------------------------------------------
 
-/// Maximum length of diff content to include in LLM prompt (characters).
-const KNOWLEDGE_DIFF_MAX_CHARS: usize = 8000;
+/// Maximum number of recently merged PRs to fetch per workspace per cycle.
+const PR_SCAN_LIMIT: u32 = 20;
 
-/// Extracts knowledge from merged PRs and completed queue items (CR-08).
+/// Maximum diff size (in bytes) to send to LLM for analysis.
+/// Larger diffs are truncated to avoid excessive token usage.
+const MAX_DIFF_SIZE: usize = 30_000;
+
+/// Maximum content length per knowledge entry to avoid bloating the DB.
+const MAX_CONTENT_LENGTH: usize = 4_000;
+
+/// Metadata for a merged pull request fetched via the `gh` CLI.
+#[derive(Debug, Clone)]
+struct MergedPrInfo {
+    number: i64,
+    title: String,
+    body: String,
+    author: String,
+    merged_at: String,
+    /// File paths changed in this PR.
+    changed_files: Vec<String>,
+    /// Review comments left on this PR.
+    review_bodies: Vec<String>,
+}
+
+/// Extract `owner/repo` from a GitHub URL.
 ///
-/// Runs every hour. Scans registered workspaces for recently merged PRs
-/// via the `gh` CLI, fetches PR title, body, and diff summary, then calls
-/// `belt agent` to extract structured knowledge. Falls back to simple
-/// keyword-based extraction for Done queue items without PR data.
+/// Handles HTTPS and SSH formats: `https://github.com/owner/repo`,
+/// `https://github.com/owner/repo.git`, `git@github.com:owner/repo.git`.
+fn extract_repo_name(url: &str) -> Option<String> {
+    let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
+    // SSH format: git@github.com:owner/repo
+    if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+        return Some(rest.to_string());
+    }
+    // HTTPS format
+    let parts: Vec<&str> = trimmed.split('/').collect();
+    if parts.len() >= 2 {
+        let owner = parts[parts.len() - 2];
+        let repo = parts[parts.len() - 1];
+        if !owner.is_empty() && !repo.is_empty() {
+            return Some(format!("{owner}/{repo}"));
+        }
+    }
+    None
+}
+
+/// Fetch recently merged PRs for a repo using the `gh` CLI.
+///
+/// Returns an empty Vec on failure (non-fatal).
+fn fetch_merged_prs(repo: &str, limit: u32) -> Vec<MergedPrInfo> {
+    let output = std::process::Command::new("gh")
+        .args([
+            "pr",
+            "list",
+            "--repo",
+            repo,
+            "--state",
+            "merged",
+            "--json",
+            "number,title,body,author,mergedAt,files,reviews",
+            "--limit",
+            &limit.to_string(),
+        ])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => {
+            tracing::debug!(
+                repo = %repo,
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "gh pr list for merged PRs failed"
+            );
+            return Vec::new();
+        }
+        Err(e) => {
+            tracing::debug!(repo = %repo, error = %e, "failed to spawn gh for merged PRs");
+            return Vec::new();
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let prs: Vec<serde_json::Value> = match serde_json::from_str(&stdout) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    prs.iter()
+        .filter_map(|pr| {
+            let number = pr["number"].as_i64()?;
+            let title = pr["title"].as_str().unwrap_or("").to_string();
+            let body = pr["body"].as_str().unwrap_or("").to_string();
+            let author = pr["author"]["login"]
+                .as_str()
+                .unwrap_or("unknown")
+                .to_string();
+            let merged_at = pr["mergedAt"].as_str().unwrap_or("").to_string();
+
+            let changed_files = pr["files"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|f| f["path"].as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let review_bodies = pr["reviews"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|r| {
+                            let body = r["body"].as_str().unwrap_or("");
+                            if body.is_empty() {
+                                None
+                            } else {
+                                Some(body.to_string())
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            Some(MergedPrInfo {
+                number,
+                title,
+                body,
+                author,
+                merged_at,
+                changed_files,
+                review_bodies,
+            })
+        })
+        .collect()
+}
+
+/// Fetch the diff for a specific PR.
+///
+/// Returns `None` on failure or empty diff.
+fn fetch_pr_diff(repo: &str, pr_number: i64) -> Option<String> {
+    let output = std::process::Command::new("gh")
+        .args(["pr", "diff", &pr_number.to_string(), "--repo", repo])
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let diff = String::from_utf8_lossy(&o.stdout).to_string();
+            if diff.is_empty() {
+                None
+            } else if diff.len() > MAX_DIFF_SIZE {
+                // Truncate large diffs to avoid excessive LLM token usage.
+                Some(format!(
+                    "{}\n\n... (diff truncated at {} bytes, total {} bytes)",
+                    &diff[..MAX_DIFF_SIZE],
+                    MAX_DIFF_SIZE,
+                    diff.len()
+                ))
+            } else {
+                Some(diff)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Build the LLM prompt for knowledge extraction from a merged PR.
+fn build_extraction_prompt(pr: &MergedPrInfo, diff: Option<&str>) -> String {
+    let mut prompt = format!(
+        "Analyze this merged pull request and extract knowledge entries.\n\n\
+         PR #{}: {}\n\
+         Author: {}\n\
+         Merged at: {}\n",
+        pr.number, pr.title, pr.author, pr.merged_at,
+    );
+
+    if !pr.body.is_empty() {
+        prompt.push_str(&format!("\nDescription:\n{}\n", pr.body));
+    }
+
+    if !pr.changed_files.is_empty() {
+        prompt.push_str("\nChanged files:\n");
+        for f in &pr.changed_files {
+            prompt.push_str(&format!("- {f}\n"));
+        }
+    }
+
+    if !pr.review_bodies.is_empty() {
+        prompt.push_str("\nReview comments:\n");
+        for (i, body) in pr.review_bodies.iter().enumerate() {
+            prompt.push_str(&format!("Review {}: {body}\n", i + 1));
+        }
+    }
+
+    if let Some(d) = diff {
+        prompt.push_str(&format!("\nDiff:\n```\n{d}\n```\n"));
+    }
+
+    prompt.push_str(
+        "\nFor each knowledge entry, output a JSON array. Each element should have:\n\
+         - \"category\": one of \"decision\", \"pattern\", \"domain\", \"review_feedback\"\n\
+         - \"content\": a concise summary of the knowledge (max 500 words)\n\n\
+         Rules:\n\
+         - \"decision\": architectural or design decisions made in this PR\n\
+         - \"pattern\": reusable patterns, conventions, or abstractions introduced\n\
+         - \"domain\": domain-specific knowledge or business logic\n\
+         - \"review_feedback\": actionable insights from review comments\n\
+         - Skip trivial changes (version bumps, typo fixes, formatting)\n\
+         - If nothing meaningful, return an empty array []\n\n\
+         Respond with ONLY the JSON array, no other text.",
+    );
+
+    prompt
+}
+
+/// Invoke the LLM subprocess to extract knowledge from a PR.
+///
+/// Falls back to heuristic extraction if the LLM call fails.
+fn invoke_llm_extraction(prompt: &str) -> Option<Vec<(String, String)>> {
+    // Use `belt agent` subprocess for LLM invocation, similar to the evaluator.
+    // If belt binary is not available, we fall back gracefully.
+    let output = std::process::Command::new("belt")
+        .args(["agent", "-p", prompt, "--json"])
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return None,
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Try to parse JSON array from stdout. The LLM may wrap it in markdown
+    // fences, so attempt to extract the JSON portion.
+    let json_str = extract_json_array(&stdout)?;
+    let entries: Vec<serde_json::Value> = serde_json::from_str(json_str).ok()?;
+
+    let results: Vec<(String, String)> = entries
+        .iter()
+        .filter_map(|e| {
+            let category = e["category"].as_str()?.to_string();
+            let content = e["content"].as_str()?.to_string();
+            if content.is_empty() {
+                return None;
+            }
+            // Validate category.
+            match category.as_str() {
+                "decision" | "pattern" | "domain" | "review_feedback" => Some((category, content)),
+                _ => Some(("domain".to_string(), content)),
+            }
+        })
+        .collect();
+
+    if results.is_empty() {
+        None
+    } else {
+        Some(results)
+    }
+}
+
+/// Try to extract a JSON array from text that may contain markdown fences.
+fn extract_json_array(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+
+    // Direct JSON array.
+    if trimmed.starts_with('[') {
+        return Some(trimmed);
+    }
+
+    // Try to find array within markdown code fences.
+    if let Some(start) = trimmed.find('[')
+        && let Some(end) = trimmed.rfind(']')
+        && end > start
+    {
+        return Some(&trimmed[start..=end]);
+    }
+
+    None
+}
+
+/// Extract knowledge from a merged PR, using LLM when available,
+/// falling back to heuristic classification.
+fn extract_knowledge_from_pr(
+    pr: &MergedPrInfo,
+    diff: Option<&str>,
+    workspace: &str,
+    source_ref: &str,
+    ctx: &CronContext,
+) -> Vec<belt_infra::db::KnowledgeEntry> {
+    let prompt = build_extraction_prompt(pr, diff);
+
+    // Attempt LLM extraction first.
+    if let Some(llm_entries) = invoke_llm_extraction(&prompt) {
+        return llm_entries
+            .into_iter()
+            .enumerate()
+            .map(|(i, (category, content))| {
+                let truncated = truncate_content(&content);
+                belt_infra::db::KnowledgeEntry {
+                    id: None,
+                    workspace: workspace.to_string(),
+                    source_ref: if i == 0 {
+                        source_ref.to_string()
+                    } else {
+                        format!("{source_ref}:{i}")
+                    },
+                    category,
+                    content: truncated,
+                    created_at: ctx.now.to_rfc3339(),
+                }
+            })
+            .collect();
+    }
+
+    // Fallback: heuristic extraction from PR metadata.
+    heuristic_pr_extraction(pr, diff, workspace, source_ref, ctx)
+}
+
+/// Heuristic (non-LLM) knowledge extraction from PR metadata and diff.
+fn heuristic_pr_extraction(
+    pr: &MergedPrInfo,
+    diff: Option<&str>,
+    workspace: &str,
+    source_ref: &str,
+    ctx: &CronContext,
+) -> Vec<belt_infra::db::KnowledgeEntry> {
+    let mut entries = Vec::new();
+
+    // Build a summary content from PR metadata.
+    let mut content = format!(
+        "Merged PR #{}: {} (by {}, merged {})",
+        pr.number, pr.title, pr.author, pr.merged_at,
+    );
+
+    if !pr.body.is_empty() {
+        let body_preview = if pr.body.len() > 500 {
+            format!("{}...", &pr.body[..500])
+        } else {
+            pr.body.clone()
+        };
+        content.push_str(&format!("\n\nDescription: {body_preview}"));
+    }
+
+    if !pr.changed_files.is_empty() {
+        content.push_str(&format!(
+            "\n\nChanged files ({}): {}",
+            pr.changed_files.len(),
+            pr.changed_files.join(", ")
+        ));
+    }
+
+    // Classify based on title + body keywords.
+    let haystack = format!("{} {}", pr.title.to_lowercase(), pr.body.to_lowercase());
+    let category = if DECISION_KEYWORDS.iter().any(|kw| haystack.contains(kw)) {
+        "decision"
+    } else if PATTERN_KEYWORDS.iter().any(|kw| haystack.contains(kw)) {
+        "pattern"
+    } else {
+        "domain"
+    };
+
+    // Estimate diff significance: skip trivial PRs.
+    let is_trivial = match diff {
+        Some(d) => {
+            let line_count = d.lines().count();
+            line_count < 5
+        }
+        None => pr.changed_files.len() <= 1 && pr.body.is_empty(),
+    };
+
+    if !is_trivial {
+        entries.push(belt_infra::db::KnowledgeEntry {
+            id: None,
+            workspace: workspace.to_string(),
+            source_ref: source_ref.to_string(),
+            category: category.to_string(),
+            content: truncate_content(&content),
+            created_at: ctx.now.to_rfc3339(),
+        });
+    }
+
+    // Extract review feedback as separate entries.
+    for (i, review_body) in pr.review_bodies.iter().enumerate() {
+        if review_body.len() < 10 {
+            continue; // Skip trivial reviews like "LGTM".
+        }
+        let review_content = format!(
+            "Review feedback on PR #{} ({}): {}",
+            pr.number, pr.title, review_body,
+        );
+        entries.push(belt_infra::db::KnowledgeEntry {
+            id: None,
+            workspace: workspace.to_string(),
+            source_ref: format!("{source_ref}:review:{i}"),
+            category: "review_feedback".to_string(),
+            content: truncate_content(&review_content),
+            created_at: ctx.now.to_rfc3339(),
+        });
+    }
+
+    entries
+}
+
+/// Truncate content to `MAX_CONTENT_LENGTH` to prevent DB bloat.
+fn truncate_content(content: &str) -> String {
+    if content.len() <= MAX_CONTENT_LENGTH {
+        content.to_string()
+    } else {
+        format!("{}... (truncated)", &content[..MAX_CONTENT_LENGTH])
+    }
+}
+
+/// Extracts knowledge from completed (Done) queue items and merged PRs (CR-08).
+///
+/// Runs every hour. Performs two extraction passes:
+///
+/// 1. **PR scanning**: Iterates registered workspaces with GitHub sources,
+///    fetches recently merged PRs via the `gh` CLI, retrieves their diffs,
+///    and uses an LLM subprocess to extract structured knowledge.
+/// 2. **Done-item extraction**: Queries items in the `Done` phase, checks
+///    whether knowledge has already been extracted for each item (via
+///    `source_ref` deduplication), and persists new [`KnowledgeEntry`] rows.
 ///
 /// Knowledge is categorised into:
 /// - **decision**: items whose title or state suggests a decision was made
 /// - **pattern**: items related to implementation patterns
 /// - **domain**: general domain knowledge from the item context
-/// - **review_feedback**: insights extracted from PR review comments
+/// - **review_feedback**: feedback distilled from PR review comments
 ///
 /// [`KnowledgeEntry`]: belt_infra::db::KnowledgeEntry
 pub struct KnowledgeExtractionJob {
@@ -1850,150 +2263,11 @@ impl KnowledgeExtractionJob {
         Self { db }
     }
 
-    /// Fetch recently merged PRs for a repository via `gh pr list`.
+    /// Scan merged PRs for all workspaces that have a GitHub source configured.
     ///
-    /// Returns a list of `(pr_number, title, body)` tuples for merged PRs
-    /// that have not yet been extracted (checked via `source_ref` dedup).
-    fn fetch_merged_prs(repo: &str) -> Result<Vec<(i64, String, Option<String>)>, BeltError> {
-        let output = std::process::Command::new("gh")
-            .args([
-                "pr",
-                "list",
-                "--repo",
-                repo,
-                "--state",
-                "merged",
-                "--json",
-                "number,title,body",
-                "--limit",
-                &KNOWLEDGE_PR_LIMIT.to_string(),
-            ])
-            .output()
-            .map_err(|e| BeltError::Runtime(format!("failed to invoke gh CLI: {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            tracing::warn!(
-                repo = %repo,
-                stderr = %stderr,
-                "gh pr list failed"
-            );
-            return Ok(Vec::new());
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let prs: Vec<serde_json::Value> = serde_json::from_str(&stdout)
-            .map_err(|e| BeltError::Runtime(format!("failed to parse gh pr list output: {e}")))?;
-
-        let mut result = Vec::new();
-        for pr in prs {
-            let number = match pr["number"].as_i64() {
-                Some(n) => n,
-                None => continue,
-            };
-            let title = pr["title"].as_str().unwrap_or("").to_string();
-            let body = pr["body"].as_str().and_then(|s| {
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s.to_string())
-                }
-            });
-            result.push((number, title, body));
-        }
-
-        Ok(result)
-    }
-
-    /// Fetch the diff summary for a specific PR via `gh pr diff`.
-    ///
-    /// Returns the diff content truncated to [`KNOWLEDGE_DIFF_MAX_CHARS`].
-    fn fetch_pr_diff(repo: &str, pr_number: i64) -> Option<String> {
-        let output = std::process::Command::new("gh")
-            .args(["pr", "diff", &pr_number.to_string(), "--repo", repo])
-            .output()
-            .ok()?;
-
-        if !output.status.success() {
-            return None;
-        }
-
-        let diff = String::from_utf8_lossy(&output.stdout).to_string();
-        if diff.len() > KNOWLEDGE_DIFF_MAX_CHARS {
-            // Find a safe truncation point at a char boundary.
-            let truncate_at = diff
-                .char_indices()
-                .take_while(|(i, _)| *i < KNOWLEDGE_DIFF_MAX_CHARS)
-                .last()
-                .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(0);
-            Some(format!(
-                "{}...\n[truncated, {} total chars]",
-                &diff[..truncate_at],
-                diff.len()
-            ))
-        } else {
-            Some(diff)
-        }
-    }
-
-    /// Call `belt agent` to extract structured knowledge from a merged PR.
-    ///
-    /// Spawns `belt agent -p <prompt> --json` as a subprocess and parses
-    /// the JSON output to extract `category` and `content` fields.
-    ///
-    /// Returns `(category, content)` on success.
-    fn extract_knowledge_via_llm(
-        title: &str,
-        body: Option<&str>,
-        diff: Option<&str>,
-    ) -> Option<(String, String)> {
-        let body_text = body.unwrap_or("(no description)");
-        let diff_text = diff.unwrap_or("(no diff available)");
-
-        let prompt = format!(
-            r#"You are a knowledge extraction agent. Analyze this merged PR and extract the key knowledge.
-
-PR Title: {title}
-PR Description: {body_text}
-Diff summary:
-{diff_text}
-
-Respond with ONLY a JSON object (no markdown, no explanation):
-{{
-  "category": "<one of: decision, pattern, domain, review_feedback>",
-  "content": "<2-4 sentence summary of the key knowledge, decisions, or patterns from this PR>"
-}}"#
-        );
-
-        let output = std::process::Command::new("belt")
-            .args(["agent", "-p", &prompt, "--json"])
-            .output()
-            .ok()?;
-
-        if !output.status.success() {
-            tracing::warn!(
-                "belt agent knowledge extraction failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return None;
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-
-        // Try to parse the JSON response — the output may contain extra text
-        // around the JSON object, so find the first `{` and last `}`.
-        let json_str = extract_json_object(&stdout)?;
-        let val: serde_json::Value = serde_json::from_str(json_str).ok()?;
-
-        let category = val["category"].as_str().unwrap_or("domain").to_string();
-        let content = val["content"].as_str()?.to_string();
-
-        Some((category, content))
-    }
-
-    /// Extract knowledge from merged PRs for all registered workspaces.
-    fn extract_from_merged_prs(&self, ctx: &CronContext) -> Result<(u32, u32), BeltError> {
+    /// For each workspace, fetches recently merged PRs, retrieves their diffs,
+    /// and extracts knowledge entries via LLM analysis.
+    fn scan_merged_prs(&self, ctx: &CronContext) -> Result<(u32, u32), BeltError> {
         let workspaces = self.db.list_workspaces()?;
         let mut extracted_count = 0u32;
         let mut skipped_count = 0u32;
@@ -2018,108 +2292,67 @@ Respond with ONLY a JSON object (no markdown, no explanation):
                 None => continue,
             };
 
-            let repo = match belt_infra::sources::github::GitHubDataSource::extract_repo_name(
-                source_url,
-            ) {
+            let repo = match extract_repo_name(source_url) {
                 Some(r) => r,
                 None => {
                     tracing::warn!(
                         workspace = %name,
                         url = %source_url,
-                        "KnowledgeExtractionJob: could not extract repo name"
+                        "KnowledgeExtractionJob: could not extract repo name from URL"
                     );
                     continue;
                 }
             };
+
+            let merged_prs = fetch_merged_prs(&repo, PR_SCAN_LIMIT);
+            if merged_prs.is_empty() {
+                tracing::debug!(
+                    workspace = %name,
+                    "KnowledgeExtractionJob: no recently merged PRs found"
+                );
+                continue;
+            }
 
             tracing::info!(
                 workspace = %name,
-                repo = %repo,
-                "KnowledgeExtractionJob: scanning merged PRs"
+                count = merged_prs.len(),
+                "KnowledgeExtractionJob: found merged PRs to scan"
             );
 
-            let merged_prs = match Self::fetch_merged_prs(&repo) {
-                Ok(prs) => prs,
-                Err(e) => {
-                    tracing::warn!(
-                        workspace = %name,
-                        error = %e,
-                        "KnowledgeExtractionJob: failed to fetch merged PRs"
-                    );
-                    continue;
-                }
-            };
+            for pr in &merged_prs {
+                let source_ref = format!("gh:{}#{}", repo, pr.number);
 
-            for (pr_number, title, body) in &merged_prs {
-                let source_ref = format!("gh:{repo}#{pr_number}");
-
-                // Deduplicate.
+                // Deduplicate: skip PRs whose source_ref already exists.
                 let existing = self.db.get_knowledge_by_source(&source_ref)?;
                 if !existing.is_empty() {
                     skipped_count += 1;
                     continue;
                 }
 
-                // Fetch diff.
-                let diff = Self::fetch_pr_diff(&repo, *pr_number);
+                // Fetch diff for richer analysis.
+                let diff = fetch_pr_diff(&repo, pr.number);
 
-                // Try LLM extraction first, fall back to keyword-based.
-                let (category, content) = match Self::extract_knowledge_via_llm(
-                    title,
-                    body.as_deref(),
-                    diff.as_deref(),
-                ) {
-                    Some((cat, cont)) => (cat, cont),
-                    None => {
-                        // Fallback: keyword-based classification with structured content.
-                        let category = classify_knowledge_category(title, "merged");
-                        let body_summary = body
-                            .as_deref()
-                            .map(|b| {
-                                if b.len() > 500 {
-                                    // Safe char-boundary truncation.
-                                    let end = b
-                                        .char_indices()
-                                        .take_while(|(i, _)| *i < 500)
-                                        .last()
-                                        .map(|(i, c)| i + c.len_utf8())
-                                        .unwrap_or(0);
-                                    format!("{}...", &b[..end])
-                                } else {
-                                    b.to_string()
-                                }
-                            })
-                            .unwrap_or_default();
-                        let content =
-                            format!("Merged PR #{}: {}. {}", pr_number, title, body_summary);
-                        (category.to_string(), content)
-                    }
-                };
+                // Extract knowledge via LLM subprocess (falls back to heuristic).
+                let entries =
+                    extract_knowledge_from_pr(pr, diff.as_deref(), name, &source_ref, ctx);
 
-                let entry = belt_infra::db::KnowledgeEntry {
-                    id: None,
-                    workspace: name.clone(),
-                    source_ref: source_ref.clone(),
-                    category,
-                    content,
-                    created_at: ctx.now.to_rfc3339(),
-                };
-
-                match self.db.insert_knowledge(&entry) {
-                    Ok(()) => {
-                        extracted_count += 1;
-                        tracing::info!(
-                            source_ref = %source_ref,
-                            category = %entry.category,
-                            "KnowledgeExtractionJob: extracted knowledge from merged PR"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            source_ref = %source_ref,
-                            error = %e,
-                            "KnowledgeExtractionJob: failed to persist PR knowledge entry"
-                        );
+                for entry in &entries {
+                    match self.db.insert_knowledge(entry) {
+                        Ok(()) => {
+                            extracted_count += 1;
+                            tracing::info!(
+                                source_ref = %source_ref,
+                                category = %entry.category,
+                                "KnowledgeExtractionJob: extracted PR knowledge entry"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                source_ref = %source_ref,
+                                error = %e,
+                                "KnowledgeExtractionJob: failed to persist PR knowledge entry"
+                            );
+                        }
                     }
                 }
             }
@@ -2127,28 +2360,6 @@ Respond with ONLY a JSON object (no markdown, no explanation):
 
         Ok((extracted_count, skipped_count))
     }
-}
-
-/// Extract the first JSON object from a string that may contain surrounding text.
-///
-/// Finds the first `{` and its matching `}` (handling nesting) and returns
-/// the substring. Returns `None` if no valid braces are found.
-fn extract_json_object(s: &str) -> Option<&str> {
-    let start = s.find('{')?;
-    let mut depth = 0i32;
-    for (i, ch) in s[start..].char_indices() {
-        match ch {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&s[start..start + i + 1]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 /// Keywords that signal a "decision" category.
@@ -2183,28 +2394,31 @@ fn classify_knowledge_category(title: &str, state: &str) -> &'static str {
 
 impl CronHandler for KnowledgeExtractionJob {
     fn execute(&self, ctx: &CronContext) -> Result<(), BeltError> {
-        tracing::info!("KnowledgeExtractionJob: scanning merged PRs and completed items");
+        tracing::info!(
+            "KnowledgeExtractionJob: scanning merged PRs and completed items for knowledge"
+        );
 
-        // Phase 1: Extract knowledge from merged PRs via GitHub API + LLM.
-        let (pr_extracted, pr_skipped) = match self.extract_from_merged_prs(ctx) {
+        // Pass 1: Scan merged PRs from GitHub sources.
+        let (pr_extracted, pr_skipped) = match self.scan_merged_prs(ctx) {
             Ok(counts) => counts,
             Err(e) => {
+                // PR scanning failure is non-fatal; log and continue to done-item pass.
                 tracing::warn!(
                     error = %e,
-                    "KnowledgeExtractionJob: merged PR extraction failed, continuing with Done items"
+                    "KnowledgeExtractionJob: PR scanning failed, continuing with done-item pass"
                 );
                 (0, 0)
             }
         };
 
-        // Phase 2: Fallback — extract from Done queue items (keyword-based).
+        // Pass 2: Extract knowledge from Done queue items.
         let done_items = self.db.list_items(Some(QueuePhase::Done), None)?;
 
         let mut item_extracted = 0u32;
         let mut item_skipped = 0u32;
 
         for item in &done_items {
-            // Deduplicate — skip items whose source_ref already exists.
+            // Deduplicate: skip items whose source_ref already exists.
             let source_ref = &item.source_id;
             let existing = self.db.get_knowledge_by_source(source_ref)?;
             if !existing.is_empty() {
@@ -2253,6 +2467,7 @@ impl CronHandler for KnowledgeExtractionJob {
             pr_skipped = pr_skipped,
             item_extracted = item_extracted,
             item_skipped = item_skipped,
+            total_done = done_items.len(),
             "KnowledgeExtractionJob: completed knowledge extraction"
         );
         Ok(())
@@ -3213,46 +3428,15 @@ mod tests {
     }
 
     #[test]
-    fn extract_json_object_simple() {
-        let input = r#"{"category":"domain","content":"some knowledge"}"#;
-        assert_eq!(extract_json_object(input), Some(input));
-    }
-
-    #[test]
-    fn extract_json_object_with_surrounding_text() {
-        let input = r#"Here is the result: {"category":"decision","content":"chose JWT"} done."#;
-        assert_eq!(
-            extract_json_object(input),
-            Some(r#"{"category":"decision","content":"chose JWT"}"#)
-        );
-    }
-
-    #[test]
-    fn extract_json_object_nested_braces() {
-        let input = r#"{"outer":{"inner":"value"}}"#;
-        assert_eq!(extract_json_object(input), Some(input));
-    }
-
-    #[test]
-    fn extract_json_object_no_braces() {
-        assert_eq!(extract_json_object("no json here"), None);
-    }
-
-    #[test]
-    fn extract_json_object_unclosed_brace() {
-        assert_eq!(extract_json_object("{incomplete"), None);
-    }
-
-    #[test]
     fn knowledge_extraction_pr_limit_is_reasonable() {
-        assert!(KNOWLEDGE_PR_LIMIT > 0);
-        assert!(KNOWLEDGE_PR_LIMIT <= 100);
+        assert!(PR_SCAN_LIMIT > 0);
+        assert!(PR_SCAN_LIMIT <= 100);
     }
 
     #[test]
-    fn knowledge_extraction_diff_max_chars_is_reasonable() {
-        assert!(KNOWLEDGE_DIFF_MAX_CHARS > 0);
-        assert!(KNOWLEDGE_DIFF_MAX_CHARS <= 50_000);
+    fn knowledge_extraction_diff_max_size_is_reasonable() {
+        assert!(MAX_DIFF_SIZE > 0);
+        assert!(MAX_DIFF_SIZE <= 100_000);
     }
 
     #[test]
@@ -4443,5 +4627,223 @@ mod tests {
     fn llm_coverage_result_rejects_missing_score() {
         let json = r#"{"missing": ["something"]}"#;
         assert!(serde_json::from_str::<LlmCoverageResult>(json).is_err());
+    }
+
+    // -- Merged PR knowledge extraction helper tests --
+
+    #[test]
+    fn extract_repo_name_https() {
+        assert_eq!(
+            extract_repo_name("https://github.com/org/repo"),
+            Some("org/repo".to_string())
+        );
+        assert_eq!(
+            extract_repo_name("https://github.com/org/repo.git"),
+            Some("org/repo".to_string())
+        );
+        assert_eq!(
+            extract_repo_name("https://github.com/org/repo/"),
+            Some("org/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_repo_name_ssh() {
+        assert_eq!(
+            extract_repo_name("git@github.com:org/repo.git"),
+            Some("org/repo".to_string())
+        );
+        assert_eq!(
+            extract_repo_name("git@github.com:owner/project"),
+            Some("owner/project".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_repo_name_invalid() {
+        assert_eq!(extract_repo_name("not-a-url"), None);
+        assert_eq!(extract_repo_name(""), None);
+    }
+
+    #[test]
+    fn extract_json_array_direct() {
+        let input = r#"[{"category":"domain","content":"test"}]"#;
+        assert_eq!(extract_json_array(input), Some(input));
+    }
+
+    #[test]
+    fn extract_json_array_with_fences() {
+        let input = "```json\n[{\"category\":\"domain\",\"content\":\"test\"}]\n```";
+        let result = extract_json_array(input).unwrap();
+        assert!(result.starts_with('['));
+        assert!(result.ends_with(']'));
+    }
+
+    #[test]
+    fn extract_json_array_empty() {
+        assert_eq!(extract_json_array("[]"), Some("[]"));
+    }
+
+    #[test]
+    fn extract_json_array_no_array() {
+        assert_eq!(extract_json_array("no json here"), None);
+    }
+
+    #[test]
+    fn truncate_content_short_text() {
+        let short = "short text";
+        assert_eq!(truncate_content(short), short);
+    }
+
+    #[test]
+    fn truncate_content_long_text() {
+        let long = "a".repeat(5000);
+        let result = truncate_content(&long);
+        assert!(result.len() < long.len());
+        assert!(result.contains("... (truncated)"));
+    }
+
+    #[test]
+    fn build_extraction_prompt_includes_pr_metadata() {
+        let pr = MergedPrInfo {
+            number: 42,
+            title: "feat: add auth module".to_string(),
+            body: "This PR adds JWT-based authentication.".to_string(),
+            author: "alice".to_string(),
+            merged_at: "2026-03-27T10:00:00Z".to_string(),
+            changed_files: vec!["src/auth.rs".to_string(), "src/main.rs".to_string()],
+            review_bodies: vec!["Consider using refresh tokens".to_string()],
+        };
+
+        let prompt = build_extraction_prompt(&pr, Some("diff content"));
+        assert!(prompt.contains("PR #42"));
+        assert!(prompt.contains("add auth module"));
+        assert!(prompt.contains("alice"));
+        assert!(prompt.contains("src/auth.rs"));
+        assert!(prompt.contains("Consider using refresh tokens"));
+        assert!(prompt.contains("diff content"));
+        assert!(prompt.contains("decision"));
+        assert!(prompt.contains("pattern"));
+    }
+
+    #[test]
+    fn heuristic_pr_extraction_classifies_domain() {
+        let pr = MergedPrInfo {
+            number: 10,
+            title: "fix: resolve login bug".to_string(),
+            body: "Fixed a null pointer in the login flow.".to_string(),
+            author: "bob".to_string(),
+            merged_at: "2026-03-27T12:00:00Z".to_string(),
+            changed_files: vec![
+                "src/login.rs".to_string(),
+                "tests/login_test.rs".to_string(),
+            ],
+            review_bodies: vec![],
+        };
+
+        let ctx = CronContext { now: Utc::now() };
+        let entries = heuristic_pr_extraction(
+            &pr,
+            Some("some diff\nline2\nline3\nline4\nline5\n"),
+            "ws",
+            "gh:org/repo#10",
+            &ctx,
+        );
+
+        assert!(!entries.is_empty());
+        assert_eq!(entries[0].category, "domain");
+        assert!(entries[0].content.contains("resolve login bug"));
+    }
+
+    #[test]
+    fn heuristic_pr_extraction_classifies_decision() {
+        let pr = MergedPrInfo {
+            number: 11,
+            title: "decided to use PostgreSQL".to_string(),
+            body: "After discussion, we chose PostgreSQL over MySQL.".to_string(),
+            author: "carol".to_string(),
+            merged_at: "2026-03-27T12:00:00Z".to_string(),
+            changed_files: vec!["src/db.rs".to_string()],
+            review_bodies: vec![],
+        };
+
+        let ctx = CronContext { now: Utc::now() };
+        let entries = heuristic_pr_extraction(
+            &pr,
+            Some("diff\nline2\nline3\nline4\nline5\n"),
+            "ws",
+            "gh:org/repo#11",
+            &ctx,
+        );
+
+        assert!(!entries.is_empty());
+        assert_eq!(entries[0].category, "decision");
+    }
+
+    #[test]
+    fn heuristic_pr_extraction_skips_trivial() {
+        let pr = MergedPrInfo {
+            number: 12,
+            title: "bump version".to_string(),
+            body: "".to_string(),
+            author: "bot".to_string(),
+            merged_at: "2026-03-27T12:00:00Z".to_string(),
+            changed_files: vec!["Cargo.toml".to_string()],
+            review_bodies: vec![],
+        };
+
+        let ctx = CronContext { now: Utc::now() };
+        // Trivial diff (less than 5 lines).
+        let entries =
+            heuristic_pr_extraction(&pr, Some("one\ntwo\n"), "ws", "gh:org/repo#12", &ctx);
+
+        // Should be empty because it's trivial.
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn heuristic_pr_extraction_includes_review_feedback() {
+        let pr = MergedPrInfo {
+            number: 13,
+            title: "feat: add caching layer".to_string(),
+            body: "Adds Redis-based caching.".to_string(),
+            author: "dave".to_string(),
+            merged_at: "2026-03-27T12:00:00Z".to_string(),
+            changed_files: vec!["src/cache.rs".to_string()],
+            review_bodies: vec![
+                "Consider adding TTL configuration for cache entries".to_string(),
+                "LGTM".to_string(), // Short review, should be skipped.
+            ],
+        };
+
+        let ctx = CronContext { now: Utc::now() };
+        let entries = heuristic_pr_extraction(
+            &pr,
+            Some("diff\nline2\nline3\nline4\nline5\n"),
+            "ws",
+            "gh:org/repo#13",
+            &ctx,
+        );
+
+        // Should have domain entry + 1 review feedback entry (the short "LGTM" is skipped).
+        let review_entries: Vec<_> = entries
+            .iter()
+            .filter(|e| e.category == "review_feedback")
+            .collect();
+        assert_eq!(review_entries.len(), 1);
+        assert!(review_entries[0].content.contains("TTL configuration"));
+        assert_eq!(review_entries[0].source_ref, "gh:org/repo#13:review:0");
+    }
+
+    #[test]
+    fn knowledge_extraction_pr_scan_with_no_workspaces() {
+        // When there are no workspaces registered, PR scan should succeed with 0 counts.
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let job = KnowledgeExtractionJob::new(Arc::clone(&db));
+        let ctx = CronContext { now: Utc::now() };
+
+        let (extracted, skipped) = job.scan_merged_prs(&ctx).unwrap();
+        assert_eq!(extracted, 0);
+        assert_eq!(skipped, 0);
     }
 }
