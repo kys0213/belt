@@ -4,14 +4,15 @@
 //! - `run()`: interactive ratatui-based real-time TUI dashboard with multiple tabs
 //! - `render_runtime_panel()`: text-based runtime statistics panel for non-TUI output
 //!
-//! The dashboard supports five tabs:
+//! The dashboard supports six tabs:
 //! - **Dashboard** (`d`): phase summary + running/recent items
 //! - **PerWorkspace** (`w`): items filtered by a selected workspace
 //! - **Spec** (`s`): spec progress view
 //! - **Board** (`b`): kanban-style board with columns per queue phase
 //! - **DataSource** (`n`): real-time DataSource connection status panel
+//! - **Scripts** (`x`): script execution statistics with success/fail rates
 //!
-//! Tab switching: `d/w/s/b` to jump, or `Tab`/`Shift+Tab` to cycle.
+//! Tab switching: `d/w/s/b/n/x` to jump, or `Tab`/`Shift+Tab` to cycle.
 //! Item selection with arrow keys and item detail overlay (Enter).
 //! Help overlay (`h`) showing all available key bindings.
 //! Scroll positions are preserved per tab.
@@ -37,7 +38,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::spec::SpecStatus;
-use belt_infra::db::{Database, RuntimeStats, TransitionEvent};
+use belt_infra::db::{Database, HistoryEvent, RuntimeStats, ScriptExecStats, TransitionEvent};
 use belt_infra::workspace_loader::load_workspace_config;
 
 /// Connection status of a DataSource.
@@ -119,6 +120,8 @@ enum DashboardTab {
     Board,
     /// DataSource connection status panel.
     DataSource,
+    /// Scripts execution statistics panel.
+    Scripts,
 }
 
 impl DashboardTab {
@@ -129,18 +132,20 @@ impl DashboardTab {
             DashboardTab::PerWorkspace => DashboardTab::Spec,
             DashboardTab::Spec => DashboardTab::Board,
             DashboardTab::Board => DashboardTab::DataSource,
-            DashboardTab::DataSource => DashboardTab::Dashboard,
+            DashboardTab::DataSource => DashboardTab::Scripts,
+            DashboardTab::Scripts => DashboardTab::Dashboard,
         }
     }
 
     /// Return the previous tab in reverse order (Shift+Tab).
     fn prev(self) -> Self {
         match self {
-            DashboardTab::Dashboard => DashboardTab::DataSource,
+            DashboardTab::Dashboard => DashboardTab::Scripts,
             DashboardTab::PerWorkspace => DashboardTab::Dashboard,
             DashboardTab::Spec => DashboardTab::PerWorkspace,
             DashboardTab::Board => DashboardTab::Spec,
             DashboardTab::DataSource => DashboardTab::Board,
+            DashboardTab::Scripts => DashboardTab::DataSource,
         }
     }
 }
@@ -197,6 +202,7 @@ impl DashboardState {
         tab_states.insert(2, TabState::default());
         tab_states.insert(3, TabState::default());
         tab_states.insert(4, TabState::default());
+        tab_states.insert(5, TabState::default());
 
         Self {
             active_tab: DashboardTab::Dashboard,
@@ -216,6 +222,7 @@ impl DashboardState {
             DashboardTab::Spec => 2,
             DashboardTab::Board => 3,
             DashboardTab::DataSource => 4,
+            DashboardTab::Scripts => 5,
         }
     }
 
@@ -293,6 +300,10 @@ fn run_loop(
             DashboardTab::Spec => specs.len(),
             DashboardTab::Board => 0, // Board uses column/row navigation, not a single list.
             DashboardTab::DataSource => datasource_entries.len(),
+            DashboardTab::Scripts => db
+                .get_script_execution_stats()
+                .map(|s| s.len())
+                .unwrap_or(0),
         };
 
         // Clamp selected_index for non-Board tabs.
@@ -372,6 +383,14 @@ fn run_loop(
                         state.current_tab_state().selected_index,
                     );
                 }
+                DashboardTab::Scripts => {
+                    render_scripts_tab(
+                        frame,
+                        db,
+                        outer_chunks[1],
+                        state.current_tab_state().selected_index,
+                    );
+                }
             }
 
             // Overlays (rendered on top of everything).
@@ -419,6 +438,9 @@ fn run_loop(
                 }
                 KeyCode::Char('n') => {
                     state.active_tab = DashboardTab::DataSource;
+                }
+                KeyCode::Char('x') => {
+                    state.active_tab = DashboardTab::Scripts;
                 }
                 KeyCode::Char('h') => {
                     state.show_help = true;
@@ -518,7 +540,7 @@ fn handle_nav_left(state: &mut DashboardState, workspaces: &[(String, String, St
             state.board_selected_col = state.board_selected_col.saturating_sub(1);
             state.board_selected_row = 0;
         }
-        DashboardTab::Spec | DashboardTab::DataSource => {}
+        DashboardTab::Spec | DashboardTab::DataSource | DashboardTab::Scripts => {}
     }
     let _ = workspaces;
 }
@@ -547,7 +569,7 @@ fn handle_nav_right(
                 state.board_selected_row = 0;
             }
         }
-        DashboardTab::Spec | DashboardTab::DataSource => {}
+        DashboardTab::Spec | DashboardTab::DataSource | DashboardTab::Scripts => {}
     }
 }
 
@@ -585,8 +607,8 @@ fn handle_enter(
                 }
             }
         }
-        DashboardTab::Spec | DashboardTab::DataSource => {
-            // Spec/DataSource tabs: no overlay on Enter.
+        DashboardTab::Spec | DashboardTab::DataSource | DashboardTab::Scripts => {
+            // No overlay on Enter for Spec/DataSource/Scripts tabs.
         }
         DashboardTab::Board => {
             if let Some(col) = board_columns.get(state.board_selected_col)
@@ -611,6 +633,7 @@ fn render_tab_bar(active: DashboardTab) -> Paragraph<'static> {
         ("s", "Spec", DashboardTab::Spec),
         ("b", "Board", DashboardTab::Board),
         ("n", "DataSource", DashboardTab::DataSource),
+        ("x", "Scripts", DashboardTab::Scripts),
     ];
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -1529,6 +1552,213 @@ fn render_spec_tab(
     frame.render_widget(table, chunks[1]);
 }
 
+/// Render the scripts execution statistics tab.
+///
+/// Layout:
+/// - Summary bar with overall success rate (top)
+/// - Per-script statistics table (middle)
+/// - Recent 10 script executions log (bottom)
+fn render_scripts_tab(frame: &mut ratatui::Frame, db: &Database, area: Rect, selected: usize) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(8),
+            Constraint::Length(14),
+        ])
+        .split(area);
+
+    let script_stats = db.get_script_execution_stats().unwrap_or_default();
+    let recent_execs = db.get_recent_script_executions(10).unwrap_or_default();
+
+    // -- Summary bar --
+    render_scripts_summary(frame, chunks[0], &script_stats);
+
+    // -- Per-script stats table --
+    render_scripts_stats_table(frame, chunks[1], &script_stats, selected);
+
+    // -- Recent executions log --
+    render_recent_executions(frame, chunks[2], &recent_execs);
+}
+
+/// Render overall scripts execution summary.
+fn render_scripts_summary(frame: &mut ratatui::Frame, area: Rect, stats: &[ScriptExecStats]) {
+    let total_runs: u64 = stats.iter().map(|s| s.total_runs).sum();
+    let total_success: u64 = stats.iter().map(|s| s.success_count).sum();
+    let total_fail: u64 = stats.iter().map(|s| s.fail_count).sum();
+    let overall_rate = if total_runs > 0 {
+        (total_success as f64 / total_runs as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    let rate_color = if overall_rate >= 90.0 {
+        Color::Green
+    } else if overall_rate >= 70.0 {
+        Color::Yellow
+    } else {
+        Color::Red
+    };
+
+    let line1 = Line::from(vec![
+        Span::styled(
+            format!("Total Runs: {total_runs}"),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("Success: {total_success}"),
+            Style::default().fg(Color::Green),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("Failed: {total_fail}"),
+            Style::default().fg(Color::Red),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("Rate: {overall_rate:.1}%"),
+            Style::default().fg(rate_color).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+
+    let unique_scripts = stats.len();
+    let line2 = Line::from(vec![Span::styled(
+        format!("Scripts: {unique_scripts}"),
+        Style::default().fg(Color::Cyan),
+    )]);
+
+    let paragraph = Paragraph::new(vec![line1, Line::from(""), line2]).block(
+        Block::default()
+            .title(" Scripts Execution Summary ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    frame.render_widget(paragraph, area);
+}
+
+/// Render per-script statistics as a table.
+fn render_scripts_stats_table(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    stats: &[ScriptExecStats],
+    selected: usize,
+) {
+    let rows: Vec<Row<'static>> = stats
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let rate_color = if s.success_rate >= 90.0 {
+                Color::Green
+            } else if s.success_rate >= 70.0 {
+                Color::Yellow
+            } else {
+                Color::Red
+            };
+
+            let avg_dur = s
+                .avg_duration_ms
+                .map_or_else(|| "-".to_string(), |d| format!("{d:.0}"));
+
+            let row = Row::new(vec![
+                Cell::from(s.state.clone()),
+                Cell::from(s.total_runs.to_string()),
+                Cell::from(s.success_count.to_string()).style(Style::default().fg(Color::Green)),
+                Cell::from(s.fail_count.to_string()).style(Style::default().fg(Color::Red)),
+                Cell::from(format!("{:.1}%", s.success_rate))
+                    .style(Style::default().fg(rate_color)),
+                Cell::from(avg_dur),
+            ]);
+
+            if i == selected {
+                row.style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                row
+            }
+        })
+        .collect();
+
+    let header = Row::new(vec!["Script", "Runs", "OK", "Fail", "Rate", "Avg ms"])
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .bottom_margin(1);
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(20),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(10),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .title(" Per-Script Statistics ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Green)),
+    );
+    frame.render_widget(table, area);
+}
+
+/// Render recent script execution log.
+fn render_recent_executions(frame: &mut ratatui::Frame, area: Rect, events: &[HistoryEvent]) {
+    let rows: Vec<Row<'static>> = events
+        .iter()
+        .map(|e| {
+            let status_color = if e.status == "success" {
+                Color::Green
+            } else {
+                Color::Red
+            };
+            Row::new(vec![
+                Cell::from(e.state.clone()),
+                Cell::from(e.work_id.clone()),
+                Cell::from(e.status.clone()).style(Style::default().fg(status_color)),
+                Cell::from(e.attempt.to_string()),
+                Cell::from(format_transition_time(&e.created_at)),
+            ])
+        })
+        .collect();
+
+    let header = Row::new(vec!["Script", "Work ID", "Status", "Attempt", "Time"])
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .bottom_margin(1);
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Min(15),
+            Constraint::Min(20),
+            Constraint::Length(10),
+            Constraint::Length(8),
+            Constraint::Length(22),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .title(" Recent Executions (last 10) ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta)),
+    );
+    frame.render_widget(table, area);
+}
+
 /// Aggregate counts of spec statuses.
 struct SpecStatusCounts {
     draft: usize,
@@ -1604,6 +1834,10 @@ fn render_help_overlay(frame: &mut ratatui::Frame) {
         Line::from(vec![
             Span::styled("  n       ", Style::default().fg(Color::Yellow)),
             Span::raw("Switch to DataSource status tab"),
+        ]),
+        Line::from(vec![
+            Span::styled("  x       ", Style::default().fg(Color::Yellow)),
+            Span::raw("Switch to Scripts statistics tab"),
         ]),
         Line::from(vec![
             Span::styled("  h       ", Style::default().fg(Color::Yellow)),
@@ -2489,12 +2723,14 @@ mod tests {
         assert_eq!(DashboardTab::PerWorkspace.next(), DashboardTab::Spec);
         assert_eq!(DashboardTab::Spec.next(), DashboardTab::Board);
         assert_eq!(DashboardTab::Board.next(), DashboardTab::DataSource);
-        assert_eq!(DashboardTab::DataSource.next(), DashboardTab::Dashboard);
+        assert_eq!(DashboardTab::DataSource.next(), DashboardTab::Scripts);
+        assert_eq!(DashboardTab::Scripts.next(), DashboardTab::Dashboard);
     }
 
     #[test]
     fn tab_cycle_backward() {
-        assert_eq!(DashboardTab::Dashboard.prev(), DashboardTab::DataSource);
+        assert_eq!(DashboardTab::Dashboard.prev(), DashboardTab::Scripts);
+        assert_eq!(DashboardTab::Scripts.prev(), DashboardTab::DataSource);
         assert_eq!(DashboardTab::DataSource.prev(), DashboardTab::Board);
         assert_eq!(DashboardTab::Board.prev(), DashboardTab::Spec);
         assert_eq!(DashboardTab::Spec.prev(), DashboardTab::PerWorkspace);
@@ -2633,14 +2869,14 @@ mod tests {
     #[test]
     fn tab_next_full_cycle_returns_to_start() {
         let start = DashboardTab::Dashboard;
-        let result = start.next().next().next().next().next();
+        let result = start.next().next().next().next().next().next();
         assert_eq!(result, start);
     }
 
     #[test]
     fn tab_prev_full_cycle_returns_to_start() {
         let start = DashboardTab::Dashboard;
-        let result = start.prev().prev().prev().prev().prev();
+        let result = start.prev().prev().prev().prev().prev().prev();
         assert_eq!(result, start);
     }
 
@@ -2652,8 +2888,9 @@ mod tests {
             DashboardTab::Spec,
             DashboardTab::Board,
             DashboardTab::DataSource,
+            DashboardTab::Scripts,
         ] {
-            assert_eq!(tab.next().next().next().next().next(), tab);
+            assert_eq!(tab.next().next().next().next().next().next(), tab);
         }
     }
 
@@ -2665,8 +2902,9 @@ mod tests {
             DashboardTab::Spec,
             DashboardTab::Board,
             DashboardTab::DataSource,
+            DashboardTab::Scripts,
         ] {
-            assert_eq!(tab.prev().prev().prev().prev().prev(), tab);
+            assert_eq!(tab.prev().prev().prev().prev().prev().prev(), tab);
         }
     }
 
@@ -2678,6 +2916,7 @@ mod tests {
             DashboardTab::Spec,
             DashboardTab::Board,
             DashboardTab::DataSource,
+            DashboardTab::Scripts,
         ] {
             assert_eq!(tab.next().prev(), tab);
         }
@@ -2691,6 +2930,7 @@ mod tests {
             DashboardTab::Spec,
             DashboardTab::Board,
             DashboardTab::DataSource,
+            DashboardTab::Scripts,
         ] {
             assert_eq!(tab.prev().next(), tab);
         }
@@ -2716,6 +2956,9 @@ mod tests {
 
         state.active_tab = DashboardTab::DataSource;
         assert_eq!(state.tab_key(), 4);
+
+        state.active_tab = DashboardTab::Scripts;
+        assert_eq!(state.tab_key(), 5);
     }
 
     // ---- Board view state ----
@@ -2919,5 +3162,98 @@ mod tests {
         assert_eq!(DashboardTab::DataSource, DashboardTab::DataSource);
         assert_ne!(DashboardTab::DataSource, DashboardTab::Dashboard);
         assert_ne!(DashboardTab::DataSource, DashboardTab::Board);
+    }
+
+    // ---- Scripts tab ----
+
+    #[test]
+    fn scripts_tab_in_tab_cycle() {
+        // Verify Scripts tab is reachable via next/prev cycling.
+        assert_eq!(DashboardTab::DataSource.next(), DashboardTab::Scripts);
+        assert_eq!(DashboardTab::Scripts.next(), DashboardTab::Dashboard);
+        assert_eq!(DashboardTab::Dashboard.prev(), DashboardTab::Scripts);
+        assert_eq!(DashboardTab::Scripts.prev(), DashboardTab::DataSource);
+    }
+
+    #[test]
+    fn scripts_tab_key_is_five() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Scripts;
+        assert_eq!(state.tab_key(), 5);
+    }
+
+    #[test]
+    fn render_scripts_tab_no_panic_empty_db() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let db = make_db();
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_scripts_tab(frame, &db, frame.area(), 0);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(content.contains("Scripts Execution Summary"));
+        assert!(content.contains("Per-Script Statistics"));
+        assert!(content.contains("Recent Executions"));
+    }
+
+    #[test]
+    fn render_scripts_tab_no_panic_with_data() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let db = make_db();
+
+        // Insert some history events.
+        let event = belt_infra::db::HistoryEvent {
+            work_id: "w1".to_string(),
+            source_id: "s1".to_string(),
+            state: "analyze".to_string(),
+            status: "success".to_string(),
+            attempt: 1,
+            summary: None,
+            error: None,
+            created_at: "2026-03-25T10:00:00Z".to_string(),
+        };
+        db.append_history(&event).unwrap();
+
+        let event2 = belt_infra::db::HistoryEvent {
+            work_id: "w2".to_string(),
+            source_id: "s2".to_string(),
+            state: "analyze".to_string(),
+            status: "failed".to_string(),
+            attempt: 1,
+            summary: None,
+            error: Some("timeout".to_string()),
+            created_at: "2026-03-25T11:00:00Z".to_string(),
+        };
+        db.append_history(&event2).unwrap();
+
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_scripts_tab(frame, &db, frame.area(), 0);
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(content.contains("analyze"));
+        assert!(content.contains("Total Runs: 2"));
     }
 }
