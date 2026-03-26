@@ -19,6 +19,7 @@ use belt_infra::runtimes::gemini::GeminiRuntime;
 use belt_infra::sources::github::GitHubDataSource;
 use belt_infra::worktree::{GitWorktreeManager, WorktreeManager};
 
+mod auto;
 mod claw;
 
 #[derive(Parser)]
@@ -121,6 +122,11 @@ enum Commands {
         #[command(subcommand)]
         command: ClawCommands,
     },
+    /// Manage the /auto slash command plugin for Claude Code.
+    Auto {
+        #[command(subcommand)]
+        command: AutoCommands,
+    },
     /// Bootstrap .claude/rules files for a workspace.
     Bootstrap {
         /// Workspace root directory (defaults to current directory).
@@ -147,6 +153,40 @@ enum Commands {
         /// Brief project description (used with --llm).
         #[arg(long)]
         description: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AutoCommands {
+    /// Install the /auto slash command into the project's .claude/commands/.
+    Plugin {
+        #[command(subcommand)]
+        command: AutoPluginCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AutoPluginCommands {
+    /// Install the /auto slash command files.
+    Install {
+        /// Project root directory (defaults to current directory).
+        #[arg(long)]
+        project: Option<String>,
+        /// Overwrite existing command files.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Remove the /auto slash command files.
+    Uninstall {
+        /// Project root directory (defaults to current directory).
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Check whether the /auto plugin is installed.
+    Status {
+        /// Project root directory (defaults to current directory).
+        #[arg(long)]
+        project: Option<String>,
     },
 }
 
@@ -2833,6 +2873,53 @@ async fn main() -> anyhow::Result<()> {
             HitlCommands::Timeout { command } => {
                 cmd_hitl_timeout(command)?;
             }
+        },
+
+        Commands::Auto { command } => match command {
+            AutoCommands::Plugin { command } => match command {
+                AutoPluginCommands::Install { project, force } => {
+                    let project_root = match project {
+                        Some(p) => PathBuf::from(p),
+                        None => std::env::current_dir()?,
+                    };
+                    let written = auto::plugin::install(&project_root, force)?;
+                    if written.is_empty() {
+                        println!("No files written (already installed). Use --force to overwrite.");
+                    } else {
+                        for path in &written {
+                            println!("Installed: {}", path.display());
+                        }
+                        println!(
+                            "\n/auto slash command installed. Restart Claude Code to activate."
+                        );
+                    }
+                }
+                AutoPluginCommands::Uninstall { project } => {
+                    let project_root = match project {
+                        Some(p) => PathBuf::from(p),
+                        None => std::env::current_dir()?,
+                    };
+                    let removed = auto::plugin::uninstall(&project_root)?;
+                    if removed.is_empty() {
+                        println!("Nothing to remove (not installed).");
+                    } else {
+                        for path in &removed {
+                            println!("Removed: {}", path.display());
+                        }
+                    }
+                }
+                AutoPluginCommands::Status { project } => {
+                    let project_root = match project {
+                        Some(p) => PathBuf::from(p),
+                        None => std::env::current_dir()?,
+                    };
+                    if auto::plugin::is_installed(&project_root) {
+                        println!("Installed");
+                    } else {
+                        println!("Not installed");
+                    }
+                }
+            },
         },
 
         Commands::Claw { command } => match command {
