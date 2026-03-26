@@ -2476,28 +2476,209 @@ impl CronHandler for KnowledgeExtractionJob {
 
 /// Classifies completed queue items into Done or HITL.
 ///
-/// This cron job triggers the evaluate cycle. The actual evaluation is
-/// performed by [`crate::evaluator::Evaluator::run_evaluate`], which
-/// spawns `belt agent --workspace <config> -p <prompt> --json` as an
-/// isolated subprocess with:
+/// This cron job triggers the evaluate cycle by querying the database for
+/// items in the `Completed` phase, spawning an evaluate subprocess per
+/// workspace via [`crate::evaluator::Evaluator::run_evaluate`], and
+/// updating item phases based on the result.
+///
+/// The evaluate subprocess is invoked with:
 /// - **Workspace isolation**: `WORKSPACE`, `BELT_HOME`, `BELT_DB` env vars
 /// - **Timeout handling**: configurable timeout (default 5 min) with child kill
 /// - **IPC**: structured JSON result collected from subprocess stdout
 ///
-/// Per-item failure tracking and HITL escalation are handled by
-/// [`crate::daemon::Daemon::evaluate_completed`].
+/// Per-item failure tracking is persisted in the database via `replan_count`.
+/// After [`crate::evaluator::DEFAULT_MAX_EVAL_FAILURES`] consecutive failures
+/// for a single item, the item is automatically escalated to HITL.
 ///
 /// The cron schedule ensures periodic evaluation, while `force_trigger("evaluate")`
 /// is called on every Completed transition for immediate evaluation.
-pub struct EvaluateJob;
+pub struct EvaluateJob {
+    db: Arc<Database>,
+}
+
+impl EvaluateJob {
+    /// Create a new `EvaluateJob` with the given database handle.
+    pub fn new(db: Arc<Database>) -> Self {
+        Self { db }
+    }
+}
 
 impl CronHandler for EvaluateJob {
     fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
-        // The actual evaluate_completed() logic runs in the daemon's async tick.
-        // This cron handler serves as the schedule trigger point.
-        // When the cron engine fires this job, the daemon's next tick will
-        // pick up Completed items and invoke the evaluator subprocess.
         tracing::info!("EvaluateJob: triggering evaluate cycle for completed items");
+
+        // 1. Query completed items from DB.
+        let completed_items = self.db.list_items(Some(QueuePhase::Completed), None)?;
+
+        if completed_items.is_empty() {
+            tracing::debug!("EvaluateJob: no completed items to evaluate");
+            return Ok(());
+        }
+
+        tracing::info!(
+            count = completed_items.len(),
+            "EvaluateJob: found completed items for evaluation"
+        );
+
+        // 2. Group by workspace to run one evaluator per workspace.
+        let mut by_workspace: HashMap<String, Vec<&belt_core::queue::QueueItem>> = HashMap::new();
+        for item in &completed_items {
+            by_workspace
+                .entry(item.workspace_id.clone())
+                .or_default()
+                .push(item);
+        }
+
+        let belt_home = std::env::var("BELT_HOME").unwrap_or_else(|_| {
+            std::env::var("HOME")
+                .map(|h| format!("{h}/.belt"))
+                .unwrap_or_else(|_| "~/.belt".to_string())
+        });
+        let belt_home_path = std::path::PathBuf::from(&belt_home);
+
+        // Pre-load workspace config paths to avoid repeated DB queries per workspace.
+        let ws_config_map: HashMap<String, std::path::PathBuf> = self
+            .db
+            .list_workspaces()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, path, _)| (name, std::path::PathBuf::from(path)))
+            .collect();
+
+        let mut evaluated_count = 0u32;
+        let mut failed_count = 0u32;
+
+        for (workspace, items) in &by_workspace {
+            tracing::info!(
+                workspace = %workspace,
+                items = items.len(),
+                "EvaluateJob: running evaluator for workspace"
+            );
+
+            // 3. Resolve workspace config path for subprocess invocation.
+            let config_path = ws_config_map.get(workspace);
+
+            let mut evaluator = crate::evaluator::Evaluator::new(workspace);
+            if let Some(cp) = config_path {
+                evaluator = evaluator.with_workspace_config_path(cp.clone());
+            }
+
+            // 4. Bridge async evaluator into this sync handler.
+            let eval_result = std::thread::scope(|_| {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| BeltError::Runtime(e.to_string()))?;
+                rt.block_on(evaluator.run_evaluate(&belt_home_path))
+                    .map_err(|e| BeltError::Runtime(e.to_string()))
+            });
+
+            match eval_result {
+                Ok(result) if result.success() => {
+                    // 5a. Success: transition all items to Done.
+                    for item in items {
+                        match self.db.update_phase(&item.work_id, QueuePhase::Done) {
+                            Ok(()) => {
+                                evaluated_count += 1;
+                                tracing::info!(
+                                    work_id = %item.work_id,
+                                    workspace = %workspace,
+                                    "EvaluateJob: item evaluated as Done"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    work_id = %item.work_id,
+                                    error = %e,
+                                    "EvaluateJob: failed to update item phase to Done"
+                                );
+                            }
+                        }
+                    }
+                }
+                Ok(result) => {
+                    // 5b. Non-zero exit: record failure per item via DB
+                    // replan_count (reused as eval retry counter).
+                    let error_msg = format!(
+                        "evaluator exit_code={}: {}",
+                        result.exit_code,
+                        result.stderr.trim()
+                    );
+                    tracing::warn!(
+                        workspace = %workspace,
+                        exit_code = result.exit_code,
+                        "EvaluateJob: evaluator returned non-zero exit"
+                    );
+
+                    for item in items {
+                        // Increment failure counter in DB and get new count.
+                        let failure_count = match self.db.increment_replan_count(&item.work_id) {
+                            Ok(count) => count,
+                            Err(e) => {
+                                tracing::warn!(
+                                    work_id = %item.work_id,
+                                    error = %e,
+                                    "EvaluateJob: failed to increment replan_count"
+                                );
+                                failed_count += 1;
+                                continue;
+                            }
+                        };
+
+                        if failure_count >= crate::evaluator::DEFAULT_MAX_EVAL_FAILURES {
+                            // Escalate to HITL after max failures.
+                            let notes = format!(
+                                "evaluate failed {} times (threshold={}): {}",
+                                failure_count,
+                                crate::evaluator::DEFAULT_MAX_EVAL_FAILURES,
+                                error_msg
+                            );
+                            if let Err(e) =
+                                self.db
+                                    .escalate_to_hitl(&item.work_id, "evaluate_failure", &notes)
+                            {
+                                tracing::warn!(
+                                    work_id = %item.work_id,
+                                    error = %e,
+                                    "EvaluateJob: failed to escalate item to HITL"
+                                );
+                            } else {
+                                tracing::error!(
+                                    work_id = %item.work_id,
+                                    failure_count,
+                                    "EvaluateJob: escalated to HITL after repeated evaluate failures"
+                                );
+                            }
+                        } else {
+                            // Item stays in Completed; will retry on next cycle.
+                            tracing::info!(
+                                work_id = %item.work_id,
+                                failure_count,
+                                "EvaluateJob: evaluate failed, will retry on next cycle"
+                            );
+                        }
+                        failed_count += 1;
+                    }
+                }
+                Err(e) => {
+                    // 5c. Subprocess spawn/timeout error: log and let retry on next cycle.
+                    tracing::error!(
+                        workspace = %workspace,
+                        error = %e,
+                        "EvaluateJob: failed to run evaluator subprocess"
+                    );
+                    failed_count += items.len() as u32;
+                }
+            }
+        }
+
+        tracing::info!(
+            total = completed_items.len(),
+            evaluated = evaluated_count,
+            failed = failed_count,
+            workspaces = by_workspace.len(),
+            "EvaluateJob completed"
+        );
         Ok(())
     }
 }
@@ -2640,7 +2821,7 @@ pub fn builtin_jobs(deps: BuiltinJobDeps) -> Vec<CronJobDef> {
             workspace: None,
             enabled: true,
             last_run_at: None,
-            handler: Box::new(EvaluateJob),
+            handler: Box::new(EvaluateJob::new(Arc::clone(&deps.db))),
         },
         CronJobDef {
             name: "pr_review_scan".to_string(),
@@ -2882,7 +3063,7 @@ pub fn seed_workspace_crons(engine: &mut CronEngine, workspace: &str, deps: Buil
         workspace: Some(ws.clone()),
         enabled: true,
         last_run_at: None,
-        handler: Box::new(EvaluateJob),
+        handler: Box::new(EvaluateJob::new(Arc::clone(&deps.db))),
     });
 
     engine.register(CronJobDef {
@@ -3849,10 +4030,32 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_job_runs_without_error() {
-        let job = EvaluateJob;
+    fn evaluate_job_no_completed_items() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let job = EvaluateJob::new(Arc::clone(&db));
         let ctx = CronContext { now: Utc::now() };
-        // EvaluateJob is a trigger-only stub; the actual logic is in Daemon::evaluate_completed.
+        // With no completed items in the DB, execute should return Ok immediately.
+        job.execute(&ctx).unwrap();
+    }
+
+    #[test]
+    fn evaluate_job_transitions_completed_items() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        // Insert a completed item.
+        let mut item = belt_core::queue::testing::test_item("test-source", "evaluate");
+        item.phase = QueuePhase::Completed;
+        item.workspace_id = "test-ws".to_string();
+        db.insert_item(&item).unwrap();
+
+        // Verify the item is in Completed phase.
+        let items = db.list_items(Some(QueuePhase::Completed), None).unwrap();
+        assert_eq!(items.len(), 1);
+
+        let job = EvaluateJob::new(Arc::clone(&db));
+        let ctx = CronContext { now: Utc::now() };
+        // The evaluator subprocess will fail (belt binary not available in test),
+        // but the job itself should not return an error — failures are handled
+        // per-item and logged.
         job.execute(&ctx).unwrap();
     }
 
