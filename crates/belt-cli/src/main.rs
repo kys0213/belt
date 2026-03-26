@@ -2676,11 +2676,14 @@ async fn main() -> anyhow::Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
                     .join(".belt");
                 let claw_workspace = claw::ClawWorkspace::init(&belt_home)?;
+                let runtime: Arc<dyn belt_core::runtime::AgentRuntime> =
+                    Arc::new(ClaudeRuntime::new(None));
                 let config = claw::session::SessionConfig {
                     workspace: None,
                     claw_workspace,
+                    runtime: Some(runtime),
                 };
-                claw::session::run_interactive(config)?;
+                claw::session::run_interactive(config).await?;
             }
         },
     }
