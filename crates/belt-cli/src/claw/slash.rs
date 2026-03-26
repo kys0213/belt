@@ -221,10 +221,8 @@ fn format_spec_output(spec: &serde_json::Value) -> String {
         }
     }
 
-    // Trim trailing newline for consistency with other handlers.
-    while out.ends_with('\n') {
-        out.pop();
-    }
+    // Trim trailing newlines for consistency with other handlers.
+    out.truncate(out.trim_end_matches('\n').len());
     out
 }
 
@@ -232,7 +230,7 @@ fn format_spec_output(spec: &serde_json::Value) -> String {
 /// content (first non-empty line after the heading, truncated to 60 chars).
 fn extract_sections(content: &str) -> Vec<(String, String)> {
     let mut sections = Vec::new();
-    let mut lines = content.lines().peekable();
+    let mut lines = content.lines();
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
@@ -246,9 +244,7 @@ fn extract_sections(content: &str) -> Vec<(String, String)> {
                     continue;
                 }
                 if next_trimmed.starts_with('#') {
-                    // Reached next heading without content; put it back via
-                    // re-processing on the outer loop is not possible with
-                    // by_ref, so we just stop.
+                    // Next heading reached; stop preview collection.
                     break;
                 }
                 preview = if next_trimmed.len() > 60 {
