@@ -2828,6 +2828,69 @@ async fn main() -> anyhow::Result<()> {
                             belt_core::queue::HitlRespondAction::Replan => unreachable!(),
                         };
                         db.update_phase(&item_id, target_phase)?;
+
+                        // Handle spec-completion HITL: transition spec status
+                        // based on the respond action.
+                        if item.state == "spec_completion" {
+                            let spec_id = &item.source_id;
+                            match action {
+                                belt_core::queue::HitlRespondAction::Done => {
+                                    match db.update_spec_status(
+                                        spec_id,
+                                        belt_core::spec::SpecStatus::Completed,
+                                    ) {
+                                        Ok(()) => {
+                                            tracing::info!(
+                                                spec_id = %spec_id,
+                                                "spec transitioned from Completing to \
+                                                 Completed via HITL approval"
+                                            );
+                                            println!(
+                                                "Spec '{}' transitioned to Completed.",
+                                                spec_id
+                                            );
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                spec_id = %spec_id,
+                                                error = %e,
+                                                "failed to transition spec to Completed \
+                                                 after HITL approval"
+                                            );
+                                        }
+                                    }
+                                }
+                                belt_core::queue::HitlRespondAction::Retry
+                                | belt_core::queue::HitlRespondAction::Skip => {
+                                    // Rejection or retry: revert spec to Active
+                                    // so gap-detection can re-evaluate.
+                                    match db.update_spec_status(
+                                        spec_id,
+                                        belt_core::spec::SpecStatus::Active,
+                                    ) {
+                                        Ok(()) => {
+                                            tracing::info!(
+                                                spec_id = %spec_id,
+                                                "spec reverted to Active after HITL \
+                                                 {action}"
+                                            );
+                                            println!("Spec '{}' reverted to Active.", spec_id);
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                spec_id = %spec_id,
+                                                error = %e,
+                                                "failed to revert spec to Active"
+                                            );
+                                        }
+                                    }
+                                }
+                                belt_core::queue::HitlRespondAction::Replan => {
+                                    unreachable!()
+                                }
+                            }
+                        }
+
                         println!(
                             "Item '{}' transitioned from hitl to {} (action: {}).",
                             item_id, target_phase, action
