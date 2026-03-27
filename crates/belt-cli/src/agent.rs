@@ -27,6 +27,20 @@ fn load_workspace_config(path: &str) -> Result<WorkspaceConfig> {
 ///
 /// Returns `None` if no rules directory is found.
 fn resolve_rules_dir(config: &WorkspaceConfig) -> Option<PathBuf> {
+    resolve_rules_dir_with_home(config, None)
+}
+
+/// Resolve the workspace rules directory using an explicit `belt_home` override.
+///
+/// When `belt_home` is `None`, the function reads the `BELT_HOME` environment
+/// variable (falling back to `~/.belt`).  Accepting the home path as a
+/// parameter allows tests to inject a temporary directory without mutating
+/// process-global environment variables, eliminating race conditions in
+/// parallel test execution.
+fn resolve_rules_dir_with_home(
+    config: &WorkspaceConfig,
+    belt_home: Option<&Path>,
+) -> Option<PathBuf> {
     // 1. Explicit rules_path in claw_config.
     if let Some(ref claw) = config.claw_config
         && let Some(ref path) = claw.rules_path
@@ -38,12 +52,19 @@ fn resolve_rules_dir(config: &WorkspaceConfig) -> Option<PathBuf> {
     }
 
     // 2. Per-workspace Claw directory under BELT_HOME.
-    let belt_home = std::env::var("BELT_HOME")
-        .map(PathBuf::from)
-        .ok()
-        .or_else(|| dirs::home_dir().map(|h| h.join(".belt")));
+    let owned_home: Option<PathBuf>;
+    let belt_home = match belt_home {
+        Some(p) => Some(p),
+        None => {
+            owned_home = std::env::var("BELT_HOME")
+                .map(PathBuf::from)
+                .ok()
+                .or_else(|| dirs::home_dir().map(|h| h.join(".belt")));
+            owned_home.as_deref()
+        }
+    };
 
-    if let Some(ref home) = belt_home {
+    if let Some(home) = belt_home {
         let ws_rules = home
             .join("workspaces")
             .join(&config.name)
@@ -55,7 +76,7 @@ fn resolve_rules_dir(config: &WorkspaceConfig) -> Option<PathBuf> {
     }
 
     // 3. Global Claw workspace rules.
-    if let Some(ref home) = belt_home {
+    if let Some(home) = belt_home {
         let global_rules = home.join("claw-workspace").join(".claude").join("rules");
         if global_rules.is_dir() {
             return Some(global_rules);
@@ -743,11 +764,8 @@ runtime:
             .join("system");
         std::fs::create_dir_all(&ws_rules).unwrap();
 
-        // Set BELT_HOME to the temp directory so the per-workspace path is found.
-        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
-
         let config = empty_workspace();
-        let resolved = resolve_rules_dir(&config);
+        let resolved = resolve_rules_dir_with_home(&config, Some(tmp.path()));
         assert_eq!(resolved, Some(ws_rules));
     }
 
@@ -761,10 +779,8 @@ runtime:
             .join("rules");
         std::fs::create_dir_all(&global_rules).unwrap();
 
-        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
-
         let config = empty_workspace();
-        let resolved = resolve_rules_dir(&config);
+        let resolved = resolve_rules_dir_with_home(&config, Some(tmp.path()));
         assert_eq!(resolved, Some(global_rules));
     }
 
@@ -786,10 +802,8 @@ runtime:
             .join("rules");
         std::fs::create_dir_all(&global_rules).unwrap();
 
-        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
-
         let config = empty_workspace();
-        let resolved = resolve_rules_dir(&config);
+        let resolved = resolve_rules_dir_with_home(&config, Some(tmp.path()));
         // Per-workspace (priority 2) should win over global (priority 3).
         assert_eq!(resolved, Some(ws_rules));
     }
@@ -808,15 +822,13 @@ runtime:
             .join("system");
         std::fs::create_dir_all(&ws_rules).unwrap();
 
-        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
-
         let mut config = empty_workspace();
         config.claw_config = Some(belt_core::workspace::ClawConfig {
             rules_path: Some(explicit_dir.to_string_lossy().to_string()),
             ..Default::default()
         });
 
-        let resolved = resolve_rules_dir(&config);
+        let resolved = resolve_rules_dir_with_home(&config, Some(tmp.path()));
         // Explicit path (priority 1) should win over per-workspace (priority 2).
         assert_eq!(resolved, Some(explicit_dir));
     }
@@ -889,17 +901,16 @@ runtime:
 
     #[test]
     fn workspace_without_rules_has_no_system_prompt() {
-        // Point BELT_HOME to an empty temp dir so global claw rules are not found.
+        // Point belt_home to an empty temp dir so global claw rules are not found.
         let tmp = tempfile::tempdir().unwrap();
-        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
 
         let config = empty_workspace();
-        // No claw_config, so resolve_rules_dir returns None.
+        // No claw_config, so resolve_rules_dir_with_home returns None.
         // Simulate the run_agent flow.
         let working_dir = std::env::current_dir().unwrap();
         let mut env = ActionEnv::new("test-agent", &working_dir);
 
-        if let Some(rules_dir) = resolve_rules_dir(&config)
+        if let Some(rules_dir) = resolve_rules_dir_with_home(&config, Some(tmp.path()))
             && let Ok(Some(system_prompt)) = load_rules_from_dir(&rules_dir)
         {
             env = env.with_system_prompt(system_prompt);
@@ -1049,56 +1060,5 @@ runtime:
         // Which results in the default of 10.
         let prompt = build_claw_rules_prompt(max_turns);
         assert!(prompt.contains("session: 10"));
-    }
-
-    /// Global mutex that serializes tests which mutate environment variables.
-    /// Rust's test harness runs tests in parallel threads by default, so any
-    /// test that calls `std::env::set_var` must hold this lock for the
-    /// duration of the test to avoid races with other env-mutating tests.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII guard for setting environment variables in tests.
-    ///
-    /// Acquires `ENV_LOCK` for its entire lifetime so that concurrent tests
-    /// cannot observe each other's temporary env-var mutations.
-    /// Restores (or removes) the variable on drop.
-    struct EnvGuard {
-        key: String,
-        prev: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &str, value: &str) -> Self {
-            // Acquire the global env lock first to serialize all env mutations.
-            // `unwrap_or_else` recovers from a poisoned mutex caused by a
-            // previous test panic.
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var(key).ok();
-            // SAFETY: We hold ENV_LOCK, so no other test is mutating env vars
-            // concurrently.
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self {
-                key: key.to_string(),
-                prev,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: We still hold ENV_LOCK here (released when _lock is
-            // dropped at the end of this block).
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var(&self.key, v),
-                    None => std::env::remove_var(&self.key),
-                }
-            }
-            // _lock is dropped here, releasing ENV_LOCK.
-        }
     }
 }
