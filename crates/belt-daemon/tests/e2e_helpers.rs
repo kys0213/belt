@@ -155,15 +155,7 @@ pub fn cleanup_all_e2e_issues() {
     for label in &["e2e-test:analyze", "e2e-test:implement"] {
         let output = Command::new("gh")
             .args([
-                "issue",
-                "list",
-                "--repo",
-                REPO,
-                "--label",
-                label,
-                "--state",
-                "open",
-                "--json",
+                "issue", "list", "--repo", REPO, "--label", label, "--state", "open", "--json",
                 "number",
             ])
             .output();
@@ -266,8 +258,5 @@ impl Drop for TestIssueGuard {
 // ─── Internal Helpers ────────────────────────────────────────────
 
 fn extract_issue_number(url: &str) -> Option<i64> {
-    url.trim()
-        .rsplit('/')
-        .next()
-        .and_then(|s| s.parse().ok())
+    url.trim().rsplit('/').next().and_then(|s| s.parse().ok())
 }

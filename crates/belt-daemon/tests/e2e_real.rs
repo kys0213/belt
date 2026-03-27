@@ -41,7 +41,10 @@ async fn e2e_setup_and_collect() {
 
     // Collect should pick up our test issue.
     let collected = daemon.collect().await.unwrap();
-    assert!(collected >= 1, "expected at least 1 item collected, got {collected}");
+    assert!(
+        collected >= 1,
+        "expected at least 1 item collected, got {collected}"
+    );
 
     // Find our item by source_id pattern.
     let our_item = daemon
@@ -130,10 +133,7 @@ async fn e2e_full_pipeline_analyze() {
 async fn e2e_handler_failure_escalation() {
     assert_prerequisites();
 
-    let number = create_test_issue(
-        "[E2E] handler_failure_escalation test",
-        "e2e-test:analyze",
-    );
+    let number = create_test_issue("[E2E] handler_failure_escalation test", "e2e-test:analyze");
     let _guard = TestIssueGuard { number };
 
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -217,18 +217,12 @@ async fn e2e_hitl_respond() {
         None,
     );
     assert!(hitl_result.is_ok(), "mark_hitl should succeed");
-    assert_eq!(
-        daemon.get_item(&work_id).unwrap().phase,
-        QueuePhase::Hitl
-    );
+    assert_eq!(daemon.get_item(&work_id).unwrap().phase, QueuePhase::Hitl);
 
     // Respond with Done.
     let done_result = daemon.mark_done(&work_id);
     assert!(done_result.is_ok(), "mark_done should succeed");
-    assert_eq!(
-        daemon.get_item(&work_id).unwrap().phase,
-        QueuePhase::Done
-    );
+    assert_eq!(daemon.get_item(&work_id).unwrap().phase, QueuePhase::Done);
 }
 
 // ─── Test 5: Token Usage Tracking ────────────────────────────────
@@ -251,12 +245,9 @@ async fn e2e_token_usage_tracking() {
     let mut daemon = setup_real_daemon(&tmp);
 
     // Run one full tick (collect → advance → execute → evaluate).
-    let tick_result = tokio::time::timeout(
-        std::time::Duration::from_secs(120),
-        daemon.tick(),
-    )
-    .await
-    .expect("tick timed out after 120s");
+    let tick_result = tokio::time::timeout(std::time::Duration::from_secs(120), daemon.tick())
+        .await
+        .expect("tick timed out after 120s");
 
     assert!(tick_result.is_ok(), "tick should succeed: {tick_result:?}");
 
