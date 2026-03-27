@@ -343,6 +343,591 @@ pub fn print_spec_status(status: &SpecStatus, format: &str) -> anyhow::Result<()
     Ok(())
 }
 
+fn print_text_status(status: &SystemStatus) {
+    println!("Belt System Status");
+    println!("==================");
+    println!("Total items: {}", status.total_items);
+    if status.hitl_count > 0 {
+        println!("\x1b[31mHITL: {}\x1b[0m", status.hitl_count);
+    } else {
+        println!("HITL: 0");
+    }
+    println!();
+    if !status.phase_counts.is_empty() {
+        println!("Phase breakdown:");
+        for pc in &status.phase_counts {
+            println!("  {:<12} {}", pc.phase, pc.count);
+        }
+        println!();
+    }
+    if status.running_items.is_empty() {
+        println!("No items currently running.");
+    } else {
+        println!("Running items:");
+        for item in &status.running_items {
+            println!("  {} ({}/{})", item.work_id, item.workspace, item.state);
+        }
+    }
+    println!();
+    if !status.recent_events.is_empty() {
+        println!("Recent transitions:");
+        for ev in &status.recent_events {
+            println!(
+                "  {} -> {} [{}] {} ({})",
+                ev.from_state, ev.to_state, ev.event_type, ev.item_id, ev.timestamp
+            );
+        }
+    }
+    if let Some(ref s) = status.runtime_stats {
+        println!();
+        println!(
+            "  Tokens (24h): {} total, {} executions",
+            s.total_tokens, s.executions
+        );
+    }
+    if status.hitl_count > 0 {
+        println!();
+        println!(
+            "\x1b[33m\u{26a0}\u{fe0f} {} items require human intervention. Run 'belt claw' to review.\x1b[0m",
+            status.hitl_count
+        );
+    }
+}
+
+/// Map a ratatui [`ratatui::style::Color`] to the corresponding
+/// [`crossterm::style::Color`] for terminal output outside the TUI.
+fn to_crossterm_color(c: ratatui::style::Color) -> crossterm::style::Color {
+    match c {
+        ratatui::style::Color::Gray => crossterm::style::Color::Grey,
+        ratatui::style::Color::Blue => crossterm::style::Color::Blue,
+        ratatui::style::Color::Green => crossterm::style::Color::Green,
+        ratatui::style::Color::Cyan => crossterm::style::Color::Cyan,
+        ratatui::style::Color::White => crossterm::style::Color::White,
+        ratatui::style::Color::Yellow => crossterm::style::Color::Yellow,
+        ratatui::style::Color::Red => crossterm::style::Color::Red,
+        ratatui::style::Color::DarkGray => crossterm::style::Color::DarkGrey,
+        _ => crossterm::style::Color::White,
+    }
+}
+
+fn print_rich_status(status: &SystemStatus, daemon_running: Option<bool>) {
+    let mut stdout = io::stdout();
+    let w = box_content_width();
+
+    // Header box
+    let border_h = "\u{2500}".repeat(w);
+    let _ = writeln!(stdout, "\u{250c}{border_h}\u{2510}");
+    let title = format!("{:^width$}", "Belt System Status", width = w - 2);
+    let _ = writeln!(stdout, "\u{2502} {} \u{2502}", title.bold());
+    let _ = writeln!(stdout, "\u{251c}{border_h}\u{2524}");
+
+    // Daemon status row (when provided)
+    if let Some(running) = daemon_running {
+        let (label, indicator) = if running {
+            ("running", "\u{25cf} running".green())
+        } else {
+            ("stopped", "\u{25cb} stopped".red())
+        };
+        let pad = w - 2 - "Daemon: ".len() - label.len();
+        let _ = writeln!(
+            stdout,
+            "\u{2502} Daemon: {indicator}{:pad$} \u{2502}",
+            "",
+            pad = pad,
+        );
+    }
+
+    let items_str = format!("{}", status.total_items);
+    let pad = w - 2 - "Total items: ".len() - items_str.len();
+    let _ = writeln!(
+        stdout,
+        "\u{2502} Total items: {items_str}{:pad$} \u{2502}",
+        "",
+        pad = pad,
+    );
+
+    if status.hitl_count > 0 {
+        let hitl_str = format!("{}", status.hitl_count);
+        let hpad = w - 2 - "HITL items:  ".len() - hitl_str.len();
+        let _ = writeln!(
+            stdout,
+            "\u{2502} HITL items:  {}{:hpad$} \u{2502}",
+            hitl_str.yellow(),
+            "",
+            hpad = hpad,
+        );
+    }
+
+    let _ = writeln!(stdout, "\u{2514}{border_h}\u{2518}");
+
+    // Phase table with colours and progress bar
+    if !status.phase_counts.is_empty() {
+        let total = status.total_items.max(1);
+        // Adaptive progress bar width: use remaining space after phase (16) + count (10) + separators
+        let bar_width = (w.saturating_sub(32)).max(8);
+
+        let _ = writeln!(stdout);
+        let _ = writeln!(
+            stdout,
+            "  {} {:<14} {} {:<8} {} {}",
+            "\u{2502}".dark_grey(),
+            "Phase".bold().underlined(),
+            "\u{2502}".dark_grey(),
+            "Count".bold().underlined(),
+            "\u{2502}".dark_grey(),
+            "Progress".bold().underlined(),
+        );
+        let _ = writeln!(
+            stdout,
+            "  {}{}{}{}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(16),
+            "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(9),
+            "\u{253c}".dark_grey(),
+        );
+        for pc in &status.phase_counts {
+            let color = to_crossterm_color(dashboard::phase_color(&pc.phase));
+            let phase_styled = style::style(format!("{:<14}", pc.phase)).with(color);
+            let pct = (pc.count as f64 / total as f64 * 100.0) as u32;
+            let bar = render_progress_bar(pct, bar_width);
+            let _ = writeln!(
+                stdout,
+                "  {} {phase_styled} {} {:<8} {} {} {:>3}%",
+                "\u{2502}".dark_grey(),
+                "\u{2502}".dark_grey(),
+                pc.count,
+                "\u{2502}".dark_grey(),
+                bar,
+                pct,
+            );
+        }
+    }
+
+    // Per-workspace breakdown
+    if !status.workspace_summary.is_empty() {
+        let phases_col_width = w.saturating_sub(26).max(10);
+
+        let _ = writeln!(stdout);
+        let _ = writeln!(stdout, "  {}", "Per-Workspace Status".bold().cyan());
+        let _ = writeln!(
+            stdout,
+            "  {}{}{}{}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(16),
+            "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(7),
+            "\u{253c}".dark_grey(),
+        );
+        let _ = writeln!(
+            stdout,
+            "  {} {:<14} {} {:<5} {} {}",
+            "\u{2502}".dark_grey(),
+            "Workspace".bold().underlined(),
+            "\u{2502}".dark_grey(),
+            "Items".bold().underlined(),
+            "\u{2502}".dark_grey(),
+            "Phases".bold().underlined(),
+        );
+        let _ = writeln!(
+            stdout,
+            "  {}{}{}{}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(16),
+            "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(7),
+            "\u{253c}".dark_grey(),
+        );
+        for ws in &status.workspace_summary {
+            let phases_str: String = ws
+                .phase_counts
+                .iter()
+                .map(|pc| format!("{}:{}", pc.phase, pc.count))
+                .collect::<Vec<_>>()
+                .join(", ");
+            // Truncate phases string if it exceeds available width.
+            let display_phases = if phases_str.len() > phases_col_width {
+                format!("{}\u{2026}", &phases_str[..phases_col_width - 1])
+            } else {
+                phases_str
+            };
+            let _ = writeln!(
+                stdout,
+                "  {} {:<14} {} {:<5} {} {}",
+                "\u{2502}".dark_grey(),
+                ws.workspace,
+                "\u{2502}".dark_grey(),
+                ws.total,
+                "\u{2502}".dark_grey(),
+                display_phases.dark_grey(),
+            );
+        }
+    }
+
+    // Running items
+    if !status.running_items.is_empty() {
+        let _ = writeln!(stdout);
+        let _ = writeln!(stdout, "  {}", "Running Items".bold().green());
+        for item in &status.running_items {
+            let _ = writeln!(
+                stdout,
+                "    {} {} {}",
+                "\u{25cf}".green(),
+                item.work_id,
+                format!("({})", item.workspace).dark_grey(),
+            );
+        }
+    }
+
+    // Recent transitions
+    if !status.recent_events.is_empty() {
+        let _ = writeln!(stdout);
+        let _ = writeln!(stdout, "  {}", "Recent Transitions".bold());
+        for ev in &status.recent_events {
+            let from_color = to_crossterm_color(dashboard::phase_color(&ev.from_state));
+            let to_color = to_crossterm_color(dashboard::phase_color(&ev.to_state));
+            let from = style::style(&ev.from_state).with(from_color);
+            let to = style::style(&ev.to_state).with(to_color);
+            let _ = writeln!(
+                stdout,
+                "    {from} \u{2192} {to}  {} {}",
+                ev.item_id.as_str().dark_grey(),
+                format!("[{}]", ev.event_type).dark_grey(),
+            );
+        }
+    }
+
+    // Error/HITL summary
+    if !status.error_items.is_empty() {
+        let _ = writeln!(stdout);
+        let header = format!("Recent Errors ({} items)", status.error_items.len());
+        let _ = writeln!(stdout, "  {}", header.bold().red());
+        for item in &status.error_items {
+            let _ = writeln!(
+                stdout,
+                "    {} {} {}",
+                "\u{2716}".red(),
+                item.work_id.as_str().red(),
+                format!("({}) {}", item.workspace, item.updated_at).dark_grey(),
+            );
+        }
+    }
+
+    if !status.hitl_items.is_empty() {
+        let _ = writeln!(stdout);
+        let header = format!("HITL Pending ({} items)", status.hitl_items.len());
+        let _ = writeln!(stdout, "  {}", header.bold().yellow());
+        for item in &status.hitl_items {
+            let _ = writeln!(
+                stdout,
+                "    {} {} {}",
+                "\u{26a0}".yellow(),
+                item.work_id.as_str().yellow(),
+                format!("({}) {}", item.workspace, item.updated_at).dark_grey(),
+            );
+        }
+        let _ = writeln!(stdout);
+        let _ = writeln!(
+            stdout,
+            "  {}",
+            format!(
+                "{} items require human intervention. Run 'belt claw' to review.",
+                status.hitl_items.len()
+            )
+            .yellow(),
+        );
+    } else if status.hitl_count > 0 {
+        let _ = writeln!(stdout);
+        let _ = writeln!(
+            stdout,
+            "  {}",
+            format!(
+                "{} items require human intervention. Run 'belt claw' to review.",
+                status.hitl_count
+            )
+            .yellow(),
+        );
+    }
+}
+
+/// Render runtime statistics with crossterm colours for the rich format.
+fn print_rich_runtime(stats: &RuntimeStats) {
+    let mut stdout = io::stdout();
+
+    let _ = writeln!(stdout);
+    let _ = writeln!(stdout, "  {}", "Runtime Stats (last 24h)".bold().cyan());
+    let _ = writeln!(
+        stdout,
+        "  {}",
+        "\u{2500}".repeat(box_content_width().min(60)).dark_grey()
+    );
+    let _ = writeln!(
+        stdout,
+        "  Total tokens:  {} (in: {} / out: {})",
+        fmt_num(stats.total_tokens).bold(),
+        fmt_num(stats.total_tokens_input),
+        fmt_num(stats.total_tokens_output),
+    );
+    let _ = writeln!(
+        stdout,
+        "  Executions:    {}",
+        stats.executions.to_string().bold()
+    );
+    match stats.avg_duration_ms {
+        Some(d) => {
+            let _ = writeln!(stdout, "  Avg duration:  {:.0}ms", d);
+        }
+        None => {
+            let _ = writeln!(stdout, "  Avg duration:  -");
+        }
+    }
+
+    if !stats.by_model.is_empty() {
+        let _ = writeln!(stdout);
+        let _ = writeln!(
+            stdout,
+            "  {:<20} {:>10} {:>10} {:>10} {:>6} {:>10}",
+            "Model".bold().underlined(),
+            "Input".bold().underlined(),
+            "Output".bold().underlined(),
+            "Total".bold().underlined(),
+            "Runs".bold().underlined(),
+            "Avg ms".bold().underlined(),
+        );
+        let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(70).dark_grey(),);
+
+        let mut models: Vec<_> = stats.by_model.values().collect();
+        models.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+
+        for m in &models {
+            let avg = m
+                .avg_duration_ms
+                .map_or_else(|| "-".to_string(), |d| format!("{d:.0}"));
+            let _ = writeln!(
+                stdout,
+                "  {:<20} {:>10} {:>10} {:>10} {:>6} {:>10}",
+                m.model.as_str().cyan(),
+                fmt_num(m.input_tokens),
+                fmt_num(m.output_tokens),
+                fmt_num(m.total_tokens),
+                m.executions,
+                avg,
+            );
+        }
+
+        // Aggregation totals row when multiple models present
+        if models.len() > 1 {
+            let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(70).dark_grey());
+            let _ = writeln!(
+                stdout,
+                "  {:<20} {:>10} {:>10} {:>10} {:>6}",
+                "Total".bold(),
+                fmt_num(stats.total_tokens_input),
+                fmt_num(stats.total_tokens_output),
+                fmt_num(stats.total_tokens),
+                stats.executions,
+            );
+        }
+    }
+    let _ = writeln!(stdout);
+}
+
+fn print_text_spec_status(status: &SpecStatus) {
+    println!("Workspace: {}", status.workspace);
+    println!("Config:    {}", status.config_path);
+    println!("Items:     {}", status.item_count);
+    println!();
+    if status.phase_counts.is_empty() {
+        println!("No items in this workspace.");
+    } else {
+        println!("Phase breakdown:");
+        for pc in &status.phase_counts {
+            println!("  {:<12} {}", pc.phase, pc.count);
+        }
+    }
+}
+
+fn print_rich_spec_status(status: &SpecStatus) {
+    let mut stdout = io::stdout();
+    let w = box_content_width();
+
+    let border_h = "\u{2500}".repeat(w);
+    let _ = writeln!(stdout, "\u{250c}{border_h}\u{2510}");
+
+    // Workspace name (bold) with padding
+    let ws_label = "Workspace: ";
+    let ws_pad = w.saturating_sub(2 + ws_label.len() + status.workspace.len());
+    let _ = writeln!(
+        stdout,
+        "\u{2502} {ws_label}{}{:ws_pad$} \u{2502}",
+        status.workspace.clone().bold(),
+        "",
+        ws_pad = ws_pad,
+    );
+
+    let cfg_label = "Config:    ";
+    let cfg_val = &status.config_path;
+    let cfg_pad = w.saturating_sub(2 + cfg_label.len() + cfg_val.len());
+    let _ = writeln!(
+        stdout,
+        "\u{2502} {cfg_label}{cfg_val}{:cfg_pad$} \u{2502}",
+        "",
+        cfg_pad = cfg_pad,
+    );
+
+    let items_label = "Items:     ";
+    let items_val = status.item_count.to_string();
+    let items_pad = w.saturating_sub(2 + items_label.len() + items_val.len());
+    let _ = writeln!(
+        stdout,
+        "\u{2502} {items_label}{items_val}{:items_pad$} \u{2502}",
+        "",
+        items_pad = items_pad,
+    );
+
+    let _ = writeln!(stdout, "\u{2514}{border_h}\u{2518}");
+
+    if !status.phase_counts.is_empty() {
+        let bar_width = (w.saturating_sub(32)).max(8);
+
+        let _ = writeln!(stdout);
+        let _ = writeln!(
+            stdout,
+            "  {} {:<14} {} {:<8} {} {}",
+            "\u{2502}".dark_grey(),
+            "Phase".bold().underlined(),
+            "\u{2502}".dark_grey(),
+            "Count".bold().underlined(),
+            "\u{2502}".dark_grey(),
+            "Progress".bold().underlined(),
+        );
+        let _ = writeln!(
+            stdout,
+            "  {}{}{}{}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
+            "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(16),
+            "\u{253c}".dark_grey(),
+            "\u{2500}".repeat(9),
+            "\u{253c}".dark_grey(),
+        );
+        let total = status.item_count.max(1);
+        for pc in &status.phase_counts {
+            let color = to_crossterm_color(dashboard::phase_color(&pc.phase));
+            let phase_styled = style::style(format!("{:<14}", pc.phase)).with(color);
+            let pct = (pc.count as f64 / total as f64 * 100.0) as u32;
+            let bar = render_progress_bar(pct, bar_width);
+            let _ = writeln!(
+                stdout,
+                "  {} {phase_styled} {} {:<8} {} {} {:>3}%",
+                "\u{2502}".dark_grey(),
+                "\u{2502}".dark_grey(),
+                pc.count,
+                "\u{2502}".dark_grey(),
+                bar,
+                pct,
+            );
+        }
+
+        // Overall completion: done + completed + skipped as "finished"
+        let finished: u32 = status
+            .phase_counts
+            .iter()
+            .filter(|pc| matches!(pc.phase.as_str(), "done" | "completed" | "skipped"))
+            .map(|pc| pc.count)
+            .sum();
+        let overall_pct = (finished as f64 / total as f64 * 100.0) as u32;
+        let overall_bar_width = (w.saturating_sub(22)).max(10);
+        let overall_bar = render_progress_bar(overall_pct, overall_bar_width);
+        let _ = writeln!(stdout);
+        let _ = writeln!(
+            stdout,
+            "  Overall: {}/{} {} {:>3}%",
+            finished, total, overall_bar, overall_pct
+        );
+    }
+
+    // Token usage analysis
+    if let Some(ref usage) = status.token_usage {
+        let _ = writeln!(stdout);
+        let _ = writeln!(stdout, "  {}", "Token Usage".bold().cyan());
+        let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(w.min(60)).dark_grey());
+        let _ = writeln!(
+            stdout,
+            "  Total:  {} (in: {} / out: {})",
+            fmt_num(usage.total_tokens).bold(),
+            fmt_num(usage.total_input),
+            fmt_num(usage.total_output),
+        );
+        let _ = writeln!(
+            stdout,
+            "  Executions: {}",
+            usage.executions.to_string().bold()
+        );
+        if !usage.by_model.is_empty() {
+            let _ = writeln!(stdout);
+            let _ = writeln!(
+                stdout,
+                "  {:<20} {:>10} {:>10} {:>10} {:>5}",
+                "Model".bold().underlined(),
+                "Input".bold().underlined(),
+                "Output".bold().underlined(),
+                "Total".bold().underlined(),
+                "Runs".bold().underlined(),
+            );
+            let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(59).dark_grey(),);
+            for m in &usage.by_model {
+                let _ = writeln!(
+                    stdout,
+                    "  {:<20} {:>10} {:>10} {:>10} {:>5}",
+                    m.model.as_str().cyan(),
+                    fmt_num(m.input_tokens),
+                    fmt_num(m.output_tokens),
+                    fmt_num(m.total_tokens),
+                    m.executions,
+                );
+            }
+            // Aggregation totals row
+            if usage.by_model.len() > 1 {
+                let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(59).dark_grey());
+                let _ = writeln!(
+                    stdout,
+                    "  {:<20} {:>10} {:>10} {:>10} {:>5}",
+                    "Total".bold(),
+                    fmt_num(usage.total_input),
+                    fmt_num(usage.total_output),
+                    fmt_num(usage.total_tokens),
+                    usage.executions,
+                );
+            }
+        }
+    }
+}
+
+/// Render a text-based progress bar of the given width.
+///
+/// `pct` is a value 0..=100 and `width` is the number of character cells.
+fn render_progress_bar(pct: u32, width: usize) -> String {
+    let filled = (pct as usize * width / 100).min(width);
+    let empty = width - filled;
+    format!("[{}{}]", "#".repeat(filled), ".".repeat(empty),)
+}
+
+/// Format a number with comma separators for readability.
+fn fmt_num(n: u64) -> String {
+    if n < 1_000 {
+        return n.to_string();
+    }
+    let s = n.to_string();
+    let mut result = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use belt_core::phase::QueuePhase;
@@ -1681,589 +2266,4 @@ mod tests {
         assert_eq!(phase_map.get("hitl").copied(), Some(1));
         assert_eq!(phase_map.get("done").copied(), Some(1));
     }
-}
-
-fn print_text_status(status: &SystemStatus) {
-    println!("Belt System Status");
-    println!("==================");
-    println!("Total items: {}", status.total_items);
-    if status.hitl_count > 0 {
-        println!("\x1b[31mHITL: {}\x1b[0m", status.hitl_count);
-    } else {
-        println!("HITL: 0");
-    }
-    println!();
-    if !status.phase_counts.is_empty() {
-        println!("Phase breakdown:");
-        for pc in &status.phase_counts {
-            println!("  {:<12} {}", pc.phase, pc.count);
-        }
-        println!();
-    }
-    if status.running_items.is_empty() {
-        println!("No items currently running.");
-    } else {
-        println!("Running items:");
-        for item in &status.running_items {
-            println!("  {} ({}/{})", item.work_id, item.workspace, item.state);
-        }
-    }
-    println!();
-    if !status.recent_events.is_empty() {
-        println!("Recent transitions:");
-        for ev in &status.recent_events {
-            println!(
-                "  {} -> {} [{}] {} ({})",
-                ev.from_state, ev.to_state, ev.event_type, ev.item_id, ev.timestamp
-            );
-        }
-    }
-    if let Some(ref s) = status.runtime_stats {
-        println!();
-        println!(
-            "  Tokens (24h): {} total, {} executions",
-            s.total_tokens, s.executions
-        );
-    }
-    if status.hitl_count > 0 {
-        println!();
-        println!(
-            "\x1b[33m\u{26a0}\u{fe0f} {} items require human intervention. Run 'belt claw' to review.\x1b[0m",
-            status.hitl_count
-        );
-    }
-}
-
-/// Map a ratatui [`ratatui::style::Color`] to the corresponding
-/// [`crossterm::style::Color`] for terminal output outside the TUI.
-fn to_crossterm_color(c: ratatui::style::Color) -> crossterm::style::Color {
-    match c {
-        ratatui::style::Color::Gray => crossterm::style::Color::Grey,
-        ratatui::style::Color::Blue => crossterm::style::Color::Blue,
-        ratatui::style::Color::Green => crossterm::style::Color::Green,
-        ratatui::style::Color::Cyan => crossterm::style::Color::Cyan,
-        ratatui::style::Color::White => crossterm::style::Color::White,
-        ratatui::style::Color::Yellow => crossterm::style::Color::Yellow,
-        ratatui::style::Color::Red => crossterm::style::Color::Red,
-        ratatui::style::Color::DarkGray => crossterm::style::Color::DarkGrey,
-        _ => crossterm::style::Color::White,
-    }
-}
-
-fn print_rich_status(status: &SystemStatus, daemon_running: Option<bool>) {
-    let mut stdout = io::stdout();
-    let w = box_content_width();
-
-    // Header box
-    let border_h = "\u{2500}".repeat(w);
-    let _ = writeln!(stdout, "\u{250c}{border_h}\u{2510}");
-    let title = format!("{:^width$}", "Belt System Status", width = w - 2);
-    let _ = writeln!(stdout, "\u{2502} {} \u{2502}", title.bold());
-    let _ = writeln!(stdout, "\u{251c}{border_h}\u{2524}");
-
-    // Daemon status row (when provided)
-    if let Some(running) = daemon_running {
-        let (label, indicator) = if running {
-            ("running", "\u{25cf} running".green())
-        } else {
-            ("stopped", "\u{25cb} stopped".red())
-        };
-        let pad = w - 2 - "Daemon: ".len() - label.len();
-        let _ = writeln!(
-            stdout,
-            "\u{2502} Daemon: {indicator}{:pad$} \u{2502}",
-            "",
-            pad = pad,
-        );
-    }
-
-    let items_str = format!("{}", status.total_items);
-    let pad = w - 2 - "Total items: ".len() - items_str.len();
-    let _ = writeln!(
-        stdout,
-        "\u{2502} Total items: {items_str}{:pad$} \u{2502}",
-        "",
-        pad = pad,
-    );
-
-    if status.hitl_count > 0 {
-        let hitl_str = format!("{}", status.hitl_count);
-        let hpad = w - 2 - "HITL items:  ".len() - hitl_str.len();
-        let _ = writeln!(
-            stdout,
-            "\u{2502} HITL items:  {}{:hpad$} \u{2502}",
-            hitl_str.yellow(),
-            "",
-            hpad = hpad,
-        );
-    }
-
-    let _ = writeln!(stdout, "\u{2514}{border_h}\u{2518}");
-
-    // Phase table with colours and progress bar
-    if !status.phase_counts.is_empty() {
-        let total = status.total_items.max(1);
-        // Adaptive progress bar width: use remaining space after phase (16) + count (10) + separators
-        let bar_width = (w.saturating_sub(32)).max(8);
-
-        let _ = writeln!(stdout);
-        let _ = writeln!(
-            stdout,
-            "  {} {:<14} {} {:<8} {} {}",
-            "\u{2502}".dark_grey(),
-            "Phase".bold().underlined(),
-            "\u{2502}".dark_grey(),
-            "Count".bold().underlined(),
-            "\u{2502}".dark_grey(),
-            "Progress".bold().underlined(),
-        );
-        let _ = writeln!(
-            stdout,
-            "  {}{}{}{}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
-            "\u{253c}".dark_grey(),
-            "\u{2500}".repeat(16),
-            "\u{253c}".dark_grey(),
-            "\u{2500}".repeat(9),
-            "\u{253c}".dark_grey(),
-        );
-        for pc in &status.phase_counts {
-            let color = to_crossterm_color(dashboard::phase_color(&pc.phase));
-            let phase_styled = style::style(format!("{:<14}", pc.phase)).with(color);
-            let pct = (pc.count as f64 / total as f64 * 100.0) as u32;
-            let bar = render_progress_bar(pct, bar_width);
-            let _ = writeln!(
-                stdout,
-                "  {} {phase_styled} {} {:<8} {} {} {:>3}%",
-                "\u{2502}".dark_grey(),
-                "\u{2502}".dark_grey(),
-                pc.count,
-                "\u{2502}".dark_grey(),
-                bar,
-                pct,
-            );
-        }
-    }
-
-    // Per-workspace breakdown
-    if !status.workspace_summary.is_empty() {
-        let phases_col_width = w.saturating_sub(26).max(10);
-
-        let _ = writeln!(stdout);
-        let _ = writeln!(stdout, "  {}", "Per-Workspace Status".bold().cyan());
-        let _ = writeln!(
-            stdout,
-            "  {}{}{}{}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
-            "\u{253c}".dark_grey(),
-            "\u{2500}".repeat(16),
-            "\u{253c}".dark_grey(),
-            "\u{2500}".repeat(7),
-            "\u{253c}".dark_grey(),
-        );
-        let _ = writeln!(
-            stdout,
-            "  {} {:<14} {} {:<5} {} {}",
-            "\u{2502}".dark_grey(),
-            "Workspace".bold().underlined(),
-            "\u{2502}".dark_grey(),
-            "Items".bold().underlined(),
-            "\u{2502}".dark_grey(),
-            "Phases".bold().underlined(),
-        );
-        let _ = writeln!(
-            stdout,
-            "  {}{}{}{}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
-            "\u{253c}".dark_grey(),
-            "\u{2500}".repeat(16),
-            "\u{253c}".dark_grey(),
-            "\u{2500}".repeat(7),
-            "\u{253c}".dark_grey(),
-        );
-        for ws in &status.workspace_summary {
-            let phases_str: String = ws
-                .phase_counts
-                .iter()
-                .map(|pc| format!("{}:{}", pc.phase, pc.count))
-                .collect::<Vec<_>>()
-                .join(", ");
-            // Truncate phases string if it exceeds available width.
-            let display_phases = if phases_str.len() > phases_col_width {
-                format!("{}\u{2026}", &phases_str[..phases_col_width - 1])
-            } else {
-                phases_str
-            };
-            let _ = writeln!(
-                stdout,
-                "  {} {:<14} {} {:<5} {} {}",
-                "\u{2502}".dark_grey(),
-                ws.workspace,
-                "\u{2502}".dark_grey(),
-                ws.total,
-                "\u{2502}".dark_grey(),
-                display_phases.dark_grey(),
-            );
-        }
-    }
-
-    // Running items
-    if !status.running_items.is_empty() {
-        let _ = writeln!(stdout);
-        let _ = writeln!(stdout, "  {}", "Running Items".bold().green());
-        for item in &status.running_items {
-            let _ = writeln!(
-                stdout,
-                "    {} {} {}",
-                "\u{25cf}".green(),
-                item.work_id,
-                format!("({})", item.workspace).dark_grey(),
-            );
-        }
-    }
-
-    // Recent transitions
-    if !status.recent_events.is_empty() {
-        let _ = writeln!(stdout);
-        let _ = writeln!(stdout, "  {}", "Recent Transitions".bold());
-        for ev in &status.recent_events {
-            let from_color = to_crossterm_color(dashboard::phase_color(&ev.from_state));
-            let to_color = to_crossterm_color(dashboard::phase_color(&ev.to_state));
-            let from = style::style(&ev.from_state).with(from_color);
-            let to = style::style(&ev.to_state).with(to_color);
-            let _ = writeln!(
-                stdout,
-                "    {from} \u{2192} {to}  {} {}",
-                ev.item_id.as_str().dark_grey(),
-                format!("[{}]", ev.event_type).dark_grey(),
-            );
-        }
-    }
-
-    // Error/HITL summary
-    if !status.error_items.is_empty() {
-        let _ = writeln!(stdout);
-        let header = format!("Recent Errors ({} items)", status.error_items.len());
-        let _ = writeln!(stdout, "  {}", header.bold().red());
-        for item in &status.error_items {
-            let _ = writeln!(
-                stdout,
-                "    {} {} {}",
-                "\u{2716}".red(),
-                item.work_id.as_str().red(),
-                format!("({}) {}", item.workspace, item.updated_at).dark_grey(),
-            );
-        }
-    }
-
-    if !status.hitl_items.is_empty() {
-        let _ = writeln!(stdout);
-        let header = format!("HITL Pending ({} items)", status.hitl_items.len());
-        let _ = writeln!(stdout, "  {}", header.bold().yellow());
-        for item in &status.hitl_items {
-            let _ = writeln!(
-                stdout,
-                "    {} {} {}",
-                "\u{26a0}".yellow(),
-                item.work_id.as_str().yellow(),
-                format!("({}) {}", item.workspace, item.updated_at).dark_grey(),
-            );
-        }
-        let _ = writeln!(stdout);
-        let _ = writeln!(
-            stdout,
-            "  {}",
-            format!(
-                "{} items require human intervention. Run 'belt claw' to review.",
-                status.hitl_items.len()
-            )
-            .yellow(),
-        );
-    } else if status.hitl_count > 0 {
-        let _ = writeln!(stdout);
-        let _ = writeln!(
-            stdout,
-            "  {}",
-            format!(
-                "{} items require human intervention. Run 'belt claw' to review.",
-                status.hitl_count
-            )
-            .yellow(),
-        );
-    }
-}
-
-/// Render runtime statistics with crossterm colours for the rich format.
-fn print_rich_runtime(stats: &RuntimeStats) {
-    let mut stdout = io::stdout();
-
-    let _ = writeln!(stdout);
-    let _ = writeln!(stdout, "  {}", "Runtime Stats (last 24h)".bold().cyan());
-    let _ = writeln!(
-        stdout,
-        "  {}",
-        "\u{2500}".repeat(box_content_width().min(60)).dark_grey()
-    );
-    let _ = writeln!(
-        stdout,
-        "  Total tokens:  {} (in: {} / out: {})",
-        fmt_num(stats.total_tokens).bold(),
-        fmt_num(stats.total_tokens_input),
-        fmt_num(stats.total_tokens_output),
-    );
-    let _ = writeln!(
-        stdout,
-        "  Executions:    {}",
-        stats.executions.to_string().bold()
-    );
-    match stats.avg_duration_ms {
-        Some(d) => {
-            let _ = writeln!(stdout, "  Avg duration:  {:.0}ms", d);
-        }
-        None => {
-            let _ = writeln!(stdout, "  Avg duration:  -");
-        }
-    }
-
-    if !stats.by_model.is_empty() {
-        let _ = writeln!(stdout);
-        let _ = writeln!(
-            stdout,
-            "  {:<20} {:>10} {:>10} {:>10} {:>6} {:>10}",
-            "Model".bold().underlined(),
-            "Input".bold().underlined(),
-            "Output".bold().underlined(),
-            "Total".bold().underlined(),
-            "Runs".bold().underlined(),
-            "Avg ms".bold().underlined(),
-        );
-        let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(70).dark_grey(),);
-
-        let mut models: Vec<_> = stats.by_model.values().collect();
-        models.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
-
-        for m in &models {
-            let avg = m
-                .avg_duration_ms
-                .map_or_else(|| "-".to_string(), |d| format!("{d:.0}"));
-            let _ = writeln!(
-                stdout,
-                "  {:<20} {:>10} {:>10} {:>10} {:>6} {:>10}",
-                m.model.as_str().cyan(),
-                fmt_num(m.input_tokens),
-                fmt_num(m.output_tokens),
-                fmt_num(m.total_tokens),
-                m.executions,
-                avg,
-            );
-        }
-
-        // Aggregation totals row when multiple models present
-        if models.len() > 1 {
-            let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(70).dark_grey());
-            let _ = writeln!(
-                stdout,
-                "  {:<20} {:>10} {:>10} {:>10} {:>6}",
-                "Total".bold(),
-                fmt_num(stats.total_tokens_input),
-                fmt_num(stats.total_tokens_output),
-                fmt_num(stats.total_tokens),
-                stats.executions,
-            );
-        }
-    }
-    let _ = writeln!(stdout);
-}
-
-fn print_text_spec_status(status: &SpecStatus) {
-    println!("Workspace: {}", status.workspace);
-    println!("Config:    {}", status.config_path);
-    println!("Items:     {}", status.item_count);
-    println!();
-    if status.phase_counts.is_empty() {
-        println!("No items in this workspace.");
-    } else {
-        println!("Phase breakdown:");
-        for pc in &status.phase_counts {
-            println!("  {:<12} {}", pc.phase, pc.count);
-        }
-    }
-}
-
-fn print_rich_spec_status(status: &SpecStatus) {
-    let mut stdout = io::stdout();
-    let w = box_content_width();
-
-    let border_h = "\u{2500}".repeat(w);
-    let _ = writeln!(stdout, "\u{250c}{border_h}\u{2510}");
-
-    // Workspace name (bold) with padding
-    let ws_label = "Workspace: ";
-    let ws_pad = w.saturating_sub(2 + ws_label.len() + status.workspace.len());
-    let _ = writeln!(
-        stdout,
-        "\u{2502} {ws_label}{}{:ws_pad$} \u{2502}",
-        status.workspace.clone().bold(),
-        "",
-        ws_pad = ws_pad,
-    );
-
-    let cfg_label = "Config:    ";
-    let cfg_val = &status.config_path;
-    let cfg_pad = w.saturating_sub(2 + cfg_label.len() + cfg_val.len());
-    let _ = writeln!(
-        stdout,
-        "\u{2502} {cfg_label}{cfg_val}{:cfg_pad$} \u{2502}",
-        "",
-        cfg_pad = cfg_pad,
-    );
-
-    let items_label = "Items:     ";
-    let items_val = status.item_count.to_string();
-    let items_pad = w.saturating_sub(2 + items_label.len() + items_val.len());
-    let _ = writeln!(
-        stdout,
-        "\u{2502} {items_label}{items_val}{:items_pad$} \u{2502}",
-        "",
-        items_pad = items_pad,
-    );
-
-    let _ = writeln!(stdout, "\u{2514}{border_h}\u{2518}");
-
-    if !status.phase_counts.is_empty() {
-        let bar_width = (w.saturating_sub(32)).max(8);
-
-        let _ = writeln!(stdout);
-        let _ = writeln!(
-            stdout,
-            "  {} {:<14} {} {:<8} {} {}",
-            "\u{2502}".dark_grey(),
-            "Phase".bold().underlined(),
-            "\u{2502}".dark_grey(),
-            "Count".bold().underlined(),
-            "\u{2502}".dark_grey(),
-            "Progress".bold().underlined(),
-        );
-        let _ = writeln!(
-            stdout,
-            "  {}{}{}{}{}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}",
-            "\u{253c}".dark_grey(),
-            "\u{2500}".repeat(16),
-            "\u{253c}".dark_grey(),
-            "\u{2500}".repeat(9),
-            "\u{253c}".dark_grey(),
-        );
-        let total = status.item_count.max(1);
-        for pc in &status.phase_counts {
-            let color = to_crossterm_color(dashboard::phase_color(&pc.phase));
-            let phase_styled = style::style(format!("{:<14}", pc.phase)).with(color);
-            let pct = (pc.count as f64 / total as f64 * 100.0) as u32;
-            let bar = render_progress_bar(pct, bar_width);
-            let _ = writeln!(
-                stdout,
-                "  {} {phase_styled} {} {:<8} {} {} {:>3}%",
-                "\u{2502}".dark_grey(),
-                "\u{2502}".dark_grey(),
-                pc.count,
-                "\u{2502}".dark_grey(),
-                bar,
-                pct,
-            );
-        }
-
-        // Overall completion: done + completed + skipped as "finished"
-        let finished: u32 = status
-            .phase_counts
-            .iter()
-            .filter(|pc| matches!(pc.phase.as_str(), "done" | "completed" | "skipped"))
-            .map(|pc| pc.count)
-            .sum();
-        let overall_pct = (finished as f64 / total as f64 * 100.0) as u32;
-        let overall_bar_width = (w.saturating_sub(22)).max(10);
-        let overall_bar = render_progress_bar(overall_pct, overall_bar_width);
-        let _ = writeln!(stdout);
-        let _ = writeln!(
-            stdout,
-            "  Overall: {}/{} {} {:>3}%",
-            finished, total, overall_bar, overall_pct
-        );
-    }
-
-    // Token usage analysis
-    if let Some(ref usage) = status.token_usage {
-        let _ = writeln!(stdout);
-        let _ = writeln!(stdout, "  {}", "Token Usage".bold().cyan());
-        let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(w.min(60)).dark_grey());
-        let _ = writeln!(
-            stdout,
-            "  Total:  {} (in: {} / out: {})",
-            fmt_num(usage.total_tokens).bold(),
-            fmt_num(usage.total_input),
-            fmt_num(usage.total_output),
-        );
-        let _ = writeln!(
-            stdout,
-            "  Executions: {}",
-            usage.executions.to_string().bold()
-        );
-        if !usage.by_model.is_empty() {
-            let _ = writeln!(stdout);
-            let _ = writeln!(
-                stdout,
-                "  {:<20} {:>10} {:>10} {:>10} {:>5}",
-                "Model".bold().underlined(),
-                "Input".bold().underlined(),
-                "Output".bold().underlined(),
-                "Total".bold().underlined(),
-                "Runs".bold().underlined(),
-            );
-            let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(59).dark_grey(),);
-            for m in &usage.by_model {
-                let _ = writeln!(
-                    stdout,
-                    "  {:<20} {:>10} {:>10} {:>10} {:>5}",
-                    m.model.as_str().cyan(),
-                    fmt_num(m.input_tokens),
-                    fmt_num(m.output_tokens),
-                    fmt_num(m.total_tokens),
-                    m.executions,
-                );
-            }
-            // Aggregation totals row
-            if usage.by_model.len() > 1 {
-                let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(59).dark_grey());
-                let _ = writeln!(
-                    stdout,
-                    "  {:<20} {:>10} {:>10} {:>10} {:>5}",
-                    "Total".bold(),
-                    fmt_num(usage.total_input),
-                    fmt_num(usage.total_output),
-                    fmt_num(usage.total_tokens),
-                    usage.executions,
-                );
-            }
-        }
-    }
-}
-
-/// Render a text-based progress bar of the given width.
-///
-/// `pct` is a value 0..=100 and `width` is the number of character cells.
-fn render_progress_bar(pct: u32, width: usize) -> String {
-    let filled = (pct as usize * width / 100).min(width);
-    let empty = width - filled;
-    format!("[{}{}]", "#".repeat(filled), ".".repeat(empty),)
-}
-
-/// Format a number with comma separators for readability.
-fn fmt_num(n: u64) -> String {
-    if n < 1_000 {
-        return n.to_string();
-    }
-    let s = n.to_string();
-    let mut result = String::with_capacity(s.len() + s.len() / 3);
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result.chars().rev().collect()
 }

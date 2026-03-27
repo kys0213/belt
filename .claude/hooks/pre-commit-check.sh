@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Pre-commit quality gate: cargo fmt + clippy
+# Pre-commit quality gate: fmt + check (fast)
 # Triggered by PreToolUse on Bash when git commit is detected
+# Speed: cargo check only — clippy + test는 pre-pr hook에서 실행 (pre-pr-clippy-check.sh)
 
 set -euo pipefail
 
@@ -16,14 +17,13 @@ if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
   exit 0
 fi
 
-# cargo fmt check
-if ! cargo fmt --check >/dev/null 2>&1; then
-  echo '{"continue":false,"stopReason":"cargo fmt --check failed. Run cargo fmt first."}'
+# Flags mirror ci.yml
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+  echo '{"continue":false,"stopReason":"cargo fmt --all -- --check failed. Run cargo fmt first."}'
   exit 0
 fi
 
-# cargo clippy check
-if ! cargo clippy -- -D warnings >/dev/null 2>&1; then
-  echo '{"continue":false,"stopReason":"cargo clippy -- -D warnings failed. Fix clippy warnings first."}'
+if ! RUSTFLAGS="-D warnings" cargo check --all-targets >/dev/null 2>&1; then
+  echo '{"continue":false,"stopReason":"cargo check --all-targets failed. Fix compilation errors first."}'
   exit 0
 fi

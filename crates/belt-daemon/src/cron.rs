@@ -3609,12 +3609,14 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn knowledge_extraction_pr_limit_is_reasonable() {
         assert!(PR_SCAN_LIMIT > 0);
         assert!(PR_SCAN_LIMIT <= 100);
     }
 
     #[test]
+    #[allow(clippy::assertions_on_constants)]
     fn knowledge_extraction_diff_max_size_is_reasonable() {
         assert!(MAX_DIFF_SIZE > 0);
         assert!(MAX_DIFF_SIZE <= 100_000);

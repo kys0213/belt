@@ -889,7 +889,7 @@ mod tests {
     #[test]
     fn conflict_detector_skips_self() {
         let spec = make_spec_with_entry("s1", "self", Some("src/auth.rs"));
-        let conflicts = ConflictDetector::detect(&spec, &[spec.clone()]);
+        let conflicts = ConflictDetector::detect(&spec, std::slice::from_ref(&spec));
         assert!(conflicts.is_empty());
     }
 

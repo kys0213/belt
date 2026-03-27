@@ -1422,6 +1422,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn workspace_stats_banner_displays_counts() {
         let stats = WorkspaceStats {
             workspace_name: "my-project".to_string(),

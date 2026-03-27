@@ -1529,6 +1529,7 @@ impl Daemon {
     /// Handle SIGUSR1 by performing a full sync of custom cron jobs from
     /// the database (including new/removed/paused/resumed/triggered jobs)
     /// and running an immediate tick.
+    #[cfg(unix)]
     async fn handle_cron_trigger_signal(&mut self) {
         tracing::info!("received SIGUSR1, syncing custom cron jobs from DB...");
         if let (Some(engine), Some(db)) = (&mut self.cron_engine, &self.db) {
@@ -3533,7 +3534,7 @@ sources:
         // Verify by adding a new item and advancing it.
         daemon.push_item(test_item("github:org/repo#2", "analyze"));
         daemon.advance();
-        assert!(daemon.items_in_phase(QueuePhase::Running).len() >= 1);
+        assert!(!daemon.items_in_phase(QueuePhase::Running).is_empty());
     }
 
     // ---------------------------------------------------------------

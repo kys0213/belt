@@ -129,7 +129,7 @@ Pending → Ready → Running → Completed → Done | HITL | Failed | Skipped
 | 레이어 | 책임 | 토큰 |
 |--------|------|------|
 | Daemon | 상태 머신 + yaml prompt/script 실행 + cron 스케줄링 | 0 |
-| 인프라 | worktree 생성/정리 | 0 |
+| 인프라 | worktree 생성/정리, 플랫폼 추상화 (셸, IPC) | 0 |
 | DataSource | 수집(collect) + 컨텍스트 조회(context) | 0 |
 | AgentRuntime | LLM 실행 추상화 | handler별 |
 | evaluate | 완료/추가검토 분류 (Done or HITL), CLI 도구 호출 | 분류 시 |
@@ -146,6 +146,7 @@ Pending → Ready → Running → Completed → Done | HITL | Failed | Skipped
 새 LLM            = AgentRuntime impl 추가    → 코어 변경 0
 새 파이프라인 단계  = workspace yaml 수정       → 코어 변경 0
 새 품질 검사       = Cron 등록                 → 코어 변경 0
+새 OS/플랫폼      = ShellExecutor/DaemonNotifier impl 추가 → 코어 변경 0
 ```
 
 ---
@@ -161,6 +162,7 @@ Pending → Ready → Running → Completed → Done | HITL | Failed | Skipped
 | [Claw](./concerns/claw-workspace.md) | 대화형 에이전트, evaluate, slash command |
 | [Cron 엔진](./concerns/cron-engine.md) | 품질 루프, force trigger, cron 관리 |
 | [CLI 레퍼런스](./concerns/cli-reference.md) | 3-layer SSOT, belt context, 전체 커맨드 |
+| [Cross-Platform](./concerns/cross-platform.md) | OS 추상화 (ShellExecutor, DaemonNotifier), 플랫폼별 구현 |
 
 ---
 
