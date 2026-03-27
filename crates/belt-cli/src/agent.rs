@@ -1061,6 +1061,7 @@ runtime:
     ///
     /// Acquires `ENV_LOCK` for its entire lifetime so that concurrent tests
     /// cannot observe each other's temporary env-var mutations.
+    /// Restores (or removes) the variable on drop.
     struct EnvGuard {
         key: String,
         prev: Option<String>,
