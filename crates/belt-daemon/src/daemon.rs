@@ -4340,4 +4340,337 @@ sources:
 
         assert!(daemon.cron_engine.is_some());
     }
+
+    // ---------------------------------------------------------------
+    // mark_hitl: HITL state transition detail tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn mark_hitl_sets_reason_notes_and_created_at() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Running;
+        item.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(item);
+
+        daemon.complete_item("s1:analyze").unwrap();
+        daemon
+            .mark_hitl(
+                "s1:analyze",
+                HitlReason::EvaluateFailure,
+                Some("partial result".into()),
+            )
+            .unwrap();
+
+        let item = daemon.get_item("s1:analyze").unwrap();
+        assert_eq!(item.phase, QueuePhase::Hitl);
+        assert_eq!(item.hitl_reason, Some(HitlReason::EvaluateFailure));
+        assert_eq!(item.hitl_notes.as_deref(), Some("partial result"));
+        assert!(
+            item.hitl_created_at.is_some(),
+            "hitl_created_at should be set"
+        );
+    }
+
+    #[test]
+    fn mark_hitl_with_none_notes() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Running;
+        item.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(item);
+
+        daemon.complete_item("s1:analyze").unwrap();
+        daemon
+            .mark_hitl("s1:analyze", HitlReason::Timeout, None)
+            .unwrap();
+
+        let item = daemon.get_item("s1:analyze").unwrap();
+        assert_eq!(item.phase, QueuePhase::Hitl);
+        assert_eq!(item.hitl_reason, Some(HitlReason::Timeout));
+        assert!(item.hitl_notes.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // retry_from_hitl: transition detail tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn retry_from_hitl_resets_phase_to_pending() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Hitl;
+        item.hitl_reason = Some(HitlReason::RetryMaxExceeded);
+        item.hitl_notes = Some("needs review".into());
+        item.hitl_created_at = Some(Utc::now().to_rfc3339());
+        daemon.push_item(item);
+
+        daemon.retry_from_hitl("s1:analyze").unwrap();
+
+        let item = daemon.get_item("s1:analyze").unwrap();
+        assert_eq!(item.phase, QueuePhase::Pending);
+    }
+
+    // ---------------------------------------------------------------
+    // respond_hitl: Retry and Skip action tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn respond_hitl_retry_transitions_to_pending() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Hitl;
+        daemon.push_item(item);
+
+        let result = daemon.respond_hitl(
+            "s1:analyze",
+            HitlRespondAction::Retry,
+            Some("reviewer".into()),
+            Some("retrying after fix".into()),
+        );
+        assert!(result.is_ok());
+
+        let item = daemon.get_item("s1:analyze").unwrap();
+        assert_eq!(item.phase, QueuePhase::Pending);
+        assert_eq!(item.hitl_respondent.as_deref(), Some("reviewer"));
+        assert_eq!(item.hitl_notes.as_deref(), Some("retrying after fix"));
+    }
+
+    #[test]
+    fn respond_hitl_skip_transitions_to_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Hitl;
+        daemon.push_item(item);
+
+        let result = daemon.respond_hitl(
+            "s1:analyze",
+            HitlRespondAction::Skip,
+            Some("admin".into()),
+            None,
+        );
+        assert!(result.is_ok());
+
+        let item = daemon.get_item("s1:analyze").unwrap();
+        assert_eq!(item.phase, QueuePhase::Skipped);
+        assert_eq!(item.hitl_respondent.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn respond_hitl_returns_error_for_unknown_id() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let result = daemon.respond_hitl("nonexistent", HitlRespondAction::Done, None, None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn respond_hitl_updates_notes_when_provided() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Hitl;
+        item.hitl_notes = Some("original notes".into());
+        daemon.push_item(item);
+
+        daemon
+            .respond_hitl(
+                "s1:analyze",
+                HitlRespondAction::Done,
+                None,
+                Some("updated notes".into()),
+            )
+            .unwrap();
+
+        let item = daemon.get_item("s1:analyze").unwrap();
+        assert_eq!(item.hitl_notes.as_deref(), Some("updated notes"));
+    }
+
+    #[test]
+    fn respond_hitl_preserves_notes_when_not_provided() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Hitl;
+        item.hitl_notes = Some("original notes".into());
+        daemon.push_item(item);
+
+        daemon
+            .respond_hitl(
+                "s1:analyze",
+                HitlRespondAction::Done,
+                Some("reviewer".into()),
+                None,
+            )
+            .unwrap();
+
+        let item = daemon.get_item("s1:analyze").unwrap();
+        assert_eq!(item.hitl_notes.as_deref(), Some("original notes"));
+    }
+
+    // ---------------------------------------------------------------
+    // history() accessor tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn history_returns_empty_initially() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![]);
+
+        assert!(daemon.history().is_empty());
+    }
+
+    #[tokio::test]
+    async fn history_records_completed_items() {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+
+        // Exit code 0 means handler succeeds.
+        let mut daemon = setup_daemon(&tmp, source, vec![0]);
+
+        daemon.tick().await.unwrap();
+
+        let entries = daemon.history();
+        assert!(
+            !entries.is_empty(),
+            "history should contain entries after tick"
+        );
+        assert!(
+            entries.iter().any(|h| h.source_id == "github:org/repo#1"),
+            "history should contain the processed item's source_id"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // history_events() accessor tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn history_events_returns_empty_initially() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![]);
+
+        assert!(daemon.history_events().is_empty());
+    }
+
+    #[test]
+    fn history_events_records_failed_items_with_error() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Running;
+        item.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(item);
+
+        daemon
+            .mark_failed("s1:analyze", "handler crashed".into())
+            .unwrap();
+
+        let events = daemon.history_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].work_id, "s1:analyze");
+        assert_eq!(events[0].source_id, "s1");
+        assert_eq!(events[0].state, "analyze");
+        assert_eq!(events[0].status, "failed");
+        assert_eq!(events[0].error.as_deref(), Some("handler crashed"));
+        assert_eq!(events[0].attempt, 1);
+    }
+
+    #[test]
+    fn history_events_increments_attempt_on_repeated_failures() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        // First failure.
+        let mut item = test_item("s1", "analyze");
+        item.phase = QueuePhase::Running;
+        item.updated_at = Utc::now().to_rfc3339();
+        daemon.push_item(item);
+        daemon
+            .mark_failed("s1:analyze", "first error".into())
+            .unwrap();
+
+        // Manually reset to Running for second failure.
+        let item = daemon
+            .queue
+            .iter_mut()
+            .find(|it| it.work_id == "s1:analyze")
+            .unwrap();
+        item.phase = QueuePhase::Running;
+
+        daemon
+            .mark_failed("s1:analyze", "second error".into())
+            .unwrap();
+
+        let events = daemon.history_events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].attempt, 1);
+        assert_eq!(events[1].attempt, 2);
+    }
+
+    // ---------------------------------------------------------------
+    // with_cron_engine() builder pattern test
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn with_cron_engine_injects_engine() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Inject a CronEngine via the builder method.
+        let engine = CronEngine::new();
+        let daemon = daemon.with_cron_engine(engine);
+
+        assert!(
+            daemon.cron_engine.is_some(),
+            "cron_engine should be set after with_cron_engine()"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // with_max_eval_failures() builder pattern test
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn with_max_eval_failures_sets_evaluator_threshold() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![]);
+
+        // Set a custom threshold. The method should not panic and
+        // should return a daemon with the updated evaluator.
+        let daemon = daemon.with_max_eval_failures(5);
+
+        // We cannot directly inspect evaluator.max_eval_failures (private),
+        // but verify the daemon was constructed without error.
+        assert_eq!(daemon.config.name, "test-ws");
+    }
 }
