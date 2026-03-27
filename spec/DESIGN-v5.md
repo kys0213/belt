@@ -163,6 +163,7 @@ Pending → Ready → Running → Completed → Done | HITL | Failed | Skipped
 | [Cron 엔진](./concerns/cron-engine.md) | 품질 루프, force trigger, cron 관리 |
 | [CLI 레퍼런스](./concerns/cli-reference.md) | 3-layer SSOT, belt context, 전체 커맨드 |
 | [Cross-Platform](./concerns/cross-platform.md) | OS 추상화 (ShellExecutor, DaemonNotifier), 플랫폼별 구현 |
+| [Data Model](./concerns/data-model.md) | SQLite 스키마, 도메인 enum, 직렬화 규칙, 컨텍스트 모델 |
 
 ---
 

@@ -118,8 +118,62 @@ v4 (15개) → v5 (3개):
 
 ---
 
+## `belt agent` 실행 메커니즘
+
+evaluate cron과 `/claw` 세션의 공통 실행 경로.
+
+### 사용법
+
+```bash
+belt agent --workspace workspace.yaml -p "프롬프트"   # 비대화형 (evaluate cron이 호출)
+belt agent --workspace workspace.yaml                 # 대화형 세션
+belt agent --workspace workspace.yaml --plan          # 실행 계획만 출력
+```
+
+### 실행 흐름
+
+```
+1. workspace.yaml 로드 → WorkspaceConfig 파싱
+2. RuntimeRegistry 구성 (workspace yaml의 runtime 설정 기반)
+3. Rules 로딩 (아래 우선순위)
+4. System prompt = built-in Claw rules + workspace rules
+5. ActionExecutor로 prompt 실행 (ClaudeRuntime 사용)
+```
+
+### Rules 로딩 우선순위
+
+1. `claw_config.rules_path` — workspace yaml에서 명시적 지정
+2. `~/.belt/workspaces/<name>/claw/system/` — per-workspace 오버라이드
+3. `~/.belt/claw-workspace/.claude/rules/` — 글로벌 기본값
+
+디렉토리 내 모든 `.md` 파일을 concat하여 system prompt에 주입한다.
+
+### LLM이 사용 가능한 도구
+
+`belt agent`로 실행된 LLM은 bash tool을 통해 다음 belt CLI를 호출할 수 있다:
+
+| CLI | 용도 | 사용 시점 |
+|-----|------|----------|
+| `belt context $WORK_ID --json` | 아이템 정보 조회 | evaluate 판단 입력 |
+| `belt queue done $WORK_ID` | Done 판정 | evaluate 결과 |
+| `belt queue hitl $WORK_ID --reason "..."` | HITL 판정 | evaluate 결과 |
+| `belt status --json` | 시스템 상태 조회 | /claw 세션 |
+| `belt hitl list --json` | HITL 목록 조회 | /claw 세션 |
+| `belt queue list --json` | 큐 목록 조회 | /claw 세션 |
+
+### evaluate cron과의 관계
+
+evaluate cron은 내부적으로 `belt agent --workspace <path> -p "<prompt>"`를 호출한다. 이때:
+- Completed 아이템 목록을 프롬프트에 포함
+- LLM이 `belt context`로 각 아이템 정보를 조회
+- 판단 후 `belt queue done/hitl` CLI를 직접 호출하여 상태 전이
+- classify-policy.md의 state별 Done 조건이 판단 기준
+
+---
+
 ### 관련 문서
 
 - [DESIGN-v5](../DESIGN-v5.md) — QueuePhase 상태 머신 + evaluate 위치
 - [CLI 레퍼런스](./cli-reference.md) — CLI 전체 커맨드 트리
 - [Cron 엔진](./cron-engine.md) — evaluate cron
+- [Data Model](./data-model.md) — 컨텍스트 모델 (belt context 출력)
