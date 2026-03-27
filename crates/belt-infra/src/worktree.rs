@@ -60,6 +60,15 @@ pub trait WorktreeManager: Send + Sync {
     /// Called after the preserved worktree has been successfully handed off
     /// to a new work item or explicitly cleaned up.
     fn clear_preserved(&self, _source_id: &str) {}
+
+    /// Validates that a preserved worktree path is still usable.
+    ///
+    /// Returns `true` if the path exists and is a valid working directory.
+    /// For git worktree implementations, this also verifies the git state.
+    /// The default implementation only checks that the path exists on disk.
+    fn validate_preserved(&self, worktree_path: &std::path::Path) -> bool {
+        worktree_path.exists()
+    }
 }
 
 /// Thread-safe registry for tracking preserved worktrees by `source_id`.
@@ -159,6 +168,40 @@ impl GitWorktreeManager {
     fn branch_name(sanitized: &str) -> String {
         format!("belt/{sanitized}")
     }
+
+    /// Validates that a worktree path is a usable git worktree.
+    ///
+    /// Checks that the directory exists and is recognized as a valid git
+    /// working directory by running `git -C <path> rev-parse --git-dir`.
+    fn validate_worktree(&self, wt_path: &std::path::Path) -> bool {
+        if !wt_path.exists() {
+            tracing::debug!(?wt_path, "worktree path does not exist");
+            return false;
+        }
+
+        // Verify that git recognizes this directory as a valid worktree.
+        let output = Command::new("git")
+            .args(["-C"])
+            .arg(wt_path)
+            .args(["rev-parse", "--git-dir"])
+            .output();
+
+        match output {
+            Ok(o) if o.status.success() => {
+                tracing::debug!(?wt_path, "worktree validated as a valid git directory");
+                true
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                tracing::warn!(?wt_path, "worktree failed git validation: {stderr}");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(?wt_path, "failed to run git rev-parse for validation: {e}");
+                false
+            }
+        }
+    }
 }
 
 impl WorktreeManager for GitWorktreeManager {
@@ -174,41 +217,51 @@ impl WorktreeManager for GitWorktreeManager {
             return Ok(wt_path);
         }
 
-        // If a previous worktree path is provided and exists on disk, rename
-        // it to the new location so the retry item inherits the preserved state.
+        // If a previous worktree path is provided and exists on disk, validate
+        // its git state and move it to the new location so the retry item
+        // inherits the preserved working tree state.
         if let Some(prev) = previous_worktree_path {
             let prev_path = PathBuf::from(prev);
             if prev_path.exists() {
-                tracing::info!(
-                    work_id,
-                    ?prev_path,
-                    ?wt_path,
-                    "reusing preserved worktree from previous item"
-                );
+                // Validate the preserved worktree is still a valid git directory.
+                if !self.validate_worktree(&prev_path) {
+                    tracing::warn!(
+                        work_id,
+                        ?prev_path,
+                        "preserved worktree failed validation, falling back to fresh create"
+                    );
+                } else {
+                    tracing::info!(
+                        work_id,
+                        ?prev_path,
+                        ?wt_path,
+                        "reusing preserved worktree from previous item"
+                    );
 
-                // git worktree move <old> <new>
-                let output = Command::new("git")
-                    .args(["worktree", "move"])
-                    .arg(&prev_path)
-                    .arg(&wt_path)
-                    .current_dir(&self.repo_path)
-                    .output()
-                    .map_err(|e| {
-                        BeltError::Worktree(format!("failed to run git worktree move: {e}"))
-                    })?;
+                    // git worktree move <old> <new>
+                    let output = Command::new("git")
+                        .args(["worktree", "move"])
+                        .arg(&prev_path)
+                        .arg(&wt_path)
+                        .current_dir(&self.repo_path)
+                        .output()
+                        .map_err(|e| {
+                            BeltError::Worktree(format!("failed to run git worktree move: {e}"))
+                        })?;
 
-                if output.status.success() {
-                    tracing::info!(work_id, ?wt_path, "worktree moved from preserved location");
-                    return Ok(wt_path);
+                    if output.status.success() {
+                        tracing::info!(work_id, ?wt_path, "worktree moved from preserved location");
+                        return Ok(wt_path);
+                    }
+
+                    // Move failed -- fall through to normal creation.
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    tracing::warn!(
+                        work_id,
+                        ?prev_path,
+                        "git worktree move failed, falling back to fresh create: {stderr}"
+                    );
                 }
-
-                // Move failed — fall through to normal creation.
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!(
-                    work_id,
-                    ?prev_path,
-                    "git worktree move failed, falling back to fresh create: {stderr}"
-                );
             }
         }
 
@@ -305,6 +358,10 @@ impl WorktreeManager for GitWorktreeManager {
 
     fn clear_preserved(&self, source_id: &str) {
         self.registry.clear(source_id);
+    }
+
+    fn validate_preserved(&self, worktree_path: &std::path::Path) -> bool {
+        self.validate_worktree(worktree_path)
     }
 }
 
@@ -683,5 +740,165 @@ mod tests {
             .create_or_reuse_with_previous("work-1", Some("/some/old/path"))
             .unwrap();
         assert_eq!(path, existing);
+    }
+
+    #[test]
+    fn mock_validate_preserved_returns_true_for_existing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = MockWorktreeManager::new(tmp.path().to_path_buf());
+
+        let path = mgr.create_or_reuse("work-1").unwrap();
+        assert!(mgr.validate_preserved(&path));
+    }
+
+    #[test]
+    fn mock_validate_preserved_returns_false_for_nonexistent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = MockWorktreeManager::new(tmp.path().to_path_buf());
+
+        assert!(!mgr.validate_preserved(&PathBuf::from("/nonexistent/path")));
+    }
+
+    #[test]
+    fn git_worktree_manager_validate_worktree_with_real_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("repo");
+        let wt_base = tmp.path().join("worktrees");
+
+        fs::create_dir_all(&repo_path).unwrap();
+        fs::create_dir_all(&wt_base).unwrap();
+
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo_path)
+                .output()
+                .expect("git command failed")
+        };
+
+        run(&["init"]);
+        run(&["config", "user.email", "test@test.com"]);
+        run(&["config", "user.name", "Test"]);
+        fs::write(repo_path.join("README"), "hello").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "init"]);
+
+        let mgr = GitWorktreeManager::new(wt_base.clone(), repo_path.clone());
+
+        // Create a real worktree.
+        let wt_path = mgr.create_or_reuse("task-valid").unwrap();
+        assert!(mgr.validate_worktree(&wt_path));
+
+        // A plain directory (not a git worktree) should fail validation.
+        let plain_dir = tmp.path().join("not-a-worktree");
+        fs::create_dir_all(&plain_dir).unwrap();
+        assert!(!mgr.validate_worktree(&plain_dir));
+
+        // Nonexistent path should fail validation.
+        assert!(!mgr.validate_worktree(&PathBuf::from("/nonexistent")));
+
+        // Cleanup.
+        mgr.cleanup("task-valid").unwrap();
+    }
+
+    #[test]
+    fn git_worktree_manager_reuse_with_previous_validates_and_moves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("repo");
+        let wt_base = tmp.path().join("worktrees");
+
+        fs::create_dir_all(&repo_path).unwrap();
+        fs::create_dir_all(&wt_base).unwrap();
+
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo_path)
+                .output()
+                .expect("git command failed")
+        };
+
+        run(&["init"]);
+        run(&["config", "user.email", "test@test.com"]);
+        run(&["config", "user.name", "Test"]);
+        fs::write(repo_path.join("README"), "hello").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "init"]);
+
+        let mgr = GitWorktreeManager::new(wt_base.clone(), repo_path.clone());
+
+        // Create the "previous" worktree and add some content.
+        let prev_path = mgr.create_or_reuse("old-task").unwrap();
+        fs::write(prev_path.join("work.txt"), "preserved-state").unwrap();
+
+        // Reuse the previous worktree for a new task.
+        let new_path = mgr
+            .create_or_reuse_with_previous("new-task", Some(prev_path.to_str().unwrap()))
+            .unwrap();
+
+        assert!(new_path.exists());
+        assert_eq!(
+            fs::read_to_string(new_path.join("work.txt")).unwrap(),
+            "preserved-state"
+        );
+        // Old path should no longer exist (it was moved).
+        assert!(!prev_path.exists());
+
+        // Cleanup: worktree was moved but branch retains old name (belt/old-task).
+        // Remove the worktree from the new location and delete the original branch.
+        Command::new("git")
+            .args(["worktree", "remove", "--force"])
+            .arg(&new_path)
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["branch", "-D", "belt/old-task"])
+            .current_dir(&repo_path)
+            .output()
+            .unwrap();
+    }
+
+    #[test]
+    fn git_worktree_manager_reuse_with_invalid_previous_falls_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo_path = tmp.path().join("repo");
+        let wt_base = tmp.path().join("worktrees");
+
+        fs::create_dir_all(&repo_path).unwrap();
+        fs::create_dir_all(&wt_base).unwrap();
+
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(&repo_path)
+                .output()
+                .expect("git command failed")
+        };
+
+        run(&["init"]);
+        run(&["config", "user.email", "test@test.com"]);
+        run(&["config", "user.name", "Test"]);
+        fs::write(repo_path.join("README"), "hello").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "init"]);
+
+        let mgr = GitWorktreeManager::new(wt_base.clone(), repo_path.clone());
+
+        // Create a plain directory (not a valid git worktree) as the "previous".
+        let fake_prev = tmp.path().join("fake-worktree");
+        fs::create_dir_all(&fake_prev).unwrap();
+
+        // Should fall back to fresh creation because validation fails.
+        let new_path = mgr
+            .create_or_reuse_with_previous("fallback-task", Some(fake_prev.to_str().unwrap()))
+            .unwrap();
+
+        assert!(new_path.exists());
+        // The new worktree was created fresh (not moved from the fake).
+        assert!(fake_prev.exists()); // fake dir still exists since it wasn't moved
+
+        // Cleanup.
+        mgr.cleanup("fallback-task").unwrap();
     }
 }

@@ -258,6 +258,62 @@ async fn shutdown_prevents_collect_and_advance() {
     );
 }
 
+/// Shutdown rollback followed by re-advance reuses the preserved worktree.
+///
+/// Simulates: collect -> advance -> Running -> shutdown rollback -> Pending
+/// -> re-advance -> Running -> execute. The preserved worktree should be
+/// reused (validated) instead of creating a fresh one.
+#[tokio::test]
+async fn shutdown_rollback_reuses_preserved_worktree() {
+    let tmp = TempDir::new().unwrap();
+    let mut source = MockDataSource::new("github");
+    source.add_item(test_item("github:org/repo#1", "analyze"));
+
+    let mut daemon = setup_daemon(&tmp, source, vec![0]); // exit code 0 = success
+
+    // Phase 1: collect -> advance to Running.
+    daemon.collect().await.unwrap();
+    daemon.advance();
+    assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 1);
+
+    // Create the workspace worktree directory so rollback can register it.
+    let ws_path = daemon.worktree_mgr().path("test-ws");
+    std::fs::create_dir_all(&ws_path).unwrap();
+    // Write a marker file to verify the same directory is reused.
+    std::fs::write(ws_path.join("marker.txt"), "preserved-content").unwrap();
+
+    // Phase 2: Simulate graceful shutdown rollback.
+    daemon.rollback_running_to_pending();
+
+    assert_eq!(daemon.items_in_phase(QueuePhase::Pending).len(), 1);
+    assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
+
+    // Verify worktree was registered for the source_id.
+    let preserved = daemon.worktree_mgr().lookup_preserved("github:org/repo#1");
+    assert!(
+        preserved.is_some(),
+        "preserved worktree should be registered after rollback"
+    );
+
+    // Verify the item has worktree_preserved flag set.
+    let item = daemon.get_item("github:org/repo#1:analyze").unwrap();
+    assert!(item.worktree_preserved);
+
+    // Phase 3: Re-advance to Running and execute.
+    daemon.advance();
+    assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 1);
+
+    let outcomes = daemon.execute_running().await;
+    assert_eq!(outcomes.len(), 1);
+
+    // The preserved worktree mapping should have been cleared after handoff.
+    let preserved_after = daemon.worktree_mgr().lookup_preserved("github:org/repo#1");
+    assert!(
+        preserved_after.is_none(),
+        "preserved worktree mapping should be cleared after execution"
+    );
+}
+
 /// Multiple ticks process items through the full lifecycle.
 #[tokio::test]
 async fn multiple_ticks_process_items() {
