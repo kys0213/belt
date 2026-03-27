@@ -548,16 +548,43 @@ impl Daemon {
         let on_fail_actions: Vec<Action> = state_config.on_fail.iter().map(Action::from).collect();
 
         // Try to reuse a preserved worktree from a previous run for this source_id.
-        // Falls back to previous_worktree_path (retry handoff) or fresh creation.
+        // Validates the preserved worktree before using it; if invalid, falls through
+        // to normal creation.
         let worktree = if let Some(preserved) = worktree_mgr.lookup_preserved(&item.source_id) {
-            tracing::info!(
-                source_id = %item.source_id,
-                ?preserved,
-                "reusing preserved worktree from previous run"
-            );
-            worktree_mgr.clear_preserved(&item.source_id);
-            item.previous_worktree_path = None;
-            preserved
+            if worktree_mgr.validate_preserved(&preserved) {
+                tracing::info!(
+                    source_id = %item.source_id,
+                    ?preserved,
+                    "reusing validated preserved worktree from previous run"
+                );
+                worktree_mgr.clear_preserved(&item.source_id);
+                item.previous_worktree_path = None;
+                preserved
+            } else {
+                tracing::warn!(
+                    source_id = %item.source_id,
+                    ?preserved,
+                    "preserved worktree failed validation, falling back to fresh creation"
+                );
+                worktree_mgr.clear_preserved(&item.source_id);
+                item.previous_worktree_path = None;
+                match worktree_mgr.create_or_reuse(&ws_name) {
+                    Ok(path) => path,
+                    Err(e) => {
+                        item.phase = QueuePhase::Failed;
+                        return ExecutionResult {
+                            item,
+                            outcome: ExecutionOutcome::WorktreeError {
+                                error: format!("worktree creation failed: {e}"),
+                            },
+                            ws_name,
+                            on_fail_actions: Vec::new(),
+                            worktree: None,
+                            on_enter_result: None,
+                        };
+                    }
+                }
+            }
         } else {
             let previous_wt = item.previous_worktree_path.as_deref();
             match worktree_mgr.create_or_reuse_with_previous(&ws_name, previous_wt) {
@@ -1672,7 +1699,7 @@ impl Daemon {
     ///
     /// 보존된 worktree 경로를 `WorktreeManager`의 preserved registry에 등록하여
     /// 재시작 후 동일 source_id의 아이템이 기존 worktree를 재사용할 수 있게 한다.
-    fn rollback_running_to_pending(&mut self) {
+    pub fn rollback_running_to_pending(&mut self) {
         let ws_name = self.config.name.clone();
         for item in self.queue.iter_mut() {
             if item.phase == QueuePhase::Running {
@@ -1890,6 +1917,11 @@ impl Daemon {
     /// Look up a queue item by work_id.
     pub fn get_item(&self, work_id: &str) -> Option<&QueueItem> {
         self.queue.iter().find(|it| it.work_id == work_id)
+    }
+
+    /// Access the worktree manager.
+    pub fn worktree_mgr(&self) -> &dyn WorktreeManager {
+        &*self.worktree_mgr
     }
 
     /// Return the number of items currently in Running phase.
