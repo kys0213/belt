@@ -3445,4 +3445,240 @@ mod tests {
         }
         assert_eq!(columns.len(), expected.len());
     }
+
+    // ---- respond_hitl additional tests -------------------------------------
+
+    #[test]
+    fn respond_hitl_not_found() {
+        let db = test_db();
+        let err = db
+            .respond_hitl("nonexistent", QueuePhase::Done, Some("irene"), None)
+            .unwrap_err();
+        assert!(matches!(err, BeltError::ItemNotFound(_)));
+    }
+
+    #[test]
+    fn respond_hitl_with_none_respondent_and_notes() {
+        let db = test_db();
+        let mut item = sample_item();
+        item.phase = QueuePhase::Hitl;
+        item.hitl_created_at = Some(Utc::now().to_rfc3339());
+        item.hitl_notes = Some("original notes".to_string());
+        db.insert_item(&item).unwrap();
+
+        db.respond_hitl(&item.work_id, QueuePhase::Pending, None, None)
+            .unwrap();
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert_eq!(fetched.phase, QueuePhase::Pending);
+        assert!(fetched.hitl_respondent.is_none());
+        // When notes is NULL, COALESCE preserves original notes
+        assert_eq!(fetched.hitl_notes.as_deref(), Some("original notes"));
+    }
+
+    #[test]
+    fn respond_hitl_overwrites_notes_when_provided() {
+        let db = test_db();
+        let mut item = sample_item();
+        item.phase = QueuePhase::Hitl;
+        item.hitl_created_at = Some(Utc::now().to_rfc3339());
+        item.hitl_notes = Some("old notes".to_string());
+        db.insert_item(&item).unwrap();
+
+        db.respond_hitl(
+            &item.work_id,
+            QueuePhase::Done,
+            Some("bob"),
+            Some("new notes"),
+        )
+        .unwrap();
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert_eq!(fetched.hitl_notes.as_deref(), Some("new notes"));
+    }
+
+    // ---- toggle_cron_job tests ---------------------------------------------
+
+    #[test]
+    fn toggle_cron_job_disable_and_enable() {
+        let db = test_db();
+        db.add_cron_job("my-job", "*/5 * * * *", "run.sh", None)
+            .unwrap();
+
+        // Jobs start enabled (enabled=1 in INSERT)
+        let job = db.get_cron_job("my-job").unwrap();
+        assert!(job.enabled);
+
+        // Disable
+        db.toggle_cron_job("my-job", false).unwrap();
+        let job = db.get_cron_job("my-job").unwrap();
+        assert!(!job.enabled);
+
+        // Re-enable
+        db.toggle_cron_job("my-job", true).unwrap();
+        let job = db.get_cron_job("my-job").unwrap();
+        assert!(job.enabled);
+    }
+
+    #[test]
+    fn toggle_cron_job_not_found() {
+        let db = test_db();
+        let err = db.toggle_cron_job("nonexistent", true).unwrap_err();
+        assert!(matches!(err, BeltError::ItemNotFound(_)));
+    }
+
+    // ---- has_open_items_for_source tests ------------------------------------
+
+    #[test]
+    fn has_open_items_for_source_returns_false_when_empty() {
+        let db = test_db();
+        let result = db.has_open_items_for_source("gh:org/repo#99").unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn has_open_items_for_source_returns_true_for_pending() {
+        let db = test_db();
+        let item = sample_item(); // phase = Pending
+        db.insert_item(&item).unwrap();
+
+        let result = db.has_open_items_for_source(&item.source_id).unwrap();
+        assert!(result);
+    }
+
+    #[test]
+    fn has_open_items_for_source_returns_false_for_done() {
+        let db = test_db();
+        let mut item = sample_item();
+        item.phase = QueuePhase::Done;
+        db.insert_item(&item).unwrap();
+
+        let result = db.has_open_items_for_source(&item.source_id).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn has_open_items_for_source_returns_false_for_skipped() {
+        let db = test_db();
+        let mut item = sample_item();
+        item.phase = QueuePhase::Skipped;
+        db.insert_item(&item).unwrap();
+
+        let result = db.has_open_items_for_source(&item.source_id).unwrap();
+        assert!(!result);
+    }
+
+    #[test]
+    fn has_open_items_for_source_different_source_ids() {
+        let db = test_db();
+        let item = sample_item(); // source_id = "gh:org/repo#1"
+        db.insert_item(&item).unwrap();
+
+        // Same source_id should find it
+        assert!(db.has_open_items_for_source("gh:org/repo#1").unwrap());
+        // Different source_id should not
+        assert!(!db.has_open_items_for_source("gh:org/repo#999").unwrap());
+    }
+
+    // ---- update_cron_last_run tests ----------------------------------------
+
+    #[test]
+    fn update_cron_last_run_sets_timestamp() {
+        let db = test_db();
+        db.add_cron_job("runner", "0 * * * *", "script.sh", None)
+            .unwrap();
+
+        // Initially last_run_at is None
+        let job = db.get_cron_job("runner").unwrap();
+        assert!(job.last_run_at.is_none());
+
+        // After update it should have a timestamp
+        db.update_cron_last_run("runner").unwrap();
+        let job = db.get_cron_job("runner").unwrap();
+        assert!(job.last_run_at.is_some());
+    }
+
+    #[test]
+    fn update_cron_last_run_not_found() {
+        let db = test_db();
+        let err = db.update_cron_last_run("nonexistent").unwrap_err();
+        assert!(matches!(err, BeltError::ItemNotFound(_)));
+    }
+
+    // ---- set_hitl_timeout additional tests ----------------------------------
+
+    #[test]
+    fn set_hitl_timeout_with_no_terminal_action() {
+        let db = test_db();
+        let mut item = sample_item();
+        item.phase = QueuePhase::Hitl;
+        db.insert_item(&item).unwrap();
+
+        let timeout_at = (Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
+        db.set_hitl_timeout(&item.work_id, &timeout_at, None)
+            .unwrap();
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert_eq!(
+            fetched.hitl_timeout_at.as_deref(),
+            Some(timeout_at.as_str())
+        );
+        assert!(fetched.hitl_terminal_action.is_none());
+    }
+
+    // ---- list_cron_jobs tests -----------------------------------------------
+
+    #[test]
+    fn list_cron_jobs_empty() {
+        let db = test_db();
+        let jobs = db.list_cron_jobs().unwrap();
+        assert!(jobs.is_empty());
+    }
+
+    #[test]
+    fn list_cron_jobs_returns_all_sorted_by_name() {
+        let db = test_db();
+        db.add_cron_job("zebra-job", "0 * * * *", "z.sh", None)
+            .unwrap();
+        db.add_cron_job("alpha-job", "*/10 * * * *", "a.sh", Some("ws1"))
+            .unwrap();
+        db.add_cron_job("mid-job", "*/5 * * * *", "m.sh", None)
+            .unwrap();
+
+        let jobs = db.list_cron_jobs().unwrap();
+        assert_eq!(jobs.len(), 3);
+        // Sorted by name ascending
+        assert_eq!(jobs[0].name, "alpha-job");
+        assert_eq!(jobs[1].name, "mid-job");
+        assert_eq!(jobs[2].name, "zebra-job");
+    }
+
+    #[test]
+    fn list_cron_jobs_reflects_fields() {
+        let db = test_db();
+        db.add_cron_job("test-job", "*/5 * * * *", "run.sh", Some("ws1"))
+            .unwrap();
+
+        let jobs = db.list_cron_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        let job = &jobs[0];
+        assert_eq!(job.name, "test-job");
+        assert_eq!(job.schedule, "*/5 * * * *");
+        assert_eq!(job.script, "run.sh");
+        assert_eq!(job.workspace.as_deref(), Some("ws1"));
+        assert!(job.enabled);
+        assert!(job.last_run_at.is_none());
+    }
+
+    #[test]
+    fn list_cron_jobs_reflects_toggle_state() {
+        let db = test_db();
+        db.add_cron_job("toggled", "0 * * * *", "t.sh", None)
+            .unwrap();
+        db.toggle_cron_job("toggled", false).unwrap();
+
+        let jobs = db.list_cron_jobs().unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert!(!jobs[0].enabled);
+    }
 }
