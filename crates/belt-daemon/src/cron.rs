@@ -2515,14 +2515,19 @@ impl CronHandler for EvaluateJob {
             return Ok(());
         }
 
+        // 2. Apply batch size limit to avoid unbounded LLM calls per cycle.
+        let batch_size = crate::evaluator::DEFAULT_EVAL_BATCH_SIZE;
+        let batch_items: Vec<_> = completed_items.into_iter().take(batch_size).collect();
+
         tracing::info!(
-            count = completed_items.len(),
+            count = batch_items.len(),
+            batch_size,
             "EvaluateJob: found completed items for evaluation"
         );
 
-        // 2. Group by workspace to run one evaluator per workspace.
+        // 3. Group by workspace for per-workspace evaluator configuration.
         let mut by_workspace: HashMap<String, Vec<&belt_core::queue::QueueItem>> = HashMap::new();
-        for item in &completed_items {
+        for item in &batch_items {
             by_workspace
                 .entry(item.workspace_id.clone())
                 .or_default()
@@ -2552,10 +2557,10 @@ impl CronHandler for EvaluateJob {
             tracing::info!(
                 workspace = %workspace,
                 items = items.len(),
-                "EvaluateJob: running evaluator for workspace"
+                "EvaluateJob: running per-item LLM evaluation for workspace"
             );
 
-            // 3. Resolve workspace config path for subprocess invocation.
+            // 4. Resolve workspace config path for subprocess invocation.
             let config_path = ws_config_map.get(workspace);
 
             let mut evaluator = crate::evaluator::Evaluator::new(workspace);
@@ -2563,55 +2568,113 @@ impl CronHandler for EvaluateJob {
                 evaluator = evaluator.with_workspace_config_path(cp.clone());
             }
 
-            // 4. Bridge async evaluator into this sync handler.
-            let eval_result = std::thread::scope(|_| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| BeltError::Runtime(e.to_string()))?;
-                rt.block_on(evaluator.run_evaluate(&belt_home_path))
-                    .map_err(|e| BeltError::Runtime(e.to_string()))
-            });
+            // 5. Evaluate each item individually via LLM subprocess.
+            for item in items {
+                let eval_result = std::thread::scope(|_| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| BeltError::Runtime(e.to_string()))?;
+                    rt.block_on(evaluator.run_evaluate(&belt_home_path))
+                        .map_err(|e| BeltError::Runtime(e.to_string()))
+                });
 
-            match eval_result {
-                Ok(result) if result.success() => {
-                    // 5a. Success: transition all items to Done.
-                    for item in items {
-                        match self.db.update_phase(&item.work_id, QueuePhase::Done) {
-                            Ok(()) => {
-                                evaluated_count += 1;
-                                tracing::info!(
-                                    work_id = %item.work_id,
-                                    workspace = %workspace,
-                                    "EvaluateJob: item evaluated as Done"
-                                );
-                            }
-                            Err(e) => {
+                match eval_result {
+                    Ok(result) if result.success() => {
+                        // 6a. LLM call succeeded -- parse verdict from stdout.
+                        let verdict = crate::evaluator::EvalVerdict::parse(&result.stdout);
+                        let decision = match &verdict {
+                            Some(v) if v.is_pass() => crate::evaluator::EvalDecision::Done,
+                            Some(v) => crate::evaluator::EvalDecision::Hitl {
+                                reason: v
+                                    .reason
+                                    .clone()
+                                    .unwrap_or_else(|| "LLM evaluation found issues".to_string()),
+                            },
+                            None => {
+                                // Subprocess succeeded but no parseable verdict.
+                                // Default to Done (backward-compatible behavior).
                                 tracing::warn!(
                                     work_id = %item.work_id,
-                                    error = %e,
-                                    "EvaluateJob: failed to update item phase to Done"
+                                    "EvaluateJob: no parseable verdict from LLM, defaulting to Done"
+                                );
+                                crate::evaluator::EvalDecision::Done
+                            }
+                        };
+
+                        // Log suggestions if present.
+                        if let Some(v) = &verdict
+                            && !v.suggestions.is_empty()
+                        {
+                            tracing::info!(
+                                work_id = %item.work_id,
+                                suggestions = ?v.suggestions,
+                                "EvaluateJob: LLM evaluation suggestions"
+                            );
+                        }
+
+                        match &decision {
+                            crate::evaluator::EvalDecision::Done => {
+                                match self.db.update_phase(&item.work_id, QueuePhase::Done) {
+                                    Ok(()) => {
+                                        evaluated_count += 1;
+                                        tracing::info!(
+                                            work_id = %item.work_id,
+                                            workspace = %workspace,
+                                            "EvaluateJob: item evaluated as Done"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            work_id = %item.work_id,
+                                            error = %e,
+                                            "EvaluateJob: failed to update item phase to Done"
+                                        );
+                                    }
+                                }
+                            }
+                            crate::evaluator::EvalDecision::Hitl { reason } => {
+                                if let Err(e) = self.db.escalate_to_hitl(
+                                    &item.work_id,
+                                    "evaluate_issues",
+                                    reason,
+                                ) {
+                                    tracing::warn!(
+                                        work_id = %item.work_id,
+                                        error = %e,
+                                        "EvaluateJob: failed to escalate item to HITL"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        work_id = %item.work_id,
+                                        reason = %reason,
+                                        "EvaluateJob: item escalated to HITL due to evaluation issues"
+                                    );
+                                }
+                                evaluated_count += 1;
+                            }
+                            crate::evaluator::EvalDecision::Retry => {
+                                // Should not occur in this path, but handle gracefully.
+                                tracing::debug!(
+                                    work_id = %item.work_id,
+                                    "EvaluateJob: item stays in Completed for retry"
                                 );
                             }
                         }
                     }
-                }
-                Ok(result) => {
-                    // 5b. Non-zero exit: record failure per item via DB
-                    // replan_count (reused as eval retry counter).
-                    let error_msg = format!(
-                        "evaluator exit_code={}: {}",
-                        result.exit_code,
-                        result.stderr.trim()
-                    );
-                    tracing::warn!(
-                        workspace = %workspace,
-                        exit_code = result.exit_code,
-                        "EvaluateJob: evaluator returned non-zero exit"
-                    );
+                    Ok(result) => {
+                        // 6b. Non-zero exit: record per-item failure via DB replan_count.
+                        let error_msg = format!(
+                            "evaluator exit_code={}: {}",
+                            result.exit_code,
+                            result.stderr.trim()
+                        );
+                        tracing::warn!(
+                            work_id = %item.work_id,
+                            exit_code = result.exit_code,
+                            "EvaluateJob: evaluator returned non-zero exit for item"
+                        );
 
-                    for item in items {
-                        // Increment failure counter in DB and get new count.
                         let failure_count = match self.db.increment_replan_count(&item.work_id) {
                             Ok(count) => count,
                             Err(e) => {
@@ -2626,7 +2689,6 @@ impl CronHandler for EvaluateJob {
                         };
 
                         if failure_count >= crate::evaluator::DEFAULT_MAX_EVAL_FAILURES {
-                            // Escalate to HITL after max failures.
                             let notes = format!(
                                 "evaluate failed {} times (threshold={}): {}",
                                 failure_count,
@@ -2650,7 +2712,6 @@ impl CronHandler for EvaluateJob {
                                 );
                             }
                         } else {
-                            // Item stays in Completed; will retry on next cycle.
                             tracing::info!(
                                 work_id = %item.work_id,
                                 failure_count,
@@ -2659,21 +2720,22 @@ impl CronHandler for EvaluateJob {
                         }
                         failed_count += 1;
                     }
-                }
-                Err(e) => {
-                    // 5c. Subprocess spawn/timeout error: log and let retry on next cycle.
-                    tracing::error!(
-                        workspace = %workspace,
-                        error = %e,
-                        "EvaluateJob: failed to run evaluator subprocess"
-                    );
-                    failed_count += items.len() as u32;
+                    Err(e) => {
+                        // 6c. Subprocess spawn/timeout error for this item.
+                        tracing::error!(
+                            work_id = %item.work_id,
+                            workspace = %workspace,
+                            error = %e,
+                            "EvaluateJob: failed to run evaluator subprocess for item"
+                        );
+                        failed_count += 1;
+                    }
                 }
             }
         }
 
         tracing::info!(
-            total = completed_items.len(),
+            total = batch_items.len(),
             evaluated = evaluated_count,
             failed = failed_count,
             workspaces = by_workspace.len(),
