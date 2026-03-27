@@ -174,6 +174,11 @@ impl Daemon {
         self
     }
 
+    /// Return a reference to the database, if configured.
+    pub fn database(&self) -> Option<&Arc<Database>> {
+        self.db.as_ref()
+    }
+
     /// Set the belt home directory for evaluator scripts.
     pub fn with_belt_home(mut self, belt_home: PathBuf) -> Self {
         self.belt_home = belt_home;
@@ -1026,6 +1031,9 @@ impl Daemon {
                     "handler",
                     Some("hitl respond: retry".to_string()),
                 );
+                if is_spec_completion {
+                    self.apply_spec_active_revert(&spec_id);
+                }
                 Ok(())
             }
             HitlRespondAction::Skip => {
@@ -1040,10 +1048,7 @@ impl Daemon {
                     Some("hitl respond: skip".to_string()),
                 );
                 if is_spec_completion {
-                    tracing::info!(
-                        spec_id = %spec_id,
-                        "spec completion HITL rejected — spec remains in Completing"
-                    );
+                    self.apply_spec_active_revert(&spec_id);
                 }
                 Ok(())
             }
@@ -1150,6 +1155,35 @@ impl Daemon {
             tracing::warn!(
                 spec_id = %spec_id,
                 "no database configured — cannot transition spec to Completed"
+            );
+        }
+    }
+
+    /// Revert a spec from Completing to Active in the database.
+    ///
+    /// Called when a `spec_completion` HITL item is rejected (Skip) or
+    /// needs additional modifications (Retry).
+    fn apply_spec_active_revert(&self, spec_id: &str) {
+        if let Some(db) = &self.db {
+            match db.update_spec_status(spec_id, belt_core::spec::SpecStatus::Active) {
+                Ok(()) => {
+                    tracing::info!(
+                        spec_id = %spec_id,
+                        "spec reverted from Completing to Active via HITL rejection/retry"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        spec_id = %spec_id,
+                        error = %e,
+                        "failed to revert spec to Active after HITL rejection/retry"
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                spec_id = %spec_id,
+                "no database configured — cannot revert spec to Active"
             );
         }
     }
@@ -3811,7 +3845,7 @@ sources:
     }
 
     #[test]
-    fn respond_hitl_skip_spec_completion_keeps_spec_in_completing() {
+    fn respond_hitl_skip_spec_completion_reverts_spec_to_active() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let daemon = setup_daemon(&tmp, source, vec![]);
@@ -3856,9 +3890,60 @@ sources:
             QueuePhase::Skipped
         );
 
-        // Spec should remain in Completing.
+        // Spec should revert to Active after rejection.
         let updated_spec = daemon.db.as_ref().unwrap().get_spec("spec-43").unwrap();
-        assert_eq!(updated_spec.status, belt_core::spec::SpecStatus::Completing);
+        assert_eq!(updated_spec.status, belt_core::spec::SpecStatus::Active);
+    }
+
+    #[test]
+    fn respond_hitl_retry_spec_completion_reverts_spec_to_active() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![]);
+
+        let db = Database::open_in_memory().unwrap();
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-44".to_string(),
+            "test-ws".to_string(),
+            "Test Spec".to_string(),
+            "content".to_string(),
+        );
+        spec.status = belt_core::spec::SpecStatus::Completing;
+        db.insert_spec(&spec).unwrap();
+
+        let mut daemon = daemon.with_db(db);
+
+        let mut item = QueueItem::new(
+            "spec-completion:spec-44:hitl".to_string(),
+            "spec-44".to_string(),
+            "test-ws".to_string(),
+            "spec_completion".to_string(),
+        );
+        item.phase = QueuePhase::Hitl;
+        item.hitl_reason = Some(HitlReason::SpecCompletionReview);
+        daemon.push_item(item);
+
+        // Retry (additional modifications needed) the HITL item.
+        let result = daemon.respond_hitl(
+            "spec-completion:spec-44:hitl",
+            HitlRespondAction::Retry,
+            Some("reviewer".into()),
+            None,
+        );
+        assert!(result.is_ok());
+
+        // Queue item should be Pending (retried).
+        assert_eq!(
+            daemon
+                .get_item("spec-completion:spec-44:hitl")
+                .unwrap()
+                .phase,
+            QueuePhase::Pending
+        );
+
+        // Spec should revert to Active for additional modifications.
+        let updated_spec = daemon.db.as_ref().unwrap().get_spec("spec-44").unwrap();
+        assert_eq!(updated_spec.status, belt_core::spec::SpecStatus::Active);
     }
 
     // ---------------------------------------------------------------

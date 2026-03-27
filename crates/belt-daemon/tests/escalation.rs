@@ -412,3 +412,169 @@ fn escalation_on_fail_policy() {
     assert!(EscalationAction::Skip.should_run_on_fail());
     assert!(EscalationAction::Replan.should_run_on_fail());
 }
+
+// ---------------------------------------------------------------
+// Spec completion HITL flow
+// ---------------------------------------------------------------
+
+/// Spec completion HITL approved (Done) transitions spec Completing -> Completed.
+#[test]
+fn spec_completion_hitl_approve_transitions_to_completed() {
+    use belt_core::queue::QueueItem;
+    use belt_core::spec::{Spec, SpecStatus};
+    use belt_infra::db::Database;
+
+    let tmp = TempDir::new().unwrap();
+    let source = MockDataSource::new("github");
+    let daemon = setup_daemon(&tmp, source, vec![]);
+
+    let db = Database::open_in_memory().unwrap();
+    let mut spec = Spec::new(
+        "spec-100".to_string(),
+        "test-ws".to_string(),
+        "Integration Test Spec".to_string(),
+        "spec content".to_string(),
+    );
+    spec.status = SpecStatus::Completing;
+    db.insert_spec(&spec).unwrap();
+
+    let mut daemon = daemon.with_db(db);
+
+    let mut item = QueueItem::new(
+        "spec-completion:spec-100:hitl".to_string(),
+        "spec-100".to_string(),
+        "test-ws".to_string(),
+        "spec_completion".to_string(),
+    );
+    item.phase = QueuePhase::Hitl;
+    item.hitl_reason = Some(HitlReason::SpecCompletionReview);
+    daemon.push_item(item);
+
+    daemon
+        .respond_hitl(
+            "spec-completion:spec-100:hitl",
+            HitlRespondAction::Done,
+            Some("human-reviewer".into()),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        daemon
+            .get_item("spec-completion:spec-100:hitl")
+            .unwrap()
+            .phase,
+        QueuePhase::Done
+    );
+
+    let updated = daemon.database().unwrap().get_spec("spec-100").unwrap();
+    assert_eq!(updated.status, SpecStatus::Completed);
+}
+
+/// Spec completion HITL rejected (Skip) reverts spec Completing -> Active.
+#[test]
+fn spec_completion_hitl_reject_reverts_to_active() {
+    use belt_core::queue::QueueItem;
+    use belt_core::spec::{Spec, SpecStatus};
+    use belt_infra::db::Database;
+
+    let tmp = TempDir::new().unwrap();
+    let source = MockDataSource::new("github");
+    let daemon = setup_daemon(&tmp, source, vec![]);
+
+    let db = Database::open_in_memory().unwrap();
+    let mut spec = Spec::new(
+        "spec-101".to_string(),
+        "test-ws".to_string(),
+        "Integration Test Spec".to_string(),
+        "spec content".to_string(),
+    );
+    spec.status = SpecStatus::Completing;
+    db.insert_spec(&spec).unwrap();
+
+    let mut daemon = daemon.with_db(db);
+
+    let mut item = QueueItem::new(
+        "spec-completion:spec-101:hitl".to_string(),
+        "spec-101".to_string(),
+        "test-ws".to_string(),
+        "spec_completion".to_string(),
+    );
+    item.phase = QueuePhase::Hitl;
+    item.hitl_reason = Some(HitlReason::SpecCompletionReview);
+    daemon.push_item(item);
+
+    daemon
+        .respond_hitl(
+            "spec-completion:spec-101:hitl",
+            HitlRespondAction::Skip,
+            Some("human-reviewer".into()),
+            None,
+        )
+        .unwrap();
+
+    assert_eq!(
+        daemon
+            .get_item("spec-completion:spec-101:hitl")
+            .unwrap()
+            .phase,
+        QueuePhase::Skipped
+    );
+
+    let updated = daemon.database().unwrap().get_spec("spec-101").unwrap();
+    assert_eq!(updated.status, SpecStatus::Active);
+}
+
+/// Spec completion HITL retry reverts spec Completing -> Active.
+#[test]
+fn spec_completion_hitl_retry_reverts_to_active() {
+    use belt_core::queue::QueueItem;
+    use belt_core::spec::{Spec, SpecStatus};
+    use belt_infra::db::Database;
+
+    let tmp = TempDir::new().unwrap();
+    let source = MockDataSource::new("github");
+    let daemon = setup_daemon(&tmp, source, vec![]);
+
+    let db = Database::open_in_memory().unwrap();
+    let mut spec = Spec::new(
+        "spec-102".to_string(),
+        "test-ws".to_string(),
+        "Integration Test Spec".to_string(),
+        "spec content".to_string(),
+    );
+    spec.status = SpecStatus::Completing;
+    db.insert_spec(&spec).unwrap();
+
+    let mut daemon = daemon.with_db(db);
+
+    let mut item = QueueItem::new(
+        "spec-completion:spec-102:hitl".to_string(),
+        "spec-102".to_string(),
+        "test-ws".to_string(),
+        "spec_completion".to_string(),
+    );
+    item.phase = QueuePhase::Hitl;
+    item.hitl_reason = Some(HitlReason::SpecCompletionReview);
+    daemon.push_item(item);
+
+    daemon
+        .respond_hitl(
+            "spec-completion:spec-102:hitl",
+            HitlRespondAction::Retry,
+            Some("human-reviewer".into()),
+            Some("needs more work on module X".into()),
+        )
+        .unwrap();
+
+    assert_eq!(
+        daemon
+            .get_item("spec-completion:spec-102:hitl")
+            .unwrap()
+            .phase,
+        QueuePhase::Pending
+    );
+
+    let updated = daemon.database().unwrap().get_spec("spec-102").unwrap();
+    assert_eq!(updated.status, SpecStatus::Active);
+}
