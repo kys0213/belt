@@ -3533,7 +3533,7 @@ sources:
         // Verify by adding a new item and advancing it.
         daemon.push_item(test_item("github:org/repo#2", "analyze"));
         daemon.advance();
-        assert!(daemon.items_in_phase(QueuePhase::Running).len() >= 1);
+        assert!(!daemon.items_in_phase(QueuePhase::Running).is_empty());
     }
 
     // ---------------------------------------------------------------

@@ -233,6 +233,125 @@ fn print_plan(
     Ok(())
 }
 
+/// Entry point for `belt agent` command.
+///
+/// Returns the exit code from the agent execution (0 on success).
+pub async fn run_agent(
+    workspace_path: Option<String>,
+    prompt: Option<String>,
+    plan: bool,
+    json_output: bool,
+) -> Result<i32> {
+    let workspace_path =
+        workspace_path.ok_or_else(|| anyhow::anyhow!("--workspace is required"))?;
+
+    let config = load_workspace_config(&workspace_path)?;
+    let actions = collect_actions(&config, prompt.as_deref());
+
+    if actions.is_empty() {
+        bail!("no actions found in workspace config");
+    }
+
+    if plan {
+        let rules_dir = resolve_rules_dir(&config);
+        print_plan(&config, &actions, rules_dir.as_deref(), json_output)?;
+        return Ok(0);
+    }
+
+    // Build runtime registry and executor.
+    let registry = Arc::new(build_registry(&config));
+    let executor = ActionExecutor::new(registry);
+
+    // Use current directory as working directory.
+    let working_dir = std::env::current_dir().context("failed to determine current directory")?;
+
+    // Build the system prompt by combining built-in Claw rules with
+    // workspace-specific rules loaded from the rules directory.
+    let mut env = ActionEnv::new("cli-agent", &working_dir);
+
+    let max_turns = config
+        .claw_config
+        .as_ref()
+        .and_then(|c| c.max_conversation_turns);
+    let claw_rules = build_claw_rules_prompt(max_turns);
+
+    let file_rules = if let Some(rules_dir) = resolve_rules_dir(&config) {
+        match load_rules_from_dir(&rules_dir) {
+            Ok(Some(rules)) => {
+                tracing::info!(
+                    rules_dir = %rules_dir.display(),
+                    "loaded workspace rules from directory"
+                );
+                Some(rules)
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    rules_dir = %rules_dir.display(),
+                    "rules directory exists but contains no .md files"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    rules_dir = %rules_dir.display(),
+                    error = %e,
+                    "failed to load workspace rules, continuing without"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let system_prompt = match file_rules {
+        Some(file_prompt) => format!("{claw_rules}\n\n---\n\n{file_prompt}"),
+        None => claw_rules,
+    };
+    env = env.with_system_prompt(system_prompt);
+
+    tracing::info!(
+        workspace = config.name,
+        actions = actions.len(),
+        has_rules = env.system_prompt.is_some(),
+        "executing agent"
+    );
+
+    let result = executor.execute_all(&actions, &env).await?;
+
+    match result {
+        Some(action_result) => {
+            if json_output {
+                let output = serde_json::json!({
+                    "workspace": config.name,
+                    "exit_code": action_result.exit_code,
+                    "stdout": action_result.stdout,
+                    "stderr": action_result.stderr,
+                    "duration_ms": action_result.duration.as_millis(),
+                    "token_usage": action_result.token_usage.as_ref().map(|u| serde_json::json!({
+                        "input_tokens": u.input_tokens,
+                        "output_tokens": u.output_tokens,
+                        "cache_read_tokens": u.cache_read_tokens,
+                        "cache_write_tokens": u.cache_write_tokens,
+                    })),
+                });
+                println!("{}", serde_json::to_string_pretty(&output)?);
+            } else {
+                if !action_result.stdout.is_empty() {
+                    print!("{}", action_result.stdout);
+                }
+                if !action_result.stderr.is_empty() {
+                    eprint!("{}", action_result.stderr);
+                }
+            }
+            Ok(action_result.exit_code)
+        }
+        None => {
+            bail!("no actions were executed");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -454,7 +573,7 @@ runtime:
     fn print_plan_json_prompt_action_serializes_fields() {
         // Validate the JSON structure by constructing the same json! value.
         let config = empty_workspace();
-        let actions = vec![
+        let actions = [
             Action::Prompt {
                 text: "analyze".to_string(),
                 runtime: Some("claude".to_string()),
@@ -498,7 +617,7 @@ runtime:
 
     #[test]
     fn print_plan_json_prompt_without_runtime_serializes_null() {
-        let actions = vec![Action::Prompt {
+        let actions = [Action::Prompt {
             text: "do work".to_string(),
             runtime: None,
             model: None,
@@ -770,16 +889,20 @@ runtime:
 
     #[test]
     fn workspace_without_rules_has_no_system_prompt() {
+        // Point BELT_HOME to an empty temp dir so global claw rules are not found.
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
+
         let config = empty_workspace();
         // No claw_config, so resolve_rules_dir returns None.
         // Simulate the run_agent flow.
         let working_dir = std::env::current_dir().unwrap();
         let mut env = ActionEnv::new("test-agent", &working_dir);
 
-        if let Some(rules_dir) = resolve_rules_dir(&config) {
-            if let Ok(Some(system_prompt)) = load_rules_from_dir(&rules_dir) {
-                env = env.with_system_prompt(system_prompt);
-            }
+        if let Some(rules_dir) = resolve_rules_dir(&config)
+            && let Ok(Some(system_prompt)) = load_rules_from_dir(&rules_dir)
+        {
+            env = env.with_system_prompt(system_prompt);
         }
 
         assert!(env.system_prompt.is_none());
@@ -960,125 +1083,6 @@ runtime:
                     None => std::env::remove_var(&self.key),
                 }
             }
-        }
-    }
-}
-
-/// Entry point for `belt agent` command.
-///
-/// Returns the exit code from the agent execution (0 on success).
-pub async fn run_agent(
-    workspace_path: Option<String>,
-    prompt: Option<String>,
-    plan: bool,
-    json_output: bool,
-) -> Result<i32> {
-    let workspace_path =
-        workspace_path.ok_or_else(|| anyhow::anyhow!("--workspace is required"))?;
-
-    let config = load_workspace_config(&workspace_path)?;
-    let actions = collect_actions(&config, prompt.as_deref());
-
-    if actions.is_empty() {
-        bail!("no actions found in workspace config");
-    }
-
-    if plan {
-        let rules_dir = resolve_rules_dir(&config);
-        print_plan(&config, &actions, rules_dir.as_deref(), json_output)?;
-        return Ok(0);
-    }
-
-    // Build runtime registry and executor.
-    let registry = Arc::new(build_registry(&config));
-    let executor = ActionExecutor::new(registry);
-
-    // Use current directory as working directory.
-    let working_dir = std::env::current_dir().context("failed to determine current directory")?;
-
-    // Build the system prompt by combining built-in Claw rules with
-    // workspace-specific rules loaded from the rules directory.
-    let mut env = ActionEnv::new("cli-agent", &working_dir);
-
-    let max_turns = config
-        .claw_config
-        .as_ref()
-        .and_then(|c| c.max_conversation_turns);
-    let claw_rules = build_claw_rules_prompt(max_turns);
-
-    let file_rules = if let Some(rules_dir) = resolve_rules_dir(&config) {
-        match load_rules_from_dir(&rules_dir) {
-            Ok(Some(rules)) => {
-                tracing::info!(
-                    rules_dir = %rules_dir.display(),
-                    "loaded workspace rules from directory"
-                );
-                Some(rules)
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    rules_dir = %rules_dir.display(),
-                    "rules directory exists but contains no .md files"
-                );
-                None
-            }
-            Err(e) => {
-                tracing::warn!(
-                    rules_dir = %rules_dir.display(),
-                    error = %e,
-                    "failed to load workspace rules, continuing without"
-                );
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    let system_prompt = match file_rules {
-        Some(file_prompt) => format!("{claw_rules}\n\n---\n\n{file_prompt}"),
-        None => claw_rules,
-    };
-    env = env.with_system_prompt(system_prompt);
-
-    tracing::info!(
-        workspace = config.name,
-        actions = actions.len(),
-        has_rules = env.system_prompt.is_some(),
-        "executing agent"
-    );
-
-    let result = executor.execute_all(&actions, &env).await?;
-
-    match result {
-        Some(action_result) => {
-            if json_output {
-                let output = serde_json::json!({
-                    "workspace": config.name,
-                    "exit_code": action_result.exit_code,
-                    "stdout": action_result.stdout,
-                    "stderr": action_result.stderr,
-                    "duration_ms": action_result.duration.as_millis(),
-                    "token_usage": action_result.token_usage.as_ref().map(|u| serde_json::json!({
-                        "input_tokens": u.input_tokens,
-                        "output_tokens": u.output_tokens,
-                        "cache_read_tokens": u.cache_read_tokens,
-                        "cache_write_tokens": u.cache_write_tokens,
-                    })),
-                });
-                println!("{}", serde_json::to_string_pretty(&output)?);
-            } else {
-                if !action_result.stdout.is_empty() {
-                    print!("{}", action_result.stdout);
-                }
-                if !action_result.stderr.is_empty() {
-                    eprint!("{}", action_result.stderr);
-                }
-            }
-            Ok(action_result.exit_code)
-        }
-        None => {
-            bail!("no actions were executed");
         }
     }
 }

@@ -16,14 +16,14 @@ if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
   exit 0
 fi
 
-# cargo fmt check
-if ! cargo fmt --check >/dev/null 2>&1; then
-  echo '{"continue":false,"stopReason":"cargo fmt --check failed. Run cargo fmt first."}'
+# cargo fmt check (matches CI: cargo fmt --all -- --check)
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+  echo '{"continue":false,"stopReason":"cargo fmt --all -- --check failed. Run cargo fmt first."}'
   exit 0
 fi
 
-# cargo clippy check
-if ! cargo clippy -- -D warnings >/dev/null 2>&1; then
-  echo '{"continue":false,"stopReason":"cargo clippy -- -D warnings failed. Fix clippy warnings first."}'
+# cargo clippy check (matches CI: --all-targets --all-features, RUSTFLAGS="-D warnings")
+if ! RUSTFLAGS="-D warnings" cargo clippy --all-targets --all-features 2>&1 | tail -5; then
+  echo '{"continue":false,"stopReason":"cargo clippy --all-targets --all-features failed (warnings as errors). Fix clippy warnings first."}'
   exit 0
 fi

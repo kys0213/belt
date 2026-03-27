@@ -388,7 +388,7 @@ mod tests {
     fn no_entry_point_is_clear() {
         let guard = SpecDependencyGuard;
         let spec = make_spec_with_entry("s1", SpecStatus::Active, None);
-        let result = guard.check_conflicts(&spec, || vec![]);
+        let result = guard.check_conflicts(&spec, std::vec::Vec::new);
         assert_eq!(result, ConflictCheckResult::Clear);
         assert!(result.is_clear());
     }
@@ -397,7 +397,7 @@ mod tests {
     fn empty_entry_point_is_clear() {
         let guard = SpecDependencyGuard;
         let spec = make_spec_with_entry("s1", SpecStatus::Active, Some(""));
-        let result = guard.check_conflicts(&spec, || vec![]);
+        let result = guard.check_conflicts(&spec, std::vec::Vec::new);
         assert_eq!(result, ConflictCheckResult::Clear);
     }
 
@@ -474,7 +474,7 @@ mod tests {
             overlap_type: OverlapType::File,
             path: "src/auth.rs".to_string(),
         };
-        let resolutions = resolve_conflicts(&[conflict.clone()]);
+        let resolutions = resolve_conflicts(std::slice::from_ref(&conflict));
         assert_eq!(resolutions.len(), 1);
         assert_eq!(resolutions[0].conflict, conflict);
         assert!(matches!(resolutions[0].action, ConflictAction::Hitl { .. }));
@@ -488,7 +488,7 @@ mod tests {
             overlap_type: OverlapType::Module,
             path: "src/auth/token.rs".to_string(),
         };
-        let resolutions = resolve_conflicts(&[conflict.clone()]);
+        let resolutions = resolve_conflicts(std::slice::from_ref(&conflict));
         assert_eq!(resolutions.len(), 1);
         assert_eq!(
             resolutions[0].action,

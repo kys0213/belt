@@ -3610,14 +3610,12 @@ mod tests {
 
     #[test]
     fn knowledge_extraction_pr_limit_is_reasonable() {
-        assert!(PR_SCAN_LIMIT > 0);
-        assert!(PR_SCAN_LIMIT <= 100);
+        assert_eq!(PR_SCAN_LIMIT, 20);
     }
 
     #[test]
     fn knowledge_extraction_diff_max_size_is_reasonable() {
-        assert!(MAX_DIFF_SIZE > 0);
-        assert!(MAX_DIFF_SIZE <= 100_000);
+        assert_eq!(MAX_DIFF_SIZE, 30_000);
     }
 
     #[test]

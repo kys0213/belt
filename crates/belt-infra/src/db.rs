@@ -2584,7 +2584,6 @@ mod tests {
             output_tokens: 500,
             cache_read_tokens: Some(200),
             cache_write_tokens: Some(100),
-            ..Default::default()
         };
         db.record_token_usage("w1", "ws1", "claude", "opus-4", &usage, Some(1234))
             .unwrap();

@@ -9,8 +9,20 @@ CMD=$(cat | jq -r '.tool_input.command // empty')
 # Only run on gh pr create commands
 echo "$CMD" | grep -qE 'gh\s+pr\s+create' || exit 0
 
-# cargo clippy with warnings as errors
-if ! cargo clippy -- -D warnings 2>&1; then
-  echo '{"continue":false,"stopReason":"cargo clippy -- -D warnings failed. Fix clippy warnings before creating PR."}'
+# cargo fmt check (matches CI)
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+  echo '{"continue":false,"stopReason":"cargo fmt --all -- --check failed. Run cargo fmt before creating PR."}'
+  exit 0
+fi
+
+# cargo clippy (matches CI: --all-targets --all-features, RUSTFLAGS="-D warnings")
+if ! RUSTFLAGS="-D warnings" cargo clippy --all-targets --all-features 2>&1; then
+  echo '{"continue":false,"stopReason":"cargo clippy --all-targets --all-features failed. Fix clippy warnings before creating PR."}'
+  exit 0
+fi
+
+# cargo test (matches CI: --workspace)
+if ! cargo test --workspace 2>&1; then
+  echo '{"continue":false,"stopReason":"cargo test --workspace failed. Fix tests before creating PR."}'
   exit 0
 fi

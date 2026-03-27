@@ -3,6 +3,8 @@
 //! Provides gh CLI wrappers, real daemon factory, and prerequisite checks.
 //! These helpers interact with **real** GitHub (kys0213/belt) and Claude API.
 
+#![allow(dead_code)]
+
 use std::process::Command;
 use std::sync::Arc;
 

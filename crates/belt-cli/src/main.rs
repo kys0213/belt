@@ -3433,7 +3433,7 @@ mod tests {
         db.insert_spec_link(&parent_link).unwrap();
 
         // Store child issue links (as the CLI handler does).
-        let child_urls = vec![
+        let child_urls = [
             "https://github.com/owner/repo/issues/201",
             "https://github.com/owner/repo/issues/202",
         ];
@@ -3543,7 +3543,7 @@ mod tests {
         assert!(preview.contains("AC2"));
 
         // Simulate issue creation and store decomposed_issues.
-        let child_nums = vec!["301".to_string(), "302".to_string()];
+        let child_nums = ["301".to_string(), "302".to_string()];
         spec.decomposed_issues = Some(child_nums.join(","));
         db.update_spec(&spec).unwrap();
 
@@ -3578,7 +3578,7 @@ mod tests {
     #[test]
     fn decompose_workflow_parent_body_update_format() {
         let spec_content = "## Overview\nFeature spec.\n\n## Acceptance Criteria\n- A\n- B";
-        let child_urls = vec![
+        let child_urls = [
             "https://github.com/owner/repo/issues/501".to_string(),
             "https://github.com/owner/repo/issues/502".to_string(),
         ];
