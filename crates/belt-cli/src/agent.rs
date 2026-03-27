@@ -1051,38 +1051,53 @@ runtime:
         assert!(prompt.contains("session: 10"));
     }
 
+    /// Global mutex that serializes tests which mutate environment variables.
+    /// Rust's test harness runs tests in parallel threads by default, so any
+    /// test that calls `std::env::set_var` must hold this lock for the
+    /// duration of the test to avoid races with other env-mutating tests.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// RAII guard for setting environment variables in tests.
-    /// Restores (or removes) the variable on drop.
+    ///
+    /// Acquires `ENV_LOCK` for its entire lifetime so that concurrent tests
+    /// cannot observe each other's temporary env-var mutations.
     struct EnvGuard {
         key: String,
         prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn set(key: &str, value: &str) -> Self {
+            // Acquire the global env lock first to serialize all env mutations.
+            // `unwrap_or_else` recovers from a poisoned mutex caused by a
+            // previous test panic.
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var(key).ok();
-            // SAFETY: These tests run sequentially (not in parallel threads)
-            // so mutating env vars is safe within test context.
+            // SAFETY: We hold ENV_LOCK, so no other test is mutating env vars
+            // concurrently.
             unsafe {
                 std::env::set_var(key, value);
             }
             Self {
                 key: key.to_string(),
                 prev,
+                _lock: lock,
             }
         }
     }
 
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            // SAFETY: Restoring env var in test teardown; tests using EnvGuard
-            // are not run concurrently with other env-dependent tests.
+            // SAFETY: We still hold ENV_LOCK here (released when _lock is
+            // dropped at the end of this block).
             unsafe {
                 match &self.prev {
                     Some(v) => std::env::set_var(&self.key, v),
                     None => std::env::remove_var(&self.key),
                 }
             }
+            // _lock is dropped here, releasing ENV_LOCK.
         }
     }
 }
