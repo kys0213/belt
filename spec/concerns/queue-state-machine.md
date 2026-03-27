@@ -164,9 +164,44 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 ---
 
+---
+
+## 수용 기준
+
+### 상태 전이 규칙
+
+- [ ] Pending→Ready 전이는 Daemon tick마다 자동 수행된다
+- [ ] Ready→Running 전이는 workspace.concurrency와 daemon.max_concurrent 모두 만족할 때만 수행된다
+- [ ] queue_dependencies에 미완료(Done이 아닌) 의존이 있으면 Ready→Running 전이가 블로킹된다
+- [ ] `can_transition_to()`가 허용하지 않는 전이를 시도하면 `InvalidTransition` 에러가 반환된다
+- [ ] Done, Skipped는 terminal — 이후 전이 불가
+
+### Escalation 정책
+
+- [ ] failure_count=1일 때 `retry`가 적용되면 on_fail을 실행하지 않고 새 아이템으로 재시도한다
+- [ ] failure_count=2일 때 `retry_with_comment`가 적용되면 on_fail 실행 후 새 아이템으로 재시도한다
+- [ ] failure_count=3일 때 `hitl`이 적용되면 on_fail 실행 후 HITL 이벤트가 생성된다
+- [ ] on_enter 실패도 failure_count에 포함된다
+
+### Evaluate 실패 시 재시도
+
+- [ ] evaluate LLM 오류 시 아이템은 Completed에 머무르고, 다음 cron tick에서 재시도된다
+- [ ] evaluate 반복 실패(N회)로 HITL 에스컬레이션 시 HitlReason::EvaluateFailure가 기록된다
+- [ ] on_done script 실패 시 Failed 전이되고, on_fail은 실행하지 않는다
+
+### Worktree 생명주기
+
+- [ ] Running 진입 시 worktree가 생성된다 (retry 시 기존 worktree 재사용)
+- [ ] Done, Skipped 전이 시 worktree가 정리된다
+- [ ] HITL, Failed 전이 시 worktree가 보존된다
+- [ ] log-cleanup cron이 TTL(7일) 초과 보존 worktree를 정리한다
+
+---
+
 ### 관련 문서
 
 - [DESIGN-v5](../DESIGN-v5.md) — 설계 철학
 - [DataSource](./datasource.md) — escalation 정책 + on_fail script
 - [Cron 엔진](./cron-engine.md) — evaluate cron + force_trigger
 - [실패 복구와 HITL](../flows/04-failure-and-hitl.md) — 실패/HITL 시나리오
+- [Data Model](./data-model.md) — 테이블 스키마, 도메인 enum

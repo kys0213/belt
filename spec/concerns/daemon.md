@@ -106,12 +106,21 @@ for item in queue.get(Completed):
 
 ## 통합 액션 타입
 
-handler, on_done, on_fail, on_enter 전부 같은 두 가지 타입:
+두 가지 실행 단위가 있으며, 사용 위치에 따라 허용 범위가 다르다:
 
 ```yaml
 - prompt: "..."    # → AgentRuntime.invoke() (LLM, worktree 안에서)
 - script: "..."    # → bash 실행 (결정적, WORK_ID + WORKTREE 주입)
 ```
+
+| 위치 | prompt | script | 설명 |
+|------|:------:|:------:|------|
+| `handlers` | O | O | 워크플로우 핵심 작업 |
+| `on_enter` | X | O | Running 진입 시 사전 작업 |
+| `on_done` | X | O | 완료 후 외부 시스템 반영 |
+| `on_fail` | X | O | 실패 시 외부 시스템 알림 |
+
+lifecycle hook(`on_enter`/`on_done`/`on_fail`)은 **script만 허용**한다. 결정적 실행이 보장되어야 하고, LLM 호출은 handler에서만 수행한다. 상세는 [Data Model](./data-model.md#액션-타입) 참조.
 
 script 안에서 `belt context $WORK_ID --json`을 호출하여 필요한 정보를 조회한다.
 
@@ -141,6 +150,30 @@ SIGINT → on_shutdown:
 ```
 
 > **worktree 보존 원칙**: shutdown 롤백 시 worktree를 정리하지 않는다. retry와 동일하게, 재시작 후 이전 작업 위에서 이어서 진행할 수 있도록 worktree를 보존한다. 좀비 worktree는 `log-cleanup` cron이 TTL 기반으로 정리한다.
+
+---
+
+---
+
+## 수용 기준
+
+### Concurrency 제어
+
+- [ ] workspace.concurrency=2인 workspace에서 Running 아이템이 2개이면 추가 Ready→Running 전이가 발생하지 않는다
+- [ ] daemon.max_concurrent에 도달하면 모든 workspace에서 Ready→Running 전이가 중단된다
+- [ ] evaluate LLM 호출도 concurrency slot을 소비한다
+
+### Graceful Shutdown
+
+- [ ] SIGINT 수신 시 새 아이템 수집/전이를 즉시 중단한다
+- [ ] Running 아이템의 완료를 최대 30초 대기한다
+- [ ] 30초 초과 시 Running 아이템을 Pending으로 롤백하고 worktree를 보존한다
+- [ ] 재시작 후 롤백된 아이템이 기존 worktree를 재사용하여 Running에 재진입한다
+
+### 환경변수
+
+- [ ] handler/script 실행 시 WORK_ID, WORKTREE 두 환경변수만 주입된다
+- [ ] `belt context $WORK_ID --json`이 아이템의 전체 정보를 반환한다
 
 ---
 
