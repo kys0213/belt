@@ -98,6 +98,12 @@ struct SourceStatusEntry {
     status: SourceStatus,
     /// Number of active (non-terminal) items from this source.
     active_item_count: usize,
+    /// Timestamp of the last scan (from cron job `last_run_at`).
+    last_scan_time: Option<String>,
+    /// Number of items collected in the last scan.
+    last_scan_result_count: Option<usize>,
+    /// Error message when status is `Error`.
+    error_message: Option<String>,
 }
 
 /// Which panel is currently focused for item selection.
@@ -377,7 +383,7 @@ fn run_loop(
         let recent_items = collect_recent_items(db);
         let workspaces = db.list_workspaces().unwrap_or_default();
         let specs = db.list_specs(None, None).unwrap_or_default();
-        let datasource_entries = collect_datasource_status(&workspaces, &all_items);
+        let datasource_entries = collect_datasource_status(&workspaces, &all_items, Some(db));
 
         // Compute list length for navigation clamping.
         let active_list_len = match state.active_tab {
@@ -1038,13 +1044,30 @@ fn render_board_tab(
 fn collect_datasource_status(
     workspaces: &[(String, String, String)],
     all_items: &[QueueItem],
+    db: Option<&Database>,
 ) -> Vec<SourceStatusEntry> {
     let mut entries = Vec::new();
+
+    // Build a map of workspace -> last_run_at from cron jobs (evaluate job).
+    let cron_last_run: HashMap<String, String> = db
+        .and_then(|d| d.list_cron_jobs().ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|job| {
+            // Match workspace-scoped evaluate jobs: "{workspace}:evaluate"
+            let ws = job.workspace.as_ref()?;
+            if job.name.ends_with(":evaluate") {
+                job.last_run_at.map(|t| (ws.clone(), t))
+            } else {
+                None
+            }
+        })
+        .collect();
 
     for (ws_name, config_path, _created_at) in workspaces {
         let config = match load_workspace_config(Path::new(config_path)) {
             Ok(c) => c,
-            Err(_) => {
+            Err(e) => {
                 // Config could not be loaded — report error status.
                 entries.push(SourceStatusEntry {
                     workspace: ws_name.clone(),
@@ -1054,10 +1077,23 @@ fn collect_datasource_status(
                     scan_interval_secs: 0,
                     status: SourceStatus::Error,
                     active_item_count: 0,
+                    last_scan_time: None,
+                    last_scan_result_count: None,
+                    error_message: Some(format!("{e}")),
                 });
                 continue;
             }
         };
+
+        let last_scan = cron_last_run.get(ws_name).cloned();
+
+        // Count items created after the last scan time (approximate scan result).
+        let scan_result_count = last_scan.as_ref().map(|scan_time| {
+            all_items
+                .iter()
+                .filter(|item| item.workspace_id == *ws_name && item.created_at >= *scan_time)
+                .count()
+        });
 
         for (source_name, source_config) in &config.sources {
             // Count active (non-terminal) items from this workspace.
@@ -1072,7 +1108,7 @@ fn collect_datasource_status(
                 })
                 .count();
 
-            let status = if active_count > 0 {
+            let status = if last_scan.is_some() || active_count > 0 {
                 SourceStatus::Connected
             } else {
                 SourceStatus::Disconnected
@@ -1086,6 +1122,9 @@ fn collect_datasource_status(
                 scan_interval_secs: source_config.scan_interval_secs,
                 status,
                 active_item_count: active_count,
+                last_scan_time: last_scan.clone(),
+                last_scan_result_count: scan_result_count,
+                error_message: None,
             });
         }
     }
@@ -1155,6 +1194,8 @@ fn render_datasource_tab(
         Cell::from("States"),
         Cell::from("Interval"),
         Cell::from("Active"),
+        Cell::from("Last Scan"),
+        Cell::from("Count"),
     ])
     .style(
         Style::default()
@@ -1184,14 +1225,57 @@ fn render_datasource_tab(
                 format!("{}s", entry.scan_interval_secs)
             };
 
+            // Format last scan time: show only time portion if available.
+            let last_scan_display = match &entry.last_scan_time {
+                Some(ts) => {
+                    // Extract HH:MM:SS from RFC 3339 timestamp.
+                    if let Some(time_part) = ts.split('T').nth(1) {
+                        time_part
+                            .trim_end_matches('Z')
+                            .split('+')
+                            .next()
+                            .unwrap_or(time_part)
+                            .to_string()
+                    } else {
+                        truncate_str(ts, 19)
+                    }
+                }
+                None => "-".to_string(),
+            };
+
+            let last_scan_style = match &entry.last_scan_time {
+                Some(_) => Style::default().fg(Color::Green),
+                None => Style::default().fg(Color::DarkGray),
+            };
+
+            let count_display = match entry.last_scan_result_count {
+                Some(c) => c.to_string(),
+                None => "-".to_string(),
+            };
+
+            // Show error message tooltip via status indicator when in Error state.
+            let status_cell = if entry.status == SourceStatus::Error {
+                let err_msg = entry.error_message.as_deref().unwrap_or("unknown error");
+                Cell::from(format!(
+                    "{} {}",
+                    entry.status.indicator(),
+                    truncate_str(err_msg, 12)
+                ))
+                .style(status_style)
+            } else {
+                Cell::from(indicator).style(status_style)
+            };
+
             Row::new(vec![
-                Cell::from(indicator).style(status_style),
+                status_cell,
                 Cell::from(entry.workspace.clone()),
                 Cell::from(entry.source_name.clone()),
-                Cell::from(truncate_str(&entry.url, 40)),
+                Cell::from(truncate_str(&entry.url, 30)),
                 Cell::from(entry.state_count.to_string()),
                 Cell::from(interval_display),
                 Cell::from(entry.active_item_count.to_string()),
+                Cell::from(last_scan_display).style(last_scan_style),
+                Cell::from(count_display),
             ])
             .style(style)
         })
@@ -1201,12 +1285,14 @@ fn render_datasource_tab(
         rows,
         [
             Constraint::Length(16),
-            Constraint::Length(18),
+            Constraint::Length(16),
             Constraint::Length(12),
-            Constraint::Min(20),
+            Constraint::Min(16),
             Constraint::Length(8),
             Constraint::Length(10),
             Constraint::Length(8),
+            Constraint::Length(12),
+            Constraint::Length(7),
         ],
     )
     .header(header)
@@ -4154,7 +4240,7 @@ mod tests {
 
     #[test]
     fn collect_datasource_status_empty_workspaces() {
-        let entries = collect_datasource_status(&[], &[]);
+        let entries = collect_datasource_status(&[], &[], None);
         assert!(entries.is_empty());
     }
 
@@ -4165,10 +4251,11 @@ mod tests {
             "/nonexistent/path.yml".to_string(),
             "2026-03-25T00:00:00Z".to_string(),
         )];
-        let entries = collect_datasource_status(&workspaces, &[]);
+        let entries = collect_datasource_status(&workspaces, &[], None);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].status, SourceStatus::Error);
         assert_eq!(entries[0].workspace, "test-ws");
+        assert!(entries[0].error_message.is_some());
     }
 
     #[test]
@@ -4198,6 +4285,9 @@ mod tests {
             scan_interval_secs: 300,
             status: SourceStatus::Connected,
             active_item_count: 5,
+            last_scan_time: Some("2026-03-25T10:30:00Z".to_string()),
+            last_scan_result_count: Some(3),
+            error_message: None,
         };
         assert_eq!(entry.workspace, "my-ws");
         assert_eq!(entry.source_name, "github");
@@ -4205,6 +4295,12 @@ mod tests {
         assert_eq!(entry.scan_interval_secs, 300);
         assert_eq!(entry.active_item_count, 5);
         assert_eq!(entry.status, SourceStatus::Connected);
+        assert_eq!(
+            entry.last_scan_time.as_deref(),
+            Some("2026-03-25T10:30:00Z")
+        );
+        assert_eq!(entry.last_scan_result_count, Some(3));
+        assert!(entry.error_message.is_none());
     }
 
     #[test]
