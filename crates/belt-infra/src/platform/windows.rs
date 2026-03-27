@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn windows_shell_executor_default() {
-        let _executor = WindowsShellExecutor::default();
+        let _executor = WindowsShellExecutor;
     }
 
     #[test]
@@ -191,7 +191,7 @@ mod tests {
 
     #[test]
     fn windows_daemon_notifier_default() {
-        let _notifier = WindowsDaemonNotifier::default();
+        let _notifier = WindowsDaemonNotifier;
     }
 
     #[test]
