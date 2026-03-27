@@ -1526,27 +1526,32 @@ impl Daemon {
         tracing::info!("belt daemon stopped");
     }
 
-    /// Handle SIGUSR1 by performing a full sync of custom cron jobs from
-    /// the database (including new/removed/paused/resumed/triggered jobs)
-    /// and running an immediate tick.
-    #[cfg(unix)]
-    async fn handle_cron_trigger_signal(&mut self) {
-        tracing::info!("received SIGUSR1, syncing custom cron jobs from DB...");
+    /// Handle a cron-trigger notification by performing a full sync of custom
+    /// cron jobs from the database (including new/removed/paused/resumed/
+    /// triggered jobs) and running an immediate tick.
+    async fn handle_cron_trigger_signal(&mut self, source: &str) {
+        tracing::info!(source, "syncing custom cron jobs from DB...");
         if let (Some(engine), Some(db)) = (&mut self.cron_engine, &self.db) {
             engine.sync_custom_jobs_from_db(db);
         }
         // Run an immediate tick so the triggered job executes now.
         if let Err(e) = self.tick().await {
-            tracing::error!("tick error after SIGUSR1: {e}");
+            tracing::error!("tick error after {source}: {e}");
         }
     }
 
-    /// Select loop with SIGUSR1 support (unix).
+    /// Select loop with SIGUSR1 + IPC support (unix).
     #[cfg(unix)]
     async fn run_select_loop(&mut self, tick: &mut tokio::time::Interval) {
         let mut sigusr1 =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
                 .expect("failed to register SIGUSR1 handler");
+
+        // Also start the IPC listener so that the TCP-based notification
+        // path works on Unix too (useful for testing and uniformity).
+        let ipc = belt_infra::ipc::IpcListener::bind(&self.belt_home)
+            .await
+            .ok();
 
         loop {
             tokio::select! {
@@ -1556,7 +1561,19 @@ impl Daemon {
                     }
                 }
                 _ = sigusr1.recv() => {
-                    self.handle_cron_trigger_signal().await;
+                    self.handle_cron_trigger_signal("SIGUSR1").await;
+                }
+                Some(signal) = async {
+                    match &ipc {
+                        Some(l) => l.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match signal {
+                        belt_infra::ipc::DaemonSignal::CronSync => {
+                            self.handle_cron_trigger_signal("IPC").await;
+                        }
+                    }
                 }
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("received SIGINT, initiating graceful shutdown...");
@@ -1567,14 +1584,30 @@ impl Daemon {
         }
     }
 
-    /// Select loop without SIGUSR1 (non-unix).
+    /// Select loop with IPC support (non-unix).
     #[cfg(not(unix))]
     async fn run_select_loop(&mut self, tick: &mut tokio::time::Interval) {
+        let ipc = belt_infra::ipc::IpcListener::bind(&self.belt_home)
+            .await
+            .ok();
+
         loop {
             tokio::select! {
                 _ = tick.tick() => {
                     if let Err(e) = self.tick().await {
                         tracing::error!("tick error: {e}");
+                    }
+                }
+                Some(signal) = async {
+                    match &ipc {
+                        Some(l) => l.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match signal {
+                        belt_infra::ipc::DaemonSignal::CronSync => {
+                            self.handle_cron_trigger_signal("IPC").await;
+                        }
                     }
                 }
                 _ = tokio::signal::ctrl_c() => {

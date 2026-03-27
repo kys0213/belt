@@ -1248,12 +1248,21 @@ fn notify_daemon_cron_sync() {
     }
 }
 
-/// Send SIGUSR1 to the running daemon process to trigger a cron sync.
+/// Send a cron-sync signal to the running daemon process.
+///
+/// On Unix, sends SIGUSR1 to the daemon PID. On all platforms, falls back
+/// to the TCP-based IPC mechanism provided by [`belt_infra::ipc`].
 fn signal_daemon() -> anyhow::Result<()> {
-    let pid = read_pid()?;
+    // Try IPC first -- works on all platforms.
+    let home = belt_home()?;
+    if home.join("daemon.ipc").exists() {
+        return belt_infra::ipc::notify_daemon(&home, belt_infra::ipc::DaemonSignal::CronSync);
+    }
 
+    // Fallback: Unix SIGUSR1.
     #[cfg(unix)]
     {
+        let pid = read_pid()?;
         use std::process::Command;
         let status = Command::new("kill")
             .args(["-USR1", &pid.to_string()])
@@ -1261,15 +1270,16 @@ fn signal_daemon() -> anyhow::Result<()> {
         if !status.success() {
             anyhow::bail!("failed to send SIGUSR1 to PID {pid}");
         }
+        Ok(())
     }
 
     #[cfg(not(unix))]
     {
-        let _ = pid;
-        anyhow::bail!("daemon signaling is only supported on Unix systems");
+        anyhow::bail!(
+            "daemon IPC file not found at {}; is the daemon running?",
+            home.join("daemon.ipc").display()
+        );
     }
-
-    Ok(())
 }
 
 /// Determine a recommended action based on the HITL reason.
