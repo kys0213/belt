@@ -523,9 +523,7 @@ async fn start_daemon(
     let config: belt_core::workspace::WorkspaceConfig = serde_yaml::from_str(&config_content)
         .map_err(|e| anyhow::anyhow!("failed to parse config file '{}': {}", config_path, e))?;
 
-    let belt_home = dirs::home_dir()
-        .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
-        .join(".belt");
+    let belt_home = belt_home()?;
 
     // Build DataSources from workspace config.
     let mut sources: Vec<Box<dyn belt_core::source::DataSource>> = Vec::new();
@@ -1833,9 +1831,7 @@ async fn main() -> anyhow::Result<()> {
             cmd_status(&format)?;
         }
         Commands::Dashboard => {
-            let belt_home = dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
-                .join(".belt");
+            let belt_home = belt_home()?;
             std::fs::create_dir_all(&belt_home)?;
             let db_path = belt_home.join("belt.db");
             let db = std::sync::Arc::new(belt_infra::db::Database::open(
@@ -1846,9 +1842,7 @@ async fn main() -> anyhow::Result<()> {
             dashboard::run(db)?;
         }
         Commands::Workspace { command } => {
-            let belt_home = dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
-                .join(".belt");
+            let belt_home = belt_home()?;
             std::fs::create_dir_all(&belt_home)?;
             let db_path = belt_home.join("belt.db");
             let db = belt_infra::db::Database::open(
@@ -2082,10 +2076,7 @@ async fn main() -> anyhow::Result<()> {
             json,
             field,
         } => {
-            let db_path = dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
-                .join(".belt")
-                .join("belt.db");
+            let db_path = belt_home()?.join("belt.db");
 
             if !db_path.exists() {
                 anyhow::bail!("belt database not found at {}", db_path.display());
@@ -2191,9 +2182,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Spec { command } => {
-            let belt_home = dirs::home_dir()
-                .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
-                .join(".belt");
+            let belt_home = belt_home()?;
             let db_path = belt_home.join("belt.db");
             let db = belt_infra::db::Database::open(
                 db_path
@@ -2933,9 +2922,7 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Claw { command } => match command {
             ClawCommands::Init { force } => {
-                let belt_home = dirs::home_dir()
-                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
-                    .join(".belt");
+                let belt_home = belt_home()?;
                 let ws = if force {
                     claw::ClawWorkspace::init_with_options(&belt_home, true)?
                 } else {
@@ -2944,9 +2931,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!(path = %ws.path.display(), "claw workspace initialized");
             }
             ClawCommands::Rules => {
-                let belt_home = dirs::home_dir()
-                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
-                    .join(".belt");
+                let belt_home = belt_home()?;
                 let ws = claw::ClawWorkspace {
                     path: belt_home.join("claw-workspace"),
                 };
@@ -2956,18 +2941,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             ClawCommands::Edit { rule } => {
-                let belt_home = dirs::home_dir()
-                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
-                    .join(".belt");
+                let belt_home = belt_home()?;
                 let ws = claw::ClawWorkspace {
                     path: belt_home.join("claw-workspace"),
                 };
                 ws.edit_rule(rule.as_deref())?;
             }
             ClawCommands::Session => {
-                let belt_home = dirs::home_dir()
-                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))?
-                    .join(".belt");
+                let belt_home = belt_home()?;
                 let claw_workspace = claw::ClawWorkspace::init(&belt_home)?;
                 let runtime: Arc<dyn belt_core::runtime::AgentRuntime> =
                     Arc::new(ClaudeRuntime::new(None));
