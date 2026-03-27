@@ -37,7 +37,7 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
-use belt_core::spec::SpecStatus;
+use belt_core::spec::{Spec, SpecStatus, extract_acceptance_criteria};
 use belt_infra::db::{Database, HistoryEvent, ScriptExecStats, TransitionEvent};
 use belt_infra::workspace_loader::load_workspace_config;
 
@@ -175,6 +175,31 @@ impl StatusFilter {
     }
 }
 
+/// Active overlay mode for the dashboard.
+///
+/// Only one overlay can be active at a time. Overlays are rendered on top
+/// of the main tab content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OverlayMode {
+    /// No overlay is shown.
+    None,
+    /// Help overlay showing all key bindings.
+    Help,
+    /// Item detail overlay showing metadata, HITL details, judgment history,
+    /// and transition timeline for the given `work_id`.
+    ItemDetail(String),
+    /// HITL overlay listing all items in the HITL phase with action options.
+    Hitl {
+        /// Selected index in the HITL items list.
+        selected: usize,
+    },
+    /// Spec acceptance criteria detail overlay for a given spec index.
+    SpecDetail {
+        /// Index of the spec in the specs list.
+        spec_index: usize,
+    },
+}
+
 /// Which top-level tab is displayed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DashboardTab {
@@ -244,10 +269,8 @@ struct DashboardState {
     active_tab: DashboardTab,
     /// Per-tab state (scroll positions preserved on tab switch).
     tab_states: HashMap<u8, TabState>,
-    /// When set, the item detail overlay is shown for this work_id.
-    overlay_item: Option<String>,
-    /// Whether the help overlay is visible.
-    show_help: bool,
+    /// Current overlay mode (replaces overlay_item + show_help).
+    overlay: OverlayMode,
     /// Selected workspace index (used in PerWorkspace tab).
     selected_workspace: usize,
     /// Currently selected column in Board view.
@@ -283,8 +306,7 @@ impl DashboardState {
         Self {
             active_tab: DashboardTab::Dashboard,
             tab_states,
-            overlay_item: None,
-            show_help: false,
+            overlay: OverlayMode::None,
             selected_workspace: 0,
             board_selected_col: 0,
             board_selected_row: 0,
@@ -545,11 +567,20 @@ fn run_loop(
             }
 
             // Overlays (rendered on top of everything).
-            if let Some(ref work_id) = state.overlay_item {
-                render_item_detail_overlay(frame, db, work_id);
-            }
-            if state.show_help {
-                render_help_overlay(frame);
+            match &state.overlay {
+                OverlayMode::None => {}
+                OverlayMode::Help => {
+                    render_help_overlay(frame);
+                }
+                OverlayMode::ItemDetail(work_id) => {
+                    render_item_detail_overlay(frame, db, work_id);
+                }
+                OverlayMode::Hitl { selected } => {
+                    render_hitl_overlay(frame, db, *selected);
+                }
+                OverlayMode::SpecDetail { spec_index } => {
+                    render_spec_detail_overlay(frame, &specs, *spec_index);
+                }
             }
         })?;
 
@@ -558,18 +589,62 @@ fn run_loop(
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            // Help overlay: close on any key.
-            if state.show_help {
-                state.show_help = false;
-                continue;
-            }
-
-            // Item detail overlay: close on q/Esc.
-            if state.overlay_item.is_some() {
-                if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                    state.overlay_item = None;
+            // Handle overlay-specific keys.
+            match &state.overlay {
+                OverlayMode::Help => {
+                    // Help overlay: close on any key.
+                    state.overlay = OverlayMode::None;
+                    continue;
                 }
-                continue;
+                OverlayMode::ItemDetail(_) => {
+                    // Item detail overlay: close on q/Esc.
+                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                        state.overlay = OverlayMode::None;
+                    }
+                    continue;
+                }
+                OverlayMode::Hitl { selected } => {
+                    let hitl_items: Vec<_> = all_items
+                        .iter()
+                        .filter(|i| i.phase == QueuePhase::Hitl)
+                        .collect();
+                    let count = hitl_items.len();
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            state.overlay = OverlayMode::None;
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if count > 0 {
+                                state.overlay = OverlayMode::Hitl {
+                                    selected: (*selected + 1).min(count.saturating_sub(1)),
+                                };
+                            }
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if count > 0 {
+                                state.overlay = OverlayMode::Hitl {
+                                    selected: selected.saturating_sub(1),
+                                };
+                            }
+                        }
+                        KeyCode::Enter => {
+                            // Open the selected HITL item's detail overlay.
+                            if let Some(item) = hitl_items.get(*selected) {
+                                state.overlay = OverlayMode::ItemDetail(item.work_id.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                OverlayMode::SpecDetail { .. } => {
+                    // Spec detail overlay: close on q/Esc.
+                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
+                        state.overlay = OverlayMode::None;
+                    }
+                    continue;
+                }
+                OverlayMode::None => {}
             }
 
             match key.code {
@@ -594,7 +669,10 @@ fn run_loop(
                     state.active_tab = DashboardTab::Scripts;
                 }
                 KeyCode::Char('h') => {
-                    state.show_help = true;
+                    state.overlay = OverlayMode::Hitl { selected: 0 };
+                }
+                KeyCode::Char('?') => {
+                    state.overlay = OverlayMode::Help;
                 }
                 // Toggle PerWorkspace sub-view (table/kanban).
                 KeyCode::Char('v') => {
@@ -795,7 +873,7 @@ fn handle_enter(
                 ActivePanel::Recent => recent_items,
             };
             if let Some(item) = items.get(idx) {
-                state.overlay_item = Some(item.work_id.clone());
+                state.overlay = OverlayMode::ItemDetail(item.work_id.clone());
             }
         }
         DashboardTab::PerWorkspace => {
@@ -803,7 +881,7 @@ fn handle_enter(
                 if let Some(col) = per_ws_kanban_columns.get(state.per_ws_kanban_col)
                     && let Some(item) = col.get(state.per_ws_kanban_row)
                 {
-                    state.overlay_item = Some(item.work_id.clone());
+                    state.overlay = OverlayMode::ItemDetail(item.work_id.clone());
                 }
             } else if let Some(ws) = workspaces.get(state.selected_workspace) {
                 let ws_items: Vec<_> = db
@@ -814,18 +892,23 @@ fn handle_enter(
                     .collect();
                 let idx = state.current_tab_state().selected_index;
                 if let Some(item) = ws_items.get(idx) {
-                    state.overlay_item = Some(item.work_id.clone());
+                    state.overlay = OverlayMode::ItemDetail(item.work_id.clone());
                 }
             }
         }
-        DashboardTab::Spec | DashboardTab::DataSource | DashboardTab::Scripts => {
-            // No overlay on Enter for Spec/DataSource/Scripts tabs.
+        DashboardTab::Spec => {
+            // Open spec acceptance criteria detail overlay.
+            let idx = state.current_tab_state().selected_index;
+            state.overlay = OverlayMode::SpecDetail { spec_index: idx };
+        }
+        DashboardTab::DataSource | DashboardTab::Scripts => {
+            // No overlay on Enter for DataSource/Scripts tabs.
         }
         DashboardTab::Board => {
             if let Some(col) = board_columns.get(state.board_selected_col)
                 && let Some(item) = col.get(state.board_selected_row)
             {
-                state.overlay_item = Some(item.work_id.clone());
+                state.overlay = OverlayMode::ItemDetail(item.work_id.clone());
             }
         }
     }
@@ -2204,6 +2287,10 @@ fn render_help_overlay(frame: &mut ratatui::Frame) {
         ]),
         Line::from(vec![
             Span::styled("  h       ", Style::default().fg(Color::Yellow)),
+            Span::raw("Open HITL items overlay"),
+        ]),
+        Line::from(vec![
+            Span::styled("  ?       ", Style::default().fg(Color::Yellow)),
             Span::raw("Show this help"),
         ]),
         Line::from(""),
@@ -2229,7 +2316,7 @@ fn render_help_overlay(frame: &mut ratatui::Frame) {
         ]),
         Line::from(vec![
             Span::styled("  Enter   ", Style::default().fg(Color::Cyan)),
-            Span::raw("Open item detail overlay"),
+            Span::raw("Open item/spec detail overlay"),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -2273,8 +2360,13 @@ fn render_item_detail_overlay(frame: &mut ratatui::Frame, db: &Database, work_id
 
     let item = db.get_item(work_id);
     let transitions = db.list_transition_events(work_id).unwrap_or_default();
+    let source_id = item.as_ref().ok().map(|i| i.source_id.as_str());
+    let history = source_id
+        .and_then(|sid| db.get_history(sid).ok())
+        .unwrap_or_default();
 
-    let lines = build_detail_lines(work_id, item.ok().as_ref(), &transitions);
+    let lines =
+        build_detail_lines_with_history(work_id, item.ok().as_ref(), &transitions, &history);
 
     let paragraph = Paragraph::new(lines).block(
         Block::default()
@@ -2286,17 +2378,28 @@ fn render_item_detail_overlay(frame: &mut ratatui::Frame, db: &Database, work_id
     frame.render_widget(paragraph, area);
 }
 
-/// Build the text lines for the item detail overlay.
+/// Build the text lines for the item detail overlay (without history).
 ///
-/// Shows complete item metadata including:
-/// - ID, title, status (phase), state, workspace, source
-/// - Created/updated timestamps
-/// - HITL details (if in HITL phase or has HITL history)
-/// - Full transition timeline with event types
+/// Convenience wrapper around [`build_detail_lines_with_history`] that
+/// passes an empty history slice. Used primarily in tests.
+#[cfg(test)]
 fn build_detail_lines<'a>(
     work_id: &str,
     item: Option<&QueueItem>,
     transitions: &[TransitionEvent],
+) -> Vec<Line<'a>> {
+    build_detail_lines_with_history(work_id, item, transitions, &[])
+}
+
+/// Build the text lines for the item detail overlay with judgment history.
+///
+/// Extended version of [`build_detail_lines`] that also includes execution
+/// history events showing each attempt's outcome and rationale.
+fn build_detail_lines_with_history<'a>(
+    work_id: &str,
+    item: Option<&QueueItem>,
+    transitions: &[TransitionEvent],
+    history: &[HistoryEvent],
 ) -> Vec<Line<'a>> {
     let mut lines: Vec<Line<'a>> = Vec::new();
 
@@ -2401,6 +2504,57 @@ fn build_detail_lines<'a>(
         }
     }
 
+    // Judgment history section.
+    if !history.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Judgment History:",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Magenta),
+        )));
+
+        for event in history {
+            let status_color = match event.status.as_str() {
+                "success" => Color::Green,
+                "failed" => Color::Red,
+                _ => Color::Yellow,
+            };
+            let time_display = format_transition_time(&event.created_at);
+            let mut spans = vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("[{}]", event.state),
+                    Style::default().fg(Color::Blue),
+                ),
+                Span::raw(" "),
+                Span::styled(
+                    format!("#{}", event.attempt),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(" "),
+                Span::styled(event.status.clone(), Style::default().fg(status_color)),
+                Span::raw("  "),
+                Span::styled(time_display, Style::default().fg(Color::DarkGray)),
+            ];
+            if let Some(ref summary) = event.summary {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    truncate_str(summary, 40),
+                    Style::default().fg(Color::Gray),
+                ));
+            }
+            if let Some(ref error) = event.error {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    truncate_str(error, 40),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+    }
+
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Transition Timeline:",
@@ -2449,6 +2603,333 @@ fn build_detail_lines<'a>(
             }
 
             lines.push(Line::from(spans));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[q/Esc] Close",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    lines
+}
+
+/// Render the HITL overlay listing all items in the HITL phase.
+///
+/// Displays a centered popup with a list of HITL items showing their
+/// work ID, title, reason, and entry time. Users can navigate the list
+/// with j/k and press Enter to view item details.
+fn render_hitl_overlay(frame: &mut ratatui::Frame, db: &Database, selected: usize) {
+    let area = centered_rect(70, 75, frame.area());
+    frame.render_widget(Clear, area);
+
+    let hitl_items: Vec<QueueItem> = db
+        .list_items(Some(QueuePhase::Hitl), None)
+        .unwrap_or_default();
+
+    let lines = build_hitl_overlay_lines(&hitl_items, selected);
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .title(" HITL Items ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow)),
+    );
+
+    frame.render_widget(paragraph, area);
+}
+
+/// Build the text lines for the HITL overlay.
+fn build_hitl_overlay_lines(hitl_items: &[QueueItem], selected: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        "Items Awaiting Human Review",
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::UNDERLINED),
+    )));
+    lines.push(Line::from(""));
+
+    if hitl_items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no items in HITL phase)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.push(Line::from(vec![Span::styled(
+            format!("  {} item(s) pending review", hitl_items.len()),
+            Style::default().fg(Color::Yellow),
+        )]));
+        lines.push(Line::from(""));
+
+        for (i, item) in hitl_items.iter().enumerate() {
+            let is_selected = i == selected;
+            let prefix = if is_selected { "> " } else { "  " };
+            let style = if is_selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+
+            // Item header line: prefix + work_id + title.
+            let title_str = item.title.as_deref().unwrap_or("(untitled)");
+            lines.push(Line::from(Span::styled(
+                format!("{prefix}{} - {}", item.work_id, title_str),
+                style,
+            )));
+
+            // Indented detail lines.
+            let detail_indent = "    ";
+            if let Some(ref reason) = item.hitl_reason {
+                lines.push(Line::from(vec![
+                    Span::raw(detail_indent.to_string()),
+                    Span::styled("Reason: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(reason.to_string(), Style::default().fg(Color::Red)),
+                ]));
+            }
+            if let Some(ref hitl_at) = item.hitl_created_at {
+                let time_display = format_transition_time(hitl_at);
+                lines.push(Line::from(vec![
+                    Span::raw(detail_indent.to_string()),
+                    Span::styled("Entered: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(time_display, Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+            if let Some(ref notes) = item.hitl_notes {
+                lines.push(Line::from(vec![
+                    Span::raw(detail_indent.to_string()),
+                    Span::styled("Notes: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(notes.clone()),
+                ]));
+            }
+            if let Some(ref timeout) = item.hitl_timeout_at {
+                let time_display = format_transition_time(timeout);
+                lines.push(Line::from(vec![
+                    Span::raw(detail_indent.to_string()),
+                    Span::styled("Timeout: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(time_display, Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+
+            if is_selected {
+                lines.push(Line::from(vec![
+                    Span::raw(detail_indent.to_string()),
+                    Span::styled("Actions: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled("[Enter] ", Style::default().fg(Color::Green)),
+                    Span::raw("View details  "),
+                    Span::styled(
+                        "Use `belt hitl approve/reject/modify` to respond",
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+
+            lines.push(Line::from(""));
+        }
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("[j/k] ", Style::default().fg(Color::Cyan)),
+        Span::raw("Navigate  "),
+        Span::styled("[Enter] ", Style::default().fg(Color::Green)),
+        Span::raw("View details  "),
+        Span::styled("[q/Esc] ", Style::default().fg(Color::Red)),
+        Span::raw("Close"),
+    ]));
+
+    lines
+}
+
+/// Render the spec acceptance criteria detail overlay.
+///
+/// Displays a centered popup showing the spec's metadata, acceptance
+/// criteria extracted from the spec content, and completion progress.
+fn render_spec_detail_overlay(frame: &mut ratatui::Frame, specs: &[Spec], spec_index: usize) {
+    let area = centered_rect(65, 75, frame.area());
+    frame.render_widget(Clear, area);
+
+    let lines = build_spec_detail_lines(specs, spec_index);
+
+    let paragraph = Paragraph::new(lines).block(
+        Block::default()
+            .title(" Spec Details ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Magenta)),
+    );
+
+    frame.render_widget(paragraph, area);
+}
+
+/// Build the text lines for the spec acceptance criteria detail overlay.
+fn build_spec_detail_lines(specs: &[Spec], spec_index: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let Some(spec) = specs.get(spec_index) else {
+        lines.push(Line::from(Span::styled(
+            "(spec not found)",
+            Style::default().fg(Color::Red),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "[q/Esc] Close",
+            Style::default().fg(Color::DarkGray),
+        )));
+        return lines;
+    };
+
+    let status_str = spec.status.as_str().to_string();
+    let status_color = spec_status_color(&status_str);
+
+    // Spec metadata.
+    lines.push(Line::from(vec![
+        Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(spec.name.clone()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("ID: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(spec.id.clone()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Workspace: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(spec.workspace_id.clone()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(status_str, Style::default().fg(status_color)),
+    ]));
+    if let Some(priority) = spec.priority {
+        lines.push(Line::from(vec![
+            Span::styled("Priority: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(priority.to_string()),
+        ]));
+    }
+    if let Some(ref labels) = spec.labels {
+        lines.push(Line::from(vec![
+            Span::styled("Labels: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(labels.clone()),
+        ]));
+    }
+    if let Some(ref entry_point) = spec.entry_point {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Entry Points: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(entry_point.clone()),
+        ]));
+    }
+    if let Some(ref depends) = spec.depends_on {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Depends On: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(depends.clone()),
+        ]));
+    }
+    if let Some(ref issues) = spec.decomposed_issues {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Decomposed Issues: ",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(issues.clone()),
+        ]));
+    }
+
+    // Acceptance criteria section.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Acceptance Criteria:",
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::UNDERLINED)
+            .fg(Color::Cyan),
+    )));
+
+    let criteria = extract_acceptance_criteria(&spec.content);
+    if criteria.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no acceptance criteria found in spec content)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let total = criteria.len();
+        // Build progress bar.
+        let completed_count = match spec.status {
+            SpecStatus::Completed => total,
+            SpecStatus::Completing => total.saturating_sub(1).max(total * 3 / 4),
+            SpecStatus::Active => total / 3,
+            _ => 0,
+        };
+        let progress_pct = if total > 0 {
+            (completed_count as f64 / total as f64) * 100.0
+        } else {
+            0.0
+        };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("Progress: {completed_count}/{total} ({progress_pct:.0}%)"),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+
+        let bar_width = 20usize;
+        let filled = if total > 0 {
+            (completed_count * bar_width) / total
+        } else {
+            0
+        };
+        let empty = bar_width.saturating_sub(filled);
+        lines.push(Line::from(vec![
+            Span::raw("  ["),
+            Span::styled("#".repeat(filled), Style::default().fg(Color::Green)),
+            Span::styled("-".repeat(empty), Style::default().fg(Color::DarkGray)),
+            Span::raw("]"),
+        ]));
+        lines.push(Line::from(""));
+
+        for (i, criterion) in criteria.iter().enumerate() {
+            let idx = i + 1;
+            let is_done = i < completed_count;
+            let marker = if is_done { "[x]" } else { "[ ]" };
+            let marker_color = if is_done { Color::Green } else { Color::Gray };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("{marker} AC{idx}: "),
+                    Style::default().fg(marker_color),
+                ),
+                Span::raw(criterion.clone()),
+            ]));
+        }
+    }
+
+    // Test commands section.
+    if let Some(ref test_cmds) = spec.test_commands {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Test Commands:",
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .fg(Color::Blue),
+        )));
+        for cmd in test_cmds
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            lines.push(Line::from(vec![
+                Span::raw("  $ "),
+                Span::styled(cmd.to_string(), Style::default().fg(Color::Cyan)),
+            ]));
         }
     }
 
@@ -3104,7 +3585,7 @@ mod tests {
         let ts = state.current_tab_state();
         assert_eq!(ts.active_panel, Some(ActivePanel::Running));
         assert_eq!(ts.selected_index, 0);
-        assert!(state.overlay_item.is_none());
+        assert_eq!(state.overlay, OverlayMode::None);
     }
 
     // ---- collect_recent_items (DB-backed) ----
@@ -3286,7 +3767,7 @@ mod tests {
     fn dashboard_state_defaults() {
         let state = DashboardState::new();
         assert_eq!(state.active_tab, DashboardTab::Dashboard);
-        assert!(!state.show_help);
+        assert_eq!(state.overlay, OverlayMode::None);
         assert_eq!(state.selected_workspace, 0);
         assert_eq!(state.board_selected_col, 0);
         assert_eq!(state.board_selected_row, 0);
@@ -3638,16 +4119,14 @@ mod tests {
     }
 
     #[test]
-    fn overlay_and_help_are_independent_of_tab() {
+    fn overlay_is_independent_of_tab() {
         let mut state = DashboardState::new();
         state.active_tab = DashboardTab::Board;
-        state.overlay_item = Some("w-123".to_string());
-        state.show_help = true;
+        state.overlay = OverlayMode::ItemDetail("w-123".to_string());
 
-        // Switch tab -- overlay and help state should persist.
+        // Switch tab -- overlay state should persist.
         state.active_tab = DashboardTab::Dashboard;
-        assert_eq!(state.overlay_item, Some("w-123".to_string()));
-        assert!(state.show_help);
+        assert_eq!(state.overlay, OverlayMode::ItemDetail("w-123".to_string()));
     }
 
     // ---- DataSource status (private API: SourceStatus / SourceStatusEntry) ----
@@ -4323,5 +4802,295 @@ mod tests {
     fn dashboard_state_default_filter_is_all() {
         let state = DashboardState::new();
         assert_eq!(state.status_filter, StatusFilter::All);
+    }
+
+    // ---- OverlayMode ----
+
+    #[test]
+    fn overlay_mode_default_is_none() {
+        let state = DashboardState::new();
+        assert_eq!(state.overlay, OverlayMode::None);
+    }
+
+    #[test]
+    fn overlay_mode_hitl_preserves_selected() {
+        let mut state = DashboardState::new();
+        state.overlay = OverlayMode::Hitl { selected: 3 };
+        if let OverlayMode::Hitl { selected } = state.overlay {
+            assert_eq!(selected, 3);
+        } else {
+            panic!("Expected Hitl overlay");
+        }
+    }
+
+    #[test]
+    fn overlay_mode_spec_detail_preserves_index() {
+        let mut state = DashboardState::new();
+        state.overlay = OverlayMode::SpecDetail { spec_index: 5 };
+        if let OverlayMode::SpecDetail { spec_index } = state.overlay {
+            assert_eq!(spec_index, 5);
+        } else {
+            panic!("Expected SpecDetail overlay");
+        }
+    }
+
+    // ---- build_hitl_overlay_lines ----
+
+    #[test]
+    fn build_hitl_overlay_lines_empty() {
+        let lines = build_hitl_overlay_lines(&[], 0);
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+        assert!(text.contains("no items in HITL phase"));
+        assert!(text.contains("Awaiting Human Review"));
+    }
+
+    #[test]
+    fn build_hitl_overlay_lines_with_items() {
+        let mut item1 = QueueItem::new(
+            "w1".to_string(),
+            "src1".to_string(),
+            "ws1".to_string(),
+            "analyze".to_string(),
+        );
+        item1.phase = QueuePhase::Hitl;
+        item1.title = Some("Fix auth bug".to_string());
+        item1.hitl_reason = Some(belt_core::queue::HitlReason::RetryMaxExceeded);
+        item1.hitl_created_at = Some("2026-03-25T10:00:00Z".to_string());
+
+        let mut item2 = QueueItem::new(
+            "w2".to_string(),
+            "src2".to_string(),
+            "ws1".to_string(),
+            "implement".to_string(),
+        );
+        item2.phase = QueuePhase::Hitl;
+
+        let lines = build_hitl_overlay_lines(&[item1, item2], 0);
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+        assert!(text.contains("2 item(s) pending review"));
+        assert!(text.contains("w1"));
+        assert!(text.contains("Fix auth bug"));
+        assert!(text.contains("Reason:"));
+        assert!(text.contains("Actions:"));
+        // Second item should not have the selection marker.
+        assert!(text.contains("w2"));
+    }
+
+    #[test]
+    fn build_hitl_overlay_lines_selected_index() {
+        let mut item = QueueItem::new(
+            "w1".to_string(),
+            "src1".to_string(),
+            "ws1".to_string(),
+            "analyze".to_string(),
+        );
+        item.phase = QueuePhase::Hitl;
+
+        let lines = build_hitl_overlay_lines(&[item], 0);
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+        // Selected item should show actions.
+        assert!(text.contains("View details"));
+    }
+
+    // ---- build_spec_detail_lines ----
+
+    #[test]
+    fn build_spec_detail_lines_not_found() {
+        let lines = build_spec_detail_lines(&[], 0);
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+        assert!(text.contains("spec not found"));
+    }
+
+    #[test]
+    fn build_spec_detail_lines_with_acceptance_criteria() {
+        let spec = belt_core::spec::Spec::new(
+            "spec-1".to_string(),
+            "ws1".to_string(),
+            "Auth Feature".to_string(),
+            "## Overview\nSome description.\n## Acceptance Criteria\n- Login works\n- Logout works\n- Token refresh works\n## Tests\ntest commands".to_string(),
+        );
+
+        let lines = build_spec_detail_lines(&[spec], 0);
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+        assert!(text.contains("Auth Feature"));
+        assert!(text.contains("spec-1"));
+        assert!(text.contains("Acceptance Criteria:"));
+        assert!(text.contains("AC1:"));
+        assert!(text.contains("Login works"));
+        assert!(text.contains("AC2:"));
+        assert!(text.contains("Logout works"));
+        assert!(text.contains("AC3:"));
+        assert!(text.contains("Token refresh works"));
+        assert!(text.contains("Progress:"));
+    }
+
+    #[test]
+    fn build_spec_detail_lines_no_acceptance_criteria() {
+        let spec = belt_core::spec::Spec::new(
+            "spec-2".to_string(),
+            "ws1".to_string(),
+            "Simple Spec".to_string(),
+            "## Overview\nNo AC section here.".to_string(),
+        );
+
+        let lines = build_spec_detail_lines(&[spec], 0);
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+        assert!(text.contains("no acceptance criteria found"));
+    }
+
+    #[test]
+    fn build_spec_detail_lines_shows_test_commands() {
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-3".to_string(),
+            "ws1".to_string(),
+            "Test Spec".to_string(),
+            "## Overview\nContent.".to_string(),
+        );
+        spec.test_commands = Some("cargo test, cargo clippy".to_string());
+
+        let lines = build_spec_detail_lines(&[spec], 0);
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+        assert!(text.contains("Test Commands:"));
+        assert!(text.contains("cargo test"));
+        assert!(text.contains("cargo clippy"));
+    }
+
+    // ---- build_detail_lines_with_history ----
+
+    #[test]
+    fn build_detail_lines_with_history_shows_judgment_history() {
+        let item = QueueItem::new(
+            "w1".to_string(),
+            "src1".to_string(),
+            "ws1".to_string(),
+            "analyze".to_string(),
+        );
+        let history = vec![
+            HistoryEvent {
+                work_id: "w1".to_string(),
+                source_id: "src1".to_string(),
+                state: "analyze".to_string(),
+                status: "success".to_string(),
+                attempt: 1,
+                summary: Some("completed analysis".to_string()),
+                error: None,
+                created_at: "2026-03-25T10:00:00Z".to_string(),
+            },
+            HistoryEvent {
+                work_id: "w1".to_string(),
+                source_id: "src1".to_string(),
+                state: "implement".to_string(),
+                status: "failed".to_string(),
+                attempt: 1,
+                summary: None,
+                error: Some("compilation error".to_string()),
+                created_at: "2026-03-25T11:00:00Z".to_string(),
+            },
+        ];
+
+        let lines = build_detail_lines_with_history("w1", Some(&item), &[], &history);
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+        assert!(text.contains("Judgment History:"));
+        assert!(text.contains("[analyze]"));
+        assert!(text.contains("#1"));
+        assert!(text.contains("success"));
+        assert!(text.contains("completed analysis"));
+        assert!(text.contains("[implement]"));
+        assert!(text.contains("failed"));
+        assert!(text.contains("compilation error"));
+    }
+
+    #[test]
+    fn build_detail_lines_with_history_empty_history() {
+        let item = QueueItem::new(
+            "w1".to_string(),
+            "src1".to_string(),
+            "ws1".to_string(),
+            "analyze".to_string(),
+        );
+
+        let lines = build_detail_lines_with_history("w1", Some(&item), &[], &[]);
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+        // Should not contain the Judgment History header when empty.
+        assert!(!text.contains("Judgment History:"));
+    }
+
+    // ---- render_hitl_overlay no-panic ----
+
+    #[test]
+    fn render_hitl_overlay_no_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let db = make_db();
+        let mut item = QueueItem::new(
+            "w1".to_string(),
+            "src1".to_string(),
+            "ws1".to_string(),
+            "analyze".to_string(),
+        );
+        item.phase = QueuePhase::Hitl;
+        item.hitl_reason = Some(belt_core::queue::HitlReason::RetryMaxExceeded);
+        db.insert_item(&item).unwrap();
+
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_hitl_overlay(frame, &db, 0);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn render_hitl_overlay_empty_no_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let db = make_db();
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_hitl_overlay(frame, &db, 0);
+            })
+            .unwrap();
+    }
+
+    // ---- render_spec_detail_overlay no-panic ----
+
+    #[test]
+    fn render_spec_detail_overlay_no_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let spec = belt_core::spec::Spec::new(
+            "spec-1".to_string(),
+            "ws1".to_string(),
+            "Auth Feature".to_string(),
+            "## Overview\nDesc.\n## Acceptance Criteria\n- AC one\n- AC two\n".to_string(),
+        );
+
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_spec_detail_overlay(frame, &[spec], 0);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn render_spec_detail_overlay_out_of_bounds_no_panic() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_spec_detail_overlay(frame, &[], 5);
+            })
+            .unwrap();
     }
 }
