@@ -1732,6 +1732,91 @@ async fn refine_criteria_with_llm(
     }
 }
 
+/// Decompose a spec into independent sub-issues using an LLM.
+///
+/// Sends the spec content and acceptance criteria to the LLM and asks it to
+/// produce structured JSON output with title, description, and acceptance
+/// criteria for each proposed sub-issue. Falls back to `None` if the LLM is
+/// unavailable or returns unparseable output, allowing the caller to use the
+/// simpler `build_decomposed_issues` path.
+async fn decompose_spec_with_llm(
+    criteria: &[String],
+    spec_name: &str,
+    spec_content: &str,
+) -> Option<Vec<belt_core::spec::LlmDecomposedIssue>> {
+    let runtime = belt_infra::runtimes::claude::ClaudeRuntime::new(None);
+
+    let numbered_criteria: String = criteria
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{}. {}", i + 1, c))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prompt = format!(
+        "You are a technical project manager decomposing a spec into independent GitHub issues.\n\n\
+         Spec name: {spec_name}\n\n\
+         Spec content:\n{spec_summary}\n\n\
+         Acceptance criteria:\n{numbered_criteria}\n\n\
+         Decompose this spec into independent, implementable GitHub issues. \
+         Each issue should be self-contained and map to one or more acceptance criteria.\n\n\
+         Output ONLY a JSON array of objects with these fields:\n\
+         - \"title\": concise issue title (string)\n\
+         - \"description\": detailed markdown body with context, implementation hints, \
+           affected files/modules, and verification steps (string)\n\
+         - \"acceptance_criteria\": specific testable acceptance criteria for this sub-issue \
+           (array of strings)\n\n\
+         Rules:\n\
+         - Every original acceptance criterion must be covered by at least one sub-issue\n\
+         - Each sub-issue should be independently implementable\n\
+         - Keep titles under 80 characters\n\
+         - Include enough detail in descriptions for a developer to start working immediately\n\n\
+         Output ONLY the JSON array, no wrapping object or markdown fences.",
+        spec_summary = &spec_content[..spec_content.len().min(3000)],
+    );
+
+    let request = belt_core::runtime::RuntimeRequest {
+        working_dir: std::env::current_dir().unwrap_or_default(),
+        prompt,
+        model: None,
+        system_prompt: None,
+        session_id: None,
+        structured_output: None,
+    };
+
+    let response = runtime.invoke(request).await;
+    if !response.success() {
+        eprintln!(
+            "info: LLM decomposition unavailable, falling back to criteria-based decomposition"
+        );
+        return None;
+    }
+
+    let stdout = response.stdout.trim();
+    let json_str = stdout
+        .strip_prefix("```json")
+        .or_else(|| stdout.strip_prefix("```"))
+        .unwrap_or(stdout)
+        .strip_suffix("```")
+        .unwrap_or(stdout)
+        .trim();
+
+    match serde_json::from_str::<Vec<belt_core::spec::LlmDecomposedIssue>>(json_str) {
+        Ok(issues) if !issues.is_empty() => {
+            eprintln!("info: LLM decomposed spec into {} sub-issues", issues.len());
+            Some(issues)
+        }
+        Ok(_) => {
+            eprintln!("info: LLM returned empty decomposition, falling back");
+            None
+        }
+        Err(e) => {
+            eprintln!("info: could not parse LLM decomposition ({e}), falling back");
+            None
+        }
+    }
+}
+
 /// Create a GitHub issue via the `gh` CLI and return the issue URL on success.
 fn create_github_issue(title: &str, body: &str) -> Option<String> {
     create_github_issue_with_labels(title, body, &["autopilot:ready"])
@@ -2363,18 +2448,29 @@ async fn main() -> anyhow::Result<()> {
                     {
                         let parent_number = extract_issue_number(parent);
 
-                        // Step 2: LLM refinement of acceptance criteria.
-                        // Attempt to use the default runtime to decompose each
-                        // criterion into a more detailed, actionable description.
-                        let refined =
-                            refine_criteria_with_llm(&criteria, &spec.name, &spec.content).await;
+                        // Step 2: LLM-based structured decomposition.
+                        // First try full structured decomposition (title + description +
+                        // acceptance_criteria). If unavailable, fall back to simple
+                        // criteria refinement.
+                        let llm_decomposed =
+                            decompose_spec_with_llm(&criteria, &spec.name, &spec.content).await;
 
-                        // Build structured issue proposals.
-                        let proposed_issues = belt_core::spec::build_decomposed_issues(
-                            &criteria,
-                            refined.as_deref(),
-                            parent_number.as_deref(),
-                        );
+                        let proposed_issues = if let Some(ref llm_issues) = llm_decomposed {
+                            belt_core::spec::build_decomposed_issues_from_llm(
+                                llm_issues,
+                                parent_number.as_deref(),
+                            )
+                        } else {
+                            // Fallback: refine criteria text only.
+                            let refined =
+                                refine_criteria_with_llm(&criteria, &spec.name, &spec.content)
+                                    .await;
+                            belt_core::spec::build_decomposed_issues(
+                                &criteria,
+                                refined.as_deref(),
+                                parent_number.as_deref(),
+                            )
+                        };
 
                         // Step 3: User confirmation (unless --yes).
                         let confirmed = if yes {
