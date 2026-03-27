@@ -1899,6 +1899,11 @@ impl Daemon {
             .filter(|it| it.phase == QueuePhase::Running)
             .count()
     }
+
+    /// Return a reference to the database, if configured.
+    pub fn db(&self) -> Option<&Database> {
+        self.db.as_deref()
+    }
 }
 
 #[cfg(test)]
