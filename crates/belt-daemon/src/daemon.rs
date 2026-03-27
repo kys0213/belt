@@ -1000,6 +1000,7 @@ impl Daemon {
 
         // Capture spec-completion metadata before match borrows item.
         let is_spec_completion = item.state == "spec_completion";
+        let is_spec_conflict = item.hitl_reason == Some(HitlReason::SpecConflict);
         let spec_id = item.source_id.clone();
         let source_id_clone = spec_id.clone();
 
@@ -1017,6 +1018,9 @@ impl Daemon {
                 );
                 if is_spec_completion {
                     self.apply_spec_completion_transition(&spec_id);
+                }
+                if is_spec_conflict {
+                    self.apply_spec_conflict_approved(&spec_id);
                 }
                 Ok(())
             }
@@ -1049,6 +1053,9 @@ impl Daemon {
                 );
                 if is_spec_completion {
                     self.apply_spec_active_revert(&spec_id);
+                }
+                if is_spec_conflict {
+                    self.apply_spec_conflict_rejected(&spec_id);
                 }
                 Ok(())
             }
@@ -1184,6 +1191,50 @@ impl Daemon {
             tracing::warn!(
                 spec_id = %spec_id,
                 "no database configured — cannot revert spec to Active"
+            );
+        }
+    }
+
+    /// Handle approval of a spec conflict HITL item.
+    ///
+    /// When the user approves conflicting specs to proceed in parallel,
+    /// this method logs the decision. The item has already been transitioned
+    /// to Done, so the conflicting spec's queue item will proceed normally
+    /// on the next `advance()` cycle.
+    fn apply_spec_conflict_approved(&self, spec_id: &str) {
+        tracing::info!(
+            spec_id = %spec_id,
+            "spec conflict approved — conflicting specs will proceed in parallel"
+        );
+    }
+
+    /// Handle rejection of a spec conflict HITL item.
+    ///
+    /// When the user rejects the later spec due to conflict, this method
+    /// pauses the conflicting spec in the database so it no longer competes
+    /// for the overlapping entry points. The queue item has already been
+    /// transitioned to Skipped.
+    fn apply_spec_conflict_rejected(&self, spec_id: &str) {
+        if let Some(db) = &self.db {
+            match db.update_spec_status(spec_id, belt_core::spec::SpecStatus::Paused) {
+                Ok(()) => {
+                    tracing::info!(
+                        spec_id = %spec_id,
+                        "spec paused due to conflict rejection"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        spec_id = %spec_id,
+                        error = %e,
+                        "failed to pause spec after conflict rejection"
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                spec_id = %spec_id,
+                "no database configured — cannot pause spec after conflict rejection"
             );
         }
     }
