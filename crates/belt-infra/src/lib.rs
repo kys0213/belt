@@ -1,4 +1,5 @@
 pub mod db;
+pub mod ipc;
 pub mod onboarding;
 pub mod platform;
 pub mod runtimes;
