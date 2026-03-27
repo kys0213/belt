@@ -37,9 +37,9 @@ const WORKSPACE_CRON_SEEDS: &[(&str, &str)] = &[
     ("hitl_timeout", "*/5 * * * *"),
     ("daily_report", "0 6 * * *"),
     ("log_cleanup", "0 0 * * *"),
-    ("evaluate", "*/1 * * * *"),
-    ("gap_detection", "*/30 * * * *"),
-    ("knowledge_extraction", "0 2 * * *"),
+    ("evaluate", "0 */6 * * *"),
+    ("gap_detection", "0 */12 * * *"),
+    ("knowledge_extraction", "0 0 * * *"),
 ];
 
 /// Execute the full onboarding flow for a workspace.
@@ -396,14 +396,14 @@ sources:
         );
         assert_eq!(job_map.get("test-project:daily_report"), Some(&"0 6 * * *"));
         assert_eq!(job_map.get("test-project:log_cleanup"), Some(&"0 0 * * *"));
-        assert_eq!(job_map.get("test-project:evaluate"), Some(&"*/1 * * * *"));
+        assert_eq!(job_map.get("test-project:evaluate"), Some(&"0 */6 * * *"));
         assert_eq!(
             job_map.get("test-project:gap_detection"),
-            Some(&"*/30 * * * *")
+            Some(&"0 */12 * * *")
         );
         assert_eq!(
             job_map.get("test-project:knowledge_extraction"),
-            Some(&"0 2 * * *")
+            Some(&"0 0 * * *")
         );
     }
 
