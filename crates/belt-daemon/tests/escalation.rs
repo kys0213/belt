@@ -393,6 +393,200 @@ async fn failure_records_history_event() {
     assert_eq!(daemon.history_events()[0].status, "failed");
 }
 
+/// Multi-spec conflict detection escalates to HITL with SpecConflict reason.
+///
+/// When a queue item's spec has overlapping entry_points with another active
+/// spec, the advance() method detects the conflict and escalates to HITL.
+#[tokio::test]
+async fn spec_conflict_detection_creates_hitl() {
+    let tmp = TempDir::new().unwrap();
+    let source = MockDataSource::new("github");
+    let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+    let mut item = test_item("github:org/repo#1", "implement");
+    item.phase = QueuePhase::Running;
+    item.updated_at = chrono::Utc::now().to_rfc3339();
+    daemon.push_item(item);
+
+    daemon.complete_item("github:org/repo#1:implement").unwrap();
+    daemon
+        .mark_hitl(
+            "github:org/repo#1:implement",
+            HitlReason::SpecConflict,
+            Some(
+                "spec-conflict: entry_point overlap with [spec-2] on paths [src/auth]".to_string(),
+            ),
+        )
+        .unwrap();
+
+    let item = daemon.get_item("github:org/repo#1:implement").unwrap();
+    assert_eq!(item.phase, QueuePhase::Hitl);
+    assert_eq!(item.hitl_reason, Some(HitlReason::SpecConflict));
+    assert!(
+        item.hitl_notes
+            .as_deref()
+            .unwrap()
+            .contains("spec-conflict")
+    );
+}
+
+/// Spec conflict HITL approved with Done: specs proceed in parallel.
+///
+/// When the user approves conflicting specs (Done), the item transitions
+/// to Done, allowing both specs to proceed concurrently.
+#[tokio::test]
+async fn spec_conflict_hitl_approve_proceeds_parallel() {
+    let tmp = TempDir::new().unwrap();
+    let source = MockDataSource::new("github");
+    let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+    let mut item = test_item("github:org/repo#1", "implement");
+    item.phase = QueuePhase::Running;
+    item.updated_at = chrono::Utc::now().to_rfc3339();
+    daemon.push_item(item);
+
+    daemon.complete_item("github:org/repo#1:implement").unwrap();
+    daemon
+        .mark_hitl(
+            "github:org/repo#1:implement",
+            HitlReason::SpecConflict,
+            Some("spec-conflict: overlap with [spec-2]".to_string()),
+        )
+        .unwrap();
+
+    daemon
+        .respond_hitl(
+            "github:org/repo#1:implement",
+            HitlRespondAction::Done,
+            Some("reviewer".to_string()),
+            Some("approved for parallel execution".to_string()),
+        )
+        .unwrap();
+
+    let item = daemon.get_item("github:org/repo#1:implement").unwrap();
+    assert_eq!(item.phase, QueuePhase::Done);
+    assert_eq!(item.hitl_respondent.as_deref(), Some("reviewer"));
+}
+
+/// Spec conflict HITL rejected with Skip: later spec is rejected.
+///
+/// When the user rejects the conflicting spec (Skip), the item transitions
+/// to Skipped, blocking the later spec from proceeding.
+#[tokio::test]
+async fn spec_conflict_hitl_reject_skips_later_spec() {
+    let tmp = TempDir::new().unwrap();
+    let source = MockDataSource::new("github");
+    let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+    let mut item = test_item("github:org/repo#1", "implement");
+    item.phase = QueuePhase::Running;
+    item.updated_at = chrono::Utc::now().to_rfc3339();
+    daemon.push_item(item);
+
+    daemon.complete_item("github:org/repo#1:implement").unwrap();
+    daemon
+        .mark_hitl(
+            "github:org/repo#1:implement",
+            HitlReason::SpecConflict,
+            Some("spec-conflict: overlap with [spec-2]".to_string()),
+        )
+        .unwrap();
+
+    daemon
+        .respond_hitl(
+            "github:org/repo#1:implement",
+            HitlRespondAction::Skip,
+            Some("reviewer".to_string()),
+            Some("reject conflicting spec".to_string()),
+        )
+        .unwrap();
+
+    let item = daemon.get_item("github:org/repo#1:implement").unwrap();
+    assert_eq!(item.phase, QueuePhase::Skipped);
+}
+
+/// Spec conflict HITL with Retry: re-check conflict after modification.
+///
+/// When the user requests retry on a spec conflict, the item goes back
+/// to Pending so the conflict check can be re-evaluated on the next advance().
+#[tokio::test]
+async fn spec_conflict_hitl_retry_re_evaluates() {
+    let tmp = TempDir::new().unwrap();
+    let source = MockDataSource::new("github");
+    let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+    let mut item = test_item("github:org/repo#1", "implement");
+    item.phase = QueuePhase::Running;
+    item.updated_at = chrono::Utc::now().to_rfc3339();
+    daemon.push_item(item);
+
+    daemon.complete_item("github:org/repo#1:implement").unwrap();
+    daemon
+        .mark_hitl(
+            "github:org/repo#1:implement",
+            HitlReason::SpecConflict,
+            Some("spec-conflict: overlap with [spec-2]".to_string()),
+        )
+        .unwrap();
+
+    daemon
+        .respond_hitl(
+            "github:org/repo#1:implement",
+            HitlRespondAction::Retry,
+            Some("reviewer".to_string()),
+            Some("modified entry_points, retry conflict check".to_string()),
+        )
+        .unwrap();
+
+    let item = daemon.get_item("github:org/repo#1:implement").unwrap();
+    assert_eq!(item.phase, QueuePhase::Pending);
+}
+
+/// Spec conflict HITL with Replan: delegate to Claw for spec modification.
+///
+/// When the user requests replan on a spec conflict, the item is rolled back
+/// to Pending and a new HITL item is created for spec modification proposal.
+#[tokio::test]
+async fn spec_conflict_hitl_replan_creates_modification_item() {
+    let tmp = TempDir::new().unwrap();
+    let source = MockDataSource::new("github");
+    let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+    let mut item = test_item("github:org/repo#1", "implement");
+    item.phase = QueuePhase::Running;
+    item.updated_at = chrono::Utc::now().to_rfc3339();
+    daemon.push_item(item);
+
+    daemon.complete_item("github:org/repo#1:implement").unwrap();
+    daemon
+        .mark_hitl(
+            "github:org/repo#1:implement",
+            HitlReason::SpecConflict,
+            Some("spec-conflict: overlap with [spec-2]".to_string()),
+        )
+        .unwrap();
+
+    daemon
+        .respond_hitl(
+            "github:org/repo#1:implement",
+            HitlRespondAction::Replan,
+            Some("reviewer".to_string()),
+            Some("remove overlapping entry_points from spec-2".to_string()),
+        )
+        .unwrap();
+
+    let item = daemon.get_item("github:org/repo#1:implement").unwrap();
+    assert_eq!(item.phase, QueuePhase::Pending);
+    assert_eq!(item.replan_count, 1);
+
+    let hitl_items = daemon.items_in_phase(QueuePhase::Hitl);
+    assert_eq!(hitl_items.len(), 1);
+    assert_eq!(
+        hitl_items[0].hitl_reason,
+        Some(HitlReason::SpecModificationProposed)
+    );
+}
+
 /// Escalation policy: EscalationAction::Retry.is_retry() is true.
 #[test]
 fn escalation_action_is_retry() {
