@@ -172,4 +172,82 @@ mod tests {
                 .contains("could not read IPC port file"),
         );
     }
+
+    #[test]
+    fn daemon_signal_serde_cron_sync() {
+        let signal = DaemonSignal::CronSync;
+        let json = serde_json::to_string(&signal).unwrap();
+        // Verify the internally-tagged representation.
+        assert_eq!(json, r#"{"signal":"CronSync"}"#);
+        // Round-trip back to the original variant.
+        let deserialized: DaemonSignal = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, DaemonSignal::CronSync);
+    }
+
+    #[tokio::test]
+    async fn recv_returns_signal_on_valid_connection() {
+        let tmp = TempDir::new().unwrap();
+        let listener = IpcListener::bind(tmp.path()).await.unwrap();
+
+        // Spawn a blocking sender that writes via notify_daemon.
+        let home = tmp.path().to_path_buf();
+        let sender = tokio::task::spawn_blocking(move || {
+            notify_daemon(&home, DaemonSignal::CronSync).unwrap();
+        });
+
+        let signal = listener.recv().await;
+        assert!(signal.is_some(), "recv must return Some on valid message");
+        assert_eq!(signal.unwrap(), DaemonSignal::CronSync);
+        sender.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn notify_daemon_success_writes_and_receives() {
+        let tmp = TempDir::new().unwrap();
+        let listener = IpcListener::bind(tmp.path()).await.unwrap();
+
+        // Verify the port file content matches the listener's actual port.
+        let ipc_path = tmp.path().join("daemon.ipc");
+        let port_str = std::fs::read_to_string(&ipc_path).unwrap();
+        let port: u16 = port_str.trim().parse().unwrap();
+        assert_eq!(port, listener.listener.local_addr().unwrap().port());
+
+        // notify_daemon should succeed and the listener should receive the signal.
+        let home = tmp.path().to_path_buf();
+        let sender = tokio::task::spawn_blocking(move || {
+            let result = notify_daemon(&home, DaemonSignal::CronSync);
+            assert!(result.is_ok(), "notify_daemon should succeed: {result:?}");
+        });
+
+        let signal = listener.recv().await;
+        assert_eq!(signal, Some(DaemonSignal::CronSync));
+        sender.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn notify_daemon_multiple_signals_in_order() {
+        let tmp = TempDir::new().unwrap();
+        let listener = IpcListener::bind(tmp.path()).await.unwrap();
+
+        let home = tmp.path().to_path_buf();
+
+        // Send 3 signals sequentially from a blocking task.
+        let sender = tokio::task::spawn_blocking(move || {
+            for _ in 0..3 {
+                notify_daemon(&home, DaemonSignal::CronSync).unwrap();
+            }
+        });
+
+        // Verify all 3 signals arrive in order.
+        for i in 0..3 {
+            let signal = listener.recv().await;
+            assert_eq!(
+                signal,
+                Some(DaemonSignal::CronSync),
+                "signal {i} should be CronSync",
+            );
+        }
+
+        sender.await.unwrap();
+    }
 }
