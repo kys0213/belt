@@ -6,6 +6,7 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 
 use belt_core::action::Action;
+use belt_core::platform::ShellExecutor;
 use belt_core::runtime::{RuntimeRegistry, RuntimeRequest, TokenUsage};
 
 /// Action 실행 결과.
@@ -32,11 +33,24 @@ impl ActionResult {
 /// Action 배열을 순차 실행하는 실행기.
 pub struct ActionExecutor {
     registry: Arc<RuntimeRegistry>,
+    shell: Arc<dyn ShellExecutor>,
 }
 
 impl ActionExecutor {
+    /// Create a new executor with the platform-default shell.
     pub fn new(registry: Arc<RuntimeRegistry>) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            shell: Arc::from(belt_infra::platform::default_shell_executor()),
+        }
+    }
+
+    /// Create a new executor with a custom [`ShellExecutor`].
+    pub fn with_shell_executor(
+        registry: Arc<RuntimeRegistry>,
+        shell: Arc<dyn ShellExecutor>,
+    ) -> Self {
+        Self { registry, shell }
     }
 
     /// Execute all actions sequentially, accumulating token usage across the chain.
@@ -131,33 +145,46 @@ impl ActionExecutor {
 
     async fn execute_script(&self, command: &str, env: &ActionEnv) -> Result<ActionResult> {
         let start = Instant::now();
-        let mut cmd = tokio::process::Command::new("bash");
-        cmd.arg("-c").arg(command);
-        cmd.current_dir(&env.worktree);
-        cmd.env("WORK_ID", &env.work_id);
-        cmd.env("WORKTREE", env.worktree.to_string_lossy().as_ref());
+
+        // Build environment variables map for the ShellExecutor.
+        let mut env_vars = HashMap::new();
+        env_vars.insert("WORK_ID".to_string(), env.work_id.clone());
+        env_vars.insert(
+            "WORKTREE".to_string(),
+            env.worktree.to_string_lossy().to_string(),
+        );
+
         // Inject BELT_DB path derived from BELT_HOME (or extra_vars override).
         if let Some(belt_db) = env.extra_vars.get("BELT_DB") {
-            cmd.env("BELT_DB", belt_db);
+            env_vars.insert("BELT_DB".to_string(), belt_db.clone());
         } else if let Some(belt_home) = env.extra_vars.get("BELT_HOME") {
             let db_path = Path::new(belt_home).join("belt.db");
-            cmd.env("BELT_DB", db_path.to_string_lossy().as_ref());
+            env_vars.insert("BELT_DB".to_string(), db_path.to_string_lossy().to_string());
         } else if let Ok(belt_home) = std::env::var("BELT_HOME") {
             let db_path = Path::new(&belt_home).join("belt.db");
-            cmd.env("BELT_DB", db_path.to_string_lossy().as_ref());
-        }
-        for (k, v) in &env.extra_vars {
-            cmd.env(k, v);
+            env_vars.insert("BELT_DB".to_string(), db_path.to_string_lossy().to_string());
         }
 
-        let output = cmd.output().await;
+        for (k, v) in &env.extra_vars {
+            env_vars.insert(k.clone(), v.clone());
+        }
+
+        let shell = Arc::clone(&self.shell);
+        let command = command.to_string();
+        let working_dir = env.worktree.clone();
+
+        let output =
+            tokio::task::spawn_blocking(move || shell.execute(&command, &working_dir, &env_vars))
+                .await
+                .map_err(|e| anyhow::anyhow!("shell task join error: {e}"))?;
+
         let duration = start.elapsed();
 
         match output {
             Ok(output) => Ok(ActionResult {
-                exit_code: output.status.code().unwrap_or(-1),
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+                exit_code: output.exit_code.unwrap_or(-1),
+                stdout: output.stdout,
+                stderr: output.stderr,
                 duration,
                 token_usage: None,
                 runtime_name: None,
@@ -355,7 +382,6 @@ mod tests {
 
     #[test]
     fn action_result_success_boundary() {
-        // exit_code == 0 is success
         let ok = ActionResult {
             exit_code: 0,
             stdout: String::new(),
@@ -367,7 +393,6 @@ mod tests {
         };
         assert!(ok.success());
 
-        // Any non-zero exit code is a failure
         for code in [1, -1, 127, 255] {
             let fail = ActionResult {
                 exit_code: code,
@@ -409,7 +434,6 @@ mod tests {
     #[tokio::test]
     async fn execute_script_injects_worktree_env() {
         let executor = ActionExecutor::new(setup_registry());
-        // The executor must inject WORKTREE as well as WORK_ID.
         let action = Action::script("echo $WORKTREE");
         let env = ActionEnv::new("wid", Path::new("/tmp"));
         let result = executor.execute_one(&action, &env).await.unwrap();
@@ -463,8 +487,6 @@ mod tests {
 
     #[tokio::test]
     async fn execute_prompt_unknown_runtime_returns_error() {
-        // A registry with no runtimes registered causes an error when the
-        // prompt action tries to resolve its runtime.
         let registry = RuntimeRegistry::new("nonexistent".to_string());
         let executor = ActionExecutor::new(Arc::new(registry));
         let action = Action::prompt("this will fail");
@@ -507,8 +529,6 @@ mod tests {
 
     #[tokio::test]
     async fn execute_all_first_action_fails_stops_immediately() {
-        // MockRuntime with [1, 0]: first invocation returns exit_code 1, second would return 0.
-        // Verifies execute_all returns immediately after the first failure.
         let mut registry = RuntimeRegistry::new("mock".to_string());
         registry.register(Arc::new(MockRuntime::new("mock", vec![1, 0])));
         let executor = ActionExecutor::new(Arc::new(registry));
@@ -523,7 +543,6 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // The result should be a failure from the first action.
         assert!(!result.success());
         assert_eq!(result.exit_code, 1);
     }
@@ -531,7 +550,6 @@ mod tests {
     #[tokio::test]
     async fn execute_all_scripts_produce_no_token_usage() {
         let executor = ActionExecutor::new(setup_registry());
-        // All script actions — accumulated token usage should be None.
         let actions = vec![Action::script("echo one"), Action::script("echo two")];
         let result = executor
             .execute_all(&actions, &test_env())
@@ -560,7 +578,6 @@ mod tests {
         registry.register(Arc::new(mock));
         let executor = ActionExecutor::new(Arc::new(registry));
 
-        // First: prompt (has token usage), second: script (no token usage).
         let actions = vec![Action::prompt("summarize"), Action::script("echo done")];
         let result = executor
             .execute_all(&actions, &test_env())
@@ -580,7 +597,6 @@ mod tests {
     async fn execute_all_cache_tokens_accumulate_when_only_some_have_them() {
         use belt_core::runtime::TokenUsage;
 
-        // First invocation has cache tokens; second does not.
         let mock = MockRuntime::new("mock", vec![0, 0]).with_token_usages(vec![
             TokenUsage {
                 input_tokens: 100,
@@ -609,7 +625,6 @@ mod tests {
         let usage = result.token_usage.expect("should have usage");
         assert_eq!(usage.input_tokens, 160);
         assert_eq!(usage.output_tokens, 60);
-        // Cache fields should retain whatever was accumulated from the first prompt.
         assert_eq!(usage.cache_read_tokens, Some(8));
         assert_eq!(usage.cache_write_tokens, Some(4));
     }
