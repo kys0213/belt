@@ -84,6 +84,99 @@ fn shell_command(script: &str) -> Command {
 
 **대안**: 핵심 로직(prompt 생성, 결과 파싱)을 subprocess 호출과 분리하여 플랫폼 무관 테스트 가능하게 리팩터링.
 
+## 추상화 설계 (OCP)
+
+플랫폼 의존 코드를 trait으로 추상화하여, 새 OS 지원 시 기존 코드를 수정하지 않고 구현체만 추가한다.
+
+### trait 정의 (`belt-core`)
+
+```rust
+// core/src/platform.rs
+
+/// 플랫폼별 셸 스크립트 실행을 추상화한다.
+#[async_trait]
+pub trait ShellExecutor: Send + Sync {
+    /// 셸 스크립트를 실행하고 결과를 반환한다.
+    async fn execute(
+        &self,
+        script: &str,
+        working_dir: &Path,
+        env_vars: &HashMap<String, String>,
+    ) -> Result<ShellOutput>;
+}
+
+pub struct ShellOutput {
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+/// 플랫폼별 프로세스 간 통신을 추상화한다.
+/// Daemon ↔ CLI 간 cron trigger 등에 사용.
+#[async_trait]
+pub trait DaemonNotifier: Send + Sync {
+    /// Daemon에게 cron 동기화를 요청한다.
+    async fn notify(&self, pid: u32) -> Result<()>;
+}
+```
+
+### 구현체 (`belt-infra`)
+
+```
+infra/src/platform/
+  mod.rs           // pub use + platform_default() 팩토리
+  unix_shell.rs    // sh -c 기반 ShellExecutor
+  unix_signal.rs   // SIGUSR1 기반 DaemonNotifier
+  windows_shell.rs // cmd.exe /C 기반 ShellExecutor (향후)
+  windows_ipc.rs   // named pipe 기반 DaemonNotifier (향후)
+```
+
+```rust
+// infra/src/platform/mod.rs
+
+mod unix_shell;
+mod unix_signal;
+
+/// 현재 플랫폼에 맞는 ShellExecutor를 반환한다.
+pub fn default_shell() -> Box<dyn ShellExecutor> {
+    #[cfg(unix)]
+    { Box::new(unix_shell::UnixShell) }
+    #[cfg(windows)]
+    { Box::new(windows_shell::WindowsShell) }
+}
+
+/// 현재 플랫폼에 맞는 DaemonNotifier를 반환한다.
+pub fn default_notifier() -> Box<dyn DaemonNotifier> {
+    #[cfg(unix)]
+    { Box::new(unix_signal::UnixSignalNotifier) }
+    #[cfg(windows)]
+    { Box::new(windows_ipc::WindowsIpcNotifier) }
+}
+```
+
+### 소비자 변경
+
+| 현재 | 변경 후 |
+|------|---------|
+| `executor.rs`: `Command::new("bash").arg("-c")` | `shell.execute(script, dir, vars)` |
+| `cron.rs` ScriptJob: `Command::new("sh").arg("-c")` | `shell.execute(script, dir, vars)` |
+| `test_runner.rs`: `Command::new("sh").arg("-c")` | `shell.execute(cmd, dir, vars)` |
+| `main.rs` cron run: `Command::new("sh").arg("-c")` | `shell.execute(script, dir, vars)` |
+| `main.rs` signal_daemon: `kill(pid, SIGUSR1)` | `notifier.notify(pid)` |
+| `daemon.rs` run_select_loop: `signal::unix::signal(USR1)` | 플랫폼별 `#[cfg]` 유지 (이벤트 루프는 trait 추상화 어려움) |
+
+### 주입 경로
+
+```
+Daemon::new(config, sources, registry, worktree_mgr, shell, max_concurrent)
+                                                      ^^^^^
+ActionExecutor::new(registry, shell)
+                              ^^^^^
+```
+
+`Daemon`과 `ActionExecutor`가 생성 시점에 `Box<dyn ShellExecutor>`를 받는다.
+테스트에서는 `MockShell`을 주입하여 subprocess 없이 검증 가능.
+
 ## 수용 기준
 
 1. `cargo build --target <target>` 가 5개 타겟 모두에서 경고 없이 성공
