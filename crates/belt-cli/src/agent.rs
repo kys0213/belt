@@ -47,8 +47,18 @@ fn resolve_rules_dir_with_home(
     {
         let p = PathBuf::from(path);
         if p.is_dir() {
+            tracing::debug!(
+                path = %p.display(),
+                priority = 1,
+                "resolved rules dir from claw_config.rules_path"
+            );
             return Some(p);
         }
+        tracing::debug!(
+            path = %p.display(),
+            priority = 1,
+            "claw_config.rules_path does not exist, falling through"
+        );
     }
 
     // 2. Per-workspace Claw directory under BELT_HOME.
@@ -71,18 +81,40 @@ fn resolve_rules_dir_with_home(
             .join("claw")
             .join("system");
         if ws_rules.is_dir() {
+            tracing::debug!(
+                path = %ws_rules.display(),
+                priority = 2,
+                workspace = %config.name,
+                "resolved rules dir from per-workspace claw directory"
+            );
             return Some(ws_rules);
         }
+        tracing::debug!(
+            path = %ws_rules.display(),
+            priority = 2,
+            "per-workspace claw directory does not exist, falling through"
+        );
     }
 
-    // 3. Global Claw workspace rules.
+    // 3. Global Claw workspace rules (created by `belt claw init`).
     if let Some(home) = belt_home {
         let global_rules = home.join("claw-workspace").join(".claude").join("rules");
         if global_rules.is_dir() {
+            tracing::debug!(
+                path = %global_rules.display(),
+                priority = 3,
+                "resolved rules dir from global claw workspace"
+            );
             return Some(global_rules);
         }
+        tracing::debug!(
+            path = %global_rules.display(),
+            priority = 3,
+            "global claw workspace rules directory does not exist"
+        );
     }
 
+    tracing::debug!("no rules directory found at any priority level");
     None
 }
 
@@ -1060,5 +1092,152 @@ runtime:
         // Which results in the default of 10.
         let prompt = build_claw_rules_prompt(max_turns);
         assert!(prompt.contains("session: 10"));
+    }
+
+    /// Global mutex that serializes tests which mutate environment variables.
+    /// Rust's test harness runs tests in parallel threads by default, so any
+    /// test that calls `std::env::set_var` must hold this lock for the
+    /// duration of the test to avoid races with other env-mutating tests.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    // ---- claw init → resolve_rules_dir integration ----
+
+    #[test]
+    fn claw_init_creates_global_rules_dir_discoverable_by_resolve() {
+        use crate::claw::ClawWorkspace;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
+
+        // Initialize the global claw workspace under the temp BELT_HOME.
+        let ws = ClawWorkspace::init(tmp.path()).unwrap();
+
+        // Verify the global rules directory exists at the expected path.
+        let expected_rules = tmp
+            .path()
+            .join("claw-workspace")
+            .join(".claude")
+            .join("rules");
+        assert!(
+            expected_rules.is_dir(),
+            "claw init should create global rules directory"
+        );
+        assert_eq!(ws.path, tmp.path().join("claw-workspace"));
+
+        // resolve_rules_dir should discover the global rules (priority 3)
+        // when no explicit or per-workspace rules are configured.
+        let config = empty_workspace();
+        let resolved = resolve_rules_dir(&config);
+        assert_eq!(
+            resolved,
+            Some(expected_rules),
+            "resolve_rules_dir should find global claw workspace rules at priority 3"
+        );
+    }
+
+    #[test]
+    fn claw_init_global_rules_loadable_by_agent() {
+        use crate::claw::ClawWorkspace;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
+
+        // Initialize claw workspace (creates default policy files).
+        let _ws = ClawWorkspace::init(tmp.path()).unwrap();
+
+        // resolve_rules_dir should find the global rules.
+        let config = empty_workspace();
+        let rules_dir = resolve_rules_dir(&config).expect("should resolve global rules dir");
+
+        // load_rules_from_dir should load the default policy .md files.
+        let rules_content = load_rules_from_dir(&rules_dir)
+            .expect("should load rules")
+            .expect("should have rule content");
+
+        // Default policy files created by claw init should be loadable.
+        assert!(
+            rules_content.contains("classify-policy.md"),
+            "should contain classify-policy rule header"
+        );
+        assert!(
+            rules_content.contains("hitl-policy.md"),
+            "should contain hitl-policy rule header"
+        );
+        assert!(
+            rules_content.contains("auto-approve-policy.md"),
+            "should contain auto-approve-policy rule header"
+        );
+    }
+
+    #[test]
+    fn claw_init_global_rules_overridden_by_per_workspace() {
+        use crate::claw::ClawWorkspace;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
+
+        // Initialize global claw workspace.
+        let _ws = ClawWorkspace::init(tmp.path()).unwrap();
+
+        // Also create per-workspace rules (priority 2).
+        let ws_rules = tmp
+            .path()
+            .join("workspaces")
+            .join("test-ws")
+            .join("claw")
+            .join("system");
+        std::fs::create_dir_all(&ws_rules).unwrap();
+
+        let config = empty_workspace();
+        let resolved = resolve_rules_dir(&config);
+        assert_eq!(
+            resolved,
+            Some(ws_rules),
+            "per-workspace rules (priority 2) should override global claw init rules (priority 3)"
+        );
+    }
+
+    /// RAII guard for setting environment variables in tests.
+    ///
+    /// Acquires `ENV_LOCK` for its entire lifetime so that concurrent tests
+    /// cannot observe each other's temporary env-var mutations.
+    struct EnvGuard {
+        key: String,
+        prev: Option<String>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &str, value: &str) -> Self {
+            // Acquire the global env lock first to serialize all env mutations.
+            // `unwrap_or_else` recovers from a poisoned mutex caused by a
+            // previous test panic.
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var(key).ok();
+            // SAFETY: We hold ENV_LOCK, so no other test is mutating env vars
+            // concurrently.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self {
+                key: key.to_string(),
+                prev,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: We still hold ENV_LOCK here (released when _lock is
+            // dropped at the end of this block).
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(&self.key, v),
+                    None => std::env::remove_var(&self.key),
+                }
+            }
+            // _lock is dropped here, releasing ENV_LOCK.
+        }
     }
 }
