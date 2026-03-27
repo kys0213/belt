@@ -5189,4 +5189,915 @@ mod tests {
             })
             .unwrap();
     }
+
+    // ---- DashboardState::new() comprehensive defaults ----
+
+    #[test]
+    fn dashboard_state_new_all_fields_at_defaults() {
+        let state = DashboardState::new();
+        assert_eq!(state.active_tab, DashboardTab::Dashboard);
+        assert_eq!(state.overlay, OverlayMode::None);
+        assert!(!matches!(state.overlay, OverlayMode::Help));
+        assert_eq!(state.selected_workspace, 0);
+        assert_eq!(state.board_selected_col, 0);
+        assert_eq!(state.board_selected_row, 0);
+        assert_eq!(state.per_ws_view, PerWorkspaceView::Table);
+        assert_eq!(state.per_ws_kanban_col, 0);
+        assert_eq!(state.per_ws_kanban_row, 0);
+        assert_eq!(state.status_filter, StatusFilter::All);
+        // All 6 tab states should exist (keys 0..=5).
+        for key in 0..=5u8 {
+            assert!(
+                state.tab_states.contains_key(&key),
+                "tab_states should contain key {key}"
+            );
+        }
+    }
+
+    // ---- handle_nav_up ----
+
+    #[test]
+    fn handle_nav_up_decrements_selected_index_in_default_tab() {
+        let mut state = DashboardState::new();
+        state.current_tab_state_mut().selected_index = 3;
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_up(&mut state, &board_columns);
+        assert_eq!(state.current_tab_state().selected_index, 2);
+    }
+
+    #[test]
+    fn handle_nav_up_saturates_at_zero() {
+        let mut state = DashboardState::new();
+        state.current_tab_state_mut().selected_index = 0;
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_up(&mut state, &board_columns);
+        assert_eq!(state.current_tab_state().selected_index, 0);
+    }
+
+    #[test]
+    fn handle_nav_up_board_decrements_row() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Board;
+        state.board_selected_row = 2;
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_up(&mut state, &board_columns);
+        assert_eq!(state.board_selected_row, 1);
+    }
+
+    #[test]
+    fn handle_nav_up_board_saturates_at_zero() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Board;
+        state.board_selected_row = 0;
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_up(&mut state, &board_columns);
+        assert_eq!(state.board_selected_row, 0);
+    }
+
+    #[test]
+    fn handle_nav_up_per_ws_kanban_decrements_row() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.per_ws_view = PerWorkspaceView::Kanban;
+        state.per_ws_kanban_row = 3;
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_up(&mut state, &board_columns);
+        assert_eq!(state.per_ws_kanban_row, 2);
+    }
+
+    #[test]
+    fn handle_nav_up_per_ws_kanban_saturates_at_zero() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.per_ws_view = PerWorkspaceView::Kanban;
+        state.per_ws_kanban_row = 0;
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_up(&mut state, &board_columns);
+        assert_eq!(state.per_ws_kanban_row, 0);
+    }
+
+    // ---- handle_nav_down ----
+
+    #[test]
+    fn handle_nav_down_increments_selected_index() {
+        let mut state = DashboardState::new();
+        state.current_tab_state_mut().selected_index = 0;
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        let per_ws_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_down(&mut state, 5, &board_columns, &per_ws_columns);
+        assert_eq!(state.current_tab_state().selected_index, 1);
+    }
+
+    #[test]
+    fn handle_nav_down_clamps_at_list_end() {
+        let mut state = DashboardState::new();
+        state.current_tab_state_mut().selected_index = 4;
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        let per_ws_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_down(&mut state, 5, &board_columns, &per_ws_columns);
+        assert_eq!(state.current_tab_state().selected_index, 4);
+    }
+
+    #[test]
+    fn handle_nav_down_no_change_when_list_empty() {
+        let mut state = DashboardState::new();
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        let per_ws_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_down(&mut state, 0, &board_columns, &per_ws_columns);
+        assert_eq!(state.current_tab_state().selected_index, 0);
+    }
+
+    #[test]
+    fn handle_nav_down_board_increments_row() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Board;
+        state.board_selected_col = 0;
+        state.board_selected_row = 0;
+        let item = QueueItem::new(
+            "w1".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        );
+        let item2 = QueueItem::new(
+            "w2".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        );
+        let board_columns: Vec<Vec<&QueueItem>> = vec![vec![&item, &item2]];
+        let per_ws_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_down(&mut state, 0, &board_columns, &per_ws_columns);
+        assert_eq!(state.board_selected_row, 1);
+    }
+
+    #[test]
+    fn handle_nav_down_board_clamps_at_col_end() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Board;
+        state.board_selected_col = 0;
+        state.board_selected_row = 1;
+        let item = QueueItem::new(
+            "w1".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        );
+        let item2 = QueueItem::new(
+            "w2".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        );
+        let board_columns: Vec<Vec<&QueueItem>> = vec![vec![&item, &item2]];
+        let per_ws_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_down(&mut state, 0, &board_columns, &per_ws_columns);
+        assert_eq!(state.board_selected_row, 1);
+    }
+
+    #[test]
+    fn handle_nav_down_board_empty_col_no_change() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Board;
+        state.board_selected_col = 0;
+        state.board_selected_row = 0;
+        let board_columns: Vec<Vec<&QueueItem>> = vec![vec![]];
+        let per_ws_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_down(&mut state, 0, &board_columns, &per_ws_columns);
+        assert_eq!(state.board_selected_row, 0);
+    }
+
+    #[test]
+    fn handle_nav_down_per_ws_kanban_increments_row() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.per_ws_view = PerWorkspaceView::Kanban;
+        state.per_ws_kanban_col = 0;
+        state.per_ws_kanban_row = 0;
+        let item = QueueItem::new(
+            "w1".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        );
+        let item2 = QueueItem::new(
+            "w2".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        );
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        let per_ws_columns: Vec<Vec<&QueueItem>> = vec![vec![&item, &item2]];
+        handle_nav_down(&mut state, 0, &board_columns, &per_ws_columns);
+        assert_eq!(state.per_ws_kanban_row, 1);
+    }
+
+    #[test]
+    fn handle_nav_down_per_ws_kanban_clamps_at_end() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.per_ws_view = PerWorkspaceView::Kanban;
+        state.per_ws_kanban_col = 0;
+        state.per_ws_kanban_row = 0;
+        let item = QueueItem::new(
+            "w1".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        );
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        let per_ws_columns: Vec<Vec<&QueueItem>> = vec![vec![&item]];
+        handle_nav_down(&mut state, 0, &board_columns, &per_ws_columns);
+        assert_eq!(state.per_ws_kanban_row, 0);
+    }
+
+    // ---- handle_nav_left ----
+
+    #[test]
+    fn handle_nav_left_dashboard_switches_to_running_panel() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Dashboard;
+        state.current_tab_state_mut().active_panel = Some(ActivePanel::Recent);
+        state.current_tab_state_mut().selected_index = 5;
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        handle_nav_left(&mut state, &workspaces);
+        assert_eq!(
+            state.current_tab_state().active_panel,
+            Some(ActivePanel::Running)
+        );
+        assert_eq!(state.current_tab_state().selected_index, 0);
+    }
+
+    #[test]
+    fn handle_nav_left_per_ws_table_decrements_workspace() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.selected_workspace = 2;
+        let workspaces = vec![
+            ("w1".to_string(), "p1".to_string(), "t1".to_string()),
+            ("w2".to_string(), "p2".to_string(), "t2".to_string()),
+            ("w3".to_string(), "p3".to_string(), "t3".to_string()),
+        ];
+        handle_nav_left(&mut state, &workspaces);
+        assert_eq!(state.selected_workspace, 1);
+        assert_eq!(state.current_tab_state().selected_index, 0);
+    }
+
+    #[test]
+    fn handle_nav_left_per_ws_table_no_change_at_zero() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.selected_workspace = 0;
+        let workspaces = vec![("w1".to_string(), "p1".to_string(), "t1".to_string())];
+        handle_nav_left(&mut state, &workspaces);
+        assert_eq!(state.selected_workspace, 0);
+    }
+
+    #[test]
+    fn handle_nav_left_per_ws_kanban_decrements_col() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.per_ws_view = PerWorkspaceView::Kanban;
+        state.per_ws_kanban_col = 2;
+        state.per_ws_kanban_row = 5;
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        handle_nav_left(&mut state, &workspaces);
+        assert_eq!(state.per_ws_kanban_col, 1);
+        assert_eq!(state.per_ws_kanban_row, 0);
+    }
+
+    #[test]
+    fn handle_nav_left_per_ws_kanban_saturates_at_zero() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.per_ws_view = PerWorkspaceView::Kanban;
+        state.per_ws_kanban_col = 0;
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        handle_nav_left(&mut state, &workspaces);
+        assert_eq!(state.per_ws_kanban_col, 0);
+    }
+
+    #[test]
+    fn handle_nav_left_board_decrements_col_resets_row() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Board;
+        state.board_selected_col = 3;
+        state.board_selected_row = 5;
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        handle_nav_left(&mut state, &workspaces);
+        assert_eq!(state.board_selected_col, 2);
+        assert_eq!(state.board_selected_row, 0);
+    }
+
+    #[test]
+    fn handle_nav_left_board_saturates_at_zero() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Board;
+        state.board_selected_col = 0;
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        handle_nav_left(&mut state, &workspaces);
+        assert_eq!(state.board_selected_col, 0);
+    }
+
+    #[test]
+    fn handle_nav_left_spec_noop() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Spec;
+        state.current_tab_state_mut().selected_index = 3;
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        handle_nav_left(&mut state, &workspaces);
+        // Spec tab left arrow should be a no-op.
+        assert_eq!(state.current_tab_state().selected_index, 3);
+    }
+
+    // ---- handle_nav_right ----
+
+    #[test]
+    fn handle_nav_right_dashboard_switches_to_recent_panel() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Dashboard;
+        state.current_tab_state_mut().selected_index = 3;
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_right(&mut state, &workspaces, &board_columns);
+        assert_eq!(
+            state.current_tab_state().active_panel,
+            Some(ActivePanel::Recent)
+        );
+        assert_eq!(state.current_tab_state().selected_index, 0);
+    }
+
+    #[test]
+    fn handle_nav_right_per_ws_table_increments_workspace() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.selected_workspace = 0;
+        let workspaces = vec![
+            ("w1".to_string(), "p1".to_string(), "t1".to_string()),
+            ("w2".to_string(), "p2".to_string(), "t2".to_string()),
+        ];
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_right(&mut state, &workspaces, &board_columns);
+        assert_eq!(state.selected_workspace, 1);
+        assert_eq!(state.current_tab_state().selected_index, 0);
+    }
+
+    #[test]
+    fn handle_nav_right_per_ws_table_no_change_at_last() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.selected_workspace = 1;
+        let workspaces = vec![
+            ("w1".to_string(), "p1".to_string(), "t1".to_string()),
+            ("w2".to_string(), "p2".to_string(), "t2".to_string()),
+        ];
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_right(&mut state, &workspaces, &board_columns);
+        assert_eq!(state.selected_workspace, 1);
+    }
+
+    #[test]
+    fn handle_nav_right_per_ws_kanban_increments_col() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.per_ws_view = PerWorkspaceView::Kanban;
+        state.per_ws_kanban_col = 0;
+        state.per_ws_kanban_row = 3;
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_right(&mut state, &workspaces, &board_columns);
+        assert_eq!(state.per_ws_kanban_col, 1);
+        assert_eq!(state.per_ws_kanban_row, 0);
+    }
+
+    #[test]
+    fn handle_nav_right_per_ws_kanban_clamps_at_last_col() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.per_ws_view = PerWorkspaceView::Kanban;
+        state.per_ws_kanban_col = PER_WS_KANBAN_GROUPS.len() - 1;
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_right(&mut state, &workspaces, &board_columns);
+        assert_eq!(state.per_ws_kanban_col, PER_WS_KANBAN_GROUPS.len() - 1);
+    }
+
+    #[test]
+    fn handle_nav_right_board_increments_col() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Board;
+        state.board_selected_col = 0;
+        state.board_selected_row = 2;
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        let item = QueueItem::new(
+            "w1".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        );
+        let board_columns: Vec<Vec<&QueueItem>> = vec![vec![&item], vec![&item], vec![&item]];
+        handle_nav_right(&mut state, &workspaces, &board_columns);
+        assert_eq!(state.board_selected_col, 1);
+        assert_eq!(state.board_selected_row, 0);
+    }
+
+    #[test]
+    fn handle_nav_right_board_clamps_at_last_col() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Board;
+        let item = QueueItem::new(
+            "w1".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        );
+        let board_columns: Vec<Vec<&QueueItem>> = vec![vec![&item], vec![&item]];
+        state.board_selected_col = 1;
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        handle_nav_right(&mut state, &workspaces, &board_columns);
+        assert_eq!(state.board_selected_col, 1);
+    }
+
+    #[test]
+    fn handle_nav_right_scripts_noop() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Scripts;
+        state.current_tab_state_mut().selected_index = 2;
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        handle_nav_right(&mut state, &workspaces, &board_columns);
+        assert_eq!(state.current_tab_state().selected_index, 2);
+    }
+
+    // ---- handle_enter ----
+
+    #[test]
+    fn handle_enter_dashboard_running_panel_sets_overlay() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Dashboard;
+        state.current_tab_state_mut().active_panel = Some(ActivePanel::Running);
+        state.current_tab_state_mut().selected_index = 0;
+
+        let running = vec![QueueItem::new(
+            "w-run1".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        )];
+        let recent: Vec<QueueItem> = Vec::new();
+        let all: Vec<QueueItem> = Vec::new();
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        let db = make_db();
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        let per_ws_columns: Vec<Vec<&QueueItem>> = Vec::new();
+
+        handle_enter(
+            &mut state,
+            &running,
+            &recent,
+            &all,
+            &workspaces,
+            &db,
+            &board_columns,
+            &per_ws_columns,
+        );
+        assert_eq!(state.overlay, OverlayMode::ItemDetail("w-run1".to_string()));
+    }
+
+    #[test]
+    fn handle_enter_dashboard_recent_panel_sets_overlay() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Dashboard;
+        state.current_tab_state_mut().active_panel = Some(ActivePanel::Recent);
+        state.current_tab_state_mut().selected_index = 0;
+
+        let running: Vec<QueueItem> = Vec::new();
+        let recent = vec![QueueItem::new(
+            "w-rec1".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        )];
+        let all: Vec<QueueItem> = Vec::new();
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        let db = make_db();
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        let per_ws_columns: Vec<Vec<&QueueItem>> = Vec::new();
+
+        handle_enter(
+            &mut state,
+            &running,
+            &recent,
+            &all,
+            &workspaces,
+            &db,
+            &board_columns,
+            &per_ws_columns,
+        );
+        assert_eq!(state.overlay, OverlayMode::ItemDetail("w-rec1".to_string()));
+    }
+
+    #[test]
+    fn handle_enter_dashboard_out_of_bounds_no_overlay() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Dashboard;
+        state.current_tab_state_mut().active_panel = Some(ActivePanel::Running);
+        state.current_tab_state_mut().selected_index = 5;
+
+        let running: Vec<QueueItem> = Vec::new();
+        let recent: Vec<QueueItem> = Vec::new();
+        let all: Vec<QueueItem> = Vec::new();
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        let db = make_db();
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        let per_ws_columns: Vec<Vec<&QueueItem>> = Vec::new();
+
+        handle_enter(
+            &mut state,
+            &running,
+            &recent,
+            &all,
+            &workspaces,
+            &db,
+            &board_columns,
+            &per_ws_columns,
+        );
+        assert_eq!(state.overlay, OverlayMode::None);
+    }
+
+    #[test]
+    fn handle_enter_board_sets_overlay() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Board;
+        state.board_selected_col = 0;
+        state.board_selected_row = 0;
+
+        let item = QueueItem::new(
+            "w-board1".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        );
+        let running: Vec<QueueItem> = Vec::new();
+        let recent: Vec<QueueItem> = Vec::new();
+        let all: Vec<QueueItem> = Vec::new();
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        let db = make_db();
+        let board_columns: Vec<Vec<&QueueItem>> = vec![vec![&item]];
+        let per_ws_columns: Vec<Vec<&QueueItem>> = Vec::new();
+
+        handle_enter(
+            &mut state,
+            &running,
+            &recent,
+            &all,
+            &workspaces,
+            &db,
+            &board_columns,
+            &per_ws_columns,
+        );
+        assert_eq!(
+            state.overlay,
+            OverlayMode::ItemDetail("w-board1".to_string())
+        );
+    }
+
+    #[test]
+    fn handle_enter_board_empty_col_no_overlay() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Board;
+        state.board_selected_col = 0;
+        state.board_selected_row = 0;
+
+        let running: Vec<QueueItem> = Vec::new();
+        let recent: Vec<QueueItem> = Vec::new();
+        let all: Vec<QueueItem> = Vec::new();
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        let db = make_db();
+        let board_columns: Vec<Vec<&QueueItem>> = vec![vec![]];
+        let per_ws_columns: Vec<Vec<&QueueItem>> = Vec::new();
+
+        handle_enter(
+            &mut state,
+            &running,
+            &recent,
+            &all,
+            &workspaces,
+            &db,
+            &board_columns,
+            &per_ws_columns,
+        );
+        assert_eq!(state.overlay, OverlayMode::None);
+    }
+
+    #[test]
+    fn handle_enter_per_ws_kanban_sets_overlay() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.per_ws_view = PerWorkspaceView::Kanban;
+        state.per_ws_kanban_col = 0;
+        state.per_ws_kanban_row = 0;
+
+        let item = QueueItem::new(
+            "w-kanban1".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        );
+        let running: Vec<QueueItem> = Vec::new();
+        let recent: Vec<QueueItem> = Vec::new();
+        let all: Vec<QueueItem> = Vec::new();
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        let db = make_db();
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        let per_ws_columns: Vec<Vec<&QueueItem>> = vec![vec![&item]];
+
+        handle_enter(
+            &mut state,
+            &running,
+            &recent,
+            &all,
+            &workspaces,
+            &db,
+            &board_columns,
+            &per_ws_columns,
+        );
+        assert_eq!(
+            state.overlay,
+            OverlayMode::ItemDetail("w-kanban1".to_string())
+        );
+    }
+
+    #[test]
+    fn handle_enter_spec_tab_no_overlay() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Spec;
+
+        let running: Vec<QueueItem> = Vec::new();
+        let recent: Vec<QueueItem> = Vec::new();
+        let all: Vec<QueueItem> = Vec::new();
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        let db = make_db();
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        let per_ws_columns: Vec<Vec<&QueueItem>> = Vec::new();
+
+        handle_enter(
+            &mut state,
+            &running,
+            &recent,
+            &all,
+            &workspaces,
+            &db,
+            &board_columns,
+            &per_ws_columns,
+        );
+        assert!(matches!(state.overlay, OverlayMode::SpecDetail { .. }));
+    }
+
+    #[test]
+    fn handle_enter_datasource_tab_no_overlay() {
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::DataSource;
+
+        let running: Vec<QueueItem> = Vec::new();
+        let recent: Vec<QueueItem> = Vec::new();
+        let all: Vec<QueueItem> = Vec::new();
+        let workspaces: Vec<(String, String, String)> = Vec::new();
+        let db = make_db();
+        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
+        let per_ws_columns: Vec<Vec<&QueueItem>> = Vec::new();
+
+        handle_enter(
+            &mut state,
+            &running,
+            &recent,
+            &all,
+            &workspaces,
+            &db,
+            &board_columns,
+            &per_ws_columns,
+        );
+        assert_eq!(state.overlay, OverlayMode::None);
+    }
+
+    // ---- StatusFilter::next full cycle ----
+
+    #[test]
+    fn status_filter_next_full_cycle_returns_to_start() {
+        let start = StatusFilter::All;
+        assert_eq!(start.next().next().next().next(), start);
+    }
+
+    // ---- per_ws_view toggle ----
+
+    #[test]
+    fn per_ws_view_toggle_table_to_kanban() {
+        let mut state = DashboardState::new();
+        assert_eq!(state.per_ws_view, PerWorkspaceView::Table);
+        state.per_ws_view = PerWorkspaceView::Kanban;
+        assert_eq!(state.per_ws_view, PerWorkspaceView::Kanban);
+    }
+
+    #[test]
+    fn per_ws_view_toggle_kanban_to_table() {
+        let mut state = DashboardState::new();
+        state.per_ws_view = PerWorkspaceView::Kanban;
+        state.per_ws_view = PerWorkspaceView::Table;
+        assert_eq!(state.per_ws_view, PerWorkspaceView::Table);
+    }
+
+    #[test]
+    fn per_ws_view_switch_resets_kanban_selection() {
+        let mut state = DashboardState::new();
+        state.per_ws_view = PerWorkspaceView::Kanban;
+        state.per_ws_kanban_col = 2;
+        state.per_ws_kanban_row = 5;
+        // Switching back to Table mode: kanban state remains but is unused.
+        state.per_ws_view = PerWorkspaceView::Table;
+        // When switching back to Kanban, it should resume from where it was.
+        state.per_ws_view = PerWorkspaceView::Kanban;
+        assert_eq!(state.per_ws_kanban_col, 2);
+        assert_eq!(state.per_ws_kanban_row, 5);
+    }
+
+    // ---- render_per_workspace_kanban ----
+
+    #[test]
+    fn render_per_workspace_kanban_no_panic_empty_columns() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let state = DashboardState::new();
+        let kanban_columns: Vec<Vec<&QueueItem>> = vec![vec![], vec![], vec![]];
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_per_workspace_kanban(
+                    frame,
+                    frame.area(),
+                    &kanban_columns,
+                    &state,
+                    "test-ws",
+                );
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("Pending"));
+        assert!(text.contains("In-Progress"));
+        assert!(text.contains("Completed"));
+        assert!(text.contains("(empty)"));
+        assert!(text.contains("test-ws"));
+    }
+
+    #[test]
+    fn render_per_workspace_kanban_shows_items() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.per_ws_view = PerWorkspaceView::Kanban;
+
+        let item1 = QueueItem::new(
+            "w-pending1".to_string(),
+            "src".to_string(),
+            "ws".to_string(),
+            "analyze".to_string(),
+        );
+        let mut item2 = QueueItem::new(
+            "w-running1".to_string(),
+            "src".to_string(),
+            "ws".to_string(),
+            "implement".to_string(),
+        );
+        item2.phase = QueuePhase::Running;
+
+        let kanban_columns: Vec<Vec<&QueueItem>> = vec![vec![&item1], vec![&item2], vec![]];
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_per_workspace_kanban(frame, frame.area(), &kanban_columns, &state, "my-ws");
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(text.contains("w-pending1"));
+        assert!(text.contains("w-running1"));
+        assert!(text.contains("my-ws"));
+    }
+
+    #[test]
+    fn render_per_workspace_kanban_selected_item_has_marker() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::PerWorkspace;
+        state.per_ws_view = PerWorkspaceView::Kanban;
+        state.per_ws_kanban_col = 0;
+        state.per_ws_kanban_row = 0;
+
+        let item = QueueItem::new(
+            "w-sel".to_string(),
+            "src".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        );
+        let kanban_columns: Vec<Vec<&QueueItem>> = vec![vec![&item], vec![], vec![]];
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_per_workspace_kanban(frame, frame.area(), &kanban_columns, &state, "ws");
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        // Selected item should have ">" marker.
+        assert!(text.contains("> w-sel"));
+    }
+
+    #[test]
+    fn render_per_workspace_kanban_no_panic_small_terminal() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let state = DashboardState::new();
+        let item = QueueItem::new(
+            "w1".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        );
+        let kanban_columns: Vec<Vec<&QueueItem>> = vec![vec![&item], vec![], vec![]];
+
+        let backend = TestBackend::new(10, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_per_workspace_kanban(frame, frame.area(), &kanban_columns, &state, "ws");
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn render_per_workspace_kanban_column_counts_in_title() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let state = DashboardState::new();
+        let item1 = QueueItem::new(
+            "w1".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        );
+        let item2 = QueueItem::new(
+            "w2".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        );
+        let kanban_columns: Vec<Vec<&QueueItem>> = vec![vec![&item1, &item2], vec![], vec![]];
+
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_per_workspace_kanban(frame, frame.area(), &kanban_columns, &state, "ws");
+            })
+            .unwrap();
+
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        // Title should show count like "Pending (2)"
+        assert!(text.contains("Pending (2)"));
+        assert!(text.contains("In-Progress (0)"));
+        assert!(text.contains("Completed (0)"));
+    }
 }
