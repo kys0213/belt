@@ -172,6 +172,7 @@ impl PrContext {
 ///
 /// Supports jq-style paths with optional leading dot.
 /// Numeric segments are treated as array indices.
+/// Bracket notation (`field[0]`) is also supported for array indexing.
 ///
 /// # Examples
 ///
@@ -183,6 +184,7 @@ impl PrContext {
 /// assert_eq!(extract_field(&v, ".queue.state"), Some(&json!("implement")));
 /// assert_eq!(extract_field(&v, "queue.state"), Some(&json!("implement")));
 /// assert_eq!(extract_field(&v, "history.0.state"), Some(&json!("analyze")));
+/// assert_eq!(extract_field(&v, "history[0].state"), Some(&json!("analyze")));
 /// assert_eq!(extract_field(&v, ".missing"), None);
 /// ```
 pub fn extract_field<'a>(
@@ -194,7 +196,10 @@ pub fn extract_field<'a>(
         return Some(value);
     }
 
-    path.split('.').try_fold(value, |v, key| {
+    // Expand bracket notation into dot notation: "foo[0].bar[1]" -> "foo.0.bar.1"
+    let normalized = normalize_path(path);
+
+    normalized.split('.').try_fold(value, |v, key| {
         // Try numeric index first for arrays.
         if let Ok(idx) = key.parse::<usize>() {
             v.get(idx)
@@ -202,6 +207,30 @@ pub fn extract_field<'a>(
             v.get(key)
         }
     })
+}
+
+/// Normalize bracket-notation array indices into dot-separated segments.
+///
+/// Converts `field[0]` to `field.0`, `a[1][2]` to `a.1.2`, etc.
+/// Pure dot-notation paths pass through unchanged.
+fn normalize_path(path: &str) -> String {
+    if !path.contains('[') {
+        return path.to_string();
+    }
+
+    let mut result = String::with_capacity(path.len());
+    for ch in path.chars() {
+        match ch {
+            '[' => {
+                result.push('.');
+            }
+            ']' => {}
+            other => {
+                result.push(other);
+            }
+        }
+    }
+    result
 }
 
 impl ItemContext {
@@ -501,5 +530,81 @@ mod tests {
         let value = serde_json::to_value(&ctx).unwrap();
         assert_eq!(extract_field(&value, ""), Some(&value));
         assert_eq!(extract_field(&value, "."), Some(&value));
+    }
+
+    #[test]
+    fn extract_field_bracket_notation() {
+        let ctx = make_context(vec![
+            make_history_entry("analyze", HistoryStatus::Done, 1),
+            make_history_entry("implement", HistoryStatus::Running, 1),
+        ]);
+        let value = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(
+            extract_field(&value, "history[0].state"),
+            Some(&serde_json::json!("analyze"))
+        );
+        assert_eq!(
+            extract_field(&value, ".history[1].state"),
+            Some(&serde_json::json!("implement"))
+        );
+        assert_eq!(
+            extract_field(&value, "history[0].status"),
+            Some(&serde_json::json!("done"))
+        );
+    }
+
+    #[test]
+    fn extract_field_bracket_notation_out_of_bounds() {
+        let ctx = make_context(vec![make_history_entry("analyze", HistoryStatus::Done, 1)]);
+        let value = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(extract_field(&value, "history[99]"), None);
+    }
+
+    #[test]
+    fn extract_field_bracket_notation_nested_array() {
+        let value = serde_json::json!({
+            "spec": {
+                "requirements": ["auth", "logging", "monitoring"]
+            }
+        });
+        assert_eq!(
+            extract_field(&value, "spec.requirements[0]"),
+            Some(&serde_json::json!("auth"))
+        );
+        assert_eq!(
+            extract_field(&value, "spec.requirements[2]"),
+            Some(&serde_json::json!("monitoring"))
+        );
+        assert_eq!(extract_field(&value, "spec.requirements[3]"), None);
+    }
+
+    #[test]
+    fn extract_field_mixed_dot_and_bracket() {
+        let value = serde_json::json!({
+            "data": [
+                {"items": [{"name": "first"}, {"name": "second"}]}
+            ]
+        });
+        assert_eq!(
+            extract_field(&value, "data[0].items[1].name"),
+            Some(&serde_json::json!("second"))
+        );
+    }
+
+    #[test]
+    fn normalize_path_no_brackets() {
+        assert_eq!(normalize_path("queue.state"), "queue.state");
+        assert_eq!(normalize_path("issue.number"), "issue.number");
+    }
+
+    #[test]
+    fn normalize_path_with_brackets() {
+        assert_eq!(normalize_path("history[0]"), "history.0");
+        assert_eq!(normalize_path("history[0].state"), "history.0.state");
+        assert_eq!(normalize_path("a[1][2]"), "a.1.2");
+        assert_eq!(
+            normalize_path("spec.requirements[0]"),
+            "spec.requirements.0"
+        );
     }
 }
