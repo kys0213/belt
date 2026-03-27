@@ -473,6 +473,7 @@ impl CronEngine {
                             script: db_job.script.clone(),
                             job_name: db_job.name.clone(),
                             db: Arc::clone(db),
+                            shell: Arc::from(belt_infra::platform::default_shell_executor()),
                         }),
                     });
                 }
@@ -508,6 +509,7 @@ impl CronEngine {
                         script: db_job.script.clone(),
                         job_name: db_job.name.clone(),
                         db: Arc::clone(db),
+                        shell: Arc::from(belt_infra::platform::default_shell_executor()),
                     }),
                 });
             }
@@ -2871,8 +2873,9 @@ pub struct CustomScriptJob {
     pub job_name: String,
     /// Database handle for updating `last_run_at` after execution.
     pub db: Arc<Database>,
+    /// Platform-specific shell executor.
+    pub shell: Arc<dyn belt_core::platform::ShellExecutor>,
 }
-
 impl CronHandler for CustomScriptJob {
     fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
         tracing::info!(
@@ -2883,29 +2886,26 @@ impl CronHandler for CustomScriptJob {
 
         let belt_home = std::env::var("BELT_HOME").unwrap_or_else(|_| "~/.belt".to_string());
 
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&self.script)
-            .env("BELT_HOME", &belt_home)
-            .env("BELT_CRON_JOB", &self.job_name)
-            .output()
-            .map_err(|e| {
-                BeltError::Runtime(format!("failed to spawn script '{}': {e}", self.script))
-            })?;
+        let mut env_vars = std::collections::HashMap::new();
+        env_vars.insert("BELT_HOME".to_string(), belt_home.clone());
+        env_vars.insert("BELT_CRON_JOB".to_string(), self.job_name.clone());
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        let working_dir = std::path::PathBuf::from(&belt_home);
+
+        let output = self.shell.execute(&self.script, &working_dir, &env_vars)?;
+
+        if !output.success() {
             tracing::error!(
                 job = %self.job_name,
-                exit_code = ?output.status.code(),
-                stderr = %stderr,
+                exit_code = ?output.exit_code,
+                stderr = %output.stderr,
                 "CustomScriptJob: script failed"
             );
             return Err(BeltError::Runtime(format!(
                 "script '{}' exited with status {}: {}",
                 self.script,
-                output.status.code().unwrap_or(-1),
-                stderr.trim()
+                output.exit_code.unwrap_or(-1),
+                output.stderr.trim()
             )));
         }
 
@@ -2918,11 +2918,10 @@ impl CronHandler for CustomScriptJob {
             );
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !stdout.is_empty() {
+        if !output.stdout.is_empty() {
             tracing::info!(
                 job = %self.job_name,
-                stdout = %stdout.trim(),
+                stdout = %output.stdout.trim(),
                 "CustomScriptJob: script output"
             );
         }
@@ -2998,6 +2997,7 @@ pub fn load_custom_jobs(engine: &mut CronEngine, db: &Arc<Database>) {
                 script: job.script.clone(),
                 job_name: job.name,
                 db: Arc::clone(db),
+                shell: Arc::from(belt_infra::platform::default_shell_executor()),
             }),
         });
     }

@@ -1,26 +1,52 @@
 //! Test runner for spec verification commands.
 //!
-//! Implements the [`belt_core::test_runner::TestRunner`] trait by executing
-//! shell commands via `sh -c`. Used by the gap-detection cron job to verify
-//! that a spec's test suite passes before advancing from Completing to Completed.
+//! Implements the [`belt_core::test_runner::TestRunner`] trait by delegating
+//! shell execution to a [`ShellExecutor`]. Used by the gap-detection cron job
+//! to verify that a spec's test suite passes before advancing from Completing
+//! to Completed.
+//!
+//! [`ShellExecutor`]: belt_core::platform::ShellExecutor
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
+use std::sync::Arc;
 
 use belt_core::error::BeltError;
+use belt_core::platform::ShellExecutor;
 use belt_core::test_runner::{TestCommandResult, TestRunResult, TestRunner};
 
-/// Shell-based test runner that executes commands via `sh -c`.
+/// Shell-based test runner that delegates to a [`ShellExecutor`].
 ///
-/// Each command is spawned as a child process in the given working directory.
-/// Pipes, redirects, and other shell features work as expected.
-#[derive(Debug, Default)]
-pub struct ShellTestRunner;
+/// Each command is passed to the executor with the given working directory.
+/// Pipes, redirects, and other shell features work as the underlying executor
+/// permits.
+pub struct ShellTestRunner {
+    shell: Arc<dyn ShellExecutor>,
+}
+
+impl std::fmt::Debug for ShellTestRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShellTestRunner").finish()
+    }
+}
+
+impl Default for ShellTestRunner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ShellTestRunner {
-    /// Create a new `ShellTestRunner`.
+    /// Create a new `ShellTestRunner` using the platform-default shell.
     pub fn new() -> Self {
-        Self
+        Self {
+            shell: Arc::from(crate::platform::default_shell_executor()),
+        }
+    }
+
+    /// Create a `ShellTestRunner` with a custom [`ShellExecutor`].
+    pub fn with_shell_executor(shell: Arc<dyn ShellExecutor>) -> Self {
+        Self { shell }
     }
 }
 
@@ -31,43 +57,37 @@ impl TestRunner for ShellTestRunner {
         working_dir: &Path,
         fail_fast: bool,
     ) -> Result<TestRunResult, BeltError> {
-        run_test_commands(commands, working_dir, fail_fast)
+        run_test_commands_with_shell(&*self.shell, commands, working_dir, fail_fast)
     }
 }
 
-/// Run a list of shell commands sequentially in the given working directory.
+/// Run a list of shell commands sequentially in the given working directory,
+/// using the provided [`ShellExecutor`].
 ///
-/// Each command is executed via `sh -c` (on Unix) so that pipes, redirects,
-/// and other shell features work as expected. Execution stops at the first
-/// failure when `fail_fast` is `true`.
+/// Each command is passed to the executor so that pipes, redirects, and other
+/// shell features work as the underlying implementation permits. Execution
+/// stops at the first failure when `fail_fast` is `true`.
 ///
 /// # Errors
 ///
-/// Returns `BeltError::Runtime` if a command cannot be spawned at all
-/// (e.g. `sh` not found). Individual command failures are captured in
-/// the returned `TestRunResult` rather than as errors.
-pub fn run_test_commands(
+/// Returns `BeltError::Runtime` if a command cannot be spawned at all.
+/// Individual command failures are captured in the returned `TestRunResult`
+/// rather than as errors.
+pub fn run_test_commands_with_shell(
+    shell: &dyn ShellExecutor,
     commands: &[&str],
     working_dir: &Path,
     fail_fast: bool,
 ) -> Result<TestRunResult, BeltError> {
     let mut results = Vec::with_capacity(commands.len());
     let mut all_passed = true;
+    let empty_env = HashMap::new();
 
     for cmd in commands {
-        let output = Command::new("sh")
-            .arg("-c")
-            .arg(cmd)
-            .current_dir(working_dir)
-            .output()
-            .map_err(|e| {
-                BeltError::Runtime(format!("failed to spawn test command '{cmd}': {e}"))
-            })?;
+        let output = shell.execute(cmd, working_dir, &empty_env)?;
 
-        let success = output.status.success();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let combined = format!("{stdout}{stderr}");
+        let success = output.success();
+        let combined = format!("{}{}", output.stdout, output.stderr);
 
         // Truncate output to avoid excessive memory usage.
         const MAX_OUTPUT_LEN: usize = 4096;
@@ -97,6 +117,19 @@ pub fn run_test_commands(
     })
 }
 
+/// Convenience wrapper: run test commands using the platform-default shell.
+///
+/// This preserves backward compatibility with existing callers that do not
+/// need to inject a custom [`ShellExecutor`].
+pub fn run_test_commands(
+    commands: &[&str],
+    working_dir: &Path,
+    fail_fast: bool,
+) -> Result<TestRunResult, BeltError> {
+    let shell = crate::platform::default_shell_executor();
+    run_test_commands_with_shell(&*shell, commands, working_dir, fail_fast)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,7 +157,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let result = run_test_commands(&["false", "true"], tmp.path(), true).unwrap();
         assert!(!result.all_passed);
-        // Only the first (failing) command should have been executed.
         assert_eq!(result.results.len(), 1);
     }
 
