@@ -435,6 +435,68 @@ pub struct DecomposedIssue {
     pub criterion: String,
 }
 
+/// Structured LLM decomposition output for a single sub-issue.
+///
+/// The LLM produces this structure when decomposing a spec into independent
+/// issues. Each entry includes a concise title, detailed description with
+/// implementation hints, and specific acceptance criteria for verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmDecomposedIssue {
+    /// Concise issue title (e.g. "Add OAuth2 token refresh endpoint").
+    pub title: String,
+    /// Detailed issue description in markdown with context and implementation hints.
+    pub description: String,
+    /// Specific acceptance criteria for this sub-issue.
+    pub acceptance_criteria: Vec<String>,
+}
+
+/// Build [`DecomposedIssue`] proposals from LLM-structured decomposition output.
+///
+/// Each `LlmDecomposedIssue` is converted into a `DecomposedIssue` with a
+/// formatted body that includes the description, acceptance criteria, and a
+/// back-reference to the parent spec issue.
+pub fn build_decomposed_issues_from_llm(
+    llm_issues: &[LlmDecomposedIssue],
+    parent_number: Option<&str>,
+) -> Vec<DecomposedIssue> {
+    llm_issues
+        .iter()
+        .enumerate()
+        .map(|(i, issue)| {
+            let idx = i + 1;
+            let parent_ref = parent_number.unwrap_or("?");
+            let title = format!("[sub] #{parent_ref} AC{idx}: {}", issue.title);
+
+            let parent_link = parent_number
+                .map(|n| format!("Parent: #{n}"))
+                .unwrap_or_else(|| "Parent: (pending)".to_string());
+
+            let ac_section = if issue.acceptance_criteria.is_empty() {
+                String::new()
+            } else {
+                let items: Vec<String> = issue
+                    .acceptance_criteria
+                    .iter()
+                    .map(|ac| format!("- [ ] {ac}"))
+                    .collect();
+                format!("\n\n## Acceptance Criteria\n\n{}", items.join("\n"))
+            };
+
+            let body = format!(
+                "{parent_link}\n\n## Description\n\n{}{}",
+                issue.description, ac_section
+            );
+
+            DecomposedIssue {
+                index: idx,
+                title,
+                body,
+                criterion: issue.title.clone(),
+            }
+        })
+        .collect()
+}
+
 /// Build [`DecomposedIssue`] proposals from raw acceptance criteria and optional
 /// LLM-refined descriptions.
 ///
@@ -1175,5 +1237,110 @@ mod tests {
         assert!(preview.contains("Proposed 2 child issue(s):"));
         assert!(preview.contains("AC1:"));
         assert!(preview.contains("AC2:"));
+    }
+
+    #[test]
+    fn llm_decomposed_issue_serde_roundtrip() {
+        let issue = LlmDecomposedIssue {
+            title: "Add OAuth2 token refresh".to_string(),
+            description: "Implement token refresh endpoint.".to_string(),
+            acceptance_criteria: vec![
+                "Refresh token is validated".to_string(),
+                "New access token is returned".to_string(),
+            ],
+        };
+        let json = serde_json::to_string(&issue).unwrap();
+        let parsed: LlmDecomposedIssue = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, issue);
+    }
+
+    #[test]
+    fn llm_decomposed_issue_array_parse() {
+        let json = r#"[
+            {
+                "title": "Issue one",
+                "description": "Desc one",
+                "acceptance_criteria": ["AC 1a", "AC 1b"]
+            },
+            {
+                "title": "Issue two",
+                "description": "Desc two",
+                "acceptance_criteria": ["AC 2a"]
+            }
+        ]"#;
+        let issues: Vec<LlmDecomposedIssue> = serde_json::from_str(json).unwrap();
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].title, "Issue one");
+        assert_eq!(issues[1].acceptance_criteria.len(), 1);
+    }
+
+    #[test]
+    fn build_decomposed_issues_from_llm_basic() {
+        let llm_issues = vec![
+            LlmDecomposedIssue {
+                title: "Add login endpoint".to_string(),
+                description: "Implement POST /login with JWT.".to_string(),
+                acceptance_criteria: vec![
+                    "Returns 200 with valid credentials".to_string(),
+                    "Returns 401 with invalid credentials".to_string(),
+                ],
+            },
+            LlmDecomposedIssue {
+                title: "Add logout endpoint".to_string(),
+                description: "Implement POST /logout.".to_string(),
+                acceptance_criteria: vec!["Invalidates session".to_string()],
+            },
+        ];
+
+        let issues = build_decomposed_issues_from_llm(&llm_issues, Some("100"));
+        assert_eq!(issues.len(), 2);
+
+        // Check first issue
+        assert_eq!(issues[0].index, 1);
+        assert!(issues[0].title.contains("#100"));
+        assert!(issues[0].title.contains("AC1"));
+        assert!(issues[0].title.contains("Add login endpoint"));
+        assert!(issues[0].body.contains("Parent: #100"));
+        assert!(issues[0].body.contains("## Description"));
+        assert!(issues[0].body.contains("Implement POST /login with JWT."));
+        assert!(issues[0].body.contains("## Acceptance Criteria"));
+        assert!(
+            issues[0]
+                .body
+                .contains("- [ ] Returns 200 with valid credentials")
+        );
+        assert!(
+            issues[0]
+                .body
+                .contains("- [ ] Returns 401 with invalid credentials")
+        );
+        assert_eq!(issues[0].criterion, "Add login endpoint");
+
+        // Check second issue
+        assert_eq!(issues[1].index, 2);
+        assert!(issues[1].title.contains("AC2"));
+        assert!(issues[1].body.contains("Invalidates session"));
+    }
+
+    #[test]
+    fn build_decomposed_issues_from_llm_no_parent() {
+        let llm_issues = vec![LlmDecomposedIssue {
+            title: "Setup CI".to_string(),
+            description: "Configure GitHub Actions.".to_string(),
+            acceptance_criteria: vec![],
+        }];
+
+        let issues = build_decomposed_issues_from_llm(&llm_issues, None);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].title.contains("#?"));
+        assert!(issues[0].body.contains("Parent: (pending)"));
+        // No acceptance criteria section when empty
+        assert!(!issues[0].body.contains("## Acceptance Criteria"));
+    }
+
+    #[test]
+    fn build_decomposed_issues_from_llm_empty_input() {
+        let issues = build_decomposed_issues_from_llm(&[], Some("50"));
+        assert!(issues.is_empty());
     }
 }
