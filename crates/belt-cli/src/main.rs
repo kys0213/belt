@@ -733,14 +733,13 @@ fn cmd_stop() -> anyhow::Result<()> {
         } else {
             anyhow::bail!("Failed to send signal to PID {pid}. Process may not exist.");
         }
+        Ok(())
     }
 
     #[cfg(not(unix))]
     {
         anyhow::bail!("belt stop is only supported on Unix systems");
     }
-
-    Ok(())
 }
 
 /// `belt restart` -- graceful stop then start.
@@ -1261,6 +1260,7 @@ fn signal_daemon() -> anyhow::Result<()> {
         if !status.success() {
             anyhow::bail!("failed to send SIGUSR1 to PID {pid}");
         }
+        Ok(())
     }
 
     #[cfg(not(unix))]
@@ -1268,8 +1268,6 @@ fn signal_daemon() -> anyhow::Result<()> {
         let _ = pid;
         anyhow::bail!("daemon signaling is only supported on Unix systems");
     }
-
-    Ok(())
 }
 
 /// Determine a recommended action based on the HITL reason.
