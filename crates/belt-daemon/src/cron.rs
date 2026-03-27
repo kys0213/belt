@@ -2529,13 +2529,13 @@ impl CronHandler for EvaluateJob {
                 .push(item);
         }
 
-        let belt_home = std::env::var("BELT_HOME").unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(|h| format!("{h}/.belt"))
-                .unwrap_or_else(|_| "~/.belt".to_string())
-        });
-        let belt_home_path = std::path::PathBuf::from(&belt_home);
-
+        let belt_home_path = match std::env::var("BELT_HOME") {
+            Ok(v) => std::path::PathBuf::from(v),
+            Err(_) => {
+                let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+                std::path::PathBuf::from(home).join(".belt")
+            }
+        };
         // Pre-load workspace config paths to avoid repeated DB queries per workspace.
         let ws_config_map: HashMap<String, std::path::PathBuf> = self
             .db
@@ -2881,7 +2881,13 @@ impl CronHandler for CustomScriptJob {
             "CustomScriptJob: executing user-defined script"
         );
 
-        let belt_home = std::env::var("BELT_HOME").unwrap_or_else(|_| "~/.belt".to_string());
+        let belt_home = std::env::var("BELT_HOME").unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+            std::path::PathBuf::from(home)
+                .join(".belt")
+                .to_string_lossy()
+                .to_string()
+        });
 
         let output = std::process::Command::new("sh")
             .arg("-c")
