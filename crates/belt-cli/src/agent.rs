@@ -1094,12 +1094,6 @@ runtime:
         assert!(prompt.contains("session: 10"));
     }
 
-    /// Global mutex that serializes tests which mutate environment variables.
-    /// Rust's test harness runs tests in parallel threads by default, so any
-    /// test that calls `std::env::set_var` must hold this lock for the
-    /// duration of the test to avoid races with other env-mutating tests.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     // ---- claw init → resolve_rules_dir integration ----
 
     #[test]
