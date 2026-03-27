@@ -719,29 +719,51 @@ fn read_pid() -> anyhow::Result<u32> {
 // Command handlers
 // ---------------------------------------------------------------------------
 
-/// `belt stop` -- send SIGTERM to the daemon process.
+/// `belt stop` -- terminate the daemon process.
+///
+/// On Unix, sends SIGTERM via `kill -TERM`. On Windows, uses `taskkill /PID`.
 fn cmd_stop() -> anyhow::Result<()> {
     let pid = read_pid()?;
-    tracing::info!(pid, "sending SIGTERM to daemon...");
+    tracing::info!(pid, "stopping daemon...");
 
-    // SAFETY: We are sending a well-known signal to a process we own.
+    terminate_pid(pid)?;
+
+    println!("Sent stop signal to daemon (PID {pid}).");
+    Ok(())
+}
+
+/// Platform-appropriate process termination.
+///
+/// On Unix, sends SIGTERM. On Windows, invokes `taskkill /PID`.
+fn terminate_pid(pid: u32) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::process::Command;
         let status = Command::new("kill")
             .args(["-TERM", &pid.to_string()])
             .status()?;
-        if status.success() {
-            println!("Sent stop signal to daemon (PID {pid}).");
-        } else {
-            anyhow::bail!("Failed to send signal to PID {pid}. Process may not exist.");
+        if !status.success() {
+            anyhow::bail!("failed to send signal to PID {pid} -- process may not exist");
         }
         Ok(())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        anyhow::bail!("belt stop is only supported on Unix systems");
+        use std::process::Command;
+        let output = Command::new("taskkill")
+            .args(["/PID", &pid.to_string()])
+            .output()?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("taskkill failed for PID {pid}: {stderr}");
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        anyhow::bail!("belt stop is not supported on this platform");
     }
 }
 
