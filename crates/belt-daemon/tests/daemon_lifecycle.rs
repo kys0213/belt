@@ -8,9 +8,10 @@ use std::sync::Arc;
 use belt_core::escalation::EscalationAction;
 use belt_core::phase::QueuePhase;
 use belt_core::queue::testing::test_item;
-use belt_core::runtime::RuntimeRegistry;
+use belt_core::runtime::{RuntimeRegistry, TokenUsage};
 use belt_core::workspace::WorkspaceConfig;
 use belt_daemon::daemon::{Daemon, ItemOutcome};
+use belt_infra::db::Database;
 use belt_infra::runtimes::mock::MockRuntime;
 use belt_infra::sources::mock::MockDataSource;
 use belt_infra::worktree::MockWorktreeManager;
@@ -328,4 +329,100 @@ async fn parallel_execution() {
         completed_count, 2,
         "both items should complete successfully"
     );
+}
+
+/// After execute_running, token_usage from RuntimeResponse should be
+/// automatically persisted to the database.
+#[tokio::test]
+async fn execute_running_saves_token_usage_to_db() {
+    let tmp = TempDir::new().unwrap();
+    let mut source = MockDataSource::new("github");
+    source.add_item(test_item("github:org/repo#1", "analyze"));
+
+    let config = test_workspace_config();
+    let mock = MockRuntime::new("mock", vec![0]).with_token_usages(vec![TokenUsage {
+        input_tokens: 500,
+        output_tokens: 200,
+        cache_read_tokens: Some(50),
+        cache_write_tokens: None,
+    }]);
+    let mut registry = RuntimeRegistry::new("mock".to_string());
+    registry.register(Arc::new(mock));
+    let worktree_mgr = MockWorktreeManager::new(tmp.path().to_path_buf());
+
+    let db = Database::open_in_memory().unwrap();
+    let mut daemon = Daemon::new(
+        config,
+        vec![Box::new(source)],
+        Arc::new(registry),
+        Box::new(worktree_mgr),
+        4,
+    )
+    .with_db(db);
+
+    daemon.collect().await.unwrap();
+    daemon.advance();
+    let outcomes = daemon.execute_running().await;
+    assert_eq!(outcomes.len(), 1);
+    assert!(matches!(outcomes[0], ItemOutcome::Completed(_)));
+
+    // Verify token_usage was persisted in the database.
+    let db = daemon.db().expect("daemon should have a database");
+    let rows = db
+        .get_token_usage_by_work_id("github:org/repo#1:analyze")
+        .unwrap();
+    assert_eq!(rows.len(), 1, "one token_usage row should be recorded");
+    assert_eq!(rows[0].input_tokens, 500);
+    assert_eq!(rows[0].output_tokens, 200);
+    assert_eq!(rows[0].cache_read_tokens, Some(50));
+    assert!(rows[0].cache_write_tokens.is_none());
+    assert_eq!(rows[0].runtime, "mock");
+    assert_eq!(rows[0].workspace, "test-ws");
+}
+
+/// Token usage from a failed handler execution should also be saved.
+#[tokio::test]
+async fn execute_running_saves_token_usage_on_failure() {
+    let tmp = TempDir::new().unwrap();
+    let mut source = MockDataSource::new("github");
+    source.add_item(test_item("github:org/repo#1", "analyze"));
+
+    let config = test_workspace_config();
+    let mock = MockRuntime::new("mock", vec![1]).with_token_usages(vec![TokenUsage {
+        input_tokens: 300,
+        output_tokens: 100,
+        cache_read_tokens: None,
+        cache_write_tokens: None,
+    }]);
+    let mut registry = RuntimeRegistry::new("mock".to_string());
+    registry.register(Arc::new(mock));
+    let worktree_mgr = MockWorktreeManager::new(tmp.path().to_path_buf());
+
+    let db = Database::open_in_memory().unwrap();
+    let mut daemon = Daemon::new(
+        config,
+        vec![Box::new(source)],
+        Arc::new(registry),
+        Box::new(worktree_mgr),
+        4,
+    )
+    .with_db(db);
+
+    daemon.collect().await.unwrap();
+    daemon.advance();
+    let outcomes = daemon.execute_running().await;
+    assert_eq!(outcomes.len(), 1);
+    assert!(matches!(outcomes[0], ItemOutcome::Failed { .. }));
+
+    // Even on failure, token_usage should be recorded.
+    let db = daemon.db().expect("daemon should have a database");
+    let rows = db
+        .get_token_usage_by_work_id("github:org/repo#1:analyze")
+        .unwrap();
+    assert!(
+        !rows.is_empty(),
+        "token_usage should be recorded even on failure"
+    );
+    assert_eq!(rows[0].input_tokens, 300);
+    assert_eq!(rows[0].output_tokens, 100);
 }
