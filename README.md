@@ -20,6 +20,7 @@ DataSource.collect() → Pending → Ready → Running → Completed → Done
 - **DataSource** = external system abstraction (collect + context). New system = new impl, zero core changes.
 - **AgentRuntime** = LLM abstraction (Claude, Gemini, Codex). New LLM = new impl, zero core changes.
 - **Cron Engine** = infrastructure maintenance + quality loops (evaluate, gap-detection).
+- **Platform** = OS abstraction (shell execution, daemon IPC). New platform = new impl, zero core changes.
 
 ## Architecture
 
@@ -72,7 +73,7 @@ belt queue hitl $WORK_ID --reason "needs human review"
 Design documents are in [`spec/`](./spec/):
 
 - [`DESIGN-v5.md`](./spec/DESIGN-v5.md) — design philosophy + architecture overview
-- [`concerns/`](./spec/concerns/) — implementation-level specs (state machine, daemon, datasource, runtime, claw, cron, CLI)
+- [`concerns/`](./spec/concerns/) — implementation-level specs (state machine, daemon, datasource, runtime, claw, cron, CLI, cross-platform)
 - [`flows/`](./spec/flows/) — user-facing scenarios (onboarding, spec lifecycle, issue pipeline, failure/HITL, monitoring)
 
 ## License
