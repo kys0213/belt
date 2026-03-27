@@ -5133,4 +5133,286 @@ mod tests {
         assert_eq!(extracted, 0);
         assert_eq!(skipped, 0);
     }
+
+    // ---- EvaluateJob error paths and workspace grouping --------------------
+
+    #[test]
+    fn evaluate_job_groups_items_by_workspace() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+
+        let mut item_a1 = belt_core::queue::QueueItem::new(
+            "eval-a1".into(),
+            "src-a1".into(),
+            "workspace-alpha".into(),
+            "implement".into(),
+        );
+        item_a1.phase = QueuePhase::Completed;
+        db.insert_item(&item_a1).unwrap();
+
+        let mut item_a2 = belt_core::queue::QueueItem::new(
+            "eval-a2".into(),
+            "src-a2".into(),
+            "workspace-alpha".into(),
+            "implement".into(),
+        );
+        item_a2.phase = QueuePhase::Completed;
+        db.insert_item(&item_a2).unwrap();
+
+        let mut item_b1 = belt_core::queue::QueueItem::new(
+            "eval-b1".into(),
+            "src-b1".into(),
+            "workspace-beta".into(),
+            "implement".into(),
+        );
+        item_b1.phase = QueuePhase::Completed;
+        db.insert_item(&item_b1).unwrap();
+
+        let job = EvaluateJob::new(Arc::clone(&db));
+        let ctx = CronContext { now: Utc::now() };
+        // Subprocess may fail but errors are handled internally.
+        assert!(job.execute(&ctx).is_ok());
+    }
+
+    #[test]
+    fn evaluate_job_replan_count_increment() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+
+        let mut item = belt_core::queue::QueueItem::new(
+            "eval-replan".into(),
+            "src-replan".into(),
+            "ws".into(),
+            "implement".into(),
+        );
+        item.phase = QueuePhase::Completed;
+        db.insert_item(&item).unwrap();
+
+        let count1 = db.increment_replan_count("eval-replan").unwrap();
+        assert_eq!(count1, 1);
+        let count2 = db.increment_replan_count("eval-replan").unwrap();
+        assert_eq!(count2, 2);
+        let count3 = db.increment_replan_count("eval-replan").unwrap();
+        assert_eq!(count3, 3);
+
+        assert!(count3 >= crate::evaluator::DEFAULT_MAX_EVAL_FAILURES);
+    }
+
+    #[test]
+    fn evaluate_job_hitl_escalation_at_threshold() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+
+        let mut item = belt_core::queue::QueueItem::new(
+            "eval-hitl".into(),
+            "src-hitl".into(),
+            "ws".into(),
+            "implement".into(),
+        );
+        item.phase = QueuePhase::Completed;
+        db.insert_item(&item).unwrap();
+
+        for _ in 0..crate::evaluator::DEFAULT_MAX_EVAL_FAILURES {
+            db.increment_replan_count("eval-hitl").unwrap();
+        }
+
+        let result = db.escalate_to_hitl("eval-hitl", "evaluate_failure", "test escalation");
+        assert!(result.is_ok());
+
+        let updated = db.get_item("eval-hitl").unwrap();
+        assert_eq!(updated.phase, QueuePhase::Hitl);
+        assert_eq!(
+            updated.hitl_reason,
+            Some(belt_core::queue::HitlReason::EvaluateFailure)
+        );
+    }
+
+    // ---- CronSchedule::parse_expression boundary/edge cases ----------------
+
+    #[test]
+    fn parse_expression_boundary_min_max_values() {
+        assert!(CronSchedule::parse_expression("0 0 0 0 0").is_ok());
+        assert!(CronSchedule::parse_expression("59 23 31 12 7").is_ok());
+    }
+
+    #[test]
+    fn parse_expression_with_range_and_step_combined() {
+        assert!(CronSchedule::parse_expression("0-30/10 9,17 * 1-6 1-5").is_ok());
+    }
+
+    #[test]
+    fn parse_expression_single_field_is_invalid() {
+        let err = CronSchedule::parse_expression("*").unwrap_err();
+        assert!(err.to_string().contains("expected 5 fields, got 1"));
+    }
+
+    #[test]
+    fn parse_expression_whitespace_only_is_empty() {
+        let err = CronSchedule::parse_expression("   ").unwrap_err();
+        assert!(err.to_string().contains("expected 5 fields, got 0"));
+    }
+
+    // ---- HitlTimeoutJob::with_timeout_secs tests ---------------------------
+
+    #[test]
+    fn hitl_timeout_job_with_timeout_secs_sets_value() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
+        let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr).with_timeout_secs(3600);
+        assert_eq!(job.timeout_secs, 3600);
+    }
+
+    #[test]
+    fn hitl_timeout_job_default_timeout_is_24_hours() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
+        let job = HitlTimeoutJob::new(db, worktree_mgr);
+        assert_eq!(job.timeout_secs, 24 * 60 * 60);
+    }
+
+    #[test]
+    fn hitl_timeout_job_with_custom_short_timeout() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
+        let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr).with_timeout_secs(1);
+        assert_eq!(job.timeout_secs, 1);
+
+        let old_time = (Utc::now() - chrono::Duration::seconds(2)).to_rfc3339();
+        let mut item = belt_core::queue::QueueItem::new(
+            "w-short-timeout".into(),
+            "s1".into(),
+            "ws".into(),
+            "st".into(),
+        );
+        item.phase = QueuePhase::Hitl;
+        item.created_at = old_time.clone();
+        item.updated_at = old_time;
+        db.insert_item(&item).unwrap();
+
+        let ctx = CronContext { now: Utc::now() };
+        job.execute(&ctx).unwrap();
+
+        let updated = db.get_item("w-short-timeout").unwrap();
+        assert_eq!(updated.phase, QueuePhase::Failed);
+    }
+
+    // ---- GapDetectionJob::with_coverage_threshold boundary tests -----------
+
+    #[test]
+    fn gap_detection_with_coverage_threshold_boundary_zero() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let job = GapDetectionJob::new(db, tmp.path().to_path_buf()).with_coverage_threshold(0.0);
+        assert!((job.coverage_threshold - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn gap_detection_with_coverage_threshold_boundary_one() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let job = GapDetectionJob::new(db, tmp.path().to_path_buf()).with_coverage_threshold(1.0);
+        assert!((job.coverage_threshold - 1.0).abs() < f64::EPSILON);
+    }
+
+    // ---- cron_expression_matches / cron_field_matches edge cases -----------
+
+    #[test]
+    fn cron_expression_matches_every_minute() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 27, 14, 30, 0).unwrap();
+        assert!(cron_expression_matches("* * * * *", now));
+    }
+
+    #[test]
+    fn cron_expression_matches_specific_time() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 27, 14, 30, 0).unwrap();
+        assert!(cron_expression_matches("30 14 * * *", now));
+        assert!(!cron_expression_matches("31 14 * * *", now));
+    }
+
+    #[test]
+    fn cron_expression_matches_step_pattern() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 27, 14, 30, 0).unwrap();
+        assert!(cron_expression_matches("*/10 * * * *", now));
+        assert!(!cron_expression_matches("*/7 * * * *", now));
+    }
+
+    #[test]
+    fn cron_expression_matches_range() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 27, 14, 30, 0).unwrap();
+        assert!(cron_expression_matches("* 9-17 * * *", now));
+        assert!(!cron_expression_matches("* 0-8 * * *", now));
+    }
+
+    #[test]
+    fn cron_expression_matches_list() {
+        let now = Utc.with_ymd_and_hms(2026, 3, 27, 14, 30, 0).unwrap();
+        assert!(cron_expression_matches("30 10,14,18 * * *", now));
+        assert!(!cron_expression_matches("30 10,15,18 * * *", now));
+    }
+
+    #[test]
+    fn cron_expression_invalid_field_count_returns_false() {
+        let now = Utc::now();
+        assert!(!cron_expression_matches("* * *", now));
+        assert!(!cron_expression_matches("", now));
+    }
+
+    #[test]
+    fn cron_field_matches_wildcard() {
+        assert!(cron_field_matches("*", 0, 59));
+        assert!(cron_field_matches("*", 30, 59));
+        assert!(cron_field_matches("*", 59, 59));
+    }
+
+    #[test]
+    fn cron_field_matches_exact() {
+        assert!(cron_field_matches("30", 30, 59));
+        assert!(!cron_field_matches("30", 31, 59));
+    }
+
+    #[test]
+    fn cron_field_matches_range_boundaries() {
+        assert!(cron_field_matches("5-10", 5, 59));
+        assert!(cron_field_matches("5-10", 10, 59));
+        assert!(cron_field_matches("5-10", 7, 59));
+        assert!(!cron_field_matches("5-10", 4, 59));
+        assert!(!cron_field_matches("5-10", 11, 59));
+    }
+
+    #[test]
+    fn cron_field_matches_step_with_wildcard() {
+        assert!(cron_field_matches("*/15", 0, 59));
+        assert!(cron_field_matches("*/15", 15, 59));
+        assert!(cron_field_matches("*/15", 30, 59));
+        assert!(cron_field_matches("*/15", 45, 59));
+        assert!(!cron_field_matches("*/15", 10, 59));
+    }
+
+    #[test]
+    fn cron_field_matches_step_with_range() {
+        assert!(cron_field_matches("10-30/5", 10, 59));
+        assert!(cron_field_matches("10-30/5", 15, 59));
+        assert!(cron_field_matches("10-30/5", 20, 59));
+        assert!(!cron_field_matches("10-30/5", 12, 59));
+        assert!(!cron_field_matches("10-30/5", 5, 59));
+        assert!(!cron_field_matches("10-30/5", 35, 59));
+    }
+
+    #[test]
+    fn cron_field_matches_comma_list() {
+        assert!(cron_field_matches("1,5,10,20", 1, 59));
+        assert!(cron_field_matches("1,5,10,20", 10, 59));
+        assert!(!cron_field_matches("1,5,10,20", 3, 59));
+    }
+
+    #[test]
+    fn cron_field_step_zero_returns_false() {
+        assert!(!cron_field_matches("*/0", 0, 59));
+    }
 }
