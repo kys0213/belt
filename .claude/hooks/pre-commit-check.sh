@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Pre-commit quality gate: cargo fmt + clippy
+# Pre-commit quality gate: fmt + check (fast)
 # Triggered by PreToolUse on Bash when git commit is detected
+# Speed: cargo check only — clippy + test는 pre-pr hook에서 실행 (pre-pr-clippy-check.sh)
 
 set -euo pipefail
 
