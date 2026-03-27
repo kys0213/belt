@@ -447,4 +447,97 @@ mod tests {
         });
         assert!(resp.contains("Unknown command"));
     }
+
+    #[test]
+    fn dispatch_claw_init() {
+        let d = SlashDispatcher::new(Some("ws".to_string()));
+        let resp = d.dispatch(&SlashCommand::Claw {
+            args: "init".to_string(),
+        });
+        assert!(resp.contains("[claw]"));
+        assert!(resp.contains("Re-initializing"));
+    }
+
+    #[test]
+    fn dispatch_claw_rules() {
+        let d = SlashDispatcher::new(Some("ws".to_string()));
+        let resp = d.dispatch(&SlashCommand::Claw {
+            args: "rules".to_string(),
+        });
+        assert!(resp.contains("[claw]"));
+        assert!(resp.contains("Listing policy rules"));
+    }
+
+    #[test]
+    fn dispatch_claw_unknown_subcommand() {
+        let d = SlashDispatcher::new(None);
+        let resp = d.dispatch(&SlashCommand::Claw {
+            args: "foobar".to_string(),
+        });
+        assert!(resp.contains("[claw] Unknown subcommand: foobar"));
+        assert!(resp.contains("status, init, rules"));
+    }
+
+    #[test]
+    fn dispatch_spec_with_id_error_path() {
+        // When fetch_spec_json fails (no belt binary available in test),
+        // the dispatcher should return an error message containing the spec ID.
+        let d = SlashDispatcher::new(None);
+        let resp = d.dispatch(&SlashCommand::Spec {
+            args: "42".to_string(),
+        });
+        assert!(resp.contains("[spec]"));
+        assert!(resp.contains("spec-issue-42"));
+        // Should contain an error since the belt binary is not available.
+        assert!(resp.contains("Error"));
+    }
+
+    #[test]
+    fn dispatch_spec_with_named_id_error_path() {
+        // Non-numeric spec ID should be passed through as-is.
+        let d = SlashDispatcher::new(None);
+        let resp = d.dispatch(&SlashCommand::Spec {
+            args: "my-custom-spec".to_string(),
+        });
+        assert!(resp.contains("[spec]"));
+        assert!(resp.contains("my-custom-spec"));
+        assert!(resp.contains("Error"));
+    }
+
+    #[test]
+    fn dispatch_auto_without_workspace() {
+        let d = SlashDispatcher::new(None);
+        let resp = d.dispatch(&SlashCommand::Auto {
+            args: String::new(),
+        });
+        assert!(resp.contains("[auto]"));
+        assert!(resp.contains("(no workspace selected)"));
+    }
+
+    #[test]
+    fn dispatch_auto_with_args() {
+        let d = SlashDispatcher::new(Some("my-ws".to_string()));
+        let resp = d.dispatch(&SlashCommand::Auto {
+            args: "deploy now".to_string(),
+        });
+        assert!(resp.contains("[auto] Processing: deploy now"));
+        assert!(resp.contains("my-ws"));
+    }
+
+    #[test]
+    fn dispatch_claw_status_without_workspace() {
+        let d = SlashDispatcher::new(None);
+        let resp = d.dispatch(&SlashCommand::Claw {
+            args: String::new(),
+        });
+        assert!(resp.contains("[claw]"));
+        assert!(resp.contains("(no workspace selected)"));
+    }
+
+    #[test]
+    fn dispatch_quit_returns_goodbye() {
+        let d = SlashDispatcher::new(None);
+        let resp = d.dispatch(&SlashCommand::Quit);
+        assert_eq!(resp, "Goodbye.");
+    }
 }
