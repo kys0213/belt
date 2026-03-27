@@ -1,0 +1,33 @@
+name: e2e-test
+concurrency: 1
+sources:
+  github:
+    url: https://github.com/kys0213/belt
+    states:
+      analyze:
+        trigger:
+          label: "e2e-test:analyze"
+        handlers:
+          - prompt: "Read the GitHub issue and write a one-line summary as a comment. Do NOT modify any files. Do NOT create branches or PRs."
+        on_done:
+          - script: |
+              gh issue comment "$ISSUE" --body "[e2e] analyze completed for $WORK_ID" -R kys0213/belt
+      implement:
+        trigger:
+          label: "e2e-test:implement"
+        handlers:
+          - script: "echo 'hello e2e' > e2e-test.txt"
+          - script: "test -f e2e-test.txt"
+        on_done:
+          - script: |
+              gh issue comment "$ISSUE" --body "[e2e] implement completed for $WORK_ID" -R kys0213/belt
+        on_fail:
+          - script: |
+              gh issue comment "$ISSUE" --body "[e2e] implement FAILED for $WORK_ID" -R kys0213/belt
+    escalation:
+      1: retry
+      2: hitl
+runtime:
+  default: claude
+  claude:
+    model: claude-sonnet-4-20250514
