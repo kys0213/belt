@@ -1976,4 +1976,102 @@ mod tests {
         let out = String::from_utf8(output).unwrap();
         assert!(!out.contains("Session totals:"));
     }
+
+    #[test]
+    fn collect_workspace_stats_returns_none_for_none_workspace() {
+        // When workspace parameter is None, collect_workspace_stats should
+        // return None immediately without attempting to open the database.
+        let result = collect_workspace_stats(None);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn write_token_usage_formats_correctly() {
+        let usage = TokenUsage {
+            input_tokens: 1234,
+            output_tokens: 567,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        };
+        let mut output = Vec::new();
+        write_token_usage(&mut output, &usage).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert_eq!(out, "  [tokens: in=1234, out=567]\n");
+    }
+
+    #[test]
+    fn write_token_usage_zero_values() {
+        let usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        };
+        let mut output = Vec::new();
+        write_token_usage(&mut output, &usage).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert_eq!(out, "  [tokens: in=0, out=0]\n");
+    }
+
+    #[test]
+    fn write_session_usage_formats_correctly() {
+        let usage = SessionTokenUsage {
+            total_input_tokens: 5000,
+            total_output_tokens: 2500,
+            invocation_count: 10,
+        };
+        let mut output = Vec::new();
+        write_session_usage(&mut output, &usage).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert_eq!(
+            out,
+            "Session totals: 10 invocations, 5000 input tokens, 2500 output tokens\n"
+        );
+    }
+
+    #[test]
+    fn write_session_usage_zero_invocations() {
+        let usage = SessionTokenUsage::default();
+        let mut output = Vec::new();
+        write_session_usage(&mut output, &usage).unwrap();
+        let out = String::from_utf8(output).unwrap();
+        assert!(out.contains("0 invocations"));
+        assert!(out.contains("0 input tokens"));
+        assert!(out.contains("0 output tokens"));
+    }
+
+    #[test]
+    fn collect_status_from_db_with_transition_events() {
+        use belt_core::queue::QueueItem;
+
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+
+        // Insert an item.
+        let item = QueueItem::new(
+            "w-ev".to_string(),
+            "s1".to_string(),
+            "ws1".to_string(),
+            "analyze".to_string(),
+        );
+        db.insert_item(&item).unwrap();
+
+        // Explicitly insert a transition event.
+        let ev = belt_infra::db::TransitionEvent {
+            id: "ev-1".to_string(),
+            work_id: "w-ev".to_string(),
+            source_id: "github:org/repo#1".to_string(),
+            event_type: "phase_enter".to_string(),
+            phase: Some("running".to_string()),
+            from_phase: Some("pending".to_string()),
+            detail: None,
+            created_at: "2026-03-27T10:00:00Z".to_string(),
+        };
+        db.insert_transition_event(&ev).unwrap();
+
+        let summary = collect_status_from_db(&db).unwrap();
+        assert!(!summary.recent_events.is_empty());
+        assert_eq!(summary.recent_events[0].item_id, "w-ev");
+        assert_eq!(summary.recent_events[0].from_state, "pending");
+        assert_eq!(summary.recent_events[0].to_state, "running");
+    }
 }
