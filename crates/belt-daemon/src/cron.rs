@@ -3015,12 +3015,13 @@ pub fn load_custom_jobs(engine: &mut CronEngine, db: &Arc<Database>) {
 
 /// Seed built-in cron jobs for a specific workspace.
 ///
-/// Creates workspace-scoped instances of the standard jobs with the
-/// intervals specified in the issue requirements:
+/// Creates workspace-scoped instances of the standard jobs:
 /// - `HitlTimeoutJob` — every 1 hour
 /// - `DailyReportJob` — every 24 hours
 /// - `LogCleanupJob` — every 6 hours
-/// - `EvaluateJob` — every 60 seconds
+/// - `EvaluateJob` — every 6 hours
+/// - `GapDetectionJob` — every 12 hours
+/// - `KnowledgeExtractionJob` — every 24 hours
 ///
 /// The `deps` parameter provides the shared dependencies (DB, worktree manager,
 /// belt home, workspace name) used to initialise each job handler.
@@ -3065,7 +3066,7 @@ pub fn seed_workspace_crons(engine: &mut CronEngine, workspace: &str, deps: Buil
 
     engine.register(CronJobDef {
         name: format!("{ws}:evaluate"),
-        schedule: CronSchedule::Interval(Duration::from_secs(60)),
+        schedule: CronSchedule::Interval(Duration::from_secs(21600)), // every 6 hours
         workspace: Some(ws.clone()),
         enabled: true,
         last_run_at: None,
@@ -3073,8 +3074,20 @@ pub fn seed_workspace_crons(engine: &mut CronEngine, workspace: &str, deps: Buil
     });
 
     engine.register(CronJobDef {
+        name: format!("{ws}:gap_detection"),
+        schedule: CronSchedule::Interval(Duration::from_secs(43200)), // every 12 hours
+        workspace: Some(ws.clone()),
+        enabled: true,
+        last_run_at: None,
+        handler: Box::new(GapDetectionJob::new(
+            Arc::clone(&deps.db),
+            deps.workspace_root.clone(),
+        )),
+    });
+
+    engine.register(CronJobDef {
         name: format!("{ws}:knowledge_extraction"),
-        schedule: CronSchedule::Interval(Duration::from_secs(3600)),
+        schedule: CronSchedule::Interval(Duration::from_secs(86400)), // every 24 hours
         workspace: Some(ws.clone()),
         enabled: true,
         last_run_at: None,
@@ -4070,11 +4083,11 @@ mod tests {
     // -- seed_workspace_crons tests --
 
     #[test]
-    fn seed_workspace_crons_registers_five_jobs() {
+    fn seed_workspace_crons_registers_six_jobs() {
         let mut engine = CronEngine::new();
         let deps = make_test_deps();
         seed_workspace_crons(&mut engine, "my-project", deps);
-        assert_eq!(engine.job_count(), 5);
+        assert_eq!(engine.job_count(), 6);
     }
 
     #[test]
@@ -4089,6 +4102,7 @@ mod tests {
         assert!(names.contains(&"auth:daily_report"));
         assert!(names.contains(&"auth:log_cleanup"));
         assert!(names.contains(&"auth:evaluate"));
+        assert!(names.contains(&"auth:gap_detection"));
         assert!(names.contains(&"auth:knowledge_extraction"));
     }
 
@@ -4110,7 +4124,7 @@ mod tests {
         let deps2 = make_test_deps();
         seed_workspace_crons(&mut engine, "alpha", deps1);
         seed_workspace_crons(&mut engine, "beta", deps2);
-        assert_eq!(engine.job_count(), 10);
+        assert_eq!(engine.job_count(), 12);
     }
 
     #[test]
@@ -4120,8 +4134,8 @@ mod tests {
         let deps2 = make_test_deps();
         seed_workspace_crons(&mut engine, "ws", deps1);
         seed_workspace_crons(&mut engine, "ws", deps2);
-        // register() replaces by name, so should still be 5.
-        assert_eq!(engine.job_count(), 5);
+        // register() replaces by name, so should still be 6.
+        assert_eq!(engine.job_count(), 6);
     }
 
     // -- resolve_workspace_terminal_phase unit tests --
