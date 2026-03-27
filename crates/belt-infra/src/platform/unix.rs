@@ -106,6 +106,19 @@ mod tests {
     }
 
     #[test]
+    fn execute_respects_working_dir() {
+        let executor = UnixShellExecutor;
+        let tmp = tempfile::tempdir().unwrap();
+        let result = executor
+            .execute("pwd", tmp.path(), &HashMap::new())
+            .unwrap();
+        assert!(result.success());
+        // Resolve symlinks for macOS /tmp -> /private/tmp
+        let canonical = tmp.path().canonicalize().unwrap();
+        assert_eq!(result.stdout.trim(), canonical.to_str().unwrap());
+    }
+
+    #[test]
     fn notify_invalid_pid_returns_error() {
         let notifier = UnixDaemonNotifier;
         // PID 0 would signal the entire process group; use an invalid PID instead.
