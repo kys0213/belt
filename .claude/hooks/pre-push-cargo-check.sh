@@ -9,8 +9,8 @@ CMD=$(cat | jq -r '.tool_input.command // empty')
 # Only run on git push commands
 echo "$CMD" | grep -qE 'git\s+push' || exit 0
 
-# cargo check (matches CI: warnings as errors, all targets)
-if ! RUSTFLAGS="-D warnings" cargo check --all-targets 2>&1 | tail -5; then
+# Flags mirror ci.yml
+if ! RUSTFLAGS="-D warnings" cargo check --all-targets >/dev/null 2>&1; then
   echo '{"continue":false,"stopReason":"cargo check --all-targets failed (warnings as errors). Fix before pushing."}'
   exit 0
 fi
