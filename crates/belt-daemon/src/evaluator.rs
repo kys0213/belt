@@ -1249,4 +1249,171 @@ exit {exit_code}
     fn default_eval_batch_size() {
         assert_eq!(DEFAULT_EVAL_BATCH_SIZE, 10);
     }
+
+    // --- Tests for build_evaluate_command (direct inspection without spawning) ---
+
+    #[test]
+    fn build_evaluate_command_program_is_belt() {
+        let evaluator = Evaluator::new("test-ws");
+        let belt_home = Path::new("/tmp/belt-home");
+        let cmd = evaluator.build_evaluate_command(belt_home);
+        let std_cmd = cmd.as_std();
+
+        assert_eq!(
+            std_cmd.get_program(),
+            "belt",
+            "command program should be 'belt'"
+        );
+    }
+
+    #[test]
+    fn build_evaluate_command_args_without_workspace_config() {
+        let evaluator = Evaluator::new("test-ws");
+        let belt_home = Path::new("/tmp/belt-home");
+        let cmd = evaluator.build_evaluate_command(belt_home);
+        let std_cmd = cmd.as_std();
+
+        let args: Vec<&std::ffi::OsStr> = std_cmd.get_args().collect();
+
+        // Should contain: agent -p <prompt> --json (no --workspace)
+        assert!(
+            args.contains(&std::ffi::OsStr::new("agent")),
+            "args should contain 'agent': {args:?}"
+        );
+        assert!(
+            args.contains(&std::ffi::OsStr::new("-p")),
+            "args should contain '-p': {args:?}"
+        );
+        assert!(
+            args.contains(&std::ffi::OsStr::new("--json")),
+            "args should contain '--json': {args:?}"
+        );
+        assert!(
+            !args.contains(&std::ffi::OsStr::new("--workspace")),
+            "args should NOT contain '--workspace' when config path is None: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_evaluate_command_args_with_workspace_config() {
+        let evaluator = Evaluator::new("test-ws")
+            .with_workspace_config_path(PathBuf::from("/etc/belt/ws.yaml"));
+        let belt_home = Path::new("/tmp/belt-home");
+        let cmd = evaluator.build_evaluate_command(belt_home);
+        let std_cmd = cmd.as_std();
+
+        let args: Vec<&std::ffi::OsStr> = std_cmd.get_args().collect();
+
+        assert!(
+            args.contains(&std::ffi::OsStr::new("--workspace")),
+            "args should contain '--workspace' when config path is set: {args:?}"
+        );
+        assert!(
+            args.contains(&std::ffi::OsStr::new("/etc/belt/ws.yaml")),
+            "args should contain the workspace config path: {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_evaluate_command_envs_contain_workspace_and_belt_home() {
+        let evaluator = Evaluator::new("my-ws");
+        let belt_home = Path::new("/opt/belt/home");
+        let cmd = evaluator.build_evaluate_command(belt_home);
+        let std_cmd = cmd.as_std();
+
+        let envs: Vec<(&std::ffi::OsStr, Option<&std::ffi::OsStr>)> = std_cmd.get_envs().collect();
+
+        let find_env = |key: &str| -> Option<String> {
+            envs.iter()
+                .find(|(k, _)| *k == key)
+                .and_then(|(_, v)| v.map(|val| val.to_string_lossy().to_string()))
+        };
+
+        assert_eq!(
+            find_env("WORKSPACE").as_deref(),
+            Some("my-ws"),
+            "WORKSPACE env should match workspace_name"
+        );
+        assert_eq!(
+            find_env("BELT_HOME").as_deref(),
+            Some("/opt/belt/home"),
+            "BELT_HOME env should match belt_home"
+        );
+        assert_eq!(
+            find_env("BELT_DB").as_deref(),
+            Some("/opt/belt/home/belt.db"),
+            "BELT_DB env should be belt_home/belt.db"
+        );
+    }
+
+    #[test]
+    fn build_evaluate_command_prompt_arg_contains_workspace() {
+        let evaluator = Evaluator::new("auth-project");
+        let belt_home = Path::new("/tmp/belt");
+        let cmd = evaluator.build_evaluate_command(belt_home);
+        let std_cmd = cmd.as_std();
+
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        // The prompt arg (after -p) should contain the workspace name.
+        let p_idx = args.iter().position(|a| a == "-p");
+        assert!(p_idx.is_some(), "should have -p arg");
+        let prompt_arg = &args[p_idx.unwrap() + 1];
+        assert!(
+            prompt_arg.contains("auth-project"),
+            "prompt arg should contain workspace name: {prompt_arg}"
+        );
+    }
+
+    // --- Additional build_evaluate_prompt tests ---
+
+    #[test]
+    fn build_evaluate_prompt_contains_belt_queue_hitl() {
+        let evaluator = Evaluator::new("ws");
+        let prompt = evaluator.build_evaluate_prompt();
+        assert!(
+            prompt.contains("belt queue hitl"),
+            "evaluate prompt should mention belt queue hitl"
+        );
+    }
+
+    // --- Builder defaults verification ---
+
+    #[test]
+    fn evaluator_new_sets_all_defaults() {
+        let evaluator = Evaluator::new("default-ws");
+        assert_eq!(evaluator.workspace_name, "default-ws");
+        assert!(evaluator.eval_failure_counts.is_empty());
+        assert_eq!(evaluator.max_eval_failures, DEFAULT_MAX_EVAL_FAILURES);
+        assert!(evaluator.workspace_config_path.is_none());
+        assert_eq!(
+            evaluator.evaluate_timeout,
+            Duration::from_secs(DEFAULT_EVALUATE_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn with_evaluate_timeout_zero_duration() {
+        let evaluator = Evaluator::new("ws").with_evaluate_timeout(Duration::ZERO);
+        assert_eq!(evaluator.evaluate_timeout, Duration::ZERO);
+    }
+
+    #[test]
+    fn with_evaluate_timeout_large_duration() {
+        let evaluator = Evaluator::new("ws").with_evaluate_timeout(Duration::from_secs(3600));
+        assert_eq!(evaluator.evaluate_timeout.as_secs(), 3600);
+    }
+
+    #[test]
+    fn with_workspace_config_path_empty_path() {
+        let evaluator = Evaluator::new("ws").with_workspace_config_path(PathBuf::from(""));
+        assert_eq!(
+            evaluator.workspace_config_path,
+            Some(PathBuf::from("")),
+            "empty path should be stored as-is"
+        );
+    }
 }
