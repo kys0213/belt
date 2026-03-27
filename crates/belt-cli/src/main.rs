@@ -3150,7 +3150,13 @@ async fn main() -> anyhow::Result<()> {
                 } else {
                     claw::ClawWorkspace::init(&belt_home)?
                 };
-                tracing::info!(path = %ws.path.display(), "claw workspace initialized");
+                let rules_dir = ws.path.join(".claude/rules");
+                tracing::info!(
+                    path = %ws.path.display(),
+                    rules_dir = %rules_dir.display(),
+                    rules_exist = rules_dir.is_dir(),
+                    "claw workspace initialized with global rules directory"
+                );
             }
             ClawCommands::Rules => {
                 let belt_home = dirs::home_dir()
