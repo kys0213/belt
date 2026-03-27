@@ -9,7 +9,9 @@
 //! static templates.
 
 use std::fs;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 use belt_core::runtime::{AgentRuntime, RuntimeRequest};
@@ -37,7 +39,24 @@ pub struct BootstrapResult {
     pub skipped: Vec<PathBuf>,
     /// Whether LLM-based generation was used.
     pub llm_generated: bool,
+    /// URL of the created pull request, if any.
+    pub pr_url: Option<String>,
 }
+
+/// Outcome of the interactive review step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDecision {
+    /// User approved the generated content.
+    Approved,
+    /// User rejected the generated content.
+    Rejected,
+}
+
+/// Callback type for interactive review confirmation.
+///
+/// Receives the list of generated `(filename, content)` pairs and returns
+/// whether the user approved or rejected the generated conventions.
+pub type ConfirmFn = Box<dyn Fn(&[(String, String)]) -> ReviewDecision>;
 
 /// Run the bootstrap process for the given workspace root directory.
 ///
@@ -81,6 +100,7 @@ pub fn run_in_dir(rules_dir: &Path, force: bool) -> anyhow::Result<BootstrapResu
         written,
         skipped,
         llm_generated: false,
+        pr_url: None,
     })
 }
 
@@ -93,73 +113,26 @@ pub fn run_in_dir(rules_dir: &Path, force: bool) -> anyhow::Result<BootstrapResu
 ///
 /// If the LLM invocation fails (non-zero exit code or empty output), the
 /// function falls back to the static template approach.
+///
+/// This is a non-interactive variant that auto-approves all generated content.
+/// For interactive review, use [`run_with_llm_interactive`].
+#[cfg(test)]
 pub async fn run_with_llm(
     workspace_root: &Path,
     force: bool,
     runtime: Arc<dyn AgentRuntime>,
     project_info: &ProjectInfo,
 ) -> anyhow::Result<BootstrapResult> {
-    let rules_dir = workspace_root.join(".claude/rules");
-    run_in_dir_with_llm(&rules_dir, force, runtime, project_info, workspace_root).await
-}
-
-/// Run the LLM-based bootstrap writing rule files directly into `rules_dir`.
-///
-/// The directory is created if it does not exist. Existing files are preserved
-/// unless `force` is `true`.
-async fn run_in_dir_with_llm(
-    rules_dir: &Path,
-    force: bool,
-    runtime: Arc<dyn AgentRuntime>,
-    project_info: &ProjectInfo,
-    working_dir: &Path,
-) -> anyhow::Result<BootstrapResult> {
-    fs::create_dir_all(rules_dir)?;
-
-    let prompt = build_llm_prompt(project_info);
-    let system_prompt = build_system_prompt();
-
-    let request = RuntimeRequest {
-        working_dir: working_dir.to_path_buf(),
-        prompt,
-        model: None,
-        system_prompt: Some(system_prompt),
-        session_id: None,
-        structured_output: None,
-    };
-
-    let response = runtime.invoke(request).await;
-
-    if !response.success() || response.stdout.trim().is_empty() {
-        tracing::warn!(
-            exit_code = response.exit_code,
-            "LLM invocation failed, falling back to static templates"
-        );
-        return run_in_dir(rules_dir, force);
-    }
-
-    let generated = parse_llm_response(&response.stdout);
-
-    let mut written = Vec::new();
-    let mut skipped = Vec::new();
-
-    for (filename, contents) in &generated {
-        let path = rules_dir.join(filename);
-        if force || !path.exists() {
-            fs::write(&path, contents)?;
-            written.push(path);
-        } else {
-            tracing::info!(path = %path.display(), "file already exists, skipping");
-            skipped.push(path);
-        }
-    }
-
-    Ok(BootstrapResult {
-        rules_dir: rules_dir.to_path_buf(),
-        written,
-        skipped,
-        llm_generated: true,
-    })
+    let auto_approve: ConfirmFn = Box::new(|_files: &[(String, String)]| ReviewDecision::Approved);
+    run_with_llm_interactive(
+        workspace_root,
+        force,
+        runtime,
+        project_info,
+        false,
+        Some(auto_approve),
+    )
+    .await
 }
 
 /// Build the user prompt for convention generation.
@@ -398,6 +371,203 @@ pub fn default_testing_md() -> &'static str {
 - All tests must pass before committing
 - CI runs the full test suite on every PR
 "#
+}
+
+/// Run the LLM-based bootstrap with interactive review and optional PR creation.
+///
+/// This function generates convention files via LLM, displays a preview to the
+/// user, and asks for confirmation. If approved, the files are written and
+/// optionally a pull request is created via `gh` CLI.
+///
+/// The `confirm_fn` parameter allows injecting a custom confirmation function
+/// for testing. Pass `None` to use the default stdin-based confirmation.
+pub async fn run_with_llm_interactive(
+    workspace_root: &Path,
+    force: bool,
+    runtime: Arc<dyn AgentRuntime>,
+    project_info: &ProjectInfo,
+    create_pr: bool,
+    confirm_fn: Option<ConfirmFn>,
+) -> anyhow::Result<BootstrapResult> {
+    let rules_dir = workspace_root.join(".claude/rules");
+    fs::create_dir_all(&rules_dir)?;
+
+    let prompt = build_llm_prompt(project_info);
+    let system_prompt = build_system_prompt();
+
+    let request = RuntimeRequest {
+        working_dir: workspace_root.to_path_buf(),
+        prompt,
+        model: None,
+        system_prompt: Some(system_prompt),
+        session_id: None,
+        structured_output: None,
+    };
+
+    let response = runtime.invoke(request).await;
+
+    if !response.success() || response.stdout.trim().is_empty() {
+        tracing::warn!(
+            exit_code = response.exit_code,
+            "LLM invocation failed, falling back to static templates"
+        );
+        return run_in_dir(&rules_dir, force);
+    }
+
+    let generated = parse_llm_response(&response.stdout);
+
+    // Interactive review: show preview and ask for confirmation.
+    let decision = match confirm_fn {
+        Some(f) => f(&generated),
+        None => prompt_user_review(&generated),
+    };
+
+    if decision == ReviewDecision::Rejected {
+        tracing::info!("user rejected LLM-generated conventions");
+        return Ok(BootstrapResult {
+            rules_dir,
+            written: Vec::new(),
+            skipped: Vec::new(),
+            llm_generated: true,
+            pr_url: None,
+        });
+    }
+
+    // Write approved files.
+    let mut written = Vec::new();
+    let mut skipped = Vec::new();
+
+    for (filename, contents) in &generated {
+        let path = rules_dir.join(filename);
+        if force || !path.exists() {
+            fs::write(&path, contents)?;
+            written.push(path);
+        } else {
+            tracing::info!(path = %path.display(), "file already exists, skipping");
+            skipped.push(path);
+        }
+    }
+
+    // Optionally create a PR.
+    let pr_url = if create_pr && !written.is_empty() {
+        match create_bootstrap_pr(workspace_root) {
+            Ok(url) => {
+                tracing::info!(pr_url = %url, "pull request created");
+                Some(url)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to create pull request");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    Ok(BootstrapResult {
+        rules_dir,
+        written,
+        skipped,
+        llm_generated: true,
+        pr_url,
+    })
+}
+
+/// Display generated convention files and prompt the user for approval via stdin.
+fn prompt_user_review(files: &[(String, String)]) -> ReviewDecision {
+    println!("\n--- Generated Convention Files ---\n");
+    for (filename, content) in files {
+        println!("=== {} ===", filename);
+        // Show a truncated preview (first 20 lines) to avoid flooding the terminal.
+        let preview_lines: Vec<&str> = content.lines().take(20).collect();
+        for line in &preview_lines {
+            println!("  {}", line);
+        }
+        let total_lines = content.lines().count();
+        if total_lines > 20 {
+            println!("  ... ({} more lines)", total_lines - 20);
+        }
+        println!();
+    }
+
+    print!("Accept these conventions? [Y/n] ");
+    let _ = io::stdout().flush();
+
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return ReviewDecision::Rejected;
+    }
+
+    let trimmed = input.trim().to_lowercase();
+    if trimmed.is_empty() || trimmed == "y" || trimmed == "yes" {
+        ReviewDecision::Approved
+    } else {
+        ReviewDecision::Rejected
+    }
+}
+
+/// Create a git branch, commit convention files, and open a PR via `gh` CLI.
+///
+/// Returns the PR URL on success.
+fn create_bootstrap_pr(workspace_root: &Path) -> anyhow::Result<String> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let branch_name = format!("bootstrap/{}", timestamp);
+
+    // Create and checkout a new branch.
+    run_git(workspace_root, &["checkout", "-b", &branch_name])?;
+
+    // Stage the convention files.
+    run_git(workspace_root, &["add", ".claude/rules/"])?;
+
+    // Commit.
+    run_git(
+        workspace_root,
+        &[
+            "commit",
+            "-m",
+            "chore(bootstrap): generate conventions\n\nGenerated by `belt bootstrap --llm`.",
+        ],
+    )?;
+
+    // Push the branch.
+    run_git(workspace_root, &["push", "-u", "origin", &branch_name])?;
+
+    // Create PR via gh CLI.
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "create",
+            "--title",
+            "chore: add convention.yaml",
+            "--body",
+            "Generated convention files via `belt bootstrap --llm`.\n\n\
+             This PR adds project-specific convention rules under `.claude/rules/`.",
+        ])
+        .current_dir(workspace_root)
+        .output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh pr create failed: {}", stderr.trim());
+    }
+
+    let pr_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(pr_url)
+}
+
+/// Run a git command in the given directory.
+fn run_git(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
+    let output = Command::new("git").args(args).current_dir(dir).output()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("git {} failed: {}", args.join(" "), stderr.trim());
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -820,5 +990,185 @@ mod tests {
         assert!(calls[0].contains("Rust"));
         assert!(calls[0].contains("tokio"));
         assert!(calls[0].contains("CI automation"));
+    }
+
+    // ── Interactive bootstrap tests ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn interactive_bootstrap_approved_writes_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let llm_response = "\
+--- FILE: project.md ---
+# Interactive Project Rules
+- Approved by user
+
+--- FILE: coding.md ---
+# Interactive Coding Guide
+
+--- FILE: commit.md ---
+# Interactive Commit Rules
+
+--- FILE: testing.md ---
+# Interactive Testing Rules";
+
+        let runtime = Arc::new(StubRuntime::with_stdout(llm_response));
+        let info = ProjectInfo {
+            name: "interactive-test".to_string(),
+            language: "Rust".to_string(),
+            framework: "tokio".to_string(),
+            description: "test".to_string(),
+        };
+
+        let confirm = Box::new(|_files: &[(String, String)]| ReviewDecision::Approved);
+
+        let result = run_with_llm_interactive(
+            tmp.path(),
+            false,
+            runtime,
+            &info,
+            false, // no PR creation in test
+            Some(confirm),
+        )
+        .await
+        .unwrap();
+
+        assert!(result.llm_generated);
+        assert_eq!(result.written.len(), 4);
+        assert!(result.pr_url.is_none());
+
+        let content = fs::read_to_string(tmp.path().join(".claude/rules/project.md")).unwrap();
+        assert!(content.contains("Interactive Project Rules"));
+    }
+
+    #[tokio::test]
+    async fn interactive_bootstrap_rejected_writes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let llm_response = "\
+--- FILE: project.md ---
+# Should not be written
+
+--- FILE: coding.md ---
+# Should not be written
+
+--- FILE: commit.md ---
+# Should not be written
+
+--- FILE: testing.md ---
+# Should not be written";
+
+        let runtime = Arc::new(StubRuntime::with_stdout(llm_response));
+        let info = ProjectInfo {
+            name: "reject-test".to_string(),
+            language: "Rust".to_string(),
+            framework: "tokio".to_string(),
+            description: "test".to_string(),
+        };
+
+        let confirm = Box::new(|_files: &[(String, String)]| ReviewDecision::Rejected);
+
+        let result =
+            run_with_llm_interactive(tmp.path(), false, runtime, &info, false, Some(confirm))
+                .await
+                .unwrap();
+
+        assert!(result.llm_generated);
+        assert!(result.written.is_empty());
+        assert!(result.skipped.is_empty());
+        assert!(result.pr_url.is_none());
+
+        // No files should have been created.
+        let rules_dir = tmp.path().join(".claude/rules");
+        assert!(
+            !rules_dir.join("project.md").exists(),
+            "project.md should not exist after rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_bootstrap_falls_back_on_llm_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(StubRuntime::failing());
+        let info = ProjectInfo {
+            name: "fallback-test".to_string(),
+            language: "Go".to_string(),
+            framework: "gin".to_string(),
+            description: "test".to_string(),
+        };
+
+        // confirm_fn should NOT be called when LLM fails (falls back directly).
+        let confirm = Box::new(|_files: &[(String, String)]| {
+            panic!("confirm_fn should not be called on LLM failure");
+        });
+
+        let result =
+            run_with_llm_interactive(tmp.path(), false, runtime, &info, false, Some(confirm))
+                .await
+                .unwrap();
+
+        // Should fall back to static templates without interactive review.
+        assert!(!result.llm_generated);
+        assert_eq!(result.written.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn interactive_bootstrap_confirm_receives_generated_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let llm_response = "\
+--- FILE: project.md ---
+# Verify Content
+
+--- FILE: coding.md ---
+# Coding Content
+
+--- FILE: commit.md ---
+# Commit Content
+
+--- FILE: testing.md ---
+# Testing Content";
+
+        let runtime = Arc::new(StubRuntime::with_stdout(llm_response));
+        let info = ProjectInfo {
+            name: "verify-content".to_string(),
+            language: "Rust".to_string(),
+            framework: "axum".to_string(),
+            description: "test".to_string(),
+        };
+
+        let confirm = Box::new(|files: &[(String, String)]| {
+            assert_eq!(files.len(), 4);
+            assert_eq!(files[0].0, "project.md");
+            assert!(files[0].1.contains("Verify Content"));
+            ReviewDecision::Approved
+        });
+
+        let result =
+            run_with_llm_interactive(tmp.path(), false, runtime, &info, false, Some(confirm))
+                .await
+                .unwrap();
+
+        assert!(result.llm_generated);
+        assert_eq!(result.written.len(), 4);
+    }
+
+    #[test]
+    fn review_decision_equality() {
+        assert_eq!(ReviewDecision::Approved, ReviewDecision::Approved);
+        assert_eq!(ReviewDecision::Rejected, ReviewDecision::Rejected);
+        assert_ne!(ReviewDecision::Approved, ReviewDecision::Rejected);
+    }
+
+    #[test]
+    fn bootstrap_result_has_pr_url_field() {
+        let result = BootstrapResult {
+            rules_dir: PathBuf::from("/tmp/test"),
+            written: Vec::new(),
+            skipped: Vec::new(),
+            llm_generated: false,
+            pr_url: Some("https://github.com/test/pr/1".to_string()),
+        };
+        assert_eq!(
+            result.pr_url.as_deref(),
+            Some("https://github.com/test/pr/1")
+        );
     }
 }
