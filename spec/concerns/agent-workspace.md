@@ -137,7 +137,7 @@ Step 3: 자연어 대화
     └── prioritize/
 ```
 
-Per-workspace 오버라이드: `~/.belt/workspaces/<name>/agent/`
+Per-workspace 오버라이드: `~/.belt/workspaces/<name>/agent/system/`
 
 ---
 
@@ -163,7 +163,7 @@ v4 (15개) → v5 (3개):
 ## 실행 흐름
 
 ```
-1. --workspace 있으면 workspace.yaml 로드, 없으면 글로벌 agent-workspace 사용
+1. --workspace 옵션에 따라 workspace 결정 (위 "--workspace 옵션 동작" 테이블 참조)
 2. RuntimeRegistry 구성 (workspace yaml의 runtime 설정 기반, 없으면 기본 ClaudeRuntime)
 3. Rules 로딩 (아래 우선순위)
 4. System prompt = built-in agent rules + workspace rules
