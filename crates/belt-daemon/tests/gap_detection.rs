@@ -277,8 +277,27 @@ fn terminal_items_do_not_block_gap_detection() {
         report.gaps[0].coverage_score,
     );
     assert!(
+        (report.gaps[0].coverage_score - 0.0).abs() < f64::EPSILON,
+        "coverage score should be 0.0 because no spec keywords \
+         (authorization, middleware, secure, endpoints) appear in the workspace code, \
+         got: {:.2}",
+        report.gaps[0].coverage_score,
+    );
+    assert!(
         !report.gaps[0].missing_items.is_empty(),
         "missing_items should list uncovered keywords from the spec"
+    );
+    // Verify the missing items reference the actual spec keywords that are absent.
+    let joined = report.gaps[0].missing_items.join(" ").to_lowercase();
+    assert!(
+        joined.contains("authorization") || joined.contains("middleware"),
+        "missing_items should reference authorization or middleware gaps, got: {:?}",
+        report.gaps[0].missing_items,
+    );
+    assert!(
+        joined.contains("secure") || joined.contains("endpoints"),
+        "missing_items should reference secure or endpoints gaps, got: {:?}",
+        report.gaps[0].missing_items,
     );
     assert!(
         report.covered_spec_ids.is_empty(),
