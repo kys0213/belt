@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.6](https://github.com/kys0213/belt/compare/v0.1.5...v0.1.6) (2026-03-28)
+
+
+### Bug Fixes
+
+* **ci:** pass tag_name from release-please to release build workflow ([#477](https://github.com/kys0213/belt/issues/477)) ([cdffefc](https://github.com/kys0213/belt/commit/cdffefcf65a548115d06494f7a49ebf4c3f87110))
+
 ## [0.1.5](https://github.com/kys0213/belt/compare/v0.1.4...v0.1.5) (2026-03-28)
 
 
