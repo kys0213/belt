@@ -1,7 +1,14 @@
 name: Release Please
 
 on:
+  # Manual: creates/updates Release PR
   workflow_dispatch:
+  # Auto: detects merged Release PR and creates tag + release
+  push:
+    branches:
+      - main
+    paths:
+      - '.release-please-manifest.json'
 
 permissions:
   contents: write
