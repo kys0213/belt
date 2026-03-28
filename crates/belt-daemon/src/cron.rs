@@ -4891,6 +4891,80 @@ mod tests {
         assert!(job.execute(&ctx).is_ok());
     }
 
+    #[test]
+    fn gap_detection_threshold_spec_fully_covered() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        // All 5 spec-threshold keywords are present with implementation logic.
+        std::fs::write(
+            tmp.path().join("security.rs"),
+            concat!(
+                "/// Verify user credentials and issue a session token.\n",
+                "pub fn authentication(credentials: &str) -> Result<String, AuthError> {\n",
+                "    let hash = sha256(credentials);\n",
+                "    match lookup_user(hash) {\n",
+                "        Some(user) => Ok(issue_token(&user)),\n",
+                "        None => Err(AuthError::InvalidCredentials),\n",
+                "    }\n",
+                "}\n\n",
+                "/// Validate input according to schema rules.\n",
+                "pub fn validation(input: &str, schema: &Schema) -> Result<(), ValidationError> {\n",
+                "    schema.validate(input)?;\n",
+                "    check_length(input, schema.max_length)?;\n",
+                "    check_pattern(input, &schema.pattern)?;\n",
+                "    Ok(())\n",
+                "}\n\n",
+                "/// Apply middleware transformations to the request pipeline.\n",
+                "pub fn middleware(req: Request, chain: &[Box<dyn Handler>]) -> Response {\n",
+                "    let mut current = req;\n",
+                "    for handler in chain {\n",
+                "        current = handler.process(current);\n",
+                "    }\n",
+                "    current.into_response()\n",
+                "}\n\n",
+                "/// Check whether the authenticated user has permission for the action.\n",
+                "pub fn authorization(user: &User, action: &str, resource: &str) -> bool {\n",
+                "    let policies = load_policies(user.role());\n",
+                "    policies.iter().any(|p| p.allows(action, resource))\n",
+                "}\n\n",
+                "/// Encrypt plaintext using AES-256-GCM and return the ciphertext.\n",
+                "pub fn encryption(plaintext: &[u8], key: &EncryptionKey) -> Vec<u8> {\n",
+                "    let nonce = generate_nonce();\n",
+                "    let cipher = Aes256Gcm::new(key);\n",
+                "    cipher.encrypt(&nonce, plaintext).expect(\"encryption failed\")\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        // Same spec as the threshold test: 5 keywords.
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-threshold".into(),
+            "ws".into(),
+            "Threshold Test".into(),
+            "authentication validation middleware authorization encryption".into(),
+        );
+        spec.status = belt_core::spec::SpecStatus::Active;
+        db.insert_spec(&spec).unwrap();
+
+        // With threshold 0.8, the 100% coverage (5/5 keywords) should NOT trigger a gap.
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf())
+            .with_coverage_threshold(0.8);
+        let ctx = CronContext { now: Utc::now() };
+        assert!(job.execute(&ctx).is_ok());
+
+        // Verify the spec was considered covered by checking it would transition
+        // to Completing (no gap detected). Since there are no linked issues,
+        // the spec should move to Completing status.
+        let updated = db.get_spec("spec-threshold").unwrap();
+        assert_eq!(
+            updated.status,
+            belt_core::spec::SpecStatus::Completing,
+            "fully covered spec should transition to Completing"
+        );
+    }
+
     // -- LlmCoverageResult deserialization tests --
 
     #[test]
