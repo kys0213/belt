@@ -592,18 +592,52 @@ fn multiple_specs_analyzed_independently() {
         "expected exactly one gap (spec-b), got: {:?}",
         report.gaps,
     );
+    let gap_b = &report.gaps[0];
     assert_eq!(
-        report.gaps[0].spec_id, "spec-b",
+        gap_b.spec_id, "spec-b",
         "the gap should be for spec-b (Auth Gap Multi)",
     );
-    assert!(
-        report.gaps[0].coverage_score < 0.5,
-        "spec-b coverage score {:.2} should be below threshold since no keywords are covered",
-        report.gaps[0].coverage_score,
+    assert_eq!(
+        gap_b.spec_name, "Auth Gap Multi",
+        "gap should carry the correct spec name for spec-b",
     );
     assert!(
-        !report.gaps[0].missing_items.is_empty(),
+        gap_b.coverage_score < 0.5,
+        "spec-b coverage score {:.2} should be below threshold since no keywords are covered",
+        gap_b.coverage_score,
+    );
+    assert!(
+        (gap_b.coverage_score - 0.0).abs() < f64::EPSILON,
+        "spec-b coverage score should be exactly 0.0 because none of the keywords \
+         (authorization, middleware, token, validation) appear in lib.rs, got: {:.2}",
+        gap_b.coverage_score,
+    );
+    assert!(
+        !gap_b.missing_items.is_empty(),
         "spec-b should have missing items listing uncovered keywords",
+    );
+
+    // Verify each individual keyword from spec-b is reported as missing.
+    let joined_b = gap_b.missing_items.join(" ").to_lowercase();
+    assert!(
+        joined_b.contains("authorization"),
+        "missing_items should reference 'authorization', got: {:?}",
+        gap_b.missing_items,
+    );
+    assert!(
+        joined_b.contains("middleware"),
+        "missing_items should reference 'middleware', got: {:?}",
+        gap_b.missing_items,
+    );
+    assert!(
+        joined_b.contains("token"),
+        "missing_items should reference 'token', got: {:?}",
+        gap_b.missing_items,
+    );
+    assert!(
+        joined_b.contains("validation"),
+        "missing_items should reference 'validation', got: {:?}",
+        gap_b.missing_items,
     );
 
     // Spec B should NOT appear in covered_spec_ids.
@@ -668,7 +702,7 @@ fn auth_gap_multi_detected_when_no_auth_code_present() {
     );
 
     let gap = &report.gaps[0];
-    assert_eq!(gap.spec_id, "spec-b", "gap should reference spec-b",);
+    assert_eq!(gap.spec_id, "spec-b", "gap should reference spec-b");
     assert_eq!(
         gap.spec_name, "Auth Gap Multi",
         "gap should carry the correct spec name",
@@ -680,14 +714,48 @@ fn auth_gap_multi_detected_when_no_auth_code_present() {
         gap.coverage_score,
     );
     assert!(
+        (gap.coverage_score - 0.0).abs() < f64::EPSILON,
+        "coverage score should be exactly 0.0 because no spec keywords \
+         (authorization, middleware, token, validation) appear in the workspace, \
+         got: {:.2}",
+        gap.coverage_score,
+    );
+    assert!(
         !gap.missing_items.is_empty(),
         "missing_items should list uncovered keywords",
+    );
+
+    // Verify each spec keyword is reported as missing.
+    let joined = gap.missing_items.join(" ").to_lowercase();
+    assert!(
+        joined.contains("authorization"),
+        "missing_items should reference 'authorization', got: {:?}",
+        gap.missing_items,
+    );
+    assert!(
+        joined.contains("middleware"),
+        "missing_items should reference 'middleware', got: {:?}",
+        gap.missing_items,
+    );
+    assert!(
+        joined.contains("token"),
+        "missing_items should reference 'token', got: {:?}",
+        gap.missing_items,
+    );
+    assert!(
+        joined.contains("validation"),
+        "missing_items should reference 'validation', got: {:?}",
+        gap.missing_items,
     );
 
     // Spec-b must NOT appear in covered_spec_ids.
     assert!(
         !report.covered_spec_ids.contains(&"spec-b".to_string()),
         "spec-b should not be covered when no auth code is in the workspace",
+    );
+    assert!(
+        report.covered_spec_ids.is_empty(),
+        "no spec should be marked as covered when all keywords are absent from the workspace",
     );
 
     // Full execute() path should also succeed.
