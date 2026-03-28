@@ -1,11 +1,8 @@
 name: Release
 
 on:
-  push:
-    tags:
-      - "v*"
-  release:
-    types: [published]
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -96,4 +93,5 @@ jobs:
       - name: Upload assets to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ github.event.inputs.version || '' }}
           files: artifacts/*
