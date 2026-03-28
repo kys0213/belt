@@ -967,9 +967,33 @@ fn threshold_one_requires_full_coverage() {
         "coverage score {:.2} should be below 1.0 because only partial keywords are covered",
         gap.coverage_score,
     );
+    // "authorization" is covered (1 of 4 keywords), so coverage should be ~0.25, not 0.0.
+    assert!(
+        gap.coverage_score > 0.0,
+        "coverage score should be above 0.0 because 'authorization' keyword IS present \
+         in the workspace code, got: {:.2}",
+        gap.coverage_score,
+    );
+    assert!(
+        gap.coverage_score < 0.5,
+        "coverage score {:.2} should be below 0.5 because only 1 of 4 keywords is covered",
+        gap.coverage_score,
+    );
     assert!(
         !gap.missing_items.is_empty(),
         "missing_items should list uncovered keywords (middleware, token, session)"
+    );
+    // Verify the missing items reference the specific uncovered keywords.
+    let joined = gap.missing_items.join(" ").to_lowercase();
+    assert!(
+        joined.contains("middleware") || joined.contains("token"),
+        "missing_items should reference 'middleware' or 'token' (uncovered keywords), got: {:?}",
+        gap.missing_items,
+    );
+    assert!(
+        joined.contains("session"),
+        "missing_items should reference 'session' (uncovered keyword), got: {:?}",
+        gap.missing_items,
     );
     assert!(
         !report.covered_spec_ids.contains(&"spec-full".to_string()),
