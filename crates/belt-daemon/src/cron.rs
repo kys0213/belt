@@ -3477,10 +3477,88 @@ mod tests {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let tmp = tempfile::tempdir().unwrap();
 
-        // Code covers all spec keywords.
+        // Code covers all spec keywords with actual implementation logic
+        // (not stubs) so both keyword-based and LLM-based analysis consider
+        // the requirements fulfilled.
         std::fs::write(
             tmp.path().join("lib.rs"),
-            "fn authentication() {}\nfn validation() {}\nfn middleware() {}",
+            r#"
+use std::collections::HashMap;
+
+/// Authenticate incoming requests by verifying bearer tokens.
+fn authentication(token: &str, secret: &[u8]) -> Result<Claims, AuthError> {
+    if token.is_empty() {
+        return Err(AuthError::MissingToken);
+    }
+    let parts: Vec<&str> = token.splitn(2, '.').collect();
+    if parts.len() != 2 {
+        return Err(AuthError::MalformedToken);
+    }
+    let payload = parts[0];
+    let signature = parts[1];
+    let expected_sig = hmac_sha256(secret, payload.as_bytes());
+    if signature != expected_sig {
+        return Err(AuthError::InvalidSignature);
+    }
+    let claims: Claims = serde_json::from_str(payload)?;
+    if claims.exp < current_timestamp() {
+        return Err(AuthError::TokenExpired);
+    }
+    Ok(claims)
+}
+
+/// Validate request input against defined schema rules.
+fn validation(input: &HashMap<String, String>, rules: &[ValidationRule]) -> Result<(), Vec<ValidationError>> {
+    let mut errors = Vec::new();
+    for rule in rules {
+        match input.get(&rule.field) {
+            None if rule.required => {
+                errors.push(ValidationError { field: rule.field.clone(), message: "field is required".into() });
+            }
+            Some(value) => {
+                if let Some(max_len) = rule.max_length {
+                    if value.len() > max_len {
+                        errors.push(ValidationError { field: rule.field.clone(), message: format!("exceeds max length {}", max_len) });
+                    }
+                }
+                if let Some(ref pattern) = rule.pattern {
+                    if !regex_matches(pattern, value) {
+                        errors.push(ValidationError { field: rule.field.clone(), message: "does not match pattern".into() });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+/// Middleware pipeline that chains authentication and validation before
+/// passing the request to the inner handler.
+fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Response {
+    // Step 1: Extract and verify authentication credentials.
+    let token = match request.headers.get("Authorization") {
+        Some(header) => header.strip_prefix("Bearer ").unwrap_or(""),
+        None => return Response::unauthorized("missing authorization header"),
+    };
+    let claims = match authentication(token, secret) {
+        Ok(c) => c,
+        Err(e) => return Response::unauthorized(&format!("authentication failed: {}", e)),
+    };
+
+    // Step 2: Validate the request body against schema rules.
+    if let Err(errors) = validation(&request.body, rules) {
+        let msg = errors.iter().map(|e| format!("{}: {}", e.field, e.message)).collect::<Vec<_>>().join("; ");
+        return Response::bad_request(&msg);
+    }
+
+    // Step 3: Attach authenticated claims to context and invoke handler.
+    let mut ctx = request.context;
+    ctx.insert("user_id".into(), claims.sub.clone());
+    ctx.insert("role".into(), claims.role.clone());
+    handle_request(ctx, request.body)
+}
+"#,
         )
         .unwrap();
 
