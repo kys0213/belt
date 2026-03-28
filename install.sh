@@ -17,7 +17,7 @@ _tmpdir=""
 # --- Helpers ---
 
 say() {
-    printf 'belt-installer: %s\n' "$*"
+    printf 'belt-installer: %s\n' "$*" >&2
 }
 
 err() {
