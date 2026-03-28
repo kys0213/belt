@@ -6,13 +6,7 @@
   "include-component-in-tag": false,
   "packages": {
     ".": {
-      "component": "belt",
-      "extra-files": [
-        "crates/belt-core/Cargo.toml",
-        "crates/belt-infra/Cargo.toml",
-        "crates/belt-daemon/Cargo.toml",
-        "crates/belt-cli/Cargo.toml"
-      ]
+      "component": "belt"
     }
   }
 }
