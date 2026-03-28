@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/kys0213/belt/compare/v0.1.4...v0.1.5) (2026-03-28)
+
+
+### Bug Fixes
+
+* **ci:** chain release build from release-please via workflow_call ([#475](https://github.com/kys0213/belt/issues/475)) ([91a9181](https://github.com/kys0213/belt/commit/91a9181e964b240f6a2e1b1ba305e12f14ab599c))
+
 ## [0.1.4](https://github.com/kys0213/belt/compare/v0.1.3...v0.1.4) (2026-03-28)
 
 
