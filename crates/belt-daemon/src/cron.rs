@@ -5728,19 +5728,82 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         let db = Arc::new(Database::open_in_memory().unwrap());
         let tmp = tempfile::tempdir().unwrap();
 
-        // Code covers ALL spec keywords for authorization middleware.
+        // Code covers ALL spec keywords for the full authorization middleware,
+        // including token validation, error handling, role-based access control,
+        // configurable endpoint protection, and router integration.
         std::fs::write(
             tmp.path().join("full_auth.rs"),
             concat!(
                 "/// Implement authorization middleware for secure endpoints.\n",
-                "fn authorization_middleware() -> Middleware {\n",
-                "    Middleware::new(|req| {\n",
-                "        check_authorization(req)\n",
+                "///\n",
+                "/// This middleware performs token validation, role-based access\n",
+                "/// control, and returns proper error responses (401/403) for\n",
+                "/// unauthorized or forbidden requests.\n",
+                "\n",
+                "/// Parse and validate a JWT authentication token from the request\n",
+                "/// header, including signature and expiry checks.\n",
+                "fn validate_token(header: &str) -> Result<Claims, AuthError> {\n",
+                "    let token = header.strip_prefix(\"Bearer \").ok_or(\n",
+                "        AuthError::InvalidToken\n",
+                "    )?;\n",
+                "    let claims = decode_jwt(token)?;\n",
+                "    if claims.expired() {\n",
+                "        return Err(AuthError::TokenExpired);\n",
+                "    }\n",
+                "    Ok(claims)\n",
+                "}\n",
+                "\n",
+                "/// Check role-based permission for the requested endpoint.\n",
+                "fn check_permission(claims: &Claims, endpoint: &str) -> bool {\n",
+                "    let required_role = endpoint_roles(endpoint);\n",
+                "    claims.roles.iter().any(|r| r == &required_role)\n",
+                "}\n",
+                "\n",
+                "/// Authorization middleware with error handling that validates\n",
+                "/// credentials and enforces role-based access control on\n",
+                "/// configurable secure endpoints.\n",
+                "fn authorization_middleware(router: &mut Router) -> Middleware {\n",
+                "    Middleware::new(move |req| {\n",
+                "        let header = req.header(\"Authorization\");\n",
+                "        let claims = match validate_token(header) {\n",
+                "            Ok(c) => c,\n",
+                "            Err(AuthError::InvalidToken) => {\n",
+                "                return Response::unauthorized(401, \"invalid token\");\n",
+                "            }\n",
+                "            Err(AuthError::TokenExpired) => {\n",
+                "                return Response::unauthorized(401, \"token expired\");\n",
+                "            }\n",
+                "            Err(_) => {\n",
+                "                return Response::error(500, \"verification failed\");\n",
+                "            }\n",
+                "        };\n",
+                "        if !check_permission(&claims, req.path()) {\n",
+                "            return Response::forbidden(403, \"insufficient role\");\n",
+                "        }\n",
+                "        req.set_context(claims);\n",
+                "        next(req)\n",
                 "    })\n",
                 "}\n",
                 "\n",
-                "fn secure_endpoints() -> Vec<Endpoint> {\n",
-                "    vec![Endpoint::new(\"/api/admin\")]\n",
+                "/// Return configurable secure endpoints with dynamic path protection.\n",
+                "fn secure_endpoints(config: &Config) -> Vec<Endpoint> {\n",
+                "    config.protected_paths.iter().map(|p| {\n",
+                "        Endpoint::new(p).with_roles(endpoint_roles(p))\n",
+                "    }).collect()\n",
+                "}\n",
+                "\n",
+                "/// Token parsing helper for extracting bearer credentials.\n",
+                "fn parse_bearer_token(raw: &str) -> Option<&str> {\n",
+                "    raw.strip_prefix(\"Bearer \")\n",
+                "}\n",
+                "\n",
+                "/// Wire the authorization middleware into the application router\n",
+                "/// pipeline, wired before all route handlers.\n",
+                "fn register_middleware(router: &mut Router, config: &Config) {\n",
+                "    let mw = authorization_middleware(router);\n",
+                "    for ep in secure_endpoints(config) {\n",
+                "        router.use_middleware(ep.path(), mw.clone());\n",
+                "    }\n",
                 "}\n",
             ),
         )
@@ -5750,13 +5813,22 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "spec-full-auth-mw".into(),
             "ws".into(),
             "Full Auth Middleware".into(),
-            "implement authorization middleware for secure endpoints".into(),
+            concat!(
+                "implement authorization middleware for secure endpoints ",
+                "with token validation and credential verification ",
+                "error handling for unauthorized requests with 401 403 responses ",
+                "middleware wired into router application pipeline ",
+                "configurable endpoint protection with dynamic paths ",
+                "role-based permission access control ",
+                "authentication token parsing including JWT verification",
+            )
+            .to_string(),
         );
         spec.status = belt_core::spec::SpecStatus::Active;
         db.insert_spec(&spec).unwrap();
 
-        // All keywords (implement, authorization, middleware, secure, endpoints)
-        // are present in the code — no gap should be detected.
+        // All keywords from the expanded spec content are present in the code
+        // corpus — no gap should be detected.
         let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
         let ctx = CronContext { now: Utc::now() };
         assert!(job.execute(&ctx).is_ok());
