@@ -550,6 +550,84 @@ fn multiple_specs_analyzed_independently() {
 }
 
 // ---------------------------------------------------------------------------
+// Auth Gap Multi: standalone spec-b gap detection
+// ---------------------------------------------------------------------------
+
+/// Dedicated test for the "Auth Gap Multi" (spec-b) gap detection scenario.
+///
+/// When the workspace contains no authorization, middleware, token, or
+/// validation code, gap analysis must report spec-b as a gap with a
+/// coverage score below the default threshold and all four keywords
+/// listed as missing.  This mirrors the gap-detection cron report for
+/// spec-b (coverage 0.00, threshold 0.50).
+#[test]
+fn auth_gap_multi_detected_when_no_auth_code_present() {
+    let db = test_db();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Workspace contains only unrelated code -- no authorization,
+    // middleware, token, or validation keywords.
+    std::fs::write(
+        tmp.path().join("main.rs"),
+        concat!(
+            "/// Application entry point.\n",
+            "fn main() {\n",
+            "    println!(\"hello world\");\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let spec = make_active_spec(
+        "spec-b",
+        "Auth Gap Multi",
+        "authorization middleware token validation",
+    );
+    db.insert_spec(&spec).unwrap();
+
+    let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+    let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+    // Exactly one gap expected for spec-b.
+    assert_eq!(
+        report.gaps.len(),
+        1,
+        "expected exactly one gap for spec-b (Auth Gap Multi), got: {:?}",
+        report.gaps,
+    );
+
+    let gap = &report.gaps[0];
+    assert_eq!(gap.spec_id, "spec-b", "gap should reference spec-b",);
+    assert_eq!(
+        gap.spec_name, "Auth Gap Multi",
+        "gap should carry the correct spec name",
+    );
+    assert!(
+        gap.coverage_score < 0.5,
+        "coverage score {:.2} should be below the 0.50 default threshold \
+         because no auth code is present",
+        gap.coverage_score,
+    );
+    assert!(
+        !gap.missing_items.is_empty(),
+        "missing_items should list uncovered keywords",
+    );
+
+    // Spec-b must NOT appear in covered_spec_ids.
+    assert!(
+        !report.covered_spec_ids.contains(&"spec-b".to_string()),
+        "spec-b should not be covered when no auth code is in the workspace",
+    );
+
+    // Full execute() path should also succeed.
+    let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+    assert!(
+        job.execute(&ctx()).is_ok(),
+        "gap detection execute should succeed for Auth Gap Multi",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Spec with no extractable keywords
 // ---------------------------------------------------------------------------
 
