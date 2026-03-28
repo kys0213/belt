@@ -1068,6 +1068,91 @@ impl GapDetectionJob {
         self.coverage_threshold = threshold.clamp(0.0, 1.0);
         self
     }
+
+    /// Analyse active specs against the workspace code and return a report
+    /// of detected gaps and covered specs.
+    ///
+    /// This is a **pure analysis** method — it does not create GitHub issues,
+    /// transition spec statuses, or perform any other side effects.  Use it
+    /// in tests or when you need programmatic access to gap results.
+    pub fn analyze_gaps(&self) -> Result<GapAnalysisReport, BeltError> {
+        let active_specs = self
+            .db
+            .list_specs(None, Some(belt_core::spec::SpecStatus::Active))?;
+
+        if active_specs.is_empty() {
+            return Ok(GapAnalysisReport {
+                gaps: Vec::new(),
+                covered_spec_ids: Vec::new(),
+            });
+        }
+
+        let corpus = collect_code_corpus(&self.workspace_root);
+
+        if corpus.is_empty() {
+            return Ok(GapAnalysisReport {
+                gaps: Vec::new(),
+                covered_spec_ids: Vec::new(),
+            });
+        }
+
+        let mut gaps: Vec<DetectedGap> = Vec::new();
+        let mut covered_spec_ids: Vec<String> = Vec::new();
+
+        for spec in &active_specs {
+            // Try LLM-based analysis first.
+            if let Some(llm_result) = llm_analyze_coverage(&spec.content, &corpus) {
+                if llm_result.score < self.coverage_threshold && !llm_result.missing.is_empty() {
+                    gaps.push(DetectedGap {
+                        spec_id: spec.id.clone(),
+                        spec_name: spec.name.clone(),
+                        missing_items: llm_result.missing,
+                        coverage_score: llm_result.score,
+                        used_llm: true,
+                    });
+                } else {
+                    covered_spec_ids.push(spec.id.clone());
+                }
+                continue;
+            }
+
+            // Fallback: keyword-based analysis.
+            let keywords = extract_keywords(&spec.content);
+            if keywords.is_empty() {
+                covered_spec_ids.push(spec.id.clone());
+                continue;
+            }
+
+            let missing: Vec<String> = keywords
+                .iter()
+                .filter(|kw| !corpus.contains(kw.as_str()))
+                .cloned()
+                .collect();
+
+            let matched_ratio = if keywords.is_empty() {
+                1.0
+            } else {
+                1.0 - (missing.len() as f64 / keywords.len() as f64)
+            };
+
+            if matched_ratio < self.coverage_threshold && !missing.is_empty() {
+                gaps.push(DetectedGap {
+                    spec_id: spec.id.clone(),
+                    spec_name: spec.name.clone(),
+                    missing_items: missing,
+                    coverage_score: matched_ratio,
+                    used_llm: false,
+                });
+            } else {
+                covered_spec_ids.push(spec.id.clone());
+            }
+        }
+
+        Ok(GapAnalysisReport {
+            gaps,
+            covered_spec_ids,
+        })
+    }
 }
 
 /// Check whether all linked GitHub issues for a spec are in a closed/done state.
@@ -1347,18 +1432,33 @@ fn llm_analyze_coverage(spec_content: &str, code_summary: &str) -> Option<LlmCov
 }
 
 /// Represents a detected gap between a spec and the codebase.
-#[derive(Debug)]
-struct DetectedGap {
-    spec_id: String,
-    spec_name: String,
+#[derive(Debug, Clone)]
+pub struct DetectedGap {
+    /// ID of the spec that has a coverage gap.
+    pub spec_id: String,
+    /// Human-readable name of the spec.
+    pub spec_name: String,
     /// Description of missing items — either LLM-identified requirements or
     /// keyword-based missing tokens.
-    missing_items: Vec<String>,
+    pub missing_items: Vec<String>,
     /// Coverage score (0.0–1.0). Derived from LLM analysis or keyword ratio.
-    coverage_score: f64,
+    pub coverage_score: f64,
     /// Whether the analysis was performed by LLM (`true`) or keyword
     /// matching (`false`).
-    used_llm: bool,
+    pub used_llm: bool,
+}
+
+/// Report produced by [`GapDetectionJob::analyze_gaps`].
+///
+/// Contains the list of detected gaps and fully-covered spec IDs,
+/// without performing any side effects (no issue creation, no spec
+/// transitions).
+#[derive(Debug, Clone)]
+pub struct GapAnalysisReport {
+    /// Specs whose coverage score fell below the configured threshold.
+    pub gaps: Vec<DetectedGap>,
+    /// Spec IDs that are fully covered (score >= threshold).
+    pub covered_spec_ids: Vec<String>,
 }
 
 /// Check whether an open GitHub issue already exists for a given spec's gap.
@@ -1488,106 +1588,30 @@ impl CronHandler for GapDetectionJob {
     fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
         tracing::info!("GapDetectionJob: scanning active specs for unimplemented gaps");
 
-        // Step 1: Query active specs from the database.
-        let active_specs = self
-            .db
-            .list_specs(None, Some(belt_core::spec::SpecStatus::Active))?;
+        let report = self.analyze_gaps()?;
+        let gaps = &report.gaps;
+        let covered_spec_ids = &report.covered_spec_ids;
 
-        if active_specs.is_empty() {
-            tracing::info!("GapDetectionJob: no active specs found, nothing to check");
+        if gaps.is_empty() && covered_spec_ids.is_empty() {
+            tracing::info!("GapDetectionJob: no active specs or no source files, nothing to do");
             return Ok(());
         }
 
-        tracing::info!(
-            count = active_specs.len(),
-            "GapDetectionJob: found active specs"
-        );
-
-        // Step 2: Collect code corpus from workspace root.
-        let corpus = collect_code_corpus(&self.workspace_root);
-
-        if corpus.is_empty() {
-            tracing::warn!(
-                root = %self.workspace_root.display(),
-                "GapDetectionJob: no source files found in workspace root"
+        for gap in gaps {
+            tracing::info!(
+                spec_id = %gap.spec_id,
+                spec_name = %gap.spec_name,
+                coverage_score = gap.coverage_score,
+                threshold = self.coverage_threshold,
+                missing_count = gap.missing_items.len(),
+                used_llm = gap.used_llm,
+                "GapDetectionJob: gap detected"
             );
-            return Ok(());
-        }
-
-        // Step 3: For each spec, analyse coverage (LLM-first, keyword-fallback).
-        let mut gaps: Vec<DetectedGap> = Vec::new();
-        let mut covered_spec_ids: Vec<String> = Vec::new();
-
-        for spec in &active_specs {
-            // Try LLM-based analysis first.
-            if let Some(llm_result) = llm_analyze_coverage(&spec.content, &corpus) {
-                if llm_result.score < self.coverage_threshold && !llm_result.missing.is_empty() {
-                    tracing::info!(
-                        spec_id = %spec.id,
-                        spec_name = %spec.name,
-                        coverage_score = llm_result.score,
-                        threshold = self.coverage_threshold,
-                        missing_count = llm_result.missing.len(),
-                        "GapDetectionJob: gap detected (LLM analysis)"
-                    );
-                    gaps.push(DetectedGap {
-                        spec_id: spec.id.clone(),
-                        spec_name: spec.name.clone(),
-                        missing_items: llm_result.missing,
-                        coverage_score: llm_result.score,
-                        used_llm: true,
-                    });
-                } else {
-                    covered_spec_ids.push(spec.id.clone());
-                }
-                continue;
-            }
-
-            // Fallback: keyword-based analysis.
-            let keywords = extract_keywords(&spec.content);
-            if keywords.is_empty() {
-                // Specs with no extractable keywords are considered covered.
-                covered_spec_ids.push(spec.id.clone());
-                continue;
-            }
-
-            let missing: Vec<String> = keywords
-                .iter()
-                .filter(|kw| !corpus.contains(kw.as_str()))
-                .cloned()
-                .collect();
-
-            let matched_ratio = if keywords.is_empty() {
-                1.0
-            } else {
-                1.0 - (missing.len() as f64 / keywords.len() as f64)
-            };
-
-            if matched_ratio < self.coverage_threshold && !missing.is_empty() {
-                tracing::info!(
-                    spec_id = %spec.id,
-                    spec_name = %spec.name,
-                    total_keywords = keywords.len(),
-                    missing_count = missing.len(),
-                    coverage_score = matched_ratio,
-                    threshold = self.coverage_threshold,
-                    "GapDetectionJob: gap detected (keyword analysis)"
-                );
-                gaps.push(DetectedGap {
-                    spec_id: spec.id.clone(),
-                    spec_name: spec.name.clone(),
-                    missing_items: missing,
-                    coverage_score: matched_ratio,
-                    used_llm: false,
-                });
-            } else {
-                covered_spec_ids.push(spec.id.clone());
-            }
         }
 
         // Step 4: Create GitHub issues for detected gaps (with dedupe guard).
         let mut skipped_count = 0usize;
-        for gap in &gaps {
+        for gap in gaps {
             // Dedupe guard: skip if an open queue item already targets this spec.
             if self
                 .db
@@ -1686,7 +1710,7 @@ impl CronHandler for GapDetectionJob {
         // then transition Active -> Completing, run test commands, and create
         // HITL items for final confirmation.
         let mut completing_count = 0usize;
-        for spec_id in &covered_spec_ids {
+        for spec_id in covered_spec_ids {
             // Skip if there is already an open queue item for this spec
             // (avoids duplicate HITL items on repeated cron runs).
             if self.db.has_open_items_for_source(spec_id).unwrap_or(false) {
@@ -1812,7 +1836,7 @@ impl CronHandler for GapDetectionJob {
         }
 
         tracing::info!(
-            total_specs = active_specs.len(),
+            total_specs = gaps.len() + covered_spec_ids.len(),
             gaps_found = gaps.len(),
             gaps_skipped_dedupe = skipped_count,
             completing = completing_count,
@@ -5568,15 +5592,15 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         assert!(!cron_field_matches("*/0", 0, 59));
     }
 
-    // ---- spec-no-dup: authorization middleware / secure endpoint tests ----
+    // ---- spec-partial-auth: authorization middleware / secure endpoint tests ----
     //
-    // These tests cover the gap requirements for spec "No Dup Test" (spec-no-dup):
-    //   - authorization middleware detection
-    //   - secure endpoint protection validation
-    //   - authentication/authorization logic verification
-    //
-    // They ensure gap detection correctly identifies when authorization middleware
-    // and secure endpoint protection code is present in the codebase.
+    // These tests verify gap detection behaviour for authentication and
+    // authorization coverage scenarios:
+    //   - no gap when authorization middleware code is present
+    //   - no gap when authentication/authorization logic covers spec keywords
+    //   - gap detected when only authentication exists but authorization/middleware missing
+    //   - gap detected at high threshold when one keyword is missing
+    //   - no gap when all spec keywords are fully covered
 
     #[test]
     fn gap_detection_no_gap_when_authorization_middleware_present() {
@@ -5619,8 +5643,21 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         db.insert_spec(&spec).unwrap();
 
         let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
-        let ctx = CronContext { now: Utc::now() };
-        assert!(job.execute(&ctx).is_ok());
+        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+        // All keywords (implement, authorization, middleware, secure, endpoints)
+        // appear in the code -- no gap should be reported.
+        assert!(
+            report.gaps.is_empty(),
+            "expected no gaps when authorization middleware code is present, got: {:?}",
+            report.gaps,
+        );
+        assert!(
+            report
+                .covered_spec_ids
+                .contains(&"spec-auth-mw".to_string()),
+            "spec-auth-mw should be in covered list",
+        );
     }
 
     #[test]
@@ -5658,8 +5695,20 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         db.insert_spec(&spec).unwrap();
 
         let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
-        let ctx = CronContext { now: Utc::now() };
-        assert!(job.execute(&ctx).is_ok());
+        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+        // Both "authentication" and "authorization" appear in the code.
+        assert!(
+            report.gaps.is_empty(),
+            "expected no gaps when authentication/authorization logic is present, got: {:?}",
+            report.gaps,
+        );
+        assert!(
+            report
+                .covered_spec_ids
+                .contains(&"spec-auth-logic".to_string()),
+            "spec-auth-logic should be in covered list",
+        );
     }
 
     #[test]
@@ -5683,11 +5732,40 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         spec.status = belt_core::spec::SpecStatus::Active;
         db.insert_spec(&spec).unwrap();
 
-        // Gap should be detected because authorization, middleware, secure,
-        // endpoints keywords are missing from code.
         let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
-        let ctx = CronContext { now: Utc::now() };
-        assert!(job.execute(&ctx).is_ok());
+        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+        // Only "authentication" is in the code; authorization, middleware,
+        // secure, endpoints are all missing -- gap must be detected.
+        assert_eq!(
+            report.gaps.len(),
+            1,
+            "expected exactly one gap for spec-partial-auth",
+        );
+        let gap = &report.gaps[0];
+        assert_eq!(gap.spec_id, "spec-partial-auth");
+        assert!(
+            gap.coverage_score < 0.5,
+            "coverage score {:.2} should be below the default threshold 0.5",
+            gap.coverage_score,
+        );
+        // The analysis may use LLM (descriptive phrases) or keyword
+        // fallback (individual words).  Either way, missing items must
+        // mention authorization-related gaps.
+        assert!(
+            !gap.missing_items.is_empty(),
+            "missing_items should not be empty for partial auth coverage",
+        );
+        let joined = gap.missing_items.join(" ").to_lowercase();
+        assert!(
+            joined.contains("authorization") || joined.contains("middleware"),
+            "missing_items should reference authorization or middleware gaps, got: {:?}",
+            gap.missing_items,
+        );
+        assert!(
+            report.covered_spec_ids.is_empty(),
+            "no spec should be covered",
+        );
     }
 
     #[test]
@@ -5754,11 +5832,37 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         spec.status = belt_core::spec::SpecStatus::Active;
         db.insert_spec(&spec).unwrap();
 
-        // With threshold=1.0, missing "endpoints" means gap detected (4/5 = 0.8).
+        // With threshold=1.0, missing "endpoints" means gap detected.
+        // Keyword analysis gives score 0.8 (4/5); LLM may give a different
+        // score but it should still be < 1.0.
         let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf())
             .with_coverage_threshold(1.0);
-        let ctx = CronContext { now: Utc::now() };
-        assert!(job.execute(&ctx).is_ok());
+        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+        assert_eq!(
+            report.gaps.len(),
+            1,
+            "expected one gap when threshold requires 100% coverage",
+        );
+        let gap = &report.gaps[0];
+        assert_eq!(gap.spec_id, "spec-auth-threshold");
+        assert!(
+            gap.coverage_score < 1.0,
+            "coverage score {:.2} should be below 1.0 (full coverage threshold)",
+            gap.coverage_score,
+        );
+        assert!(
+            !gap.missing_items.is_empty(),
+            "missing_items should not be empty when coverage is partial",
+        );
+        // Either keyword fallback reports "endpoints" or LLM reports a
+        // descriptive phrase about missing endpoint-related functionality.
+        let joined = gap.missing_items.join(" ").to_lowercase();
+        assert!(
+            joined.contains("endpoint") || joined.contains("missing"),
+            "missing_items should reference endpoint gaps or missing items, got: {:?}",
+            gap.missing_items,
+        );
     }
 
     #[test]
@@ -5868,7 +5972,18 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         // All keywords from the expanded spec content are present in the code
         // corpus — no gap should be detected.
         let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
-        let ctx = CronContext { now: Utc::now() };
-        assert!(job.execute(&ctx).is_ok());
+        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+        assert!(
+            report.gaps.is_empty(),
+            "expected no gaps when all keywords are covered, got: {:?}",
+            report.gaps,
+        );
+        assert!(
+            report
+                .covered_spec_ids
+                .contains(&"spec-full-auth-mw".to_string()),
+            "spec-full-auth-mw should be in covered list",
+        );
     }
 }
