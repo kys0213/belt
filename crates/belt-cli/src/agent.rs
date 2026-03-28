@@ -1101,9 +1101,8 @@ runtime:
         use crate::claw::ClawWorkspace;
 
         let tmp = tempfile::tempdir().unwrap();
-        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
 
-        // Initialize the global claw workspace under the temp BELT_HOME.
+        // Initialize the global claw workspace under the temp directory.
         let ws = ClawWorkspace::init(tmp.path()).unwrap();
 
         // Verify the global rules directory exists at the expected path.
@@ -1118,10 +1117,10 @@ runtime:
         );
         assert_eq!(ws.path, tmp.path().join("claw-workspace"));
 
-        // resolve_rules_dir should discover the global rules (priority 3)
+        // resolve_rules_dir_with_home should discover the global rules (priority 3)
         // when no explicit or per-workspace rules are configured.
         let config = empty_workspace();
-        let resolved = resolve_rules_dir(&config);
+        let resolved = resolve_rules_dir_with_home(&config, Some(tmp.path()));
         assert_eq!(
             resolved,
             Some(expected_rules),
@@ -1134,14 +1133,14 @@ runtime:
         use crate::claw::ClawWorkspace;
 
         let tmp = tempfile::tempdir().unwrap();
-        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
 
         // Initialize claw workspace (creates default policy files).
         let _ws = ClawWorkspace::init(tmp.path()).unwrap();
 
-        // resolve_rules_dir should find the global rules.
+        // resolve_rules_dir_with_home should find the global rules.
         let config = empty_workspace();
-        let rules_dir = resolve_rules_dir(&config).expect("should resolve global rules dir");
+        let rules_dir = resolve_rules_dir_with_home(&config, Some(tmp.path()))
+            .expect("should resolve global rules dir");
 
         // load_rules_from_dir should load the default policy .md files.
         let rules_content = load_rules_from_dir(&rules_dir)
@@ -1168,7 +1167,6 @@ runtime:
         use crate::claw::ClawWorkspace;
 
         let tmp = tempfile::tempdir().unwrap();
-        let _guard = EnvGuard::set("BELT_HOME", tmp.path().to_str().unwrap());
 
         // Initialize global claw workspace.
         let _ws = ClawWorkspace::init(tmp.path()).unwrap();
@@ -1183,58 +1181,11 @@ runtime:
         std::fs::create_dir_all(&ws_rules).unwrap();
 
         let config = empty_workspace();
-        let resolved = resolve_rules_dir(&config);
+        let resolved = resolve_rules_dir_with_home(&config, Some(tmp.path()));
         assert_eq!(
             resolved,
             Some(ws_rules),
             "per-workspace rules (priority 2) should override global claw init rules (priority 3)"
         );
-    }
-
-    /// Global mutex that serializes tests which mutate environment variables.
-    /// Rust's test harness runs tests in parallel threads by default, so any
-    /// test that calls `std::env::set_var` must hold this lock for the
-    /// duration of the test to avoid races with other env-mutating tests.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII guard for setting environment variables in tests.
-    /// Acquires `ENV_LOCK` for the lifetime of the guard so that concurrent
-    /// tests cannot observe each other's env-var mutations.
-    /// Restores (or removes) the variable on drop.
-    struct EnvGuard {
-        key: String,
-        prev: Option<String>,
-        _lock: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl EnvGuard {
-        fn set(key: &str, value: &str) -> Self {
-            // Acquire the global env lock first to serialize all env mutations.
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var(key).ok();
-            // SAFETY: We hold ENV_LOCK, so no other test is mutating env vars
-            // concurrently.
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self {
-                key: key.to_string(),
-                prev,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            // SAFETY: We still hold ENV_LOCK here (dropped after this fn returns).
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var(&self.key, v),
-                    None => std::env::remove_var(&self.key),
-                }
-            }
-            // _lock is dropped here, releasing ENV_LOCK.
-        }
     }
 }
