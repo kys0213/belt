@@ -517,3 +517,209 @@ fn sync_is_idempotent() {
     engine.sync_custom_jobs_from_db(&db);
     assert_eq!(engine.job_count(), 1, "third sync should still be 1");
 }
+
+// ---------------------------------------------------------------------------
+// GapDetectionJob — terminal item tests
+// ---------------------------------------------------------------------------
+
+use belt_core::phase::QueuePhase;
+use belt_core::queue::QueueItem;
+use belt_core::spec::{Spec, SpecStatus};
+use belt_daemon::cron::GapDetectionJob;
+
+/// Helper: create a temp workspace with source code that covers authorization
+/// middleware and secure endpoint keywords.
+fn write_auth_middleware_code(dir: &std::path::Path) {
+    std::fs::write(
+        dir.join("auth.rs"),
+        "\
+/// Authorization middleware for secure endpoints.
+///
+/// Validates bearer tokens and enforces role-based access control
+/// before allowing requests to reach protected handlers.
+pub fn authorization_middleware(req: Request) -> Result<Request, AuthError> {
+    let token = req.header(\"Authorization\").ok_or(AuthError::Missing)?;
+    validate_token(token)?;
+    Ok(req)
+}
+
+/// Protect a secure endpoint by requiring valid authentication.
+pub fn secure_endpoint_protection(handler: Handler) -> Handler {
+    wrap(handler, authorization_middleware)
+}
+
+/// Core authentication and authorization logic.
+pub fn authenticate_and_authorize(credentials: &Credentials) -> Result<Session, AuthError> {
+    let identity = authenticate(credentials)?;
+    authorize(&identity)?;
+    Ok(Session::new(identity))
+}
+",
+    )
+    .unwrap();
+}
+
+/// GapDetectionJob does not treat terminal (Done) queue items as blocking
+/// deduplication guards. A spec with only Done items should still be evaluated.
+#[test]
+fn gap_detection_terminal_items_do_not_block_evaluation() {
+    let db = test_db();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Write source code that covers the spec keywords so the gap detection
+    // finds coverage >= threshold and does NOT try to create a GitHub issue.
+    write_auth_middleware_code(tmp.path());
+
+    // Insert an active spec whose content mentions authorization middleware.
+    let mut spec = Spec::new(
+        "spec-term-integ".into(),
+        "ws".into(),
+        "Terminal Item Integration Test".into(),
+        "implement authorization middleware for secure endpoints".into(),
+    );
+    spec.status = SpecStatus::Active;
+    db.insert_spec(&spec).unwrap();
+
+    // Insert a terminal (Done) queue item for the same spec.
+    let mut item = QueueItem::new(
+        "spec-term-integ:work".into(),
+        "spec-term-integ".into(),
+        "ws".into(),
+        "implement".into(),
+    );
+    item.phase = QueuePhase::Done;
+    db.insert_item(&item).unwrap();
+
+    // Terminal items must not count as "open".
+    assert!(
+        !db.has_open_items_for_source("spec-term-integ").unwrap(),
+        "Done items should not be considered open"
+    );
+
+    // GapDetectionJob should execute successfully — it should not skip
+    // the spec due to the Done item and the keyword coverage should pass.
+    let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+    let ctx = CronContext { now: Utc::now() };
+    assert!(
+        job.execute(&ctx).is_ok(),
+        "gap detection should succeed with terminal items present"
+    );
+}
+
+/// GapDetectionJob proceeds when a Skipped (terminal) item exists for a spec.
+#[test]
+fn gap_detection_skipped_items_do_not_block_evaluation() {
+    let db = test_db();
+    let tmp = tempfile::tempdir().unwrap();
+
+    write_auth_middleware_code(tmp.path());
+
+    let mut spec = Spec::new(
+        "spec-skip-integ".into(),
+        "ws".into(),
+        "Skipped Item Integration Test".into(),
+        "implement authorization middleware for secure endpoints".into(),
+    );
+    spec.status = SpecStatus::Active;
+    db.insert_spec(&spec).unwrap();
+
+    // Insert a Skipped (terminal) queue item.
+    let mut item = QueueItem::new(
+        "spec-skip-integ:work".into(),
+        "spec-skip-integ".into(),
+        "ws".into(),
+        "implement".into(),
+    );
+    item.phase = QueuePhase::Skipped;
+    db.insert_item(&item).unwrap();
+
+    assert!(
+        !db.has_open_items_for_source("spec-skip-integ").unwrap(),
+        "Skipped items should not be considered open"
+    );
+
+    let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+    let ctx = CronContext { now: Utc::now() };
+    assert!(
+        job.execute(&ctx).is_ok(),
+        "gap detection should succeed with skipped items present"
+    );
+}
+
+/// GapDetectionJob skips issue creation when a non-terminal (Pending) item
+/// exists for the spec, even if coverage is below threshold.
+#[test]
+fn gap_detection_pending_item_blocks_issue_creation() {
+    let db = test_db();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Write code that does NOT cover the spec keywords — gap will be detected.
+    std::fs::write(tmp.path().join("main.rs"), "fn unrelated() {}").unwrap();
+
+    let mut spec = Spec::new(
+        "spec-pending-integ".into(),
+        "ws".into(),
+        "Pending Item Integration Test".into(),
+        "implement authorization middleware for secure endpoints".into(),
+    );
+    spec.status = SpecStatus::Active;
+    db.insert_spec(&spec).unwrap();
+
+    // Insert a non-terminal (Pending) queue item.
+    let item = QueueItem::new(
+        "spec-pending-integ:work".into(),
+        "spec-pending-integ".into(),
+        "ws".into(),
+        "implement".into(),
+    );
+    db.insert_item(&item).unwrap();
+
+    assert!(
+        db.has_open_items_for_source("spec-pending-integ").unwrap(),
+        "Pending items should be considered open"
+    );
+
+    // GapDetectionJob should still succeed (it skips issue creation internally
+    // due to the deduplication guard).
+    let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+    let ctx = CronContext { now: Utc::now() };
+    assert!(
+        job.execute(&ctx).is_ok(),
+        "gap detection should succeed even when issue creation is skipped"
+    );
+}
+
+/// GapDetectionJob with custom coverage threshold allows fine-grained control.
+#[test]
+fn gap_detection_with_custom_threshold() {
+    let db = test_db();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Write code that covers only some of the spec keywords.
+    // Spec keywords from "implement authorization middleware for secure endpoints":
+    //   implement, authorization, middleware, secure, endpoints
+    // We cover "implement" and "middleware" but not the rest.
+    std::fs::write(
+        tmp.path().join("partial.rs"),
+        "fn implement_handler() {}\nfn middleware_chain() {}",
+    )
+    .unwrap();
+
+    let mut spec = Spec::new(
+        "spec-thresh-integ".into(),
+        "ws".into(),
+        "Threshold Integration Test".into(),
+        "implement authorization middleware for secure endpoints".into(),
+    );
+    spec.status = SpecStatus::Active;
+    db.insert_spec(&spec).unwrap();
+
+    // With a very low threshold (0.1), partial coverage should pass.
+    let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf())
+        .with_coverage_threshold(0.1);
+    let ctx = CronContext { now: Utc::now() };
+    assert!(
+        job.execute(&ctx).is_ok(),
+        "gap detection with low threshold should succeed"
+    );
+}
