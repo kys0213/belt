@@ -134,4 +134,4 @@ Cron 스크립트에는 workspace 정보가 필요하므로 추가 변수를 주
 
 - [DESIGN-v5](../DESIGN-v5.md) — evaluate 아키텍처
 - [DataSource](./datasource.md) — belt context 스키마
-- [Claw](./claw-workspace.md) — evaluate와 Claw의 관계
+- [Agent](./agent-workspace.md) — evaluate와 Agent의 관계

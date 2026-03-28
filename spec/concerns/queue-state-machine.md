@@ -149,7 +149,7 @@ failure_count는 append-only history에서 계산한다: `history | filter(state
 
 2. **"충분한가?"만 판단** — "이 handler의 결과물이 다음 단계로 넘어가기에 충분한가?"만 본다. 품질 판단(좋은 코드인가?)은 Cron 품질 루프가 담당한다.
 
-3. **state별 구체 기준은 claw-workspace rules에 위임** — `~/.belt/claw-workspace/.claude/rules/classify-policy.md`에 state별 Done 조건을 정의한다 (Claw 워크스페이스의 rules 파일, [Claw 워크스페이스](./claw-workspace.md) 참조). 코어는 rules를 모르고, `belt agent`가 rules를 참조하여 판단한다.
+3. **state별 구체 기준은 agent-workspace rules에 위임** — `~/.belt/agent-workspace/.claude/rules/classify-policy.md`에 state별 Done 조건을 정의한다 (Agent 워크스페이스의 rules 파일, [Agent 워크스페이스](./agent-workspace.md) 참조). 코어는 rules를 모르고, `belt agent`가 rules를 참조하여 판단한다.
 
 ### 실패 원칙
 

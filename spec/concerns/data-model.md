@@ -254,7 +254,7 @@ HITL 생성 경로. 직렬화 시 snake_case.
 | `ManualEscalation` | `"manual_escalation"` | 사용자 수동 요청 |
 | `SpecConflict` | `"spec_conflict"` | 스펙 파일 겹침 |
 | `SpecCompletionReview` | `"spec_completion_review"` | 스펙 완료 최종 확인 |
-| `SpecModificationProposed` | `"spec_modification_proposed"` | Claw 수정 제안 |
+| `SpecModificationProposed` | `"spec_modification_proposed"` | Agent 수정 제안 |
 
 ### EscalationAction
 

@@ -82,11 +82,11 @@ on_spec_completing:
 
 ## 다중 스펙 우선순위
 
-스펙 등록 시점에 Claw가 기존 Active 스펙과의 관계를 판단한다:
+스펙 등록 시점에 Agent가 기존 Active 스펙과의 관계를 판단한다:
 
 ```
 /spec add [file]
-  → Claw: 기존 Active 스펙과 충돌/의존성 분석
+  → Agent: 기존 Active 스펙과 충돌/의존성 분석
     → 독립: 병렬 실행 가능 (concurrency 제한 내)
     → 의존: DependencyGuard 등록 → 선행 스펙 완료 후 실행
     → 충돌: 같은 파일/모듈 영향 → HITL 요청 (사용자 판단)

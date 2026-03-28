@@ -61,9 +61,9 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 
 파이프라인은 1회성, 품질은 Cron이 지속 감시. gap-detection이 새 이슈 생성 → 파이프라인 재진입. 상세: [Cron 엔진](./concerns/cron-engine.md)
 
-### Claw는 대화형 에이전트
+### Agent는 대화형 에이전트
 
-`/claw` 세션. 자연어로 큐 조회, HITL 응답, cron 관리. 상세: [Claw](./concerns/claw-workspace.md)
+`belt agent` / `/agent` 세션. 자연어로 큐 조회, HITL 응답, cron 관리. 상세: [Agent](./concerns/agent-workspace.md)
 
 ---
 
@@ -94,7 +94,7 @@ Pending → Ready → Running → Completed → Done | HITL | Failed | Skipped
 ┌──────────────────────────────────────────────────────────────┐
 │  사용자                                                       │
 │                                                               │
-│  /auto          /spec          /claw          dashboard       │
+│  /auto          /spec          /agent         dashboard       │
 └───┬──────────────┬──────────────┬──────────────┬──────────────┘
     │              │              │              │
     ▼              ▼              ▼              ▼
@@ -134,7 +134,7 @@ Pending → Ready → Running → Completed → Done | HITL | Failed | Skipped
 | AgentRuntime | LLM 실행 추상화 | handler별 |
 | evaluate | 완료/추가검토 분류 (Done or HITL), CLI 도구 호출 | 분류 시 |
 | on_done/on_fail script | 외부 시스템에 결과 반영 | 0 |
-| Claw | `/claw` 대화형 에이전트 | 세션 시 |
+| Agent | `belt agent` / `/agent` 대화형 에이전트 | 세션 시 |
 | Cron | 주기 작업, 품질 루프 | job별 |
 
 ---
@@ -159,7 +159,7 @@ Pending → Ready → Running → Completed → Done | HITL | Failed | Skipped
 | [Daemon](./concerns/daemon.md) | 실행 루프 의사코드, concurrency, graceful shutdown |
 | [DataSource](./concerns/datasource.md) | trait, context 스키마, 워크플로우 yaml, escalation |
 | [AgentRuntime](./concerns/agent-runtime.md) | LLM 실행 추상화, RuntimeRegistry |
-| [Claw](./concerns/claw-workspace.md) | 대화형 에이전트, evaluate, slash command |
+| [Agent](./concerns/agent-workspace.md) | 대화형 에이전트, evaluate, slash command |
 | [Cron 엔진](./concerns/cron-engine.md) | 품질 루프, force trigger, cron 관리 |
 | [CLI 레퍼런스](./concerns/cli-reference.md) | 3-layer SSOT, belt context, 전체 커맨드 |
 | [Cross-Platform](./concerns/cross-platform.md) | OS 추상화 (ShellExecutor, DaemonNotifier), 플랫폼별 구현 |
@@ -181,7 +181,7 @@ Pending → Ready → Running → Completed → Done | HITL | Failed | Skipped
 | 환경변수 | DataSource별 다수 | `WORK_ID` + `WORKTREE` 만 |
 | QueuePhase | 5개 | 8개 (+Completed, HITL, Failed) |
 | Pending → Ready | CLAW feature flag | **항상 자동** |
-| evaluate | Claw가 판단 | cron 기반 + force_trigger 하이브리드, CLI 도구 호출 |
+| evaluate | Agent가 판단 | cron 기반 + force_trigger 하이브리드, CLI 도구 호출 |
 | DataSource trait | 5개 메서드 | collect + get_context 만 |
 | Concurrency | InFlightTracker | 2단계 (workspace + global) |
 
@@ -197,9 +197,9 @@ Pending → Ready → Running → Completed → Done | HITL | Failed | Skipped
 | C4. escalation 정책 | workspace yaml escalation (3단계 순차 + terminal 분기) |
 | H1. Spec completion | gap-detection cron + HITL 최종 확인 |
 | H2. 섹션 검증 | /spec add 대화형 검증 |
-| H3. spec prioritize | /claw 세션 자연어 |
+| H3. spec prioritize | /agent 세션 자연어 |
 | H4. hitl timeout | hitl-timeout cron |
-| H5. claw edit | /claw 세션 자연어 |
+| H5. agent edit | /agent 세션 자연어 |
 | M1~M3 | Cron 품질 루프 + worktree 보존 정책 |
 
 ---
@@ -219,8 +219,8 @@ Phase 3: evaluate + escalation
   → evaluate cron (CLI 도구 호출), force_trigger
   → escalation 정책, on_done/on_fail, Failed 상태
 
-Phase 4: Claw + slash command
-  → /claw, /auto, /spec 통합
+Phase 4: Agent + slash command
+  → /agent, /auto, /spec 통합
 
 Phase 5: TUI + 품질 루프
   → dashboard, gap-detection, spec completion
