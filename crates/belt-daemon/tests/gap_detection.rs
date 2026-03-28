@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use belt_core::phase::QueuePhase;
 use belt_core::spec::{Spec, SpecStatus};
-use belt_daemon::cron::{CronContext, CronHandler, GapDetectionJob};
+use belt_daemon::cron::{CronContext, CronHandler, GapAnalysisReport, GapDetectionJob};
 use belt_infra::db::Database;
 use chrono::Utc;
 
@@ -346,18 +346,21 @@ fn spec_with_no_keywords_treated_as_covered() {
 
 /// Gap detection should only scan files with recognized source extensions
 /// (e.g., .rs, .ts, .py) and ignore non-source files.
+///
+/// When keywords only appear in a `.txt` file (not a recognized source
+/// extension), they must NOT count as coverage -- a gap should be reported.
 #[test]
 fn ignores_non_source_files() {
     let db = test_db();
     let tmp = tempfile::tempdir().unwrap();
 
-    // Put the keyword in a non-source file only.
+    // Put the keywords in a non-source file only.
     std::fs::write(
         tmp.path().join("notes.txt"),
         "authorization middleware token validation",
     )
     .unwrap();
-    // Source file has no keywords.
+    // Source file has no matching keywords.
     std::fs::write(tmp.path().join("main.rs"), "fn main() {}").unwrap();
 
     let spec = make_active_spec(
@@ -368,8 +371,98 @@ fn ignores_non_source_files() {
     db.insert_spec(&spec).unwrap();
 
     let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
-    // Should succeed -- the .txt file should not satisfy coverage.
-    assert!(job.execute(&ctx()).is_ok());
+
+    // Verify via analyze_gaps that the .txt file did NOT satisfy coverage.
+    let report: GapAnalysisReport = job.analyze_gaps().expect("analyze_gaps should succeed");
+    assert_eq!(
+        report.gaps.len(),
+        1,
+        "expected exactly one gap when keywords only appear in .txt file, got: {:?}",
+        report.gaps,
+    );
+    assert_eq!(report.gaps[0].spec_id, "spec-ext");
+    assert!(
+        report.gaps[0].coverage_score < 0.5,
+        "coverage score {:.2} should be below the default threshold because .txt is not scanned",
+        report.gaps[0].coverage_score,
+    );
+    assert!(
+        !report.gaps[0].missing_items.is_empty(),
+        "missing_items should list the uncovered keywords",
+    );
+    assert!(
+        report.covered_spec_ids.is_empty(),
+        "no spec should be covered when keywords are only in non-source files",
+    );
+}
+
+/// When keywords appear in a recognized source file (.rs), they should
+/// count as coverage even if the same keywords also exist in a .txt file.
+#[test]
+fn source_file_satisfies_coverage_over_non_source() {
+    let db = test_db();
+    let tmp = tempfile::tempdir().unwrap();
+
+    // Keywords in both .txt (should be ignored) and .rs (should be scanned).
+    std::fs::write(
+        tmp.path().join("notes.txt"),
+        "authorization middleware token validation",
+    )
+    .unwrap();
+    // Use realistic function bodies so keyword-based and LLM-based analysis
+    // both treat the spec as covered (empty stubs are flagged by LLM).
+    std::fs::write(
+        tmp.path().join("auth.rs"),
+        concat!(
+            "/// Checks authorization by verifying the user role against the ACL.\n",
+            "fn authorization(user: &User, acl: &[String]) -> bool {\n",
+            "    acl.contains(&user.role)\n",
+            "}\n",
+            "\n",
+            "/// Middleware that intercepts requests and validates auth headers.\n",
+            "fn middleware(req: &Request) -> Result<Response, Error> {\n",
+            "    let header = req.headers.get(\"Authorization\").ok_or(Error::Missing)?;\n",
+            "    let t = parse_token(header)?;\n",
+            "    if authorization(&t.user, &req.acl) { Ok(Response::ok()) } else { Err(Error::Forbidden) }\n",
+            "}\n",
+            "\n",
+            "/// Parses and decodes a bearer token from the Authorization header.\n",
+            "fn token(raw: &str) -> Result<Token, Error> {\n",
+            "    let stripped = raw.strip_prefix(\"Bearer \").ok_or(Error::InvalidScheme)?;\n",
+            "    decode_jwt(stripped)\n",
+            "}\n",
+            "\n",
+            "/// Validates the token signature, expiration, and issuer claims.\n",
+            "fn validation(token: &Token, keys: &KeySet) -> Result<(), Error> {\n",
+            "    if token.is_expired() { return Err(Error::Expired); }\n",
+            "    keys.verify(&token.signature)?;\n",
+            "    Ok(())\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
+
+    let spec = make_active_spec(
+        "spec-ext-covered",
+        "Extension Covered",
+        "authorization middleware token validation",
+    );
+    db.insert_spec(&spec).unwrap();
+
+    let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+
+    let report: GapAnalysisReport = job.analyze_gaps().expect("analyze_gaps should succeed");
+    assert!(
+        report.gaps.is_empty(),
+        "expected no gaps when keywords are in .rs source file, got: {:?}",
+        report.gaps,
+    );
+    assert!(
+        report
+            .covered_spec_ids
+            .contains(&"spec-ext-covered".to_string()),
+        "spec should be marked as covered when keywords appear in recognized source files",
+    );
 }
 
 // ---------------------------------------------------------------------------
