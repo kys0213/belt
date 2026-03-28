@@ -1624,7 +1624,7 @@ impl Daemon {
     /// 1. `shutdown_requested = true` -- 새 아이템 수집 중단.
     /// 2. Running 아이템 완료를 최대 30초 대기 (`drain_with_timeout`).
     /// 3. timeout 초과 시 Running -> Pending 롤백 (worktree 보존).
-    /// 4. drain 중 두 번째 SIGINT 시 즉시 종료 (Running -> Pending 롤백).
+    /// 4. drain 중 두 번째 SIGINT 시 즉시 종료 (Running -> Failed 강제 전이).
     pub async fn run(&mut self, tick_interval_secs: u64) {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs));
         tracing::info!("belt daemon started (tick={}s)", tick_interval_secs);
@@ -1768,24 +1768,24 @@ impl Daemon {
                 }
                 _ = tokio::time::sleep_until(deadline) => {
                     let remaining = self.items_in_phase(QueuePhase::Running).len();
-                    tracing::error!(
-                        "drain timeout ({}s) exceeded, force-failing {} running items",
+                    tracing::warn!(
+                        "drain timeout ({}s) exceeded, rolling back {} running items to pending",
                         timeout.as_secs(),
                         remaining
                     );
-                    self.force_fail_running();
+                    self.rollback_running_to_pending();
                     return;
                 }
                 _ = tokio::signal::ctrl_c() => {
-                    tracing::warn!("received second SIGINT, forcing shutdown");
-                    self.rollback_running_to_pending();
+                    tracing::warn!("received second SIGINT, force-failing running items");
+                    self.force_fail_running();
                     return;
                 }
             }
         }
     }
 
-    /// Running -> Failed 강제 전이 (graceful shutdown 타임아웃 초과 시).
+    /// Running -> Failed 강제 전이 (두 번째 SIGINT 수신 시).
     ///
     /// 각 Running 아이템을 Failed로 전이하고 에러 히스토리를 기록한다.
     /// worktree는 보존하여 후속 디버깅에 활용할 수 있도록 한다.
@@ -4351,10 +4351,10 @@ sources:
     }
 
     #[test]
-    fn force_fail_running_is_called_on_timeout_scenario() {
-        // Simulates the force_fail_running path that drain_with_timeout invokes
-        // when the deadline expires. We test force_fail directly since MockRuntime
-        // completes instantly and cannot simulate a hung task.
+    fn rollback_running_to_pending_is_called_on_timeout_scenario() {
+        // Simulates the rollback path that drain_with_timeout invokes when
+        // the deadline expires. Per R-DM-004, timeout rolls back Running →
+        // Pending (preserving worktrees) rather than failing items.
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
@@ -4369,6 +4369,31 @@ sources:
         assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 3);
 
         // This is what drain_with_timeout calls when the deadline expires.
+        daemon.rollback_running_to_pending();
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
+        assert_eq!(daemon.items_in_phase(QueuePhase::Pending).len(), 3);
+    }
+
+    #[test]
+    fn force_fail_running_is_called_on_second_sigint_scenario() {
+        // Simulates the force-fail path that drain_with_timeout invokes on
+        // a second SIGINT. Per R-DM-004, the second interrupt force-fails
+        // running items so the daemon can exit immediately.
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        for i in 0..3u32 {
+            let mut item = test_item(&format!("github:org/repo#{i}"), "analyze");
+            item.phase = QueuePhase::Running;
+            item.updated_at = Utc::now().to_rfc3339();
+            daemon.push_item(item);
+        }
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 3);
+
+        // This is what drain_with_timeout calls on the second SIGINT.
         daemon.force_fail_running();
 
         assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
