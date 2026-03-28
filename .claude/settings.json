@@ -53,6 +53,17 @@
             "statusMessage": "Checking branch freshness..."
           }
         ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/validate-pr-title.sh",
+            "timeout": 10,
+            "statusMessage": "Validating PR title convention..."
+          }
+        ]
       }
     ],
     "PostToolUse": [

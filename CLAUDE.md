@@ -57,3 +57,14 @@ cargo build                          # 전체 빌드
 cargo run -- status                  # 시스템 상태 조회
 cargo run -- start --config workspace.yaml --tick 30   # 데몬 시작
 ```
+
+## Release
+
+Release Please가 conventional commits를 분석하여 자동으로 Release PR을 생성한다.
+
+- `feat:` → minor bump, `fix:`/`docs:`/`refactor:` → patch bump
+- `BREAKING CHANGE:` footer → major bump
+- `test:`, `ci:`, `chore:` → 릴리즈 제외
+- Release PR 머지 시 자동으로 태그 생성 → release.yml 트리거 → 5개 플랫폼 바이너리 빌드 + GitHub Release
+
+PR 제목도 conventional commit 형식을 따른다 (squash merge 시 커밋 메시지로 사용됨).
