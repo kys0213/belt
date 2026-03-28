@@ -304,11 +304,34 @@ fn higher_threshold_catches_partial_coverage() {
     let db = test_db();
     let tmp = tempfile::tempdir().unwrap();
 
-    // Code covers "authorization" and "middleware" but NOT "token", "session",
-    // "role", "access", "control", or "401"/"403".
+    // Code covers "authorization" and "middleware" with real logic but does
+    // NOT cover "token", "session", "role", "access", or "control".
     std::fs::write(
         tmp.path().join("auth.rs"),
-        "fn authorization() {}\nfn middleware() {}",
+        concat!(
+            "use std::collections::HashMap;\n",
+            "\n",
+            "/// Check authorization by verifying the user has the required\n",
+            "/// permission for the requested resource.\n",
+            "fn authorization(user: &str, permissions: &HashMap<String, Vec<String>>, resource: &str) -> bool {\n",
+            "    match permissions.get(user) {\n",
+            "        Some(allowed) => allowed.iter().any(|r| r == resource),\n",
+            "        None => false,\n",
+            "    }\n",
+            "}\n",
+            "\n",
+            "/// Middleware that intercepts each request, extracts the caller\n",
+            "/// identity from the header, and delegates to authorization.\n",
+            "fn middleware(request: &Request, permissions: &HashMap<String, Vec<String>>) -> Result<Response, AuthError> {\n",
+            "    let caller = request.headers.get(\"X-Caller\")\n",
+            "        .ok_or(AuthError::MissingCaller)?;\n",
+            "    if authorization(caller, permissions, &request.path) {\n",
+            "        Ok(Response { status: 200 })\n",
+            "    } else {\n",
+            "        Err(AuthError::Forbidden)\n",
+            "    }\n",
+            "}\n",
+        ),
     )
     .unwrap();
 
@@ -320,6 +343,35 @@ fn higher_threshold_catches_partial_coverage() {
     db.insert_spec(&spec).unwrap();
 
     // With a very high threshold (0.90), partial coverage is a gap.
+    let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf())
+        .with_coverage_threshold(0.90);
+    let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+    assert_eq!(
+        report.gaps.len(),
+        1,
+        "expected exactly one gap for spec-partial at threshold 0.90, got: {:?}",
+        report.gaps,
+    );
+    let gap = &report.gaps[0];
+    assert_eq!(gap.spec_id, "spec-partial");
+    assert!(
+        gap.coverage_score < 0.90,
+        "coverage score {:.2} should be below the 0.90 threshold",
+        gap.coverage_score,
+    );
+    assert!(
+        !gap.missing_items.is_empty(),
+        "missing_items should list uncovered keywords (token, session, etc.)",
+    );
+    assert!(
+        !report
+            .covered_spec_ids
+            .contains(&"spec-partial".to_string()),
+        "spec-partial should not be in covered_spec_ids at threshold 0.90",
+    );
+
+    // Also verify the full execute() path completes without error.
     let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf())
         .with_coverage_threshold(0.90);
     assert!(
@@ -752,9 +804,24 @@ fn threshold_one_requires_full_coverage() {
     let db = test_db();
     let tmp = tempfile::tempdir().unwrap();
 
-    // Partial coverage: only "authorization" keyword is present.
-    // "middleware", "token", and "session" are absent.
-    std::fs::write(tmp.path().join("auth.rs"), "fn authorization() {}").unwrap();
+    // Partial coverage: only "authorization" keyword is present with real
+    // logic. "middleware", "token", and "session" are absent.
+    std::fs::write(
+        tmp.path().join("auth.rs"),
+        concat!(
+            "use std::collections::HashMap;\n",
+            "\n",
+            "/// Check authorization by verifying the caller has the required\n",
+            "/// permission entry in the permissions map.\n",
+            "fn authorization(caller: &str, permissions: &HashMap<String, Vec<String>>, resource: &str) -> bool {\n",
+            "    match permissions.get(caller) {\n",
+            "        Some(allowed) => allowed.iter().any(|r| r == resource),\n",
+            "        None => false,\n",
+            "    }\n",
+            "}\n",
+        ),
+    )
+    .unwrap();
 
     let spec = make_active_spec(
         "spec-full",
