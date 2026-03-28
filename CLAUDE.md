@@ -60,7 +60,11 @@ cargo run -- start --config workspace.yaml --tick 30   # 데몬 시작
 
 ## Release
 
-Release Please가 conventional commits를 분석하여 자동으로 Release PR을 생성한다.
+Release Please가 conventional commits를 분석하여 Release PR을 생성한다. **수동 트리거** 방식.
+
+```bash
+gh workflow run release-please.yml   # Release PR 생성/업데이트
+```
 
 - `feat:` → minor bump, `fix:`/`docs:`/`refactor:` → patch bump
 - `BREAKING CHANGE:` footer → major bump

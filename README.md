@@ -40,7 +40,19 @@ belt-cli → belt-daemon → belt-infra → belt-core
                               (traits only, no infra deps)
 ```
 
-## Build
+## Install
+
+```bash
+# macOS / Linux
+curl -sSf https://raw.githubusercontent.com/kys0213/belt/main/install.sh | bash
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/kys0213/belt/main/install.ps1 | iex
+```
+
+Specific version: `BELT_VERSION=v0.1.1 curl -sSf ... | bash`
+
+## Build from source
 
 ```bash
 cargo build --release
