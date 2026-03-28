@@ -374,15 +374,64 @@ fn higher_threshold_catches_partial_coverage() {
     );
     let gap = &report.gaps[0];
     assert_eq!(gap.spec_id, "spec-partial");
+    assert_eq!(
+        gap.spec_name, "Partial Auth",
+        "gap should carry the correct spec name",
+    );
+
+    // The fixture code only covers "authorization" and "middleware" out of
+    // 8 spec keywords -- the coverage score must be well below the 0.90
+    // threshold regardless of whether keyword or LLM analysis is used.
     assert!(
         gap.coverage_score < 0.90,
         "coverage score {:.2} should be below the 0.90 threshold",
         gap.coverage_score,
     );
     assert!(
+        gap.coverage_score < 0.50,
+        "coverage score {:.2} should be below 0.50 because only 2 of 8 \
+         keywords (authorization, middleware) are present in the fixture code",
+        gap.coverage_score,
+    );
+    assert!(
+        gap.coverage_score >= 0.0,
+        "coverage score {:.2} must be non-negative",
+        gap.coverage_score,
+    );
+
+    // Verify the missing items reference uncovered keywords.
+    assert!(
         !gap.missing_items.is_empty(),
         "missing_items should list uncovered keywords (token, session, etc.)",
     );
+    let joined_missing = gap.missing_items.join(" ").to_lowercase();
+    assert!(
+        joined_missing.contains("token") || joined_missing.contains("session"),
+        "missing_items should include 'token' or 'session', got: {:?}",
+        gap.missing_items,
+    );
+    assert!(
+        joined_missing.contains("validation") || joined_missing.contains("role"),
+        "missing_items should include 'validation' or 'role', got: {:?}",
+        gap.missing_items,
+    );
+    assert!(
+        joined_missing.contains("access") || joined_missing.contains("control"),
+        "missing_items should include 'access' or 'control', got: {:?}",
+        gap.missing_items,
+    );
+    // "authorization" and "middleware" should NOT be in missing items.
+    assert!(
+        !joined_missing.contains("authorization"),
+        "authorization is covered and should not be in missing_items, got: {:?}",
+        gap.missing_items,
+    );
+    assert!(
+        !joined_missing.contains("middleware"),
+        "middleware is covered and should not be in missing_items, got: {:?}",
+        gap.missing_items,
+    );
+
     assert!(
         !report
             .covered_spec_ids
