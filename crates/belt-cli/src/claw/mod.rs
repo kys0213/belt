@@ -36,15 +36,31 @@ impl ClawWorkspace {
     /// ```text
     /// {belt_home}/claw-workspace/
     /// ├── CLAUDE.md
+    /// ├── classify-policy.yaml          # machine-readable (daemon evaluator)
+    /// ├── hitl-policy.yaml              # machine-readable (daemon evaluator)
     /// ├── commands/
     /// ├── skills/
     /// │   ├── gap-detect/
     /// │   └── prioritize/
-    /// └── .claude/rules/
-    ///     ├── classify-policy.md
-    ///     ├── hitl-policy.md
-    ///     └── auto-approve-policy.md
+    /// └── .claude/rules/                # ← agent system prompt policies
+    ///     ├── classify-policy.md        # Done vs HITL classification criteria
+    ///     ├── hitl-policy.md            # HITL escalation criteria
+    ///     └── auto-approve-policy.md    # auto-approve criteria
     /// ```
+    ///
+    /// ## Policy file loading (classify-policy.md)
+    ///
+    /// At runtime, `agent::resolve_rules_dir` locates the rules directory
+    /// using the following priority (first existing directory wins):
+    ///
+    /// 1. `claw_config.rules_path` -- explicit path in workspace YAML
+    /// 2. `$BELT_HOME/workspaces/<name>/claw/system/` -- per-workspace override
+    /// 3. `$BELT_HOME/claw-workspace/.claude/rules/` -- global default (here)
+    ///
+    /// All `.md` files in the resolved directory are loaded by
+    /// `agent::load_rules_from_dir`, concatenated, and injected into the
+    /// agent system prompt. If no rules directory is found, the agent runs
+    /// with only the built-in Claw rules (no error).
     ///
     /// Existing files are preserved by default. Pass `force = true` to
     /// overwrite them.
@@ -207,7 +223,18 @@ pub fn default_claude_md() -> &'static str {
 "#
 }
 
-/// Returns the default classify-policy template.
+/// Returns the default `classify-policy.md` template.
+///
+/// This template is written to `<workspace>/.claude/rules/classify-policy.md`
+/// during [`ClawWorkspace::init`].  At runtime the file is loaded as part of
+/// the rules directory resolution chain described in `agent::resolve_rules_dir`:
+///
+/// 1. `claw_config.rules_path` (explicit override in workspace YAML)
+/// 2. `$BELT_HOME/workspaces/<name>/claw/system/` (per-workspace override)
+/// 3. `$BELT_HOME/claw-workspace/.claude/rules/` (global default -- written here)
+///
+/// If the file is missing at all priority levels, the agent proceeds without
+/// classification policy guidance (no error is raised).
 pub fn default_classify_policy() -> &'static str {
     r#"# Classification Policy
 
@@ -266,10 +293,16 @@ Define conditions under which items can proceed without human review.
 "#
 }
 
-/// Returns the default classify-policy YAML template.
+/// Returns the default `classify-policy.yaml` template.
 ///
 /// Provides machine-readable classification rules that the daemon uses
-/// to route incoming queue items.
+/// to route incoming queue items.  This file is written to
+/// `<workspace>/classify-policy.yaml` (at the workspace root, **not**
+/// inside `.claude/rules/`) during [`ClawWorkspace::init`].
+///
+/// Unlike `classify-policy.md` (which is loaded into the agent system
+/// prompt), the YAML variant is intended for programmatic consumption by
+/// the daemon's evaluator.
 pub fn default_classify_policy_yaml() -> &'static str {
     r#"# Classification Policy (machine-readable)
 #

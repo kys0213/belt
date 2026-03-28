@@ -148,6 +148,42 @@ belt agent --workspace workspace.yaml --plan          # 실행 계획만 출력
 
 디렉토리 내 모든 `.md` 파일을 concat하여 system prompt에 주입한다.
 
+### classify-policy.md 로딩 경로 및 해석 (R-CW-007)
+
+`classify-policy.md`는 LLM 에이전트가 큐 아이템을 Done / HITL로 분류할 때
+참조하는 정책 문서다. 두 가지 형태로 존재한다:
+
+| 파일 | 위치 | 소비자 | 용도 |
+|------|------|--------|------|
+| `classify-policy.md` | `.claude/rules/` 하위 | LLM agent (system prompt) | 자연어 분류 기준 |
+| `classify-policy.yaml` | workspace root | daemon evaluator | machine-readable 라우팅 규칙 |
+
+#### 로딩 경로 (classify-policy.md)
+
+`agent::resolve_rules_dir` 함수가 아래 우선순위로 **디렉토리**를 탐색한다.
+첫 번째로 존재하는 디렉토리 안의 **모든 `.md` 파일**이 로드된다.
+
+```
+Priority 1: claw_config.rules_path        (workspace YAML 명시)
+Priority 2: $BELT_HOME/workspaces/<name>/claw/system/   (per-workspace)
+Priority 3: $BELT_HOME/claw-workspace/.claude/rules/    (global, belt claw init)
+```
+
+`$BELT_HOME`은 환경변수 `BELT_HOME`이 설정되지 않으면 `~/.belt`로 기본값.
+
+#### 파일 미존재 시 fallback
+
+- 디렉토리 자체가 없는 경우: agent는 built-in Claw rules(대화 턴 제한, 응답 포맷,
+  에러 핸들링)만으로 실행. 에러 없음.
+- 디렉토리는 있지만 `.md` 파일이 없는 경우: 동일하게 built-in rules만 사용.
+- `classify-policy.md`만 없고 다른 `.md`가 있는 경우: 다른 정책 파일은 정상 로드,
+  분류 정책 가이던스만 빠진 채 실행.
+
+#### 구현 위치
+
+- `crates/belt-cli/src/agent.rs` — `resolve_rules_dir`, `load_rules_from_dir`
+- `crates/belt-cli/src/claw/mod.rs` — `ClawWorkspace::init`, `default_classify_policy()`
+
 ### LLM이 사용 가능한 도구
 
 `belt agent`로 실행된 LLM은 bash tool을 통해 다음 belt CLI를 호출할 수 있다:
