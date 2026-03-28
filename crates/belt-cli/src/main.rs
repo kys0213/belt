@@ -2657,6 +2657,22 @@ async fn main() -> anyhow::Result<()> {
                     }
                     db.update_spec(&spec)?;
                     println!("spec updated: {id}");
+
+                    // Force gap_detection re-evaluation on next daemon tick
+                    // by resetting the cron job's last_run_at to NULL.
+                    let gap_job_name = format!("{}:gap_detection", spec.workspace_id);
+                    match db.reset_cron_last_run(&gap_job_name) {
+                        Ok(()) => {
+                            println!("gap_detection scheduled for next tick ({})", gap_job_name);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                job = %gap_job_name,
+                                error = %e,
+                                "failed to reset gap_detection cron job"
+                            );
+                        }
+                    }
                 }
                 SpecCommands::Pause { id } => {
                     let spec = db.get_spec(&id)?;
