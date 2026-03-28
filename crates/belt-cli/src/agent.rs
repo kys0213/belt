@@ -20,23 +20,54 @@ fn load_workspace_config(path: &str) -> Result<WorkspaceConfig> {
 
 /// Resolve the workspace rules directory path.
 ///
-/// Priority:
-/// 1. `claw_config.rules_path` (explicit override from workspace YAML)
-/// 2. Per-workspace Claw directory: `~/.belt/workspaces/<name>/claw/system/`
-/// 3. Global Claw workspace: `~/.belt/claw-workspace/.claude/rules/`
+/// This is the primary entry point for locating policy files such as
+/// `classify-policy.md`, `hitl-policy.md`, and `auto-approve-policy.md`.
+/// The resolved directory is then passed to [`load_rules_from_dir`] which
+/// loads all `.md` files and concatenates them into the agent system prompt.
 ///
-/// Returns `None` if no rules directory is found.
+/// # Resolution priority (first existing directory wins)
+///
+/// 1. **Explicit override** -- `claw_config.rules_path` in workspace YAML.
+///    Allows per-invocation control (e.g. `--policy-path` in the future).
+/// 2. **Per-workspace Claw dir** -- `$BELT_HOME/workspaces/<name>/claw/system/`.
+///    Created when a workspace has its own Claw policy overrides.
+/// 3. **Global Claw workspace** -- `$BELT_HOME/claw-workspace/.claude/rules/`.
+///    Created by `belt claw init`; contains the default policy templates.
+///
+/// `$BELT_HOME` defaults to `~/.belt` when the environment variable is unset.
+///
+/// # Fallback behavior
+///
+/// Returns `None` when no directory is found at any priority level.
+/// The caller (e.g. [`run_agent`]) proceeds without workspace rules --
+/// only the built-in Claw rules prompt is used in that case.
+///
+/// See also: `spec/concerns/claw-workspace.md` section "classify-policy.md
+/// 로딩 경로 및 해석" for the full specification (R-CW-007).
 fn resolve_rules_dir(config: &WorkspaceConfig) -> Option<PathBuf> {
     resolve_rules_dir_with_home(config, None)
 }
 
 /// Resolve the workspace rules directory using an explicit `belt_home` override.
 ///
+/// This is the implementation behind [`resolve_rules_dir`] -- see that
+/// function's doc comment for the full resolution algorithm and fallback
+/// behavior.
+///
 /// When `belt_home` is `None`, the function reads the `BELT_HOME` environment
 /// variable (falling back to `~/.belt`).  Accepting the home path as a
 /// parameter allows tests to inject a temporary directory without mutating
 /// process-global environment variables, eliminating race conditions in
 /// parallel test execution.
+///
+/// # classify-policy.md loading path
+///
+/// The returned directory is expected to contain `classify-policy.md` among
+/// other policy files.  The file is **not** loaded individually -- all `.md`
+/// files in the directory are loaded by [`load_rules_from_dir`] and injected
+/// into the agent system prompt.  `classify-policy.md` is therefore only
+/// effective when it lives inside one of the three priority directories
+/// described in [`resolve_rules_dir`].
 fn resolve_rules_dir_with_home(
     config: &WorkspaceConfig,
     belt_home: Option<&Path>,
@@ -156,8 +187,25 @@ fn build_claw_rules_prompt(max_turns: Option<u32>) -> String {
 
 /// Load all `.md` rule files from a directory into a single system prompt.
 ///
-/// Files are sorted by name for deterministic ordering and concatenated
-/// with a header per file.
+/// This function is responsible for loading policy files such as
+/// `classify-policy.md`, `hitl-policy.md`, and `auto-approve-policy.md`
+/// from the directory resolved by [`resolve_rules_dir`].
+///
+/// # Behavior
+///
+/// - Only files with a `.md` extension are loaded; all others are ignored.
+/// - Files are sorted by name for deterministic ordering and concatenated
+///   with a `# Rule: <filename>` header per file, separated by `---`.
+/// - Returns `Ok(None)` when the directory exists but contains no `.md` files.
+/// - Returns `Err` when the directory cannot be read (e.g. does not exist).
+///
+/// # Fallback when classify-policy.md is missing
+///
+/// If `classify-policy.md` is absent from the resolved rules directory, no
+/// error is raised.  The agent simply runs without classification policy
+/// guidance in its system prompt.  The built-in Claw rules (conversation
+/// turn limit, response format, error handling) are always included
+/// regardless of whether any policy files are loaded.
 fn load_rules_from_dir(dir: &Path) -> Result<Option<String>> {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
         .with_context(|| format!("failed to read rules directory: {}", dir.display()))?
@@ -319,7 +367,9 @@ pub async fn run_agent(
     let working_dir = std::env::current_dir().context("failed to determine current directory")?;
 
     // Build the system prompt by combining built-in Claw rules with
-    // workspace-specific rules loaded from the rules directory.
+    // workspace-specific policy files (classify-policy.md, hitl-policy.md,
+    // auto-approve-policy.md, etc.) loaded from the rules directory.
+    // See `resolve_rules_dir` for the directory resolution priority chain.
     let mut env = ActionEnv::new("cli-agent", &working_dir);
 
     let max_turns = config
