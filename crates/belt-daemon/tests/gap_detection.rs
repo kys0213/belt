@@ -553,8 +553,10 @@ fn multiple_specs_analyzed_independently() {
 // Spec with no extractable keywords
 // ---------------------------------------------------------------------------
 
-/// Specs whose content yields no extractable keywords should be treated
-/// as covered (no gap reported).
+/// Specs whose content yields no extractable keywords (all words are
+/// stop-words or below the minimum keyword length) should be treated
+/// as covered -- no gap reported, and the spec appears in
+/// `covered_spec_ids`.
 #[test]
 fn spec_with_no_keywords_treated_as_covered() {
     let db = test_db();
@@ -566,6 +568,23 @@ fn spec_with_no_keywords_treated_as_covered() {
     let spec = make_active_spec("spec-no-kw", "No Keywords", "a an the is it of to");
     db.insert_spec(&spec).unwrap();
 
+    // Verify via analyze_gaps() that the spec is treated as covered.
+    let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+    let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+    assert!(
+        report.gaps.is_empty(),
+        "no gaps should be reported for a spec with no extractable keywords, got: {:?}",
+        report.gaps,
+    );
+    assert!(
+        report.covered_spec_ids.contains(&"spec-no-kw".to_string()),
+        "spec-no-kw should be in covered_spec_ids when all keywords are filtered out, \
+         covered_ids: {:?}",
+        report.covered_spec_ids,
+    );
+
+    // Also verify the full execute() path completes without error.
     let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
     assert!(
         job.execute(&ctx()).is_ok(),
