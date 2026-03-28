@@ -179,6 +179,14 @@ fn no_gap_when_no_active_specs() {
 
 /// When an open queue item already exists for a spec, gap detection should
 /// skip issue creation for that spec (dedupe guard).
+///
+/// This test verifies three things:
+/// 1. `has_open_items_for_source` returns `true` for specs with an open
+///    (Pending) queue item — the DB dedupe guard is active.
+/// 2. `analyze_gaps()` still detects and reports the gap — the dedupe
+///    guard lives in `execute()`, not in analysis.
+/// 3. `execute()` completes successfully, skipping issue creation for the
+///    duplicate spec.
 #[test]
 fn skips_issue_when_open_queue_item_exists() {
     let db = test_db();
@@ -204,8 +212,44 @@ fn skips_issue_when_open_queue_item_exists() {
     db.insert_item(&item).unwrap();
 
     // The DB dedupe guard should detect the open item.
-    assert!(db.has_open_items_for_source("spec-dup").unwrap());
+    assert!(
+        db.has_open_items_for_source("spec-dup").unwrap(),
+        "open Pending queue item must be detected by has_open_items_for_source"
+    );
 
+    // Use analyze_gaps() to verify the gap is still detected by pure
+    // analysis -- the dedupe guard only suppresses issue creation in
+    // execute(), not the analysis itself.
+    let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+    let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+    assert_eq!(
+        report.gaps.len(),
+        1,
+        "expected exactly one gap for spec-dup despite open queue item, got: {:?}",
+        report.gaps,
+    );
+    assert_eq!(
+        report.gaps[0].spec_id, "spec-dup",
+        "gap should reference the correct spec"
+    );
+    assert!(
+        report.gaps[0].coverage_score < 0.5,
+        "coverage score {:.2} should be below the default threshold \
+         because the workspace code does not cover the spec keywords",
+        report.gaps[0].coverage_score,
+    );
+    assert!(
+        !report.gaps[0].missing_items.is_empty(),
+        "missing_items should list uncovered keywords from the spec"
+    );
+    assert!(
+        report.covered_spec_ids.is_empty(),
+        "no spec should be marked as covered when keywords are absent from the code"
+    );
+
+    // Also verify the full execute() path completes without error --
+    // it should succeed but skip issue creation due to the dedupe guard.
     let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
     assert!(
         job.execute(&ctx()).is_ok(),
