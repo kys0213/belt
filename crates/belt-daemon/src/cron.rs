@@ -4611,10 +4611,48 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         // No open queue items for this spec.
         assert!(!db.has_open_items_for_source("spec-no-dup").unwrap());
 
+        // Verify analyze_gaps() detects the gap when no open items block it.
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+        assert_eq!(
+            report.gaps.len(),
+            1,
+            "expected exactly one gap for spec-no-dup, got: {:?}",
+            report.gaps,
+        );
+        assert_eq!(
+            report.gaps[0].spec_id, "spec-no-dup",
+            "gap should reference the correct spec",
+        );
+        assert!(
+            report.gaps[0].coverage_score < 0.5,
+            "coverage score {:.2} should be below the default threshold \
+             because the workspace code does not cover the spec keywords",
+            report.gaps[0].coverage_score,
+        );
+        assert!(
+            !report.gaps[0].missing_items.is_empty(),
+            "missing_items should list uncovered keywords from the spec",
+        );
+        let joined = report.gaps[0].missing_items.join(" ").to_lowercase();
+        assert!(
+            joined.contains("authorization") || joined.contains("middleware"),
+            "missing_items should reference authorization or middleware gaps, got: {:?}",
+            report.gaps[0].missing_items,
+        );
+        assert!(
+            report.covered_spec_ids.is_empty(),
+            "no spec should be marked as covered when keywords are absent from the code",
+        );
+
+        // Also verify the full execute() path completes without error.
         let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
         let ctx = CronContext { now: Utc::now() };
-        // Should succeed (gh CLI may warn but the job itself should not error).
-        assert!(job.execute(&ctx).is_ok());
+        assert!(
+            job.execute(&ctx).is_ok(),
+            "gap detection should proceed when no open items exist for the spec",
+        );
     }
 
     #[test]
@@ -4635,7 +4673,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         spec.status = belt_core::spec::SpecStatus::Active;
         db.insert_spec(&spec).unwrap();
 
-        // Insert a Done (terminal) queue item — should NOT block gap detection.
+        // Insert a Done (terminal) queue item -- should NOT block gap detection.
         let mut item = belt_core::queue::QueueItem::new(
             "spec-term:work".into(),
             "spec-term".into(),
@@ -4646,11 +4684,47 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         db.insert_item(&item).unwrap();
 
         // Terminal items should not count as "open".
-        assert!(!db.has_open_items_for_source("spec-term").unwrap());
+        assert!(
+            !db.has_open_items_for_source("spec-term").unwrap(),
+            "Done queue items must not be treated as open",
+        );
 
+        // Verify analyze_gaps() detects the gap despite the terminal queue item.
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+        assert_eq!(
+            report.gaps.len(),
+            1,
+            "expected exactly one gap for spec-term, got: {:?}",
+            report.gaps,
+        );
+        assert_eq!(
+            report.gaps[0].spec_id, "spec-term",
+            "gap should reference the correct spec",
+        );
+        assert!(
+            report.gaps[0].coverage_score < 0.5,
+            "coverage score {:.2} should be below the default threshold \
+             because the workspace code does not cover the spec keywords",
+            report.gaps[0].coverage_score,
+        );
+        assert!(
+            !report.gaps[0].missing_items.is_empty(),
+            "missing_items should list uncovered keywords from the spec",
+        );
+        assert!(
+            report.covered_spec_ids.is_empty(),
+            "no spec should be marked as covered when keywords are absent from the code",
+        );
+
+        // Also verify the full execute() path completes without error.
         let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
         let ctx = CronContext { now: Utc::now() };
-        assert!(job.execute(&ctx).is_ok());
+        assert!(
+            job.execute(&ctx).is_ok(),
+            "gap detection should proceed when only terminal items exist",
+        );
     }
 
     // -- CronSchedule::parse_expression tests --
