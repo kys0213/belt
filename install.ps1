@@ -63,6 +63,12 @@ function Install-Belt {
     Write-Installer "detected platform: windows $arch"
 
     $version = Resolve-Version
+
+    # Normalize version prefix
+    if (-not $version.StartsWith("v")) {
+        $version = "v$version"
+    }
+
     Write-Installer "installing belt $version"
 
     $installDir = $env:BELT_INSTALL_DIR
@@ -70,7 +76,8 @@ function Install-Belt {
         $installDir = Join-Path $HOME ".belt\bin"
     }
 
-    $asset = "belt-x86_64-pc-windows-msvc.zip"
+    $target = "${arch}-pc-windows-msvc"
+    $asset = "belt-$target.zip"
     $url = "$GitHubRelease/download/$version/$asset"
 
     # Create install directory
@@ -83,11 +90,10 @@ function Install-Belt {
         }
     }
 
-    # Download to temp directory
-    $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "belt-install-$([System.Guid]::NewGuid().ToString('N'))"
-    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
-
     try {
+        # Download to temp directory
+        $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "belt-install-$([System.Guid]::NewGuid().ToString('N'))"
+        New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
         $tmpFile = Join-Path $tmpDir $asset
 
         Write-Installer "downloading $url..."
@@ -111,7 +117,7 @@ function Install-Belt {
         $beltExe = $null
         $candidates = @(
             (Join-Path $tmpDir "belt.exe"),
-            (Join-Path $tmpDir "belt-x86_64-pc-windows-msvc\belt.exe")
+            (Join-Path $tmpDir "belt-$target\belt.exe")
         )
 
         foreach ($candidate in $candidates) {
@@ -141,32 +147,17 @@ function Install-Belt {
 
     Write-Installer "belt $version installed to $(Join-Path $installDir 'belt.exe')"
 
-    # Update PATH
+    # PATH guidance
     $currentPath = [Environment]::GetEnvironmentVariable("Path", "User")
     if ($currentPath -and $currentPath.Split(";") -contains $installDir) {
         Write-Installer "belt is already in your PATH"
     }
     else {
-        try {
-            if ($currentPath) {
-                $newPath = "$installDir;$currentPath"
-            }
-            else {
-                $newPath = $installDir
-            }
-            [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-            Write-Installer "added $installDir to User PATH"
-        }
-        catch {
-            Write-Host ""
-            Write-Installer "could not update PATH automatically. Please add the following to your PATH manually:"
-            Write-Host ""
-            Write-Host "    $installDir"
-            Write-Host ""
-        }
-
-        # Update current session PATH
-        $env:Path = "$installDir;$env:Path"
+        Write-Host ""
+        Write-Installer "add belt to your PATH by running:"
+        Write-Host ""
+        Write-Host "    [Environment]::SetEnvironmentVariable('Path', \"$installDir;\`$env:Path\", 'User')"
+        Write-Host ""
     }
 
     Write-Host ""

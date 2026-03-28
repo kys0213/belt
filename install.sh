@@ -1,6 +1,6 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Belt installer for macOS and Linux
-# Usage: curl -sSf https://raw.githubusercontent.com/kys0213/belt/main/install.sh | sh
+# Usage: curl -sSf https://raw.githubusercontent.com/kys0213/belt/main/install.sh | bash
 #
 # Environment variables:
 #   BELT_VERSION      - Version to install (default: latest)
@@ -11,6 +11,7 @@ set -eu
 REPO="kys0213/belt"
 GITHUB_API="https://api.github.com"
 GITHUB_RELEASE="https://github.com/${REPO}/releases"
+DOWNLOADER=""
 
 # --- Helpers ---
 
@@ -31,11 +32,11 @@ need_cmd() {
 
 # --- Detect download command ---
 
-downloader() {
+detect_downloader() {
     if command -v curl > /dev/null 2>&1; then
-        echo "curl"
+        DOWNLOADER="curl"
     elif command -v wget > /dev/null 2>&1; then
-        echo "wget"
+        DOWNLOADER="wget"
     else
         err "need 'curl' or 'wget' to download files"
     fi
@@ -45,12 +46,10 @@ downloader() {
 download() {
     local _url="$1"
     local _output="$2"
-    local _dl
-    _dl="$(downloader)"
 
-    if [ "$_dl" = "curl" ]; then
+    if [ "$DOWNLOADER" = "curl" ]; then
         curl -fsSL --retry 3 "$_url" -o "$_output" || err "failed to download $_url"
-    elif [ "$_dl" = "wget" ]; then
+    elif [ "$DOWNLOADER" = "wget" ]; then
         wget -q --tries=3 "$_url" -O "$_output" || err "failed to download $_url"
     fi
 }
@@ -58,12 +57,10 @@ download() {
 # Download URL and output to stdout
 download_to_stdout() {
     local _url="$1"
-    local _dl
-    _dl="$(downloader)"
 
-    if [ "$_dl" = "curl" ]; then
+    if [ "$DOWNLOADER" = "curl" ]; then
         curl -fsSL --retry 3 "$_url" || err "failed to download $_url"
-    elif [ "$_dl" = "wget" ]; then
+    elif [ "$DOWNLOADER" = "wget" ]; then
         wget -q --tries=3 "$_url" -O - || err "failed to download $_url"
     fi
 }
@@ -162,6 +159,7 @@ detect_profile() {
 main() {
     need_cmd uname
     need_cmd tar
+    detect_downloader
 
     local _os _arch _triple _version _install_dir _asset _url _tmpdir
 
@@ -172,6 +170,13 @@ main() {
     say "detected platform: ${_os} ${_arch} (${_triple})"
 
     _version="$(resolve_version)"
+
+    # Normalize version prefix
+    case "$_version" in
+        v*) ;;
+        *)  _version="v${_version}" ;;
+    esac
+
     say "installing belt ${_version}"
 
     _install_dir="${BELT_INSTALL_DIR:-$HOME/.belt/bin}"
@@ -200,7 +205,7 @@ main() {
     else
         # Try to find belt binary in extracted contents
         local _found
-        _found="$(find "$_tmpdir" -name "belt" -type f | head -1)"
+        _found="$(find "$_tmpdir" -maxdepth 2 -name "belt" -type f | head -1)"
         if [ -n "$_found" ]; then
             mv "$_found" "${_install_dir}/belt"
         else
