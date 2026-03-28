@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.4](https://github.com/kys0213/belt/compare/v0.1.3...v0.1.4) (2026-03-28)
+
+
+### Bug Fixes
+
+* **ci:** add push trigger with paths filter for release tag creation ([#473](https://github.com/kys0213/belt/issues/473)) ([e7a7409](https://github.com/kys0213/belt/commit/e7a7409d7d723c7f1696b36cbdbe3481b46b0d80))
+
 ## [0.1.3](https://github.com/kys0213/belt/compare/v0.1.2...v0.1.3) (2026-03-28)
 
 
