@@ -752,11 +752,12 @@ fn terminate_pid(pid: u32) -> anyhow::Result<()> {
         let output = Command::new("taskkill")
             .args(["/PID", &pid.to_string()])
             .output()?;
-        if !output.status.success() {
+        if output.status.success() {
+            Ok(())
+        } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("taskkill failed for PID {pid}: {stderr}");
+            anyhow::bail!("taskkill failed for PID {pid}: {stderr}")
         }
-        Ok(())
     }
 
     #[cfg(not(any(unix, windows)))]
