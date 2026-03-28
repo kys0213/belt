@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.3](https://github.com/kys0213/belt/compare/v0.1.2...v0.1.3) (2026-03-28)
+
+
+### Bug Fixes
+
+* **ci:** add release event trigger for Release Please compatibility ([#469](https://github.com/kys0213/belt/issues/469)) ([00357a2](https://github.com/kys0213/belt/commit/00357a292bd487ee4dd9c9f6ae141d177af8a0b4))
+* **dist:** move _tmpdir to global scope for trap cleanup ([#471](https://github.com/kys0213/belt/issues/471)) ([5676d91](https://github.com/kys0213/belt/commit/5676d91de5c7352a0efd230e2073513b393d308d))
+
 ## [0.1.2](https://github.com/kys0213/belt/compare/v0.1.1...v0.1.2) (2026-03-28)
 
 
