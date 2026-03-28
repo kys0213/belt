@@ -756,6 +756,7 @@ fn terminate_pid(pid: u32) -> anyhow::Result<()> {
             let stderr = String::from_utf8_lossy(&output.stderr);
             anyhow::bail!("taskkill failed for PID {pid}: {stderr}");
         }
+        Ok(())
     }
 
     #[cfg(not(any(unix, windows)))]
