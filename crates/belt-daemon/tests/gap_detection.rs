@@ -310,42 +310,65 @@ fn terminal_items_do_not_block_gap_detection() {
         "expected exactly one gap for spec-done-prev, got: {:?}",
         report.gaps,
     );
+    let gap = &report.gaps[0];
     assert_eq!(
-        report.gaps[0].spec_id, "spec-done-prev",
+        gap.spec_id, "spec-done-prev",
         "gap should reference the correct spec"
     );
+    assert_eq!(
+        gap.spec_name, "Done Prev Gap",
+        "gap should carry the correct spec name"
+    );
     assert!(
-        report.gaps[0].coverage_score < 0.5,
+        gap.coverage_score < 0.5,
         "coverage score {:.2} should be below the default threshold \
          because the workspace code does not cover the spec keywords",
-        report.gaps[0].coverage_score,
+        gap.coverage_score,
     );
     assert!(
-        (report.gaps[0].coverage_score - 0.0).abs() < f64::EPSILON,
-        "coverage score should be 0.0 because no spec keywords \
+        (gap.coverage_score - 0.0).abs() < f64::EPSILON,
+        "coverage score should be exactly 0.0 because no spec keywords \
          (authorization, middleware, secure, endpoints) appear in the workspace code, \
          got: {:.2}",
-        report.gaps[0].coverage_score,
+        gap.coverage_score,
     );
     assert!(
-        !report.gaps[0].missing_items.is_empty(),
+        !gap.missing_items.is_empty(),
         "missing_items should list uncovered keywords from the spec"
     );
-    // Verify the missing items reference the actual spec keywords that are absent.
-    let joined = report.gaps[0].missing_items.join(" ").to_lowercase();
+
+    // Verify each individual keyword from the spec is reported as missing.
+    let joined = gap.missing_items.join(" ").to_lowercase();
     assert!(
-        joined.contains("authorization") || joined.contains("middleware"),
-        "missing_items should reference authorization or middleware gaps, got: {:?}",
-        report.gaps[0].missing_items,
+        joined.contains("authorization"),
+        "missing_items should reference 'authorization', got: {:?}",
+        gap.missing_items,
     );
     assert!(
-        joined.contains("secure") || joined.contains("endpoints"),
-        "missing_items should reference secure or endpoints gaps, got: {:?}",
-        report.gaps[0].missing_items,
+        joined.contains("middleware"),
+        "missing_items should reference 'middleware', got: {:?}",
+        gap.missing_items,
     );
+    assert!(
+        joined.contains("secure"),
+        "missing_items should reference 'secure', got: {:?}",
+        gap.missing_items,
+    );
+    assert!(
+        joined.contains("endpoints"),
+        "missing_items should reference 'endpoints', got: {:?}",
+        gap.missing_items,
+    );
+
     assert!(
         report.covered_spec_ids.is_empty(),
         "no spec should be marked as covered when keywords are absent from the code"
+    );
+    assert!(
+        !report
+            .covered_spec_ids
+            .contains(&"spec-done-prev".to_string()),
+        "spec-done-prev should not appear in covered_spec_ids"
     );
 
     // Also verify the full execute() path completes without error.
