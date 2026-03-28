@@ -47,7 +47,9 @@ jobs:
 
       - name: Install cross (Linux ARM64)
         if: matrix.cross
-        run: cargo install cross --locked
+        run: |
+          curl -fsSL https://github.com/cross-rs/cross/releases/latest/download/cross-x86_64-unknown-linux-gnu.tar.gz \
+            | tar xz -C ~/.cargo/bin
 
       - name: Build binary
         run: |
@@ -78,42 +80,18 @@ jobs:
           name: belt-${{ matrix.target }}
           path: belt-${{ matrix.target }}.${{ matrix.archive }}
 
-  release:
-    name: Create Release
+  upload:
+    name: Upload Release Assets
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
-      - name: Generate changelog
-        id: changelog
-        run: |
-          PREVIOUS_TAG=$(git tag --sort=-v:refname | head -n 2 | tail -n 1)
-          if [ -z "$PREVIOUS_TAG" ]; then
-            CHANGELOG=$(git log --pretty=format:"- %s (%h)" HEAD)
-          else
-            CHANGELOG=$(git log --pretty=format:"- %s (%h)" "${PREVIOUS_TAG}..HEAD")
-          fi
-          {
-            echo "changelog<<EOF"
-            echo "$CHANGELOG"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Create GitHub Release
+      - name: Upload assets to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: false
-          body: |
-            ## Changes
-
-            ${{ steps.changelog.outputs.changelog }}
           files: artifacts/*
