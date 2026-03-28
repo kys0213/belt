@@ -395,15 +395,48 @@ fn multiple_specs_analyzed_independently() {
 
     std::fs::write(
         tmp.path().join("lib.rs"),
-        "fn logging() {}\nfn monitoring() {}\nfn metrics() {}",
+        concat!(
+            "use std::collections::HashMap;\n",
+            "\n",
+            "/// Structured logging system that writes log entries with severity\n",
+            "/// levels to the configured output sink.\n",
+            "fn logging(level: &str, message: &str, context: &HashMap<String, String>) {\n",
+            "    let timestamp = chrono::Utc::now().to_rfc3339();\n",
+            "    let ctx_str: String = context.iter()\n",
+            "        .map(|(k, v)| format!(\"{}={}\", k, v))\n",
+            "        .collect::<Vec<_>>()\n",
+            "        .join(\", \");\n",
+            "    eprintln!(\"[{}] {} - {} ({})\", timestamp, level, message, ctx_str);\n",
+            "}\n",
+            "\n",
+            "/// Health monitoring that periodically checks service status and\n",
+            "/// reports availability to the monitoring dashboard.\n",
+            "fn monitoring(services: &[&str]) -> Vec<(String, bool)> {\n",
+            "    services.iter().map(|svc| {\n",
+            "        let healthy = check_health(svc);\n",
+            "        if !healthy {\n",
+            "            logging(\"WARN\", &format!(\"service {} is unhealthy\", svc), &HashMap::new());\n",
+            "        }\n",
+            "        (svc.to_string(), healthy)\n",
+            "    }).collect()\n",
+            "}\n",
+            "\n",
+            "/// Metrics collection and aggregation for counters, gauges, and\n",
+            "/// histograms. Exports data in a format suitable for dashboards.\n",
+            "fn metrics(counters: &mut HashMap<String, u64>, name: &str, value: u64) {\n",
+            "    let entry = counters.entry(name.to_string()).or_insert(0);\n",
+            "    *entry += value;\n",
+            "    logging(\"DEBUG\", &format!(\"metric {} = {}\", name, entry), &HashMap::new());\n",
+            "}\n",
+        ),
     )
     .unwrap();
 
-    // Spec A: fully covered.
+    // Spec A: fully covered (keywords: logging, monitoring, metrics).
     let spec_a = make_active_spec("spec-a", "Logging", "logging monitoring metrics");
     db.insert_spec(&spec_a).unwrap();
 
-    // Spec B: not covered at all.
+    // Spec B: not covered at all (keywords: authorization, middleware, token, validation).
     let spec_b = make_active_spec(
         "spec-b",
         "Auth Gap Multi",
@@ -411,6 +444,46 @@ fn multiple_specs_analyzed_independently() {
     );
     db.insert_spec(&spec_b).unwrap();
 
+    // Use analyze_gaps() to verify independent per-spec analysis.
+    let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+    let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+    // Spec A should be covered -- its keywords all appear in lib.rs.
+    assert!(
+        report.covered_spec_ids.contains(&"spec-a".to_string()),
+        "spec-a (Logging) should be covered, covered_ids: {:?}, gaps: {:?}",
+        report.covered_spec_ids,
+        report.gaps,
+    );
+
+    // Spec B should have a gap -- none of its keywords appear in lib.rs.
+    assert_eq!(
+        report.gaps.len(),
+        1,
+        "expected exactly one gap (spec-b), got: {:?}",
+        report.gaps,
+    );
+    assert_eq!(
+        report.gaps[0].spec_id, "spec-b",
+        "the gap should be for spec-b (Auth Gap Multi)",
+    );
+    assert!(
+        report.gaps[0].coverage_score < 0.5,
+        "spec-b coverage score {:.2} should be below threshold since no keywords are covered",
+        report.gaps[0].coverage_score,
+    );
+    assert!(
+        !report.gaps[0].missing_items.is_empty(),
+        "spec-b should have missing items listing uncovered keywords",
+    );
+
+    // Spec B should NOT appear in covered_spec_ids.
+    assert!(
+        !report.covered_spec_ids.contains(&"spec-b".to_string()),
+        "spec-b should not be in covered_spec_ids when it has a gap",
+    );
+
+    // Also verify the full execute() path completes without error.
     let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
     assert!(
         job.execute(&ctx()).is_ok(),
