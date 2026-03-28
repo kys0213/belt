@@ -1978,9 +1978,23 @@ async fn main() -> anyhow::Result<()> {
                     let result =
                         belt_infra::onboarding::onboard_workspace(&db, config_path, &belt_home)?;
 
-                    // Initialize global claw workspace automatically
-                    let claw_ws = claw::ClawWorkspace::init(&belt_home)?;
-                    tracing::info!(path = %claw_ws.path.display(), "claw workspace initialized");
+                    // Validate claw workspace — warn on failure, never block workspace add
+                    let claw_ws_path = belt_home.join("claw-workspace");
+                    match claw::ClawWorkspace::init(&belt_home) {
+                        Ok(claw_ws) => {
+                            tracing::info!(path = %claw_ws.path.display(), "claw workspace initialized");
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "failed to initialize claw workspace");
+                            if !claw_ws_path.is_dir() {
+                                eprintln!(
+                                    "Warning: Claw workspace not found at {}",
+                                    claw_ws_path.display()
+                                );
+                                eprintln!("  Run `belt claw init` to set up the Claw workspace.");
+                            }
+                        }
+                    }
 
                     if result.created {
                         println!(
