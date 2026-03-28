@@ -177,6 +177,11 @@ main() {
         *)  _version="v${_version}" ;;
     esac
 
+    # Validate version format
+    if ! printf '%s' "$_version" | grep -qE '^v[0-9]+\.[0-9]+'; then
+        err "invalid version format: $_version (expected vX.Y.Z)"
+    fi
+
     say "installing belt ${_version}"
 
     _install_dir="${BELT_INSTALL_DIR:-$HOME/.belt/bin}"

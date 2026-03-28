@@ -44,7 +44,7 @@ function Resolve-Version {
     $url = "$GitHubApi/repos/$Repo/releases/latest"
 
     try {
-        $response = Invoke-RestMethod -Uri $url -UseBasicParsing
+        $response = Invoke-RestMethod -Uri $url -Headers @{ "User-Agent" = "belt-installer" }
         $tag = $response.tag_name
         if (-not $tag) {
             Write-InstallerError "could not determine latest version from GitHub API"
@@ -98,7 +98,7 @@ function Install-Belt {
 
         Write-Installer "downloading $url..."
         try {
-            Invoke-WebRequest -Uri $url -OutFile $tmpFile -UseBasicParsing
+            Invoke-WebRequest -Uri $url -OutFile $tmpFile -UseBasicParsing -Headers @{ "User-Agent" = "belt-installer" }
         }
         catch {
             Write-InstallerError "failed to download $url ($_)"
