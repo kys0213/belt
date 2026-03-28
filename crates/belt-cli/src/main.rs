@@ -494,16 +494,14 @@ enum SpecCommands {
         /// Spec ID.
         id: String,
         /// Target URL or issue reference (e.g. `https://...` or `owner/repo#123`).
-        #[arg(long)]
-        to: String,
+        target: String,
     },
     /// Unlink a spec from an external resource.
     Unlink {
         /// Spec ID.
         id: String,
         /// Target URL or issue reference to remove.
-        #[arg(long)]
-        from: String,
+        target: String,
     },
     /// Verify all links for a spec (check reachability).
     Verify {
@@ -2771,48 +2769,90 @@ async fn main() -> anyhow::Result<()> {
                     db.update_spec_status(&id, belt_core::spec::SpecStatus::Archived)?;
                     println!("spec archived: {id}");
                 }
-                SpecCommands::Link { id, to } => {
+                SpecCommands::Link { id, target } => {
                     // Ensure spec exists.
                     let _ = db.get_spec(&id)?;
                     let link_id = format!("link-{}", chrono::Utc::now().timestamp_millis());
                     let link =
-                        belt_core::spec::SpecLink::new(link_id.clone(), id.clone(), to.clone());
+                        belt_core::spec::SpecLink::new(link_id.clone(), id.clone(), target.clone());
                     db.insert_spec_link(&link)?;
-                    println!("linked {id} -> {to}");
+                    println!("linked {id} -> {target}");
                 }
-                SpecCommands::Unlink { id, from } => {
-                    db.remove_spec_link(&id, &from)?;
-                    println!("unlinked {id} -x- {from}");
+                SpecCommands::Unlink { id, target } => {
+                    db.remove_spec_link(&id, &target)?;
+                    println!("unlinked {id} -x- {target}");
                 }
                 SpecCommands::Verify { id, json } => {
-                    let _ = db.get_spec(&id)?;
+                    let spec = db.get_spec(&id)?;
+
+                    // Validate spec content against required sections.
+                    let section_result = belt_core::spec::validate_required_sections(&spec.content);
+
+                    // Verify link reachability.
                     let links = db.list_spec_links(&id)?;
-                    if links.is_empty() {
-                        if json {
-                            println!("[]");
-                        } else {
-                            println!("no links found for spec {id}");
-                        }
+                    let mut link_results: Vec<belt_core::spec::LinkVerification> = Vec::new();
+                    for link in links {
+                        let (valid, detail) = verify_link_target(&link.target);
+                        link_results.push(belt_core::spec::LinkVerification {
+                            link,
+                            valid,
+                            detail,
+                        });
+                    }
+
+                    let sections_ok = section_result.is_ok();
+                    let links_ok = link_results.iter().all(|r| r.valid);
+
+                    if json {
+                        let missing_sections: Vec<&str> = match &section_result {
+                            Ok(()) => vec![],
+                            Err(missing) => missing.clone(),
+                        };
+                        let output = serde_json::json!({
+                            "spec_id": id,
+                            "valid": sections_ok && links_ok,
+                            "sections": {
+                                "valid": sections_ok,
+                                "missing": missing_sections,
+                            },
+                            "links": link_results,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&output)?);
                     } else {
-                        let mut results: Vec<belt_core::spec::LinkVerification> = Vec::new();
-                        for link in links {
-                            let (valid, detail) = verify_link_target(&link.target);
-                            results.push(belt_core::spec::LinkVerification {
-                                link,
-                                valid,
-                                detail,
-                            });
+                        println!("Spec: {id}");
+                        println!();
+
+                        // Section validation results.
+                        match &section_result {
+                            Ok(()) => {
+                                println!("[OK] All required sections present");
+                            }
+                            Err(missing) => {
+                                println!(
+                                    "[FAIL] Missing required sections: {}",
+                                    missing.join(", ")
+                                );
+                            }
                         }
-                        if json {
-                            println!("{}", serde_json::to_string_pretty(&results)?);
+
+                        // Link verification results.
+                        if link_results.is_empty() {
+                            println!("[--] No links to verify");
                         } else {
-                            for r in &results {
+                            for r in &link_results {
                                 let status_icon = if r.valid { "OK" } else { "FAIL" };
                                 println!("[{status_icon}] {} - {}", r.link.target, r.detail);
                             }
-                            let total = results.len();
-                            let passed = results.iter().filter(|r| r.valid).count();
-                            println!("\n{passed}/{total} links verified successfully");
+                            let total = link_results.len();
+                            let passed = link_results.iter().filter(|r| r.valid).count();
+                            println!("{passed}/{total} links verified");
+                        }
+
+                        println!();
+                        if sections_ok && links_ok {
+                            println!("Result: PASS");
+                        } else {
+                            println!("Result: FAIL");
                         }
                     }
                 }
@@ -3849,5 +3889,90 @@ mod tests {
             extract_issue_number(parent).as_deref(),
         );
         assert!(issues[0].title.contains("#42"));
+    }
+
+    #[test]
+    fn spec_verify_parses_id_and_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "spec", "verify", "spec-42", "--json"]).unwrap();
+        match cli.command {
+            Commands::Spec {
+                command: SpecCommands::Verify { id, json },
+            } => {
+                assert_eq!(id, "spec-42");
+                assert!(json);
+            }
+            _ => panic!("expected Spec Verify command"),
+        }
+    }
+
+    #[test]
+    fn spec_verify_parses_without_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "spec", "verify", "spec-1"]).unwrap();
+        match cli.command {
+            Commands::Spec {
+                command: SpecCommands::Verify { id, json },
+            } => {
+                assert_eq!(id, "spec-1");
+                assert!(!json);
+            }
+            _ => panic!("expected Spec Verify command"),
+        }
+    }
+
+    #[test]
+    fn spec_link_parses_positional_args() {
+        let cli = Cli::try_parse_from([
+            "belt",
+            "spec",
+            "link",
+            "spec-10",
+            "https://example.com/issue/1",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Spec {
+                command: SpecCommands::Link { id, target },
+            } => {
+                assert_eq!(id, "spec-10");
+                assert_eq!(target, "https://example.com/issue/1");
+            }
+            _ => panic!("expected Spec Link command"),
+        }
+    }
+
+    #[test]
+    fn spec_link_parses_github_issue_ref() {
+        let cli =
+            Cli::try_parse_from(["belt", "spec", "link", "spec-5", "owner/repo#123"]).unwrap();
+        match cli.command {
+            Commands::Spec {
+                command: SpecCommands::Link { id, target },
+            } => {
+                assert_eq!(id, "spec-5");
+                assert_eq!(target, "owner/repo#123");
+            }
+            _ => panic!("expected Spec Link command"),
+        }
+    }
+
+    #[test]
+    fn spec_unlink_parses_positional_args() {
+        let cli = Cli::try_parse_from([
+            "belt",
+            "spec",
+            "unlink",
+            "spec-10",
+            "https://example.com/issue/1",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Spec {
+                command: SpecCommands::Unlink { id, target },
+            } => {
+                assert_eq!(id, "spec-10");
+                assert_eq!(target, "https://example.com/issue/1");
+            }
+            _ => panic!("expected Spec Unlink command"),
+        }
     }
 }
