@@ -703,6 +703,8 @@ fn source_file_satisfies_coverage_over_non_source() {
 // ---------------------------------------------------------------------------
 
 /// Coverage threshold of 0.0 means everything is covered.
+/// Even when no spec keywords appear in the workspace code, a threshold
+/// of 0.0 should treat all specs as covered (no gaps reported).
 #[test]
 fn threshold_zero_treats_all_as_covered() {
     let db = test_db();
@@ -717,6 +719,23 @@ fn threshold_zero_treats_all_as_covered() {
     );
     db.insert_spec(&spec).unwrap();
 
+    // Verify via analyze_gaps that threshold 0.0 treats everything as covered.
+    let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf())
+        .with_coverage_threshold(0.0);
+    let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+    assert!(
+        report.gaps.is_empty(),
+        "threshold 0.0 should report no gaps regardless of keyword coverage, got: {:?}",
+        report.gaps,
+    );
+    assert!(
+        report.covered_spec_ids.contains(&"spec-zero".to_string()),
+        "spec-zero should be marked as covered at threshold 0.0, covered_ids: {:?}",
+        report.covered_spec_ids,
+    );
+
+    // Also verify the full execute() path completes without error.
     let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf())
         .with_coverage_threshold(0.0);
     assert!(
@@ -726,12 +745,15 @@ fn threshold_zero_treats_all_as_covered() {
 }
 
 /// Coverage threshold of 1.0 means only 100% coverage is acceptable.
+/// With partial keyword coverage (only "authorization" out of four keywords),
+/// the gap should be detected and the report should list the missing keywords.
 #[test]
 fn threshold_one_requires_full_coverage() {
     let db = test_db();
     let tmp = tempfile::tempdir().unwrap();
 
-    // Partial coverage.
+    // Partial coverage: only "authorization" keyword is present.
+    // "middleware", "token", and "session" are absent.
     std::fs::write(tmp.path().join("auth.rs"), "fn authorization() {}").unwrap();
 
     let spec = make_active_spec(
@@ -741,6 +763,37 @@ fn threshold_one_requires_full_coverage() {
     );
     db.insert_spec(&spec).unwrap();
 
+    // Verify via analyze_gaps that threshold 1.0 detects the gap.
+    let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf())
+        .with_coverage_threshold(1.0);
+    let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+    assert_eq!(
+        report.gaps.len(),
+        1,
+        "expected exactly one gap when threshold requires 100% coverage, got: {:?}",
+        report.gaps,
+    );
+    let gap = &report.gaps[0];
+    assert_eq!(
+        gap.spec_id, "spec-full",
+        "the gap should reference spec-full"
+    );
+    assert!(
+        gap.coverage_score < 1.0,
+        "coverage score {:.2} should be below 1.0 because only partial keywords are covered",
+        gap.coverage_score,
+    );
+    assert!(
+        !gap.missing_items.is_empty(),
+        "missing_items should list uncovered keywords (middleware, token, session)"
+    );
+    assert!(
+        !report.covered_spec_ids.contains(&"spec-full".to_string()),
+        "spec-full should not be in covered_spec_ids when coverage is partial at threshold 1.0",
+    );
+
+    // Also verify the full execute() path completes without error.
     let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf())
         .with_coverage_threshold(1.0);
     assert!(
