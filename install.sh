@@ -12,6 +12,7 @@ REPO="kys0213/belt"
 GITHUB_API="https://api.github.com"
 GITHUB_RELEASE="https://github.com/${REPO}/releases"
 DOWNLOADER=""
+_tmpdir=""
 
 # --- Helpers ---
 
@@ -161,7 +162,7 @@ main() {
     need_cmd tar
     detect_downloader
 
-    local _os _arch _triple _version _install_dir _asset _url _tmpdir
+    local _os _arch _triple _version _install_dir _asset _url
 
     _os="$(detect_os)"
     _arch="$(detect_arch)"
@@ -233,13 +234,9 @@ main() {
             local _path_line="export PATH=\"${_install_dir}:\$PATH\""
 
             echo ""
-            say "add belt to your PATH by adding the following to ${_profile}:"
+            say "add belt to your PATH by running:"
             echo ""
-            echo "    ${_path_line}"
-            echo ""
-            say "then restart your shell or run:"
-            echo ""
-            echo "    source ${_profile}"
+            echo "    echo '${_path_line}' >> ${_profile} && source ${_profile}"
             echo ""
             ;;
     esac

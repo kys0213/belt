@@ -156,7 +156,7 @@ function Install-Belt {
         Write-Host ""
         Write-Installer "add belt to your PATH by running:"
         Write-Host ""
-        Write-Host "    [Environment]::SetEnvironmentVariable('Path', \"$installDir;\`$env:Path\", 'User')"
+        Write-Host "    [Environment]::SetEnvironmentVariable('Path', '$installDir;' + [Environment]::GetEnvironmentVariable('Path', 'User'), 'User'); `$env:Path = '$installDir;' + `$env:Path"
         Write-Host ""
     }
 
