@@ -219,6 +219,12 @@ fn skips_issue_when_open_queue_item_exists() {
 
 /// Terminal (Done) queue items should NOT prevent gap detection from
 /// considering a spec as needing a new issue.
+///
+/// This test verifies two things:
+/// 1. `has_open_items_for_source` returns `false` for specs with only
+///    terminal (Done) queue items.
+/// 2. `analyze_gaps()` still detects and reports the gap — the terminal
+///    item does not suppress gap analysis.
 #[test]
 fn terminal_items_do_not_block_gap_detection() {
     let db = test_db();
@@ -243,8 +249,43 @@ fn terminal_items_do_not_block_gap_detection() {
     item.phase = QueuePhase::Done;
     db.insert_item(&item).unwrap();
 
-    assert!(!db.has_open_items_for_source("spec-done-prev").unwrap());
+    // Verify Done items are not considered "open".
+    assert!(
+        !db.has_open_items_for_source("spec-done-prev").unwrap(),
+        "Done queue items must not be treated as open"
+    );
 
+    // Use analyze_gaps() to verify the gap is actually detected despite
+    // the terminal queue item.
+    let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+    let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+    assert_eq!(
+        report.gaps.len(),
+        1,
+        "expected exactly one gap for spec-done-prev, got: {:?}",
+        report.gaps,
+    );
+    assert_eq!(
+        report.gaps[0].spec_id, "spec-done-prev",
+        "gap should reference the correct spec"
+    );
+    assert!(
+        report.gaps[0].coverage_score < 0.5,
+        "coverage score {:.2} should be below the default threshold \
+         because the workspace code does not cover the spec keywords",
+        report.gaps[0].coverage_score,
+    );
+    assert!(
+        !report.gaps[0].missing_items.is_empty(),
+        "missing_items should list uncovered keywords from the spec"
+    );
+    assert!(
+        report.covered_spec_ids.is_empty(),
+        "no spec should be marked as covered when keywords are absent from the code"
+    );
+
+    // Also verify the full execute() path completes without error.
     let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
     assert!(
         job.execute(&ctx()).is_ok(),
