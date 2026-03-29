@@ -2453,6 +2453,14 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
 
+                    // Auto-transition Draft -> Active when no HITL conflicts.
+                    if !has_hitl_conflicts {
+                        spec.transition_to(belt_core::spec::SpecStatus::Active)
+                            .map_err(|e| anyhow::anyhow!("{e}"))?;
+                        db.update_spec_status(&spec.id, spec.status)?;
+                        eprintln!("spec '{}' auto-transitioned to active", id);
+                    }
+
                     // Extract acceptance criteria for decomposition.
                     let criteria = belt_core::spec::extract_acceptance_criteria(&spec.content);
 
@@ -2572,15 +2580,13 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
 
-                            // Store decomposed issue numbers and transition spec to Active.
+                            // Store decomposed issue numbers.
+                            // Note: spec is already Active (auto-transitioned earlier).
                             if !child_numbers.is_empty() {
                                 spec.decomposed_issues = Some(child_numbers.join(","));
                                 db.update_spec(&spec)?;
-                                spec.transition_to(belt_core::spec::SpecStatus::Active)
-                                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                                db.update_spec_status(&spec.id, spec.status)?;
                                 println!(
-                                    "spec {} decomposed into {} issues, status -> active",
+                                    "spec {} decomposed into {} issues",
                                     id,
                                     child_numbers.len()
                                 );
