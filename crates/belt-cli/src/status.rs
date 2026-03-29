@@ -3378,6 +3378,48 @@ mod tests {
         assert!(cron_expression_next_secs("bad", None, now).is_none());
     }
 
+    // ---- format_countdown additional edge-case tests -------------------------
+
+    #[test]
+    fn format_countdown_one_second() {
+        assert_eq!(format_countdown(1), "1s");
+    }
+
+    #[test]
+    fn format_countdown_exact_minute_boundary() {
+        // 60 seconds = exactly 1 minute, 0 seconds remainder
+        assert_eq!(format_countdown(60), "1m 00s");
+    }
+
+    #[test]
+    fn format_countdown_exact_hour_boundary() {
+        // 3600 seconds = exactly 1 hour, 0 minutes remainder
+        assert_eq!(format_countdown(3600), "1h 00m");
+    }
+
+    #[test]
+    fn format_countdown_large_value() {
+        // 86400 seconds = 24 hours = displayed as 24h 00m
+        assert_eq!(format_countdown(86400), "24h 00m");
+    }
+
+    #[test]
+    fn format_countdown_large_negative_returns_now() {
+        assert_eq!(format_countdown(-3600), "now");
+    }
+
+    #[test]
+    fn format_countdown_fifty_nine_seconds() {
+        // Just below the minute threshold
+        assert_eq!(format_countdown(59), "59s");
+    }
+
+    #[test]
+    fn format_countdown_fifty_nine_minutes_fifty_nine_seconds() {
+        // 3599 seconds = 59m 59s, just below the hour threshold
+        assert_eq!(format_countdown(3599), "59m 59s");
+    }
+
     // ---- print_rich_status with countdown -----------------------------------
 
     #[test]
@@ -3385,5 +3427,40 @@ mod tests {
         let mut status = sample_system_status();
         status.next_evaluate_secs = Some(120);
         print_rich_status(&status, Some(true));
+    }
+
+    #[test]
+    fn print_rich_status_with_countdown_zero_does_not_panic() {
+        let mut status = sample_system_status();
+        status.next_evaluate_secs = Some(0);
+        print_rich_status(&status, Some(true));
+    }
+
+    #[test]
+    fn print_rich_status_with_countdown_one_second_does_not_panic() {
+        let mut status = sample_system_status();
+        status.next_evaluate_secs = Some(1);
+        print_rich_status(&status, None);
+    }
+
+    #[test]
+    fn print_rich_status_with_countdown_large_value_does_not_panic() {
+        let mut status = sample_system_status();
+        status.next_evaluate_secs = Some(86400);
+        print_rich_status(&status, Some(false));
+    }
+
+    #[test]
+    fn print_rich_status_without_countdown_does_not_panic() {
+        let mut status = sample_system_status();
+        status.next_evaluate_secs = None;
+        print_rich_status(&status, Some(true));
+    }
+
+    #[test]
+    fn print_rich_status_empty_with_countdown_does_not_panic() {
+        let mut status = empty_system_status();
+        status.next_evaluate_secs = Some(300);
+        print_rich_status(&status, None);
     }
 }
