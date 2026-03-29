@@ -897,11 +897,81 @@ fn cmd_queue_show(work_id: &str, format: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `belt queue done` -- mark a queue item as Done.
-fn cmd_queue_done(work_id: &str) -> anyhow::Result<()> {
+/// `belt queue done` -- mark a queue item as Done, running on_done scripts if configured.
+async fn cmd_queue_done(work_id: &str) -> anyhow::Result<()> {
     let db = open_db()?;
-    db.update_phase(work_id, QueuePhase::Done)?;
-    println!("Marked {work_id} as done.");
+    let item = db.get_item(work_id)?;
+
+    // Load workspace config to find on_done scripts for this item's state.
+    let (_, config_path, _) = db.get_workspace(&item.workspace_id)?;
+    let config =
+        belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))?;
+
+    // Find the state config containing on_done scripts.
+    let state_config = config
+        .sources
+        .values()
+        .find_map(|source| source.states.get(&item.state));
+
+    let on_done_actions: Vec<belt_core::action::Action> = state_config
+        .map(|sc| {
+            sc.on_done
+                .iter()
+                .map(belt_core::action::Action::from)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if on_done_actions.is_empty() {
+        db.update_phase(work_id, QueuePhase::Done)?;
+        println!("Marked {work_id} as done.");
+        return Ok(());
+    }
+
+    // Set up execution environment.
+    let belt_home = belt_home()?;
+    let worktree_base = belt_home.join("worktrees");
+    let repo_path = std::path::PathBuf::from(".");
+    let worktree_mgr = belt_infra::worktree::GitWorktreeManager::new(worktree_base, repo_path);
+
+    let worktree_path = worktree_mgr.create_or_reuse(work_id)?;
+    let env = belt_daemon::executor::ActionEnv::new(work_id, &worktree_path);
+
+    // Build a minimal runtime registry for script execution.
+    let mut registry = belt_core::runtime::RuntimeRegistry::new("claude".to_string());
+    registry.register(std::sync::Arc::new(
+        belt_infra::runtimes::claude::ClaudeRuntime::new(None),
+    ));
+    registry.register(std::sync::Arc::new(
+        belt_infra::runtimes::gemini::GeminiRuntime::new(None),
+    ));
+    registry.register(std::sync::Arc::new(
+        belt_infra::runtimes::codex::CodexRuntime::new(None),
+    ));
+    let executor = belt_daemon::executor::ActionExecutor::new(std::sync::Arc::new(registry));
+
+    println!("Running on_done scripts for '{work_id}'...");
+
+    let result = executor.execute_all(&on_done_actions, &env).await?;
+
+    match result {
+        Some(r) if r.success() => {
+            db.update_phase(work_id, QueuePhase::Done)?;
+            println!("on_done scripts succeeded. Marked '{work_id}' as done.");
+        }
+        Some(r) => {
+            db.update_phase(work_id, QueuePhase::Failed)?;
+            println!(
+                "on_done scripts failed (exit code {}). Item '{work_id}' transitioned to failed.",
+                r.exit_code
+            );
+        }
+        None => {
+            db.update_phase(work_id, QueuePhase::Done)?;
+            println!("Marked '{work_id}' as done.");
+        }
+    }
+
     Ok(())
 }
 
@@ -2167,7 +2237,7 @@ async fn main() -> anyhow::Result<()> {
                 cmd_queue_show(&work_id, &format)?;
             }
             QueueCommands::Done { work_id } => {
-                cmd_queue_done(&work_id)?;
+                cmd_queue_done(&work_id).await?;
             }
             QueueCommands::Hitl { work_id, reason } => {
                 cmd_queue_hitl(&work_id, reason.as_deref())?;
