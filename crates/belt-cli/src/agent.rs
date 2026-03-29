@@ -33,9 +33,9 @@ fn load_workspace_config(path: &str) -> Result<WorkspaceConfig> {
 /// 1. **Explicit override** -- `claw_config.rules_path` in workspace YAML.
 ///    Allows per-invocation control (e.g. `--policy-path` in the future).
 /// 2. **Per-workspace Claw dir** -- `$BELT_HOME/workspaces/<name>/claw/system/`.
-///    Created when a workspace has its own Claw policy overrides.
-/// 3. **Global Claw workspace** -- `$BELT_HOME/agent-workspace/.claude/rules/`.
-///    Created by `belt claw init`; contains the default policy templates.
+///    Created when a workspace has its own policy overrides.
+/// 3. **Global Agent workspace** -- `$BELT_HOME/agent-workspace/.claude/rules/`.
+///    Created by `belt agent init`; contains the default policy templates.
 ///
 /// `$BELT_HOME` defaults to `~/.belt` when the environment variable is unset.
 ///
@@ -130,7 +130,7 @@ fn resolve_rules_dir_with_home(
         );
     }
 
-    // 3. Global Claw workspace rules (created by `belt claw init`).
+    // 3. Global Claw workspace rules (created by `belt agent init`).
     if let Some(home) = belt_home {
         let global_rules = home.join("agent-workspace").join(".claude").join("rules");
         if global_rules.is_dir() {

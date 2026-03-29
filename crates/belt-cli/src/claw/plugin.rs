@@ -1,6 +1,6 @@
 //! Claude Code slash command plugin generation and installation.
 //!
-//! Generates the `/claw` slash command plugin structure that can be
+//! Generates the `/agent` slash command plugin structure that can be
 //! registered in `~/.claude/commands/` for use within Claude Code sessions.
 //! The generated command collects belt system context (status, HITL items,
 //! queue list) and forwards natural language input to the belt agent LLM.
@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The plugin name used for directory naming.
-const PLUGIN_NAME: &str = "belt-claw";
+const PLUGIN_NAME: &str = "belt-agent";
 
 /// Generate the plugin.json content.
 fn plugin_json() -> &'static str {
@@ -18,29 +18,29 @@ fn plugin_json() -> &'static str {
     "name": "belt"
   },
   "commands": [
-    "./commands/claw.md"
+    "./commands/agent.md"
   ],
-  "description": "Belt Claw natural language agent for conveyor belt management",
-  "name": "belt-claw",
+  "description": "Belt agent natural language interface for conveyor belt management",
+  "name": "belt-agent",
   "version": "0.1.0"
 }
 "#
 }
 
-/// Generate the /claw slash command markdown.
+/// Generate the /agent slash command markdown.
 ///
 /// This command:
 /// 1. Collects belt system context (status, HITL list, queue list)
-/// 2. Forwards natural language input to the belt claw session
+/// 2. Forwards natural language input to the belt agent session
 /// 3. Uses Bash tool to invoke belt CLI commands
-fn claw_command_md() -> &'static str {
+fn agent_command_md() -> &'static str {
     r#"---
-description: Belt Claw natural language agent for autonomous development management
+description: Belt agent natural language interface for autonomous development management
 argument-hint: "[natural language instruction]"
 allowed-tools: ["Bash", "Read", "Glob", "Grep"]
 ---
 
-# /claw - Belt Natural Language Agent
+# /agent - Belt Natural Language Agent
 
 Manages the belt conveyor system through natural language instructions.
 Collects system context automatically and delegates tasks to the belt agent.
@@ -75,8 +75,8 @@ After collecting context, process the user's natural language input:
 3. **Complex tasks**: For multi-step operations or analysis requests, break down
    into individual belt CLI calls and execute sequentially.
 
-4. **Claw session management**: For workspace management tasks, use
-   `belt claw init`, `belt claw rules`, or `belt claw session` as appropriate.
+4. **Agent session management**: For workspace management tasks, use
+   `belt agent init`, `belt agent rules`, or `belt agent session` as appropriate.
 
 ## Available Belt Commands
 
@@ -96,10 +96,10 @@ After collecting context, process the user's natural language input:
 - `belt hitl show <item_id>` -- Show HITL item details
 - `belt hitl respond <item_id> --action <done|retry|skip|replan>` -- Respond
 
-### Claw Workspace
-- `belt claw init` -- Initialize claw workspace
-- `belt claw rules` -- List policy rules
-- `belt claw session` -- Open interactive session
+### Agent Workspace
+- `belt agent init` -- Initialize agent workspace
+- `belt agent rules` -- List policy rules
+- `belt agent session` -- Run LLM agent session
 
 ## Response Format
 
@@ -117,15 +117,15 @@ Always structure responses as:
 "#
 }
 
-/// Install the /claw slash command plugin.
+/// Install the /agent slash command plugin.
 ///
 /// Creates the plugin structure under `install_dir`:
 /// ```text
-/// {install_dir}/belt-claw/
+/// {install_dir}/belt-agent/
 /// ├── .claude-plugin/
 /// │   └── plugin.json
 /// └── commands/
-///     └── claw.md
+///     └── agent.md
 /// ```
 ///
 /// Returns the path to the installed plugin directory.
@@ -138,7 +138,7 @@ pub fn install_plugin(install_dir: &Path) -> anyhow::Result<PathBuf> {
     fs::create_dir_all(&commands_dir)?;
 
     fs::write(claude_plugin_dir.join("plugin.json"), plugin_json())?;
-    fs::write(commands_dir.join("claw.md"), claw_command_md())?;
+    fs::write(commands_dir.join("agent.md"), agent_command_md())?;
 
     Ok(plugin_dir)
 }
@@ -198,15 +198,15 @@ mod tests {
     #[test]
     fn plugin_json_is_valid_json() {
         let parsed: serde_json::Value = serde_json::from_str(plugin_json()).unwrap();
-        assert_eq!(parsed["name"], "belt-claw");
+        assert_eq!(parsed["name"], "belt-agent");
         assert_eq!(parsed["version"], "0.1.0");
         assert!(parsed["commands"].is_array());
-        assert_eq!(parsed["commands"][0], "./commands/claw.md");
+        assert_eq!(parsed["commands"][0], "./commands/agent.md");
     }
 
     #[test]
-    fn claw_command_md_has_frontmatter() {
-        let content = claw_command_md();
+    fn agent_command_md_has_frontmatter() {
+        let content = agent_command_md();
         assert!(content.starts_with("---\n"));
         assert!(content.contains("description:"));
         assert!(content.contains("argument-hint:"));
@@ -215,8 +215,8 @@ mod tests {
     }
 
     #[test]
-    fn claw_command_md_has_context_collection_instructions() {
-        let content = claw_command_md();
+    fn agent_command_md_has_context_collection_instructions() {
+        let content = agent_command_md();
         assert!(content.contains("belt status --format json"));
         assert!(content.contains("belt hitl list --format json"));
         assert!(content.contains("belt queue list --format json"));
@@ -228,16 +228,16 @@ mod tests {
         let plugin_dir = install_plugin(tmp.path()).unwrap();
 
         assert!(plugin_dir.join(".claude-plugin/plugin.json").is_file());
-        assert!(plugin_dir.join("commands/claw.md").is_file());
+        assert!(plugin_dir.join("commands/agent.md").is_file());
 
         // Verify plugin.json content.
         let json_content =
             fs::read_to_string(plugin_dir.join(".claude-plugin/plugin.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json_content).unwrap();
-        assert_eq!(parsed["name"], "belt-claw");
+        assert_eq!(parsed["name"], "belt-agent");
 
-        // Verify claw.md has frontmatter.
-        let md_content = fs::read_to_string(plugin_dir.join("commands/claw.md")).unwrap();
+        // Verify agent.md has frontmatter.
+        let md_content = fs::read_to_string(plugin_dir.join("commands/agent.md")).unwrap();
         assert!(md_content.starts_with("---\n"));
     }
 
@@ -250,7 +250,7 @@ mod tests {
 
         // Both files still exist and are valid.
         assert!(path2.join(".claude-plugin/plugin.json").is_file());
-        assert!(path2.join("commands/claw.md").is_file());
+        assert!(path2.join("commands/agent.md").is_file());
     }
 
     #[test]

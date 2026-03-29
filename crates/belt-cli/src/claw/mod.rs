@@ -8,7 +8,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub mod plugin;
+#[allow(dead_code)]
 pub mod session;
+#[allow(dead_code)]
 pub mod slash;
 
 /// Represents an initialized Claw workspace directory.
