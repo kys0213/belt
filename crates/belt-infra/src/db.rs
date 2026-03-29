@@ -180,7 +180,7 @@ pub struct RuntimeStats {
 /// Column list shared by all `queue_items` SELECT and INSERT statements.
 ///
 /// Keeping this in one place avoids drift when columns are added or reordered.
-const QUEUE_ITEM_COLUMNS: &str = "work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action, replan_count, worktree_preserved";
+const QUEUE_ITEM_COLUMNS: &str = "work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action, replan_count, worktree_preserved, previous_worktree_path";
 
 /// Shorthand for extracting a column value and mapping the error to `BeltError::Database`.
 fn col<T: rusqlite::types::FromSql>(row: &rusqlite::Row<'_>, idx: usize) -> Result<T, BeltError> {
@@ -246,7 +246,8 @@ impl Database {
                 hitl_timeout_at      TEXT,
                 hitl_terminal_action TEXT,
                 replan_count         INTEGER NOT NULL DEFAULT 0,
-                worktree_preserved   INTEGER NOT NULL DEFAULT 0
+                worktree_preserved   INTEGER NOT NULL DEFAULT 0,
+                previous_worktree_path TEXT
             );
 
             CREATE TABLE IF NOT EXISTS history (
@@ -362,7 +363,7 @@ impl Database {
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.execute(
             &format!(
-                "INSERT INTO queue_items ({QUEUE_ITEM_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
+                "INSERT INTO queue_items ({QUEUE_ITEM_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
             ),
             params![
                 item.work_id,
@@ -381,6 +382,7 @@ impl Database {
                 item.hitl_terminal_action,
                 item.replan_count,
                 item.worktree_preserved,
+                item.previous_worktree_path,
             ],
         )
         .map_err(|e| BeltError::Database(e.to_string()))?;
@@ -403,6 +405,38 @@ impl Database {
             .execute(
                 "UPDATE queue_items SET phase = ?1, updated_at = ?2 WHERE work_id = ?3",
                 params![phase_to_str(phase), now, work_id],
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        if rows == 0 {
+            return Err(BeltError::ItemNotFound(work_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Persist worktree preservation state for an item.
+    ///
+    /// Sets `worktree_preserved`, `previous_worktree_path`, and `phase`,
+    /// and refreshes `updated_at`. Used during daemon shutdown rollback
+    /// to ensure worktree reuse information survives restart.
+    ///
+    /// # Errors
+    /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
+    pub fn update_item_worktree_state(
+        &self,
+        work_id: &str,
+        phase: QueuePhase,
+        worktree_preserved: bool,
+        previous_worktree_path: Option<&str>,
+    ) -> Result<(), BeltError> {
+        let now = Utc::now().to_rfc3339();
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let rows = conn
+            .execute(
+                "UPDATE queue_items SET phase = ?1, worktree_preserved = ?2, previous_worktree_path = ?3, updated_at = ?4 WHERE work_id = ?5",
+                params![phase_to_str(phase), worktree_preserved, previous_worktree_path, now, work_id],
             )
             .map_err(|e| BeltError::Database(e.to_string()))?;
         if rows == 0 {
@@ -2142,8 +2176,7 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
         hitl_terminal_action: col(row, 13)?,
         replan_count: row.get::<_, u32>(14).unwrap_or(0),
         worktree_preserved: col(row, 15)?,
-        // previous_worktree_path is transient (in-memory only, not persisted to DB).
-        previous_worktree_path: None,
+        previous_worktree_path: col(row, 16)?,
     })
 }
 
@@ -3404,6 +3437,95 @@ mod tests {
         assert_eq!(preserved[0].work_id, "w-preserved");
     }
 
+    // ---- previous_worktree_path persistence ---------------------------------
+
+    #[test]
+    fn insert_item_with_previous_worktree_path() {
+        let db = test_db();
+        let mut item = sample_item();
+        item.previous_worktree_path = Some("/tmp/worktrees/old".to_string());
+        db.insert_item(&item).unwrap();
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert_eq!(
+            fetched.previous_worktree_path.as_deref(),
+            Some("/tmp/worktrees/old")
+        );
+    }
+
+    #[test]
+    fn insert_item_previous_worktree_path_defaults_to_none() {
+        let db = test_db();
+        let item = sample_item();
+        db.insert_item(&item).unwrap();
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert!(fetched.previous_worktree_path.is_none());
+    }
+
+    #[test]
+    fn previous_worktree_path_survives_phase_update() {
+        let db = test_db();
+        let mut item = sample_item();
+        item.previous_worktree_path = Some("/tmp/wt/old".to_string());
+        db.insert_item(&item).unwrap();
+
+        db.update_phase(&item.work_id, QueuePhase::Running).unwrap();
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert_eq!(
+            fetched.previous_worktree_path.as_deref(),
+            Some("/tmp/wt/old")
+        );
+    }
+
+    #[test]
+    fn update_item_worktree_state_persists_path() {
+        let db = test_db();
+        let item = sample_item();
+        db.insert_item(&item).unwrap();
+
+        db.update_item_worktree_state(
+            &item.work_id,
+            QueuePhase::Pending,
+            true,
+            Some("/tmp/wt/preserved"),
+        )
+        .unwrap();
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert_eq!(fetched.phase, QueuePhase::Pending);
+        assert!(fetched.worktree_preserved);
+        assert_eq!(
+            fetched.previous_worktree_path.as_deref(),
+            Some("/tmp/wt/preserved")
+        );
+    }
+
+    #[test]
+    fn update_item_worktree_state_clears_path_when_none() {
+        let db = test_db();
+        let mut item = sample_item();
+        item.previous_worktree_path = Some("/tmp/wt/old".to_string());
+        db.insert_item(&item).unwrap();
+
+        db.update_item_worktree_state(&item.work_id, QueuePhase::Running, false, None)
+            .unwrap();
+
+        let fetched = db.get_item(&item.work_id).unwrap();
+        assert!(fetched.previous_worktree_path.is_none());
+        assert!(!fetched.worktree_preserved);
+    }
+
+    #[test]
+    fn update_item_worktree_state_not_found() {
+        let db = test_db();
+        let err = db
+            .update_item_worktree_state("nonexistent", QueuePhase::Pending, true, None)
+            .unwrap_err();
+        assert!(matches!(err, BeltError::ItemNotFound(_)));
+    }
+
     // ---- reset_cron_last_run (additional) ----------------------------------
 
     #[test]
@@ -3445,12 +3567,12 @@ mod tests {
     #[test]
     fn queue_item_columns_count_matches_schema() {
         let col_count = QUEUE_ITEM_COLUMNS.split(',').count();
-        // The queue_items table has exactly 16 columns:
+        // The queue_items table has exactly 17 columns:
         // work_id, source_id, workspace_id, state, phase, title,
         // created_at, updated_at, hitl_created_at, hitl_respondent,
         // hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action,
-        // replan_count, worktree_preserved
-        assert_eq!(col_count, 16);
+        // replan_count, worktree_preserved, previous_worktree_path
+        assert_eq!(col_count, 17);
     }
 
     #[test]
@@ -3480,6 +3602,7 @@ mod tests {
             "hitl_terminal_action",
             "replan_count",
             "worktree_preserved",
+            "previous_worktree_path",
         ];
         let columns: Vec<&str> = QUEUE_ITEM_COLUMNS.split(',').map(|s| s.trim()).collect();
         for col_name in &expected {

@@ -247,8 +247,30 @@ impl Daemon {
         for source in &mut self.sources {
             let items = source.collect(&self.config).await?;
             total += items.len();
-            for item in items {
+            for mut item in items {
                 if !self.queue.iter().any(|q| q.work_id == item.work_id) {
+                    // Restore previous_worktree_path from DB if the item was
+                    // previously rolled back with a preserved worktree.
+                    if let Some(db) = &self.db
+                        && let Ok(db_item) = db.get_item(&item.work_id)
+                        && let Some(path) = db_item.previous_worktree_path.as_deref()
+                    {
+                        if std::path::Path::new(path).exists() {
+                            item.previous_worktree_path = db_item.previous_worktree_path.clone();
+                            item.worktree_preserved = db_item.worktree_preserved;
+                            tracing::info!(
+                                work_id = %item.work_id,
+                                path,
+                                "restored previous_worktree_path from DB"
+                            );
+                        } else {
+                            tracing::debug!(
+                                work_id = %item.work_id,
+                                path,
+                                "previous_worktree_path from DB no longer exists, skipping"
+                            );
+                        }
+                    }
                     self.queue.push_back(item);
                 }
             }
@@ -1858,15 +1880,16 @@ impl Daemon {
 
     /// Running → Pending 롤백. worktree는 보존하고 source_id 기반으로 등록한다.
     ///
-    /// 보존된 worktree 경로를 `WorktreeManager`의 preserved registry에 등록하여
-    /// 재시작 후 동일 source_id의 아이템이 기존 worktree를 재사용할 수 있게 한다.
+    /// 보존된 worktree 경로를 `WorktreeManager`의 preserved registry에 등록하고,
+    /// `previous_worktree_path`를 DB에 저장하여 재시작 후에도 기존 worktree를
+    /// 재사용할 수 있게 한다.
     pub fn rollback_running_to_pending(&mut self) {
         let ws_name = self.config.name.clone();
         for item in self.queue.iter_mut() {
             if item.phase == QueuePhase::Running {
                 // Register preserved worktree before rollback so it can be reused.
                 let wt_path = self.worktree_mgr.path(&ws_name);
-                if wt_path.exists() {
+                let wt_path_str = if wt_path.exists() {
                     self.worktree_mgr
                         .register_preserved(&item.source_id, wt_path.clone());
                     tracing::info!(
@@ -1874,14 +1897,36 @@ impl Daemon {
                         ?wt_path,
                         "preserved worktree registered for source_id"
                     );
-                }
+                    Some(wt_path.to_string_lossy().to_string())
+                } else {
+                    None
+                };
 
                 item.mark_worktree_preserved();
+                // Persist the worktree path so it survives daemon restart.
+                item.previous_worktree_path = wt_path_str;
 
                 if let Err(e) = transit(item, QueuePhase::Pending) {
                     tracing::error!("failed to rollback {}: {e}", item.work_id);
                     continue;
                 }
+
+                // Persist worktree state to DB so it survives restart.
+                if let Some(db) = &self.db
+                    && let Err(e) = db.update_item_worktree_state(
+                        &item.work_id,
+                        QueuePhase::Pending,
+                        item.worktree_preserved,
+                        item.previous_worktree_path.as_deref(),
+                    )
+                {
+                    tracing::warn!(
+                        work_id = %item.work_id,
+                        error = %e,
+                        "failed to persist worktree state to DB during rollback"
+                    );
+                }
+
                 self.tracker.release(&ws_name);
                 tracing::info!(
                     "rolled back {} to Pending (worktree preserved, source_id={})",
