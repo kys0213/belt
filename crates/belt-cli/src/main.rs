@@ -3488,7 +3488,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
         },
-
         // Commands::Claw is handled above via the `|` pattern with Commands::Agent
     }
 
