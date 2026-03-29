@@ -972,7 +972,7 @@ impl Daemon {
     /// For `Replan`, the item is rolled back to Pending with an incremented
     /// `replan_count`, and a new HITL item is created to delegate spec
     /// modification to the Claw agent. If `replan_count` exceeds
-    /// [`Self::MAX_REPLAN_COUNT`], the item transitions to Failed instead.
+    /// [`Self::MAX_REPLAN_COUNT`], the item transitions to Skipped instead.
     pub fn respond_hitl(
         &mut self,
         work_id: &str,
@@ -1067,16 +1067,16 @@ impl Daemon {
                         work_id,
                         replan_count = new_replan_count,
                         max = Self::MAX_REPLAN_COUNT,
-                        "replan limit exceeded, transitioning to Failed"
+                        "replan limit exceeded, transitioning to Skipped"
                     );
                     item.replan_count = new_replan_count;
-                    let from = transit(item, QueuePhase::Failed)?;
+                    let from = transit(item, QueuePhase::Skipped)?;
                     Self::record_transition(
                         &self.db,
                         work_id,
                         &source_id_clone,
                         from,
-                        QueuePhase::Failed,
+                        QueuePhase::Skipped,
                         "handler",
                         Some("replan limit exceeded".to_string()),
                     );
@@ -3492,7 +3492,7 @@ sources:
     }
 
     #[test]
-    fn respond_hitl_replan_exceeds_limit_transitions_to_failed() {
+    fn respond_hitl_replan_exceeds_limit_transitions_to_skipped() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
@@ -3505,9 +3505,9 @@ sources:
         let result = daemon.respond_hitl("s1:analyze", HitlRespondAction::Replan, None, None);
         assert!(result.is_ok());
 
-        // Should transition to Failed, not Pending.
+        // Should transition to Skipped, not Pending.
         let original = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(original.phase, QueuePhase::Failed);
+        assert_eq!(original.phase, QueuePhase::Skipped);
         assert_eq!(original.replan_count, 4);
 
         // No replan HITL item should be created.

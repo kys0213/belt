@@ -615,7 +615,7 @@ impl CronHandler for HitlTimeoutJob {
             // and finally default to Failed (safe default).
             let target_phase = match item.hitl_terminal_action.as_deref() {
                 Some("skip") => QueuePhase::Skipped,
-                Some("replan") => QueuePhase::Failed,
+                Some("replan") => QueuePhase::Skipped,
                 Some("failed") => QueuePhase::Failed,
                 _ => resolve_workspace_terminal_phase(
                     &self.db,
@@ -4487,9 +4487,9 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         let ctx = CronContext { now: Utc::now() };
         job.execute(&ctx).unwrap();
 
-        // "replan" maps to Failed (item goes back to queue for re-processing).
+        // "replan" maps to Skipped (replan max exceeded should not use Failed).
         let updated = db.get_item("w-replan").unwrap();
-        assert_eq!(updated.phase, QueuePhase::Failed);
+        assert_eq!(updated.phase, QueuePhase::Skipped);
     }
 
     #[test]
