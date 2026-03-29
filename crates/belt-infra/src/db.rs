@@ -2356,6 +2356,156 @@ mod tests {
         assert_eq!(db.count_failures("s1", "implement").unwrap(), 3);
     }
 
+    #[test]
+    fn get_history_returns_full_history_across_states_for_source_id() {
+        let db = test_db();
+        let source_id = "github:org/repo#42";
+
+        // Simulate a source_id progressing through multiple states with different work_ids.
+        let events = vec![
+            HistoryEvent {
+                work_id: "github:org/repo#42:analyze".to_string(),
+                source_id: source_id.to_string(),
+                state: "analyze".to_string(),
+                status: "done".to_string(),
+                attempt: 1,
+                summary: Some("analysis complete".to_string()),
+                error: None,
+                created_at: "2026-03-20T01:00:00Z".to_string(),
+            },
+            HistoryEvent {
+                work_id: "github:org/repo#42:implement".to_string(),
+                source_id: source_id.to_string(),
+                state: "implement".to_string(),
+                status: "failed".to_string(),
+                attempt: 1,
+                summary: None,
+                error: Some("compile error".to_string()),
+                created_at: "2026-03-20T02:00:00Z".to_string(),
+            },
+            HistoryEvent {
+                work_id: "github:org/repo#42:implement".to_string(),
+                source_id: source_id.to_string(),
+                state: "implement".to_string(),
+                status: "done".to_string(),
+                attempt: 2,
+                summary: Some("implemented".to_string()),
+                error: None,
+                created_at: "2026-03-20T03:00:00Z".to_string(),
+            },
+            HistoryEvent {
+                work_id: "github:org/repo#42:review".to_string(),
+                source_id: source_id.to_string(),
+                state: "review".to_string(),
+                status: "done".to_string(),
+                attempt: 1,
+                summary: Some("review passed".to_string()),
+                error: None,
+                created_at: "2026-03-20T04:00:00Z".to_string(),
+            },
+        ];
+
+        for event in &events {
+            db.append_history(event).unwrap();
+        }
+
+        let history = db.get_history(source_id).unwrap();
+        assert_eq!(
+            history.len(),
+            4,
+            "should return all 4 events for the source_id"
+        );
+
+        // Verify chronological order (ORDER BY created_at ASC).
+        assert_eq!(history[0].state, "analyze");
+        assert_eq!(history[1].state, "implement");
+        assert_eq!(history[1].status, "failed");
+        assert_eq!(history[2].state, "implement");
+        assert_eq!(history[2].status, "done");
+        assert_eq!(history[2].attempt, 2);
+        assert_eq!(history[3].state, "review");
+
+        // Verify all work_ids are distinct (different phases produce different work_ids).
+        assert_eq!(history[0].work_id, "github:org/repo#42:analyze");
+        assert_eq!(history[1].work_id, "github:org/repo#42:implement");
+        assert_eq!(history[3].work_id, "github:org/repo#42:review");
+
+        // Verify optional fields are preserved.
+        assert_eq!(history[0].summary.as_deref(), Some("analysis complete"));
+        assert_eq!(history[1].error.as_deref(), Some("compile error"));
+        assert!(history[0].error.is_none());
+    }
+
+    #[test]
+    fn get_history_isolates_by_source_id() {
+        let db = test_db();
+
+        // Insert history for two different source_ids.
+        let events = vec![
+            HistoryEvent {
+                work_id: "github:org/repo#42:analyze".to_string(),
+                source_id: "github:org/repo#42".to_string(),
+                state: "analyze".to_string(),
+                status: "done".to_string(),
+                attempt: 1,
+                summary: None,
+                error: None,
+                created_at: "2026-03-20T01:00:00Z".to_string(),
+            },
+            HistoryEvent {
+                work_id: "github:org/repo#42:implement".to_string(),
+                source_id: "github:org/repo#42".to_string(),
+                state: "implement".to_string(),
+                status: "done".to_string(),
+                attempt: 1,
+                summary: None,
+                error: None,
+                created_at: "2026-03-20T02:00:00Z".to_string(),
+            },
+            HistoryEvent {
+                work_id: "github:org/repo#99:analyze".to_string(),
+                source_id: "github:org/repo#99".to_string(),
+                state: "analyze".to_string(),
+                status: "failed".to_string(),
+                attempt: 1,
+                summary: None,
+                error: Some("timeout".to_string()),
+                created_at: "2026-03-20T01:30:00Z".to_string(),
+            },
+        ];
+
+        for event in &events {
+            db.append_history(event).unwrap();
+        }
+
+        let history_42 = db.get_history("github:org/repo#42").unwrap();
+        assert_eq!(
+            history_42.len(),
+            2,
+            "source #42 should have exactly 2 events"
+        );
+        assert!(
+            history_42
+                .iter()
+                .all(|h| h.source_id == "github:org/repo#42"),
+            "all events must belong to source #42"
+        );
+
+        let history_99 = db.get_history("github:org/repo#99").unwrap();
+        assert_eq!(
+            history_99.len(),
+            1,
+            "source #99 should have exactly 1 event"
+        );
+        assert_eq!(history_99[0].status, "failed");
+
+        let history_none = db.get_history("github:org/repo#999").unwrap();
+        assert!(
+            history_none.is_empty(),
+            "non-existent source should return empty"
+        );
+    }
+
     // ---- Workspaces --------------------------------------------------------
 
     #[test]

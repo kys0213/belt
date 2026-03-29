@@ -453,6 +453,85 @@ mod tests {
     }
 
     #[test]
+    fn context_history_includes_full_lifecycle() {
+        // Simulate a source_id that went through analyze -> implement (fail) ->
+        // implement (retry, success) -> review. The context JSON must include
+        // all 4 entries so downstream consumers see the complete history.
+        let history = vec![
+            make_history_entry("analyze", HistoryStatus::Done, 1),
+            make_history_entry("implement", HistoryStatus::Failed, 1),
+            make_history_entry("implement", HistoryStatus::Done, 2),
+            make_history_entry("review", HistoryStatus::Running, 1),
+        ];
+        let ctx = make_context(history);
+
+        // Serialize to JSON and parse back to verify the `history` field.
+        let json_value = serde_json::to_value(&ctx).unwrap();
+        let history_arr = json_value
+            .get("history")
+            .expect("history field must exist")
+            .as_array()
+            .expect("history must be an array");
+
+        assert_eq!(history_arr.len(), 4, "all 4 history entries must be present");
+
+        // Verify each entry has the expected state and status.
+        assert_eq!(history_arr[0]["state"], "analyze");
+        assert_eq!(history_arr[0]["status"], "done");
+        assert_eq!(history_arr[1]["state"], "implement");
+        assert_eq!(history_arr[1]["status"], "failed");
+        assert_eq!(history_arr[1]["attempt"], 1);
+        assert_eq!(history_arr[2]["state"], "implement");
+        assert_eq!(history_arr[2]["status"], "done");
+        assert_eq!(history_arr[2]["attempt"], 2);
+        assert_eq!(history_arr[3]["state"], "review");
+        assert_eq!(history_arr[3]["status"], "running");
+
+        // Verify helper methods work with full history.
+        assert_eq!(ctx.failure_count("implement"), 1);
+        assert_eq!(ctx.failure_count("analyze"), 0);
+        assert_eq!(ctx.max_attempt("implement"), 2);
+        assert_eq!(ctx.max_attempt("review"), 1);
+    }
+
+    #[test]
+    fn context_history_field_present_when_empty() {
+        let ctx = make_context(vec![]);
+        let json_value = serde_json::to_value(&ctx).unwrap();
+        let history_arr = json_value
+            .get("history")
+            .expect("history field must exist even when empty")
+            .as_array()
+            .expect("history must be an array");
+        assert!(history_arr.is_empty());
+    }
+
+    #[test]
+    fn context_history_entries_share_source_id_with_distinct_work_ids() {
+        // Verify that ItemContext correctly holds history entries where all
+        // entries share the same source_id but have different work_ids
+        // (as produced by the CLI history aggregation logic).
+        let mut entry1 = make_history_entry("analyze", HistoryStatus::Done, 1);
+        entry1.source_id = "github:org/repo#42".to_string();
+        entry1.work_id = "github:org/repo#42:analyze".to_string();
+
+        let mut entry2 = make_history_entry("implement", HistoryStatus::Done, 1);
+        entry2.source_id = "github:org/repo#42".to_string();
+        entry2.work_id = "github:org/repo#42:implement".to_string();
+
+        let ctx = make_context(vec![entry1, entry2]);
+        let json_value = serde_json::to_value(&ctx).unwrap();
+        let history_arr = json_value["history"].as_array().unwrap();
+
+        assert_eq!(history_arr.len(), 2);
+        // All entries share the same source_id.
+        assert_eq!(history_arr[0]["source_id"], "github:org/repo#42");
+        assert_eq!(history_arr[1]["source_id"], "github:org/repo#42");
+        // But have different work_ids.
+        assert_ne!(history_arr[0]["work_id"], history_arr[1]["work_id"]);
+    }
+
+    #[test]
     fn extract_field_top_level() {
         let ctx = make_context(vec![]);
         let value = serde_json::to_value(&ctx).unwrap();
