@@ -474,6 +474,7 @@ impl CronEngine {
                             job_name: db_job.name.clone(),
                             db: Arc::clone(db),
                             shell: Arc::from(belt_infra::platform::default_shell_executor()),
+                            workspace: db_job.workspace.clone(),
                         }),
                     });
                 }
@@ -510,6 +511,7 @@ impl CronEngine {
                         job_name: db_job.name.clone(),
                         db: Arc::clone(db),
                         shell: Arc::from(belt_infra::platform::default_shell_executor()),
+                        workspace: db_job.workspace.clone(),
                     }),
                 });
             }
@@ -2950,8 +2952,9 @@ pub fn builtin_jobs(deps: BuiltinJobDeps) -> Vec<CronJobDef> {
 /// A cron handler that executes a user-defined shell script.
 ///
 /// When the cron engine fires this job, the handler spawns the script as a
-/// child process and waits for it to complete. The script receives `BELT_HOME`
-/// and `BELT_CRON_JOB` environment variables.
+/// child process and waits for it to complete. The script receives `BELT_HOME`,
+/// `BELT_CRON_JOB`, and `BELT_DB` environment variables. Workspace-scoped jobs
+/// additionally receive the `WORKSPACE` variable.
 pub struct CustomScriptJob {
     /// Absolute path to the script to execute.
     pub script: String,
@@ -2961,6 +2964,8 @@ pub struct CustomScriptJob {
     pub db: Arc<Database>,
     /// Platform-specific shell executor.
     pub shell: Arc<dyn belt_core::platform::ShellExecutor>,
+    /// Optional workspace scope (`None` = global job).
+    pub workspace: Option<String>,
 }
 impl CronHandler for CustomScriptJob {
     fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
@@ -2981,6 +2986,18 @@ impl CronHandler for CustomScriptJob {
         let mut env_vars = std::collections::HashMap::new();
         env_vars.insert("BELT_HOME".to_string(), belt_home.clone());
         env_vars.insert("BELT_CRON_JOB".to_string(), self.job_name.clone());
+
+        // Inject BELT_DB path derived from BELT_HOME.
+        let db_path = std::path::PathBuf::from(&belt_home)
+            .join("belt.db")
+            .to_string_lossy()
+            .to_string();
+        env_vars.insert("BELT_DB".to_string(), db_path);
+
+        // Inject WORKSPACE for workspace-scoped jobs.
+        if let Some(ref ws) = self.workspace {
+            env_vars.insert("WORKSPACE".to_string(), ws.clone());
+        }
 
         let working_dir = std::path::PathBuf::from(&belt_home);
 
@@ -3090,6 +3107,7 @@ pub fn load_custom_jobs(engine: &mut CronEngine, db: &Arc<Database>) {
                 job_name: job.name,
                 db: Arc::clone(db),
                 shell: Arc::from(belt_infra::platform::default_shell_executor()),
+                workspace: job.workspace,
             }),
         });
     }
