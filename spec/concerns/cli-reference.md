@@ -71,6 +71,21 @@ belt
 │   ├── edit [rule]                          # 규칙 편집
 │   ├── plugin [--install-dir]               # /agent 슬래시 커맨드 설치
 │   └── context                              # 시스템 컨텍스트 수집 (agent injection용)
+├── bootstrap                                ← .claude/rules 컨벤션 파일 생성
+│   ├── [--workspace <dir>]                  # 워크스페이스 루트 (기본: 현재 디렉토리)
+│   ├── [--rules-dir <dir>]                  # 커스텀 rules 디렉토리 경로
+│   ├── [--force]                            # 기존 파일 덮어쓰기
+│   ├── [--llm]                              # LLM으로 맞춤 컨벤션 생성
+│   ├── [--project-name <name>]              # 프로젝트 이름 (--llm 전용)
+│   ├── [--language <lang>]                  # 주 언어 (--llm 전용, e.g., Rust, TypeScript)
+│   ├── [--framework <fw>]                   # 프레임워크 (--llm 전용, e.g., tokio, Next.js)
+│   ├── [--description <desc>]              # 프로젝트 설명 (--llm 전용)
+│   └── [--create-pr]                        # 생성된 컨벤션으로 PR 생성 (--llm 전용)
+├── auto                                     ← /auto 슬래시 커맨드 플러그인 관리
+│   └── plugin
+│       ├── install [--project <dir>] [--force]   # /auto 슬래시 커맨드 설치
+│       ├── uninstall [--project <dir>]           # /auto 슬래시 커맨드 제거
+│       └── status [--project <dir>]              # 플러그인 설치 상태 확인
 ```
 
 > **v4 대비 변경**: `queue advance` 제거 (Pending→Ready 자동 전이), `context` 서브커맨드 추가, `repo` → `workspace` 리네이밍. `claw` + `agent` → `agent`로 통합.
@@ -110,6 +125,75 @@ belt context $WORK_ID --field source.url      # → https://github.com/org/repo
 ```
 
 context 스키마는 DataSource별로 다르다. 상세는 [DataSource](./datasource.md) 참조.
+
+---
+
+## `belt bootstrap` 상세
+
+워크스페이스에 `.claude/rules` 컨벤션 파일을 생성한다. 정적 템플릿 또는 LLM 기반 맞춤 생성을 지원.
+
+```bash
+# 기본 사용 (정적 템플릿)
+belt bootstrap
+
+# 특정 디렉토리에 생성
+belt bootstrap --workspace /path/to/project
+
+# 기존 파일 덮어쓰기
+belt bootstrap --force
+
+# LLM으로 맞춤 컨벤션 생성
+belt bootstrap --llm \
+  --project-name my-app \
+  --language Rust \
+  --framework tokio \
+  --description "비동기 웹 서버"
+
+# LLM 생성 후 PR까지 자동 생성
+belt bootstrap --llm --create-pr
+```
+
+| 플래그 | 기본값 | 설명 |
+|--------|--------|------|
+| `--workspace` | 현재 디렉토리 | 워크스페이스 루트 경로 |
+| `--rules-dir` | `<workspace>/.claude/rules` | 커스텀 rules 디렉토리 |
+| `--force` | false | 기존 파일 덮어쓰기 |
+| `--llm` | false | LLM 기반 맞춤 생성 |
+| `--project-name` | — | 프로젝트 이름 (`--llm` 필요) |
+| `--language` | — | 주 프로그래밍 언어 (`--llm` 필요) |
+| `--framework` | — | 프레임워크/런타임 (`--llm` 필요) |
+| `--description` | — | 프로젝트 설명 (`--llm` 필요) |
+| `--create-pr` | false | 컨벤션 PR 생성 (`--llm` 필요) |
+
+---
+
+## `belt auto` 상세
+
+`/auto` 슬래시 커맨드 플러그인을 프로젝트의 `.claude/commands/`에 설치, 제거, 상태 확인한다.
+
+```bash
+# 플러그인 설치
+belt auto plugin install
+belt auto plugin install --project /path/to/project
+belt auto plugin install --force    # 기존 파일 덮어쓰기
+
+# 플러그인 제거
+belt auto plugin uninstall
+
+# 설치 상태 확인
+belt auto plugin status
+```
+
+| 서브커맨드 | 설명 |
+|-----------|------|
+| `plugin install` | `/auto` 슬래시 커맨드 파일을 `.claude/commands/`에 설치 |
+| `plugin uninstall` | 설치된 `/auto` 슬래시 커맨드 파일 제거 |
+| `plugin status` | 플러그인 설치 여부 확인 |
+
+| 플래그 | 적용 대상 | 기본값 | 설명 |
+|--------|----------|--------|------|
+| `--project` | install, uninstall, status | 현재 디렉토리 | 프로젝트 루트 경로 |
+| `--force` | install | false | 기존 파일 덮어쓰기 |
 
 ---
 
