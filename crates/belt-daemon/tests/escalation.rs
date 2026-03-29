@@ -204,6 +204,7 @@ async fn hitl_respond_done() {
             Some("human".to_string()),
             None,
         )
+        .await
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:analyze").unwrap();
@@ -239,6 +240,7 @@ async fn hitl_respond_retry() {
             None,
             None,
         )
+        .await
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:analyze").unwrap();
@@ -273,6 +275,7 @@ async fn hitl_respond_skip() {
             None,
             None,
         )
+        .await
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:analyze").unwrap();
@@ -461,6 +464,7 @@ async fn spec_conflict_hitl_approve_proceeds_parallel() {
             Some("reviewer".to_string()),
             Some("approved for parallel execution".to_string()),
         )
+        .await
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:implement").unwrap();
@@ -499,6 +503,7 @@ async fn spec_conflict_hitl_reject_skips_later_spec() {
             Some("reviewer".to_string()),
             Some("reject conflicting spec".to_string()),
         )
+        .await
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:implement").unwrap();
@@ -536,6 +541,7 @@ async fn spec_conflict_hitl_retry_re_evaluates() {
             Some("reviewer".to_string()),
             Some("modified entry_points, retry conflict check".to_string()),
         )
+        .await
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:implement").unwrap();
@@ -573,6 +579,7 @@ async fn spec_conflict_hitl_replan_creates_modification_item() {
             Some("reviewer".to_string()),
             Some("remove overlapping entry_points from spec-2".to_string()),
         )
+        .await
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:implement").unwrap();
@@ -612,8 +619,8 @@ fn escalation_on_fail_policy() {
 // ---------------------------------------------------------------
 
 /// Spec completion HITL approved (Done) transitions spec Completing -> Completed.
-#[test]
-fn spec_completion_hitl_approve_transitions_to_completed() {
+#[tokio::test]
+async fn spec_completion_hitl_approve_transitions_to_completed() {
     use belt_core::queue::QueueItem;
     use belt_core::spec::{Spec, SpecStatus};
     use belt_infra::db::Database;
@@ -651,6 +658,7 @@ fn spec_completion_hitl_approve_transitions_to_completed() {
             Some("human-reviewer".into()),
             None,
         )
+        .await
         .unwrap();
 
     assert_eq!(
@@ -666,8 +674,8 @@ fn spec_completion_hitl_approve_transitions_to_completed() {
 }
 
 /// Spec completion HITL rejected (Skip) reverts spec Completing -> Active.
-#[test]
-fn spec_completion_hitl_reject_reverts_to_active() {
+#[tokio::test]
+async fn spec_completion_hitl_reject_reverts_to_active() {
     use belt_core::queue::QueueItem;
     use belt_core::spec::{Spec, SpecStatus};
     use belt_infra::db::Database;
@@ -705,6 +713,7 @@ fn spec_completion_hitl_reject_reverts_to_active() {
             Some("human-reviewer".into()),
             None,
         )
+        .await
         .unwrap();
 
     assert_eq!(
@@ -720,8 +729,8 @@ fn spec_completion_hitl_reject_reverts_to_active() {
 }
 
 /// Spec completion HITL retry reverts spec Completing -> Active.
-#[test]
-fn spec_completion_hitl_retry_reverts_to_active() {
+#[tokio::test]
+async fn spec_completion_hitl_retry_reverts_to_active() {
     use belt_core::queue::QueueItem;
     use belt_core::spec::{Spec, SpecStatus};
     use belt_infra::db::Database;
@@ -759,6 +768,7 @@ fn spec_completion_hitl_retry_reverts_to_active() {
             Some("human-reviewer".into()),
             Some("needs more work on module X".into()),
         )
+        .await
         .unwrap();
 
     assert_eq!(
