@@ -8,6 +8,8 @@ use belt_core::runtime::RuntimeRegistry;
 use belt_core::workspace::WorkspaceConfig;
 use belt_daemon::executor::{ActionEnv, ActionExecutor};
 use belt_infra::runtimes::claude::ClaudeRuntime;
+use belt_infra::runtimes::codex::CodexRuntime;
+use belt_infra::runtimes::gemini::GeminiRuntime;
 
 /// Load a workspace config from a YAML file path.
 fn load_workspace_config(path: &str) -> Result<WorkspaceConfig> {
@@ -243,6 +245,22 @@ fn build_registry(config: &WorkspaceConfig) -> RuntimeRegistry {
         .get("claude")
         .and_then(|rc| rc.model.clone());
     registry.register(Arc::new(ClaudeRuntime::new(claude_model)));
+
+    // Register Gemini runtime with model from config if present.
+    let gemini_model = config
+        .runtime
+        .runtimes
+        .get("gemini")
+        .and_then(|rc| rc.model.clone());
+    registry.register(Arc::new(GeminiRuntime::new(gemini_model)));
+
+    // Register Codex runtime with model from config if present.
+    let codex_model = config
+        .runtime
+        .runtimes
+        .get("codex")
+        .and_then(|rc| rc.model.clone());
+    registry.register(Arc::new(CodexRuntime::new(codex_model)));
 
     registry
 }
