@@ -8,6 +8,7 @@ use std::io::{self, Write};
 
 use belt_core::phase::QueuePhase;
 use belt_infra::db::{Database, RuntimeStats};
+use chrono::Utc;
 use crossterm::style::{self, Stylize};
 use crossterm::terminal;
 use serde::Serialize;
@@ -51,6 +52,9 @@ pub struct SystemStatus {
     pub error_items: Vec<ItemSummary>,
     /// Items currently awaiting human intervention.
     pub hitl_items: Vec<ItemSummary>,
+    /// Token usage aggregation across daily/weekly/monthly periods.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_usage_aggregation: Option<TokenUsageAggregation>,
 }
 
 /// Per-workspace item summary for the system status table.
@@ -111,6 +115,37 @@ pub struct ModelTokenSummary {
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub executions: u64,
+}
+
+/// Token usage aggregation across daily, weekly, and monthly periods.
+///
+/// Each period contains per-model breakdowns so callers can compare
+/// usage trends across time windows.
+#[derive(Debug, Serialize)]
+pub struct TokenUsageAggregation {
+    /// Stats for the last 24 hours.
+    pub daily: PeriodTokenUsage,
+    /// Stats for the last 7 days.
+    pub weekly: PeriodTokenUsage,
+    /// Stats for the last 30 days.
+    pub monthly: PeriodTokenUsage,
+}
+
+/// Token usage for a single time period.
+#[derive(Debug, Serialize)]
+pub struct PeriodTokenUsage {
+    /// Human-readable label (e.g. "Last 24h", "Last 7d", "Last 30d").
+    pub label: String,
+    /// Total input tokens consumed in this period.
+    pub total_input: u64,
+    /// Total output tokens produced in this period.
+    pub total_output: u64,
+    /// Grand total of input + output tokens.
+    pub total_tokens: u64,
+    /// Number of runtime invocations.
+    pub executions: u64,
+    /// Per-model breakdown.
+    pub by_model: Vec<ModelTokenSummary>,
 }
 
 /// Workspace spec status.
@@ -217,6 +252,9 @@ pub fn gather_status(db: &Database) -> anyhow::Result<SystemStatus> {
         })
         .collect();
 
+    // Token usage aggregation (daily / weekly / monthly)
+    let token_usage_aggregation = gather_token_usage_aggregation(db);
+
     Ok(SystemStatus {
         total_items,
         hitl_count,
@@ -227,6 +265,7 @@ pub fn gather_status(db: &Database) -> anyhow::Result<SystemStatus> {
         workspace_summary,
         error_items,
         hitl_items,
+        token_usage_aggregation,
     })
 }
 
@@ -301,6 +340,65 @@ fn gather_workspace_token_usage(db: &Database, workspace: &str) -> Option<TokenU
     })
 }
 
+/// Build a [`PeriodTokenUsage`] from raw `(model, input, output, count)` rows.
+fn build_period_usage(label: &str, rows: &[(String, u64, u64, u64)]) -> PeriodTokenUsage {
+    let mut total_input: u64 = 0;
+    let mut total_output: u64 = 0;
+    let mut total_executions: u64 = 0;
+    let mut by_model = Vec::new();
+
+    for (model, inp, out, cnt) in rows {
+        total_input += inp;
+        total_output += out;
+        total_executions += cnt;
+        by_model.push(ModelTokenSummary {
+            model: model.clone(),
+            input_tokens: *inp,
+            output_tokens: *out,
+            total_tokens: inp + out,
+            executions: *cnt,
+        });
+    }
+    // Already sorted by total desc from DB, but ensure deterministic order.
+    by_model.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+
+    PeriodTokenUsage {
+        label: label.to_string(),
+        total_input,
+        total_output,
+        total_tokens: total_input + total_output,
+        executions: total_executions,
+        by_model,
+    }
+}
+
+/// Gather token usage aggregation across daily, weekly, and monthly periods.
+///
+/// Returns `None` when no usage data exists for any period.
+fn gather_token_usage_aggregation(db: &Database) -> Option<TokenUsageAggregation> {
+    let now = Utc::now();
+    let daily_cutoff = now - chrono::Duration::hours(24);
+    let weekly_cutoff = now - chrono::Duration::days(7);
+    let monthly_cutoff = now - chrono::Duration::days(30);
+
+    let daily_rows = db.get_token_usage_since(&daily_cutoff).ok()?;
+    let weekly_rows = db.get_token_usage_since(&weekly_cutoff).unwrap_or_default();
+    let monthly_rows = db
+        .get_token_usage_since(&monthly_cutoff)
+        .unwrap_or_default();
+
+    // Only return aggregation when there is at least some data.
+    if daily_rows.is_empty() && weekly_rows.is_empty() && monthly_rows.is_empty() {
+        return None;
+    }
+
+    Some(TokenUsageAggregation {
+        daily: build_period_usage("Last 24h", &daily_rows),
+        weekly: build_period_usage("Last 7d", &weekly_rows),
+        monthly: build_period_usage("Last 30d", &monthly_rows),
+    })
+}
+
 /// Print system status in the requested format.
 ///
 /// When `daemon_running` is `Some`, the daemon status indicator is included
@@ -319,9 +417,15 @@ pub fn print_status(
             if let Some(ref s) = status.runtime_stats {
                 print_rich_runtime(s);
             }
+            if let Some(ref agg) = status.token_usage_aggregation {
+                print_rich_token_aggregation(agg);
+            }
         }
         _ => {
             print_text_status(status);
+            if let Some(ref agg) = status.token_usage_aggregation {
+                print_text_token_aggregation(agg);
+            }
         }
     }
     Ok(())
@@ -726,6 +830,112 @@ fn print_rich_runtime(stats: &RuntimeStats) {
                 fmt_num(stats.total_tokens_output),
                 fmt_num(stats.total_tokens),
                 stats.executions,
+            );
+        }
+    }
+    let _ = writeln!(stdout);
+}
+
+/// Print a single period row in a compact summary table.
+fn print_period_summary_row(stdout: &mut impl Write, period: &PeriodTokenUsage) {
+    let models_str = if period.by_model.is_empty() {
+        "-".to_string()
+    } else {
+        period
+            .by_model
+            .iter()
+            .map(|m| format!("{}: {}", m.model, fmt_num(m.total_tokens)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    let _ = writeln!(
+        stdout,
+        "  {:<10} {:>12} {:>12} {:>12} {:>6}   {}",
+        period.label,
+        fmt_num(period.total_input),
+        fmt_num(period.total_output),
+        fmt_num(period.total_tokens),
+        period.executions,
+        models_str,
+    );
+}
+
+/// Render token usage aggregation as plain text.
+fn print_text_token_aggregation(agg: &TokenUsageAggregation) {
+    println!();
+    println!("Token Usage Aggregation");
+    println!("=======================");
+    println!(
+        "  {:<10} {:>12} {:>12} {:>12} {:>6}   By Model",
+        "Period", "Input", "Output", "Total", "Runs"
+    );
+    let mut stdout = io::stdout();
+    print_period_summary_row(&mut stdout, &agg.daily);
+    print_period_summary_row(&mut stdout, &agg.weekly);
+    print_period_summary_row(&mut stdout, &agg.monthly);
+}
+
+/// Render token usage aggregation with crossterm colours for the rich format.
+fn print_rich_token_aggregation(agg: &TokenUsageAggregation) {
+    let mut stdout = io::stdout();
+
+    let _ = writeln!(stdout);
+    let _ = writeln!(stdout, "  {}", "Token Usage Aggregation".bold().cyan());
+    let _ = writeln!(
+        stdout,
+        "  {}",
+        "\u{2500}".repeat(box_content_width().min(90)).dark_grey()
+    );
+    let _ = writeln!(
+        stdout,
+        "  {:<10} {:>12} {:>12} {:>12} {:>6}",
+        "Period".bold().underlined(),
+        "Input".bold().underlined(),
+        "Output".bold().underlined(),
+        "Total".bold().underlined(),
+        "Runs".bold().underlined(),
+    );
+    let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(56).dark_grey());
+
+    for period in [&agg.daily, &agg.weekly, &agg.monthly] {
+        let _ = writeln!(
+            stdout,
+            "  {:<10} {:>12} {:>12} {:>12} {:>6}",
+            period.label.as_str().cyan(),
+            fmt_num(period.total_input),
+            fmt_num(period.total_output),
+            fmt_num(period.total_tokens),
+            period.executions,
+        );
+    }
+
+    // Per-model detail for the monthly period (most comprehensive)
+    if !agg.monthly.by_model.is_empty() {
+        let _ = writeln!(stdout);
+        let _ = writeln!(stdout, "  {}", "By Model (Last 30d)".bold());
+        let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(56).dark_grey());
+        for m in &agg.monthly.by_model {
+            let _ = writeln!(
+                stdout,
+                "  {:<20} {:>12} {:>12} {:>12} {:>6}",
+                m.model.as_str().cyan(),
+                fmt_num(m.input_tokens),
+                fmt_num(m.output_tokens),
+                fmt_num(m.total_tokens),
+                m.executions,
+            );
+        }
+        if agg.monthly.by_model.len() > 1 {
+            let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(56).dark_grey());
+            let _ = writeln!(
+                stdout,
+                "  {:<20} {:>12} {:>12} {:>12} {:>6}",
+                "Total".bold(),
+                fmt_num(agg.monthly.total_input),
+                fmt_num(agg.monthly.total_output),
+                fmt_num(agg.monthly.total_tokens),
+                agg.monthly.executions,
             );
         }
     }
@@ -1409,6 +1619,7 @@ mod tests {
             workspace_summary: vec![],
             error_items: vec![],
             hitl_items: vec![],
+            token_usage_aggregation: None,
         };
         // Should not panic
         super::print_rich_status(&status, None);
@@ -1551,6 +1762,7 @@ mod tests {
             workspace_summary: vec![],
             error_items: vec![],
             hitl_items: vec![],
+            token_usage_aggregation: None,
         };
         // Calling print_status with "rich" should not panic.
         super::print_status(&status, "rich", None).unwrap();
@@ -1603,6 +1815,7 @@ mod tests {
             }],
             error_items: vec![],
             hitl_items: vec![],
+            token_usage_aggregation: None,
         }
     }
 
@@ -1617,6 +1830,7 @@ mod tests {
             workspace_summary: vec![],
             error_items: vec![],
             hitl_items: vec![],
+            token_usage_aggregation: None,
         }
     }
 
@@ -1828,6 +2042,7 @@ mod tests {
                 phase: "hitl".to_string(),
                 updated_at: "2026-03-25T12:00:00Z".to_string(),
             }],
+            token_usage_aggregation: None,
         };
         // Exercises workspace summary, error items, and HITL items branches.
         print_rich_status(&status, None);
@@ -2265,5 +2480,196 @@ mod tests {
         assert_eq!(phase_map.get("failed").copied(), Some(1));
         assert_eq!(phase_map.get("hitl").copied(), Some(1));
         assert_eq!(phase_map.get("done").copied(), Some(1));
+    }
+
+    // ---- token usage aggregation ----
+
+    #[test]
+    fn gather_token_usage_aggregation_empty_db_returns_none() {
+        let db = test_db();
+        let agg = gather_token_usage_aggregation(&db);
+        assert!(agg.is_none());
+    }
+
+    #[test]
+    fn gather_token_usage_aggregation_with_recent_data() {
+        use belt_core::runtime::TokenUsage;
+
+        let db = test_db();
+        let usage = TokenUsage {
+            input_tokens: 2_000,
+            output_tokens: 1_000,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        };
+        // Record usage that is within the last 24h (will appear in daily/weekly/monthly).
+        db.record_token_usage("w1:impl", "ws-agg", "claude", "opus", &usage, Some(300))
+            .unwrap();
+        db.record_token_usage("w2:impl", "ws-agg", "claude", "sonnet", &usage, None)
+            .unwrap();
+
+        let agg = gather_token_usage_aggregation(&db).expect("should have aggregation data");
+
+        // Daily
+        assert_eq!(agg.daily.total_input, 4_000);
+        assert_eq!(agg.daily.total_output, 2_000);
+        assert_eq!(agg.daily.total_tokens, 6_000);
+        assert_eq!(agg.daily.executions, 2);
+        assert_eq!(agg.daily.by_model.len(), 2);
+
+        // Weekly should be >= daily
+        assert!(agg.weekly.total_tokens >= agg.daily.total_tokens);
+        // Monthly should be >= weekly
+        assert!(agg.monthly.total_tokens >= agg.weekly.total_tokens);
+    }
+
+    #[test]
+    fn gather_status_includes_token_usage_aggregation() {
+        use belt_core::runtime::TokenUsage;
+
+        let db = test_db();
+        let usage = TokenUsage {
+            input_tokens: 500,
+            output_tokens: 250,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+        };
+        db.record_token_usage("w1:impl", "ws-tok", "claude", "opus", &usage, None)
+            .unwrap();
+
+        let status = gather_status(&db).unwrap();
+        assert!(status.token_usage_aggregation.is_some());
+
+        let agg = status.token_usage_aggregation.unwrap();
+        assert_eq!(agg.daily.total_tokens, 750);
+        assert_eq!(agg.daily.by_model.len(), 1);
+        assert_eq!(agg.daily.by_model[0].model, "opus");
+    }
+
+    #[test]
+    fn print_rich_token_aggregation_does_not_panic() {
+        let agg = TokenUsageAggregation {
+            daily: PeriodTokenUsage {
+                label: "Last 24h".to_string(),
+                total_input: 5_000,
+                total_output: 2_500,
+                total_tokens: 7_500,
+                executions: 10,
+                by_model: vec![ModelTokenSummary {
+                    model: "opus".to_string(),
+                    input_tokens: 5_000,
+                    output_tokens: 2_500,
+                    total_tokens: 7_500,
+                    executions: 10,
+                }],
+            },
+            weekly: PeriodTokenUsage {
+                label: "Last 7d".to_string(),
+                total_input: 20_000,
+                total_output: 10_000,
+                total_tokens: 30_000,
+                executions: 40,
+                by_model: vec![
+                    ModelTokenSummary {
+                        model: "opus".to_string(),
+                        input_tokens: 15_000,
+                        output_tokens: 7_500,
+                        total_tokens: 22_500,
+                        executions: 30,
+                    },
+                    ModelTokenSummary {
+                        model: "sonnet".to_string(),
+                        input_tokens: 5_000,
+                        output_tokens: 2_500,
+                        total_tokens: 7_500,
+                        executions: 10,
+                    },
+                ],
+            },
+            monthly: PeriodTokenUsage {
+                label: "Last 30d".to_string(),
+                total_input: 50_000,
+                total_output: 25_000,
+                total_tokens: 75_000,
+                executions: 100,
+                by_model: vec![
+                    ModelTokenSummary {
+                        model: "opus".to_string(),
+                        input_tokens: 35_000,
+                        output_tokens: 17_500,
+                        total_tokens: 52_500,
+                        executions: 70,
+                    },
+                    ModelTokenSummary {
+                        model: "sonnet".to_string(),
+                        input_tokens: 15_000,
+                        output_tokens: 7_500,
+                        total_tokens: 22_500,
+                        executions: 30,
+                    },
+                ],
+            },
+        };
+        print_rich_token_aggregation(&agg);
+    }
+
+    #[test]
+    fn print_text_token_aggregation_does_not_panic() {
+        let agg = TokenUsageAggregation {
+            daily: PeriodTokenUsage {
+                label: "Last 24h".to_string(),
+                total_input: 1_000,
+                total_output: 500,
+                total_tokens: 1_500,
+                executions: 3,
+                by_model: vec![],
+            },
+            weekly: PeriodTokenUsage {
+                label: "Last 7d".to_string(),
+                total_input: 3_000,
+                total_output: 1_500,
+                total_tokens: 4_500,
+                executions: 9,
+                by_model: vec![],
+            },
+            monthly: PeriodTokenUsage {
+                label: "Last 30d".to_string(),
+                total_input: 10_000,
+                total_output: 5_000,
+                total_tokens: 15_000,
+                executions: 30,
+                by_model: vec![],
+            },
+        };
+        print_text_token_aggregation(&agg);
+    }
+
+    #[test]
+    fn build_period_usage_aggregates_correctly() {
+        let rows = vec![
+            ("opus".to_string(), 3_000u64, 1_500u64, 5u64),
+            ("sonnet".to_string(), 2_000, 1_000, 3),
+        ];
+        let period = build_period_usage("Test", &rows);
+
+        assert_eq!(period.label, "Test");
+        assert_eq!(period.total_input, 5_000);
+        assert_eq!(period.total_output, 2_500);
+        assert_eq!(period.total_tokens, 7_500);
+        assert_eq!(period.executions, 8);
+        assert_eq!(period.by_model.len(), 2);
+        // Sorted by total desc: opus (4500) > sonnet (3000)
+        assert_eq!(period.by_model[0].model, "opus");
+        assert_eq!(period.by_model[1].model, "sonnet");
+    }
+
+    #[test]
+    fn build_period_usage_empty_rows() {
+        let rows: Vec<(String, u64, u64, u64)> = vec![];
+        let period = build_period_usage("Empty", &rows);
+
+        assert_eq!(period.total_tokens, 0);
+        assert_eq!(period.executions, 0);
+        assert!(period.by_model.is_empty());
     }
 }
