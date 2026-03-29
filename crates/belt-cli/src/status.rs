@@ -158,6 +158,40 @@ pub struct SpecStatus {
     /// Optional token usage summary, populated when rich format is requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsageSummary>,
+    /// Linked issues with their current status.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub linked_issues: Vec<LinkedIssue>,
+    /// Acceptance criteria extracted from spec content.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub acceptance_criteria: Vec<String>,
+    /// Dependencies between specs (from `depends_on` field).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<SpecDependency>,
+}
+
+/// A linked issue with its queue status.
+#[derive(Debug, Serialize)]
+pub struct LinkedIssue {
+    /// The link target (e.g. `owner/repo#42`).
+    pub target: String,
+    /// Short title from the queue item, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Current phase (e.g. "done", "running", "failed").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Total tokens consumed by this issue's work items.
+    pub total_tokens: u64,
+}
+
+/// A dependency relationship between specs.
+#[derive(Debug, Serialize)]
+pub struct SpecDependency {
+    /// The spec this depends on (spec ID or name).
+    pub depends_on: String,
+    /// Shared entry points between the two specs, if any.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub shared_entry_points: Vec<String>,
 }
 
 /// Gather system status from the database.
@@ -290,13 +324,141 @@ pub fn gather_spec_status(db: &Database, workspace: &str) -> anyhow::Result<Spec
     // Gather token usage for the workspace.
     let token_usage = gather_workspace_token_usage(db, workspace);
 
+    // Gather linked issues, acceptance criteria, and dependencies from specs.
+    let specs = db.list_specs(Some(workspace), None).unwrap_or_default();
+    let (linked_issues, acceptance_criteria, dependencies) =
+        gather_spec_details(db, &specs, &all_items);
+
     Ok(SpecStatus {
         workspace: name,
         config_path,
         item_count,
         phase_counts,
         token_usage,
+        linked_issues,
+        acceptance_criteria,
+        dependencies,
     })
+}
+
+/// Gather linked issues, acceptance criteria, and dependencies from specs.
+fn gather_spec_details(
+    db: &Database,
+    specs: &[belt_core::spec::Spec],
+    items: &[belt_core::queue::QueueItem],
+) -> (Vec<LinkedIssue>, Vec<String>, Vec<SpecDependency>) {
+    let mut linked_issues = Vec::new();
+    let mut acceptance_criteria = Vec::new();
+    let mut dependencies = Vec::new();
+
+    // Build a lookup: source_id -> (phase, title) from queue items.
+    let mut item_lookup = std::collections::HashMap::<&str, (&str, Option<&str>)>::new();
+    for item in items {
+        // Keep the latest item per source_id (items are ordered by creation).
+        item_lookup.insert(
+            item.source_id.as_str(),
+            (item.phase.as_str(), item.title.as_deref()),
+        );
+    }
+
+    // Build a lookup: work_id prefix -> total tokens.
+    let mut token_lookup = std::collections::HashMap::<String, u64>::new();
+    for item in items {
+        if let Ok(rows) = db.get_token_usage_by_work_id(&item.work_id) {
+            let total: u64 = rows.iter().map(|r| r.input_tokens + r.output_tokens).sum();
+            *token_lookup.entry(item.source_id.clone()).or_insert(0) += total;
+        }
+    }
+
+    // Collect entry points per spec for dependency shared-path detection.
+    let mut spec_entry_points = std::collections::HashMap::<&str, Vec<&str>>::new();
+    for spec in specs {
+        if let Some(ref ep) = spec.entry_point {
+            let paths: Vec<&str> = ep
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            spec_entry_points.insert(spec.id.as_str(), paths);
+        }
+    }
+
+    for spec in specs {
+        // Linked issues from spec_links table.
+        if let Ok(links) = db.list_spec_links(&spec.id) {
+            for link in &links {
+                let target = &link.target;
+                // Try to match the link target to a queue item source_id.
+                let (phase, title) = find_item_for_link(target, &item_lookup);
+                let total_tokens = find_tokens_for_link(target, &token_lookup);
+                linked_issues.push(LinkedIssue {
+                    target: target.clone(),
+                    title: title.map(|t| t.to_string()),
+                    phase: phase.map(|p| p.to_string()),
+                    total_tokens,
+                });
+            }
+        }
+
+        // Acceptance criteria from spec content.
+        let criteria = belt_core::spec::extract_acceptance_criteria(&spec.content);
+        acceptance_criteria.extend(criteria);
+
+        // Dependencies from spec.depends_on.
+        if let Some(ref deps) = spec.depends_on {
+            let current_eps: Vec<&str> = spec_entry_points
+                .get(spec.id.as_str())
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+                .to_vec();
+            for dep_id in deps.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+                let dep_eps: Vec<&str> = spec_entry_points
+                    .get(dep_id)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[])
+                    .to_vec();
+                let shared: Vec<String> = current_eps
+                    .iter()
+                    .filter(|ep| dep_eps.contains(ep))
+                    .map(|ep| ep.to_string())
+                    .collect();
+                dependencies.push(SpecDependency {
+                    depends_on: dep_id.to_string(),
+                    shared_entry_points: shared,
+                });
+            }
+        }
+    }
+
+    (linked_issues, acceptance_criteria, dependencies)
+}
+
+/// Try to match a spec link target to a queue item source_id.
+///
+/// Link targets may look like `owner/repo#42` while source_ids look like
+/// `github:owner/repo#42`.  This function tries an exact match first, then
+/// a `github:` prefix match.
+fn find_item_for_link<'a>(
+    target: &str,
+    lookup: &std::collections::HashMap<&'a str, (&'a str, Option<&'a str>)>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if let Some(&(phase, title)) = lookup.get(target) {
+        return (Some(phase), title);
+    }
+    let prefixed = format!("github:{target}");
+    if let Some(&(phase, title)) = lookup.get(prefixed.as_str()) {
+        return (Some(phase), title);
+    }
+    (None, None)
+}
+
+/// Find token usage for a link target by matching against source_id keys.
+fn find_tokens_for_link(target: &str, lookup: &std::collections::HashMap<String, u64>) -> u64 {
+    if let Some(&tokens) = lookup.get(target) {
+        return tokens;
+    }
+    let prefixed = format!("github:{target}");
+    lookup.get(&prefixed).copied().unwrap_or(0)
 }
 
 /// Aggregate token usage rows into a summary for a workspace.
@@ -955,6 +1117,48 @@ fn print_text_spec_status(status: &SpecStatus) {
             println!("  {:<12} {}", pc.phase, pc.count);
         }
     }
+
+    if !status.linked_issues.is_empty() {
+        println!();
+        println!("Issues:");
+        for issue in &status.linked_issues {
+            let phase_str = issue.phase.as_deref().unwrap_or("-");
+            let title_str = issue.title.as_deref().unwrap_or("");
+            let tokens_str = if issue.total_tokens > 0 {
+                format!("{} tokens", fmt_num(issue.total_tokens))
+            } else {
+                "-".to_string()
+            };
+            println!(
+                "  {:<30} {:<12} {}  {}",
+                issue.target, phase_str, tokens_str, title_str
+            );
+        }
+    }
+
+    if !status.acceptance_criteria.is_empty() {
+        println!();
+        println!("Acceptance Criteria:");
+        for criterion in &status.acceptance_criteria {
+            println!("  - {criterion}");
+        }
+    }
+
+    if !status.dependencies.is_empty() {
+        println!();
+        println!("Dependencies:");
+        for dep in &status.dependencies {
+            if dep.shared_entry_points.is_empty() {
+                println!("  depends on {}", dep.depends_on);
+            } else {
+                println!(
+                    "  depends on {} (shared: {})",
+                    dep.depends_on,
+                    dep.shared_entry_points.join(", ")
+                );
+            }
+        }
+    }
 }
 
 fn print_rich_spec_status(status: &SpecStatus) {
@@ -1107,6 +1311,66 @@ fn print_rich_spec_status(status: &SpecStatus) {
                     fmt_num(usage.total_output),
                     fmt_num(usage.total_tokens),
                     usage.executions,
+                );
+            }
+        }
+    }
+
+    // Linked issues section
+    if !status.linked_issues.is_empty() {
+        let _ = writeln!(stdout);
+        let _ = writeln!(stdout, "  {}", "Issues".bold().cyan());
+        let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(w.min(60)).dark_grey());
+        for issue in &status.linked_issues {
+            let icon = match issue.phase.as_deref() {
+                Some("done" | "completed" | "skipped") => "\u{2705}",
+                Some("running") => "\u{1f504}",
+                Some("failed") => "\u{26a0}",
+                Some("pending" | "ready") => "\u{2b1c}",
+                _ => "\u{2b1c}",
+            };
+            let phase_str = issue.phase.as_deref().unwrap_or("-");
+            let title_str = issue.title.as_deref().unwrap_or("");
+            let tokens_str = if issue.total_tokens > 0 {
+                format!("{} tokens", fmt_num(issue.total_tokens))
+            } else {
+                String::new()
+            };
+            let _ = writeln!(
+                stdout,
+                "  {icon} {:<24} {:<12} {:>12}  {}",
+                issue.target,
+                phase_str,
+                tokens_str,
+                title_str.dark_grey(),
+            );
+        }
+    }
+
+    // Acceptance criteria section
+    if !status.acceptance_criteria.is_empty() {
+        let _ = writeln!(stdout);
+        let _ = writeln!(stdout, "  {}", "Acceptance Criteria".bold().cyan());
+        let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(w.min(60)).dark_grey());
+        for criterion in &status.acceptance_criteria {
+            let _ = writeln!(stdout, "  \u{2b1c} {criterion}");
+        }
+    }
+
+    // Dependencies section
+    if !status.dependencies.is_empty() {
+        let _ = writeln!(stdout);
+        let _ = writeln!(stdout, "  {}", "Dependencies".bold().cyan());
+        let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(w.min(60)).dark_grey());
+        for dep in &status.dependencies {
+            if dep.shared_entry_points.is_empty() {
+                let _ = writeln!(stdout, "  depends on {}", dep.depends_on.as_str().bold(),);
+            } else {
+                let _ = writeln!(
+                    stdout,
+                    "  depends on {} {}",
+                    dep.depends_on.as_str().bold(),
+                    format!("(shared: {})", dep.shared_entry_points.join(", ")).dark_grey(),
                 );
             }
         }
@@ -1550,6 +1814,167 @@ mod tests {
         }
     }
 
+    // ---- linked issues, acceptance criteria, dependencies ----
+
+    #[test]
+    fn gather_spec_status_empty_workspace_has_empty_details() {
+        let db = test_db();
+        db.add_workspace("ws-det", "/det.yaml").unwrap();
+
+        let spec_status = gather_spec_status(&db, "ws-det").unwrap();
+
+        assert!(spec_status.linked_issues.is_empty());
+        assert!(spec_status.acceptance_criteria.is_empty());
+        assert!(spec_status.dependencies.is_empty());
+    }
+
+    #[test]
+    fn gather_spec_status_populates_acceptance_criteria() {
+        use belt_core::spec::Spec;
+
+        let db = test_db();
+        db.add_workspace("ws-ac", "/ac.yaml").unwrap();
+
+        let spec = Spec::new(
+            "spec-1".to_string(),
+            "ws-ac".to_string(),
+            "auth-spec".to_string(),
+            "## Acceptance Criteria\n- POST /auth/login returns JWT\n- POST /auth/refresh returns new token\n## Other\nstuff".to_string(),
+        );
+        db.insert_spec(&spec).unwrap();
+
+        let spec_status = gather_spec_status(&db, "ws-ac").unwrap();
+
+        assert_eq!(spec_status.acceptance_criteria.len(), 2);
+        assert_eq!(
+            spec_status.acceptance_criteria[0],
+            "POST /auth/login returns JWT"
+        );
+        assert_eq!(
+            spec_status.acceptance_criteria[1],
+            "POST /auth/refresh returns new token"
+        );
+    }
+
+    #[test]
+    fn gather_spec_status_populates_linked_issues() {
+        use belt_core::spec::{Spec, SpecLink};
+
+        let db = test_db();
+        db.add_workspace("ws-li", "/li.yaml").unwrap();
+
+        let spec = Spec::new(
+            "spec-li".to_string(),
+            "ws-li".to_string(),
+            "linked-spec".to_string(),
+            "content".to_string(),
+        );
+        db.insert_spec(&spec).unwrap();
+
+        let link = SpecLink::new(
+            "link-1".to_string(),
+            "spec-li".to_string(),
+            "org/repo#42".to_string(),
+        );
+        db.insert_spec_link(&link).unwrap();
+
+        // Insert a matching queue item
+        let mut item = QueueItem::new(
+            "github:org/repo#42:implement".to_string(),
+            "github:org/repo#42".to_string(),
+            "ws-li".to_string(),
+            "implement".to_string(),
+        );
+        item.phase = QueuePhase::Done;
+        item.title = Some("JWT middleware".to_string());
+        db.insert_item(&item).unwrap();
+
+        let spec_status = gather_spec_status(&db, "ws-li").unwrap();
+
+        assert_eq!(spec_status.linked_issues.len(), 1);
+        assert_eq!(spec_status.linked_issues[0].target, "org/repo#42");
+        assert_eq!(spec_status.linked_issues[0].phase.as_deref(), Some("done"));
+        assert_eq!(
+            spec_status.linked_issues[0].title.as_deref(),
+            Some("JWT middleware")
+        );
+    }
+
+    #[test]
+    fn gather_spec_status_populates_dependencies() {
+        use belt_core::spec::Spec;
+
+        let db = test_db();
+        db.add_workspace("ws-dep", "/dep.yaml").unwrap();
+
+        let mut spec1 = Spec::new(
+            "spec-a".to_string(),
+            "ws-dep".to_string(),
+            "auth-spec".to_string(),
+            "content".to_string(),
+        );
+        spec1.entry_point = Some("src/auth/session.rs".to_string());
+
+        let mut spec2 = Spec::new(
+            "spec-b".to_string(),
+            "ws-dep".to_string(),
+            "session-spec".to_string(),
+            "content".to_string(),
+        );
+        spec2.depends_on = Some("spec-a".to_string());
+        spec2.entry_point = Some("src/auth/session.rs, src/auth/token.rs".to_string());
+
+        db.insert_spec(&spec1).unwrap();
+        db.insert_spec(&spec2).unwrap();
+
+        let spec_status = gather_spec_status(&db, "ws-dep").unwrap();
+
+        assert_eq!(spec_status.dependencies.len(), 1);
+        assert_eq!(spec_status.dependencies[0].depends_on, "spec-a");
+        assert_eq!(
+            spec_status.dependencies[0].shared_entry_points,
+            vec!["src/auth/session.rs"]
+        );
+    }
+
+    #[test]
+    fn print_rich_spec_status_with_linked_issues_does_not_panic() {
+        let status = SpecStatus {
+            workspace: "ws-rich".to_string(),
+            config_path: "/rich.yaml".to_string(),
+            item_count: 2,
+            phase_counts: vec![PhaseCount {
+                phase: "done".to_string(),
+                count: 2,
+            }],
+            token_usage: None,
+            linked_issues: vec![
+                LinkedIssue {
+                    target: "org/repo#42".to_string(),
+                    title: Some("JWT middleware".to_string()),
+                    phase: Some("done".to_string()),
+                    total_tokens: 1_200,
+                },
+                LinkedIssue {
+                    target: "org/repo#44".to_string(),
+                    title: None,
+                    phase: Some("running".to_string()),
+                    total_tokens: 0,
+                },
+            ],
+            acceptance_criteria: vec![
+                "POST /auth/login returns JWT (200)".to_string(),
+                "POST /auth/refresh returns new token".to_string(),
+            ],
+            dependencies: vec![SpecDependency {
+                depends_on: "spec-44".to_string(),
+                shared_entry_points: vec!["src/auth/session.rs".to_string()],
+            }],
+        };
+        // Must not panic.
+        print_spec_status(&status, "rich").unwrap();
+    }
+
     // ---- rich format helpers ----
 
     #[test]
@@ -1656,6 +2081,9 @@ mod tests {
                     executions: 10,
                 }],
             }),
+            linked_issues: vec![],
+            acceptance_criteria: vec![],
+            dependencies: vec![],
         };
         // Must not panic.
         print_spec_status(&status, "rich").unwrap();
@@ -1669,6 +2097,9 @@ mod tests {
             item_count: 0,
             phase_counts: vec![],
             token_usage: None,
+            linked_issues: vec![],
+            acceptance_criteria: vec![],
+            dependencies: vec![],
         };
         print_spec_status(&status, "rich").unwrap();
     }
@@ -1705,6 +2136,9 @@ mod tests {
                     },
                 ],
             }),
+            linked_issues: vec![],
+            acceptance_criteria: vec![],
+            dependencies: vec![],
         };
         // Must not panic; exercises the aggregation totals row.
         print_spec_status(&status, "rich").unwrap();
@@ -1850,6 +2284,9 @@ mod tests {
                 },
             ],
             token_usage: None,
+            linked_issues: vec![],
+            acceptance_criteria: vec![],
+            dependencies: vec![],
         }
     }
 
@@ -1860,6 +2297,9 @@ mod tests {
             item_count: 0,
             phase_counts: vec![],
             token_usage: None,
+            linked_issues: vec![],
+            acceptance_criteria: vec![],
+            dependencies: vec![],
         }
     }
 
