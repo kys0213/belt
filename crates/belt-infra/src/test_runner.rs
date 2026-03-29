@@ -11,6 +11,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use async_trait::async_trait;
+
 use belt_core::error::BeltError;
 use belt_core::platform::ShellExecutor;
 use belt_core::test_runner::{TestCommandResult, TestRunResult, TestRunner};
@@ -50,14 +52,15 @@ impl ShellTestRunner {
     }
 }
 
+#[async_trait]
 impl TestRunner for ShellTestRunner {
-    fn run(
+    async fn run(
         &self,
         commands: &[&str],
         working_dir: &Path,
         fail_fast: bool,
     ) -> Result<TestRunResult, BeltError> {
-        run_test_commands_with_shell(&*self.shell, commands, working_dir, fail_fast)
+        run_test_commands_with_shell(&*self.shell, commands, working_dir, fail_fast).await
     }
 }
 
@@ -73,8 +76,8 @@ impl TestRunner for ShellTestRunner {
 /// Returns `BeltError::Runtime` if a command cannot be spawned at all.
 /// Individual command failures are captured in the returned `TestRunResult`
 /// rather than as errors.
-pub fn run_test_commands_with_shell(
-    shell: &dyn ShellExecutor,
+pub async fn run_test_commands_with_shell(
+    shell: &(dyn ShellExecutor + '_),
     commands: &[&str],
     working_dir: &Path,
     fail_fast: bool,
@@ -84,7 +87,7 @@ pub fn run_test_commands_with_shell(
     let empty_env = HashMap::new();
 
     for cmd in commands {
-        let output = shell.execute(cmd, working_dir, &empty_env)?;
+        let output = shell.execute(cmd, working_dir, &empty_env).await?;
 
         let success = output.success();
         let combined = format!("{}{}", output.stdout, output.stderr);
@@ -121,93 +124,111 @@ pub fn run_test_commands_with_shell(
 ///
 /// This preserves backward compatibility with existing callers that do not
 /// need to inject a custom [`ShellExecutor`].
-pub fn run_test_commands(
+pub async fn run_test_commands(
     commands: &[&str],
     working_dir: &Path,
     fail_fast: bool,
 ) -> Result<TestRunResult, BeltError> {
     let shell = crate::platform::default_shell_executor();
-    run_test_commands_with_shell(&*shell, commands, working_dir, fail_fast)
+    run_test_commands_with_shell(&*shell, commands, working_dir, fail_fast).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn run_passing_command() {
+    #[tokio::test]
+    async fn run_passing_command() {
         let tmp = tempfile::tempdir().unwrap();
-        let result = run_test_commands(&["true"], tmp.path(), false).unwrap();
+        let result = run_test_commands(&["true"], tmp.path(), false)
+            .await
+            .unwrap();
         assert!(result.all_passed);
         assert_eq!(result.results.len(), 1);
         assert!(result.results[0].success);
     }
 
-    #[test]
-    fn run_failing_command() {
+    #[tokio::test]
+    async fn run_failing_command() {
         let tmp = tempfile::tempdir().unwrap();
-        let result = run_test_commands(&["false"], tmp.path(), false).unwrap();
+        let result = run_test_commands(&["false"], tmp.path(), false)
+            .await
+            .unwrap();
         assert!(!result.all_passed);
         assert_eq!(result.results.len(), 1);
         assert!(!result.results[0].success);
     }
 
-    #[test]
-    fn fail_fast_stops_at_first_failure() {
+    #[tokio::test]
+    async fn fail_fast_stops_at_first_failure() {
         let tmp = tempfile::tempdir().unwrap();
-        let result = run_test_commands(&["false", "true"], tmp.path(), true).unwrap();
+        let result = run_test_commands(&["false", "true"], tmp.path(), true)
+            .await
+            .unwrap();
         assert!(!result.all_passed);
         assert_eq!(result.results.len(), 1);
     }
 
-    #[test]
-    fn no_fail_fast_runs_all_commands() {
+    #[tokio::test]
+    async fn no_fail_fast_runs_all_commands() {
         let tmp = tempfile::tempdir().unwrap();
-        let result = run_test_commands(&["false", "true"], tmp.path(), false).unwrap();
+        let result = run_test_commands(&["false", "true"], tmp.path(), false)
+            .await
+            .unwrap();
         assert!(!result.all_passed);
         assert_eq!(result.results.len(), 2);
         assert!(!result.results[0].success);
         assert!(result.results[1].success);
     }
 
-    #[test]
-    fn empty_commands_all_pass() {
+    #[tokio::test]
+    async fn empty_commands_all_pass() {
         let tmp = tempfile::tempdir().unwrap();
-        let result = run_test_commands(&[], tmp.path(), false).unwrap();
+        let result = run_test_commands(&[], tmp.path(), false).await.unwrap();
         assert!(result.all_passed);
         assert!(result.results.is_empty());
     }
 
-    #[test]
-    fn captures_output() {
+    #[tokio::test]
+    async fn captures_output() {
         let tmp = tempfile::tempdir().unwrap();
-        let result = run_test_commands(&["echo hello_test"], tmp.path(), false).unwrap();
+        let result = run_test_commands(&["echo hello_test"], tmp.path(), false)
+            .await
+            .unwrap();
         assert!(result.all_passed);
         assert!(result.results[0].output.contains("hello_test"));
     }
 
-    #[test]
-    fn multiple_passing_commands() {
+    #[tokio::test]
+    async fn multiple_passing_commands() {
         let tmp = tempfile::tempdir().unwrap();
-        let result = run_test_commands(&["true", "true", "true"], tmp.path(), false).unwrap();
+        let result = run_test_commands(&["true", "true", "true"], tmp.path(), false)
+            .await
+            .unwrap();
         assert!(result.all_passed);
         assert_eq!(result.results.len(), 3);
     }
 
-    #[test]
-    fn shell_test_runner_trait_impl() {
+    #[tokio::test]
+    async fn shell_test_runner_trait_impl() {
         let runner = ShellTestRunner::new();
         let tmp = tempfile::tempdir().unwrap();
-        let result = runner.run(&["true", "echo ok"], tmp.path(), false).unwrap();
+        let result = runner
+            .run(&["true", "echo ok"], tmp.path(), false)
+            .await
+            .unwrap();
         assert!(result.all_passed);
         assert_eq!(result.results.len(), 2);
     }
 
-    #[test]
-    fn shell_test_runner_fail_fast() {
+    #[tokio::test]
+    async fn shell_test_runner_fail_fast() {
         let runner = ShellTestRunner::new();
         let tmp = tempfile::tempdir().unwrap();
-        let result = runner.run(&["false", "true"], tmp.path(), true).unwrap();
+        let result = runner
+            .run(&["false", "true"], tmp.path(), true)
+            .await
+            .unwrap();
         assert!(!result.all_passed);
         assert_eq!(result.results.len(), 1);
     }

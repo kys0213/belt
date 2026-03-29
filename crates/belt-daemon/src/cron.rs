@@ -1912,11 +1912,14 @@ impl CronHandler for GapDetectionJob {
                     "GapDetectionJob: running test commands for spec"
                 );
 
-                match belt_infra::test_runner::run_test_commands(
-                    &test_cmds,
-                    &self.workspace_root,
-                    true, // fail-fast
-                ) {
+                let handle = tokio::runtime::Handle::current();
+                match tokio::task::block_in_place(|| {
+                    handle.block_on(belt_infra::test_runner::run_test_commands(
+                        &test_cmds,
+                        &self.workspace_root,
+                        true, // fail-fast
+                    ))
+                }) {
                     Ok(result) if result.all_passed => {
                         tracing::info!(
                             spec_id = %spec_id,
@@ -3066,7 +3069,10 @@ impl CronHandler for CustomScriptJob {
 
         let working_dir = std::path::PathBuf::from(&belt_home);
 
-        let output = self.shell.execute(&self.script, &working_dir, &env_vars)?;
+        let handle = tokio::runtime::Handle::current();
+        let output = tokio::task::block_in_place(|| {
+            handle.block_on(self.shell.execute(&self.script, &working_dir, &env_vars))
+        })?;
 
         if !output.success() {
             tracing::error!(

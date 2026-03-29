@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use async_trait::async_trait;
+
 use crate::error::BeltError;
 
 /// Result of executing a shell command.
@@ -32,10 +34,11 @@ impl ShellOutput {
 /// Implementations translate a command string into the appropriate shell
 /// invocation for the target platform (e.g. `bash -c` on Unix,
 /// `cmd.exe /C` on Windows).
+#[async_trait]
 pub trait ShellExecutor: Send + Sync {
-    /// Execute `command` synchronously in `working_dir` with optional
+    /// Execute `command` asynchronously in `working_dir` with optional
     /// environment variables.
-    fn execute(
+    async fn execute(
         &self,
         command: &str,
         working_dir: &Path,

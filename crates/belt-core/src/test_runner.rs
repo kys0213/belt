@@ -5,6 +5,8 @@
 
 use std::path::Path;
 
+use async_trait::async_trait;
+
 use crate::error::BeltError;
 
 /// Result of executing a single test command.
@@ -32,6 +34,7 @@ pub struct TestRunResult {
 /// Implementations receive a list of shell commands and a working directory,
 /// then execute them sequentially and report results. The `fail_fast` flag
 /// controls whether execution stops at the first failure.
+#[async_trait]
 pub trait TestRunner: Send + Sync {
     /// Run the given test commands in `working_dir`.
     ///
@@ -39,7 +42,7 @@ pub trait TestRunner: Send + Sync {
     /// Individual command failures are captured in [`TestRunResult`] rather than
     /// returned as errors. Errors are reserved for cases where a command cannot
     /// be spawned at all.
-    fn run(
+    async fn run(
         &self,
         commands: &[&str],
         working_dir: &Path,
