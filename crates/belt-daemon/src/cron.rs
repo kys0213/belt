@@ -11,10 +11,14 @@ use std::collections::HashMap;
 use belt_core::error::BeltError;
 use belt_core::escalation::EscalationAction;
 use belt_core::phase::QueuePhase;
+use belt_core::queue::HitlReason;
 use belt_core::workspace::WorkspaceConfig;
 use belt_infra::db::Database;
 use belt_infra::worktree::WorktreeManager;
 use chrono::{DateTime, Utc};
+
+/// Maximum number of replan attempts before falling back to Failed.
+const MAX_REPLAN_COUNT: u32 = 3;
 
 // ---------------------------------------------------------------------------
 // CronSchedule
@@ -474,7 +478,6 @@ impl CronEngine {
                             job_name: db_job.name.clone(),
                             db: Arc::clone(db),
                             shell: Arc::from(belt_infra::platform::default_shell_executor()),
-                            workspace: db_job.workspace.clone(),
                         }),
                     });
                 }
@@ -511,7 +514,6 @@ impl CronEngine {
                         job_name: db_job.name.clone(),
                         db: Arc::clone(db),
                         shell: Arc::from(belt_infra::platform::default_shell_executor()),
-                        workspace: db_job.workspace.clone(),
                     }),
                 });
             }
@@ -612,14 +614,14 @@ impl CronHandler for HitlTimeoutJob {
                 continue;
             }
 
-            // Determine target phase from per-item terminal action first,
-            // then fall back to workspace escalation_policy terminal action,
-            // and finally default to Failed (safe default).
-            let target_phase = match item.hitl_terminal_action.as_deref() {
-                Some("skip") => QueuePhase::Skipped,
-                Some("replan") => QueuePhase::Skipped,
-                Some("failed") => QueuePhase::Failed,
-                _ => resolve_workspace_terminal_phase(
+            // Determine resolved terminal action from per-item terminal action
+            // first, then fall back to workspace escalation_policy terminal
+            // action, and finally default to Failed (safe default).
+            let resolved = match item.hitl_terminal_action.as_deref() {
+                Some("skip") => ResolvedTerminalAction::Phase(QueuePhase::Skipped),
+                Some("replan") => ResolvedTerminalAction::Replan,
+                Some("failed") => ResolvedTerminalAction::Phase(QueuePhase::Failed),
+                _ => resolve_workspace_terminal_action(
                     &self.db,
                     &item.workspace_id,
                     &item.source_id,
@@ -627,14 +629,32 @@ impl CronHandler for HitlTimeoutJob {
                 ),
             };
 
-            if let Err(e) = self.db.update_phase(&item.work_id, target_phase) {
-                tracing::warn!(
-                    work_id = %item.work_id,
-                    error = %e,
-                    "failed to expire HITL item"
-                );
-                continue;
-            }
+            let target_phase = match resolved {
+                ResolvedTerminalAction::Phase(phase) => {
+                    if let Err(e) = self.db.update_phase(&item.work_id, phase) {
+                        tracing::warn!(
+                            work_id = %item.work_id,
+                            error = %e,
+                            "failed to expire HITL item"
+                        );
+                        continue;
+                    }
+                    phase
+                }
+                ResolvedTerminalAction::Replan => {
+                    match execute_replan(&self.db, item) {
+                        Ok(phase) => phase,
+                        Err(e) => {
+                            tracing::warn!(
+                                work_id = %item.work_id,
+                                error = %e,
+                                "failed to execute replan for expired HITL item"
+                            );
+                            continue;
+                        }
+                    }
+                }
+            };
 
             // Clean up the associated worktree for terminal phases.
             if target_phase == QueuePhase::Skipped
@@ -666,19 +686,87 @@ impl CronHandler for HitlTimeoutJob {
     }
 }
 
-/// Resolve the target phase for an expired HITL item by consulting the
+/// Resolved action for an expired HITL item's terminal handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedTerminalAction {
+    /// Transition directly to the given phase (Skipped, Failed, etc.).
+    Phase(QueuePhase),
+    /// Execute the replan workflow: increment replan_count, create a
+    /// SpecModificationProposed HITL item, and transition the original to Pending.
+    Replan,
+}
+
+/// Execute the replan workflow for an expired HITL item.
+///
+/// Increments `replan_count` and, if within the limit, transitions the item to
+/// `Pending` and creates a companion HITL item for spec modification review.
+/// If the replan limit is exceeded, transitions to `Failed` instead.
+///
+/// Returns the phase the original item was transitioned to.
+fn execute_replan(
+    db: &Database,
+    item: &belt_core::queue::QueueItem,
+) -> Result<QueuePhase, BeltError> {
+    let new_count = db.increment_replan_count(&item.work_id)?;
+
+    if new_count > MAX_REPLAN_COUNT {
+        db.update_phase(&item.work_id, QueuePhase::Failed)?;
+        tracing::info!(
+            work_id = %item.work_id,
+            replan_count = new_count,
+            max_replan = MAX_REPLAN_COUNT,
+            "replan limit exceeded, transitioned to Failed"
+        );
+        return Ok(QueuePhase::Failed);
+    }
+
+    // Transition original item back to Pending for re-processing.
+    db.update_phase(&item.work_id, QueuePhase::Pending)?;
+
+    // Create a companion HITL item for spec modification review.
+    let failure_reason = item.hitl_notes.as_deref().unwrap_or("unknown failure");
+    let replan_work_id = format!("{}:replan-{new_count}", item.work_id);
+    let mut replan_item = belt_core::queue::QueueItem::new(
+        replan_work_id.clone(),
+        item.source_id.clone(),
+        item.workspace_id.clone(),
+        item.state.clone(),
+    );
+    replan_item.phase = QueuePhase::Hitl;
+    replan_item.hitl_created_at = Some(Utc::now().to_rfc3339());
+    replan_item.hitl_reason = Some(HitlReason::SpecModificationProposed);
+    replan_item.hitl_notes = Some(format!(
+        "HITL timeout replan (attempt {new_count}): {failure_reason}"
+    ));
+    replan_item.title = Some(format!("spec-modification-proposed (replan #{new_count})"));
+    replan_item.replan_count = new_count;
+    db.insert_item(&replan_item)?;
+
+    tracing::info!(
+        work_id = %item.work_id,
+        replan_work_id = %replan_work_id,
+        replan_count = new_count,
+        max_replan = MAX_REPLAN_COUNT,
+        "replanned: original -> Pending, created spec-modification HITL item"
+    );
+
+    Ok(QueuePhase::Pending)
+}
+
+/// Resolve the terminal action for an expired HITL item by consulting the
 /// workspace's escalation policy `terminal` action.
 ///
 /// Extracts the source key from `source_id` (the prefix before the first `:`),
 /// looks up the corresponding `SourceConfig`, and maps its `terminal_action()`
-/// to a `QueuePhase`. Returns `QueuePhase::Failed` as the safe default when
-/// the workspace or source cannot be found, or when no terminal action is set.
-fn resolve_workspace_terminal_phase(
+/// to a [`ResolvedTerminalAction`]. Returns `Phase(Failed)` as the safe default
+/// when the workspace or source cannot be found, or when no terminal action is
+/// set.
+fn resolve_workspace_terminal_action(
     db: &Database,
     workspace_id: &str,
     source_id: &str,
     cache: &mut HashMap<String, Option<WorkspaceConfig>>,
-) -> QueuePhase {
+) -> ResolvedTerminalAction {
     // Load or retrieve cached workspace config.
     let ws_config = cache.entry(workspace_id.to_string()).or_insert_with(|| {
         let (_name, config_path, _created_at) = match db.get_workspace(workspace_id) {
@@ -708,7 +796,7 @@ fn resolve_workspace_terminal_phase(
     });
 
     let Some(config) = ws_config else {
-        return QueuePhase::Failed;
+        return ResolvedTerminalAction::Phase(QueuePhase::Failed);
     };
 
     // Extract source key from source_id (e.g. "github:org/repo#42" -> "github").
@@ -720,9 +808,9 @@ fn resolve_workspace_terminal_phase(
         .and_then(|src| src.escalation.terminal_action());
 
     match terminal_action {
-        Some(EscalationAction::Skip) => QueuePhase::Skipped,
-        Some(EscalationAction::Replan) => QueuePhase::Failed,
-        _ => QueuePhase::Failed,
+        Some(EscalationAction::Skip) => ResolvedTerminalAction::Phase(QueuePhase::Skipped),
+        Some(EscalationAction::Replan) => ResolvedTerminalAction::Replan,
+        _ => ResolvedTerminalAction::Phase(QueuePhase::Failed),
     }
 }
 
@@ -1078,16 +1166,9 @@ impl GapDetectionJob {
     /// transition spec statuses, or perform any other side effects.  Use it
     /// in tests or when you need programmatic access to gap results.
     pub fn analyze_gaps(&self) -> Result<GapAnalysisReport, BeltError> {
-        let all_active = self
+        let active_specs = self
             .db
             .list_specs(None, Some(belt_core::spec::SpecStatus::Active))?;
-
-        // Skip test-only specs (labeled "test") to prevent spurious gap
-        // issues for specs that exist solely as test fixtures.
-        let active_specs: Vec<_> = all_active
-            .into_iter()
-            .filter(|s| !s.is_test_only())
-            .collect();
 
         if active_specs.is_empty() {
             return Ok(GapAnalysisReport {
@@ -2616,23 +2697,83 @@ impl CronHandler for EvaluateJob {
 
                 match eval_result {
                     Ok(result) if result.success() => {
-                        // 6a. CLI direct call succeeded (exit 0) — the evaluate
-                        // subprocess already executed `belt queue done` or
-                        // `belt queue hitl` via the CLI, so we simply mark Done.
-                        match self.db.update_phase(&item.work_id, QueuePhase::Done) {
-                            Ok(()) => {
-                                evaluated_count += 1;
-                                tracing::info!(
-                                    work_id = %item.work_id,
-                                    workspace = %workspace,
-                                    "EvaluateJob: item evaluated as Done"
-                                );
-                            }
-                            Err(e) => {
+                        // 6a. LLM call succeeded -- parse verdict from stdout.
+                        let verdict = crate::evaluator::EvalVerdict::parse(&result.stdout);
+                        let decision = match &verdict {
+                            Some(v) if v.is_pass() => crate::evaluator::EvalDecision::Done,
+                            Some(v) => crate::evaluator::EvalDecision::Hitl {
+                                reason: v
+                                    .reason
+                                    .clone()
+                                    .unwrap_or_else(|| "LLM evaluation found issues".to_string()),
+                            },
+                            None => {
+                                // Subprocess succeeded but no parseable verdict.
+                                // Default to Done (backward-compatible behavior).
                                 tracing::warn!(
                                     work_id = %item.work_id,
-                                    error = %e,
-                                    "EvaluateJob: failed to update item phase to Done"
+                                    "EvaluateJob: no parseable verdict from LLM, defaulting to Done"
+                                );
+                                crate::evaluator::EvalDecision::Done
+                            }
+                        };
+
+                        // Log suggestions if present.
+                        if let Some(v) = &verdict
+                            && !v.suggestions.is_empty()
+                        {
+                            tracing::info!(
+                                work_id = %item.work_id,
+                                suggestions = ?v.suggestions,
+                                "EvaluateJob: LLM evaluation suggestions"
+                            );
+                        }
+
+                        match &decision {
+                            crate::evaluator::EvalDecision::Done => {
+                                match self.db.update_phase(&item.work_id, QueuePhase::Done) {
+                                    Ok(()) => {
+                                        evaluated_count += 1;
+                                        tracing::info!(
+                                            work_id = %item.work_id,
+                                            workspace = %workspace,
+                                            "EvaluateJob: item evaluated as Done"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            work_id = %item.work_id,
+                                            error = %e,
+                                            "EvaluateJob: failed to update item phase to Done"
+                                        );
+                                    }
+                                }
+                            }
+                            crate::evaluator::EvalDecision::Hitl { reason } => {
+                                if let Err(e) = self.db.escalate_to_hitl(
+                                    &item.work_id,
+                                    "evaluate_issues",
+                                    reason,
+                                ) {
+                                    tracing::warn!(
+                                        work_id = %item.work_id,
+                                        error = %e,
+                                        "EvaluateJob: failed to escalate item to HITL"
+                                    );
+                                } else {
+                                    tracing::info!(
+                                        work_id = %item.work_id,
+                                        reason = %reason,
+                                        "EvaluateJob: item escalated to HITL due to evaluation issues"
+                                    );
+                                }
+                                evaluated_count += 1;
+                            }
+                            crate::evaluator::EvalDecision::Retry => {
+                                // Should not occur in this path, but handle gracefully.
+                                tracing::debug!(
+                                    work_id = %item.work_id,
+                                    "EvaluateJob: item stays in Completed for retry"
                                 );
                             }
                         }
@@ -2899,9 +3040,8 @@ pub fn builtin_jobs(deps: BuiltinJobDeps) -> Vec<CronJobDef> {
 /// A cron handler that executes a user-defined shell script.
 ///
 /// When the cron engine fires this job, the handler spawns the script as a
-/// child process and waits for it to complete. The script receives `BELT_HOME`,
-/// `BELT_CRON_JOB`, and `BELT_DB` environment variables. Workspace-scoped jobs
-/// additionally receive the `WORKSPACE` variable.
+/// child process and waits for it to complete. The script receives `BELT_HOME`
+/// and `BELT_CRON_JOB` environment variables.
 pub struct CustomScriptJob {
     /// Absolute path to the script to execute.
     pub script: String,
@@ -2911,8 +3051,6 @@ pub struct CustomScriptJob {
     pub db: Arc<Database>,
     /// Platform-specific shell executor.
     pub shell: Arc<dyn belt_core::platform::ShellExecutor>,
-    /// Optional workspace scope (`None` = global job).
-    pub workspace: Option<String>,
 }
 impl CronHandler for CustomScriptJob {
     fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
@@ -2933,18 +3071,6 @@ impl CronHandler for CustomScriptJob {
         let mut env_vars = std::collections::HashMap::new();
         env_vars.insert("BELT_HOME".to_string(), belt_home.clone());
         env_vars.insert("BELT_CRON_JOB".to_string(), self.job_name.clone());
-
-        // Inject BELT_DB path derived from BELT_HOME.
-        let db_path = std::path::PathBuf::from(&belt_home)
-            .join("belt.db")
-            .to_string_lossy()
-            .to_string();
-        env_vars.insert("BELT_DB".to_string(), db_path);
-
-        // Inject WORKSPACE for workspace-scoped jobs.
-        if let Some(ref ws) = self.workspace {
-            env_vars.insert("WORKSPACE".to_string(), ws.clone());
-        }
 
         let working_dir = std::path::PathBuf::from(&belt_home);
 
@@ -3054,7 +3180,6 @@ pub fn load_custom_jobs(engine: &mut CronEngine, db: &Arc<Database>) {
                 job_name: job.name,
                 db: Arc::clone(db),
                 shell: Arc::from(belt_infra::platform::default_shell_executor()),
-                workspace: job.workspace,
             }),
         });
     }
@@ -4267,10 +4392,10 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         assert_eq!(engine.job_count(), 6);
     }
 
-    // -- resolve_workspace_terminal_phase unit tests --
+    // -- resolve_workspace_terminal_action unit tests --
 
     #[test]
-    fn resolve_terminal_phase_returns_skipped_for_skip_action() {
+    fn resolve_terminal_action_returns_skipped_for_skip_action() {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let tmp = tempfile::tempdir().unwrap();
 
@@ -4284,13 +4409,13 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             .unwrap();
 
         let mut cache = HashMap::new();
-        let phase =
-            resolve_workspace_terminal_phase(&db, "ws-skip", "github:org/repo#1", &mut cache);
-        assert_eq!(phase, QueuePhase::Skipped);
+        let action =
+            resolve_workspace_terminal_action(&db, "ws-skip", "github:org/repo#1", &mut cache);
+        assert_eq!(action, ResolvedTerminalAction::Phase(QueuePhase::Skipped));
     }
 
     #[test]
-    fn resolve_terminal_phase_returns_failed_for_replan_action() {
+    fn resolve_terminal_action_returns_replan_for_replan_action() {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let tmp = tempfile::tempdir().unwrap();
 
@@ -4304,39 +4429,39 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             .unwrap();
 
         let mut cache = HashMap::new();
-        let phase =
-            resolve_workspace_terminal_phase(&db, "ws-replan", "github:org/repo#2", &mut cache);
-        assert_eq!(phase, QueuePhase::Failed);
+        let action =
+            resolve_workspace_terminal_action(&db, "ws-replan", "github:org/repo#2", &mut cache);
+        assert_eq!(action, ResolvedTerminalAction::Replan);
     }
 
     #[test]
-    fn resolve_terminal_phase_defaults_to_failed_when_workspace_not_found() {
+    fn resolve_terminal_action_defaults_to_failed_when_workspace_not_found() {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let mut cache = HashMap::new();
-        let phase = resolve_workspace_terminal_phase(
+        let action = resolve_workspace_terminal_action(
             &db,
             "nonexistent-ws",
             "github:org/repo#1",
             &mut cache,
         );
-        assert_eq!(phase, QueuePhase::Failed);
+        assert_eq!(action, ResolvedTerminalAction::Phase(QueuePhase::Failed));
     }
 
     #[test]
-    fn resolve_terminal_phase_defaults_to_failed_when_config_missing() {
+    fn resolve_terminal_action_defaults_to_failed_when_config_missing() {
         let db = Arc::new(Database::open_in_memory().unwrap());
         // Register workspace pointing to a non-existent config file.
         db.add_workspace("ws-bad", "/nonexistent/workspace.yml")
             .unwrap();
 
         let mut cache = HashMap::new();
-        let phase =
-            resolve_workspace_terminal_phase(&db, "ws-bad", "github:org/repo#1", &mut cache);
-        assert_eq!(phase, QueuePhase::Failed);
+        let action =
+            resolve_workspace_terminal_action(&db, "ws-bad", "github:org/repo#1", &mut cache);
+        assert_eq!(action, ResolvedTerminalAction::Phase(QueuePhase::Failed));
     }
 
     #[test]
-    fn resolve_terminal_phase_defaults_to_failed_when_no_terminal_set() {
+    fn resolve_terminal_action_defaults_to_failed_when_no_terminal_set() {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let tmp = tempfile::tempdir().unwrap();
 
@@ -4350,13 +4475,13 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             .unwrap();
 
         let mut cache = HashMap::new();
-        let phase =
-            resolve_workspace_terminal_phase(&db, "ws-noterm", "github:org/repo#1", &mut cache);
-        assert_eq!(phase, QueuePhase::Failed);
+        let action =
+            resolve_workspace_terminal_action(&db, "ws-noterm", "github:org/repo#1", &mut cache);
+        assert_eq!(action, ResolvedTerminalAction::Phase(QueuePhase::Failed));
     }
 
     #[test]
-    fn resolve_terminal_phase_extracts_source_key_from_source_id() {
+    fn resolve_terminal_action_extracts_source_key_from_source_id() {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let tmp = tempfile::tempdir().unwrap();
 
@@ -4372,13 +4497,13 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
 
         let mut cache = HashMap::new();
         // source_id "custom:proj/item#5" should extract key "custom".
-        let phase =
-            resolve_workspace_terminal_phase(&db, "ws-custom", "custom:proj/item#5", &mut cache);
-        assert_eq!(phase, QueuePhase::Skipped);
+        let action =
+            resolve_workspace_terminal_action(&db, "ws-custom", "custom:proj/item#5", &mut cache);
+        assert_eq!(action, ResolvedTerminalAction::Phase(QueuePhase::Skipped));
     }
 
     #[test]
-    fn resolve_terminal_phase_uses_cache_on_repeated_call() {
+    fn resolve_terminal_action_uses_cache_on_repeated_call() {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let tmp = tempfile::tempdir().unwrap();
 
@@ -4392,17 +4517,17 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             .unwrap();
 
         let mut cache = HashMap::new();
-        let phase1 =
-            resolve_workspace_terminal_phase(&db, "ws-cached", "github:org/repo#1", &mut cache);
-        assert_eq!(phase1, QueuePhase::Skipped);
+        let action1 =
+            resolve_workspace_terminal_action(&db, "ws-cached", "github:org/repo#1", &mut cache);
+        assert_eq!(action1, ResolvedTerminalAction::Phase(QueuePhase::Skipped));
 
         // Cache should now contain the entry.
         assert!(cache.contains_key("ws-cached"));
 
         // Second call should use cache (same result).
-        let phase2 =
-            resolve_workspace_terminal_phase(&db, "ws-cached", "github:org/repo#2", &mut cache);
-        assert_eq!(phase2, QueuePhase::Skipped);
+        let action2 =
+            resolve_workspace_terminal_action(&db, "ws-cached", "github:org/repo#2", &mut cache);
+        assert_eq!(action2, ResolvedTerminalAction::Phase(QueuePhase::Skipped));
     }
 
     // -- has_existing_gap_issue unit tests --
@@ -4446,15 +4571,69 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         item.phase = QueuePhase::Hitl;
         item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
         item.hitl_terminal_action = Some("replan".to_string());
+        item.hitl_notes = Some("original failure reason".to_string());
         db.insert_item(&item).unwrap();
 
         let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr);
         let ctx = CronContext { now: Utc::now() };
         job.execute(&ctx).unwrap();
 
-        // "replan" maps to Skipped (replan max exceeded should not use Failed).
+        // "replan" transitions the original item to Pending (not Failed).
         let updated = db.get_item("w-replan").unwrap();
-        assert_eq!(updated.phase, QueuePhase::Skipped);
+        assert_eq!(updated.phase, QueuePhase::Pending);
+        assert_eq!(updated.replan_count, 1);
+
+        // A companion HITL item should be created for spec modification review.
+        let replan_item = db.get_item("w-replan:replan-1").unwrap();
+        assert_eq!(replan_item.phase, QueuePhase::Hitl);
+        assert_eq!(
+            replan_item.hitl_reason,
+            Some(belt_core::queue::HitlReason::SpecModificationProposed)
+        );
+        assert_eq!(replan_item.replan_count, 1);
+        assert!(replan_item
+            .title
+            .as_deref()
+            .unwrap()
+            .contains("spec-modification-proposed"));
+        assert!(replan_item
+            .hitl_notes
+            .as_deref()
+            .unwrap()
+            .contains("original failure reason"));
+    }
+
+    #[test]
+    fn hitl_timeout_terminal_action_replan_exceeds_limit() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
+
+        let mut item = belt_core::queue::QueueItem::new(
+            "w-replan-limit".into(),
+            "s1".into(),
+            "ws".into(),
+            "st".into(),
+        );
+        item.phase = QueuePhase::Hitl;
+        item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
+        item.hitl_terminal_action = Some("replan".to_string());
+        item.replan_count = MAX_REPLAN_COUNT; // Already at limit
+        db.insert_item(&item).unwrap();
+
+        let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr);
+        let ctx = CronContext { now: Utc::now() };
+        job.execute(&ctx).unwrap();
+
+        // When replan limit is exceeded, item transitions to Failed.
+        let updated = db.get_item("w-replan-limit").unwrap();
+        assert_eq!(updated.phase, QueuePhase::Failed);
+        assert_eq!(updated.replan_count, MAX_REPLAN_COUNT + 1);
+
+        // No companion HITL item should be created.
+        assert!(db.get_item("w-replan-limit:replan-4").is_err());
     }
 
     #[test]
@@ -6023,70 +6202,6 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
                 .covered_spec_ids
                 .contains(&"spec-full-auth-mw".to_string()),
             "spec-full-auth-mw should be in covered list",
-        );
-    }
-
-    // ---- GapDetectionJob skips test-only specs ----------------------------
-
-    #[test]
-    fn gap_detection_skips_test_only_specs() {
-        let db = Arc::new(Database::open_in_memory().unwrap());
-        let tmp = tempfile::tempdir().unwrap();
-
-        // Code that does NOT cover spec keywords.
-        std::fs::write(tmp.path().join("main.rs"), "fn unrelated() {}").unwrap();
-
-        // Insert an active spec with the "test" label — should be skipped.
-        let mut spec = belt_core::spec::Spec::new(
-            "spec-test-only".into(),
-            "ws".into(),
-            "Test Only Spec".into(),
-            "implement authorization middleware for secure endpoints".into(),
-        );
-        spec.status = belt_core::spec::SpecStatus::Active;
-        spec.labels = Some("test".into());
-        db.insert_spec(&spec).unwrap();
-
-        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
-        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
-
-        assert!(
-            report.gaps.is_empty(),
-            "test-only specs should be excluded from gap detection, got: {:?}",
-            report.gaps,
-        );
-        assert!(
-            report.covered_spec_ids.is_empty(),
-            "test-only specs should not appear in covered list either",
-        );
-    }
-
-    #[test]
-    fn gap_detection_does_not_skip_non_test_specs() {
-        let db = Arc::new(Database::open_in_memory().unwrap());
-        let tmp = tempfile::tempdir().unwrap();
-
-        // Code that does NOT cover spec keywords.
-        std::fs::write(tmp.path().join("main.rs"), "fn unrelated() {}").unwrap();
-
-        // Insert an active spec WITHOUT the "test" label.
-        let mut spec = belt_core::spec::Spec::new(
-            "spec-real".into(),
-            "ws".into(),
-            "Real Spec".into(),
-            "implement authorization middleware for secure endpoints".into(),
-        );
-        spec.status = belt_core::spec::SpecStatus::Active;
-        spec.labels = Some("feature,priority-high".into());
-        db.insert_spec(&spec).unwrap();
-
-        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
-        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
-
-        assert_eq!(
-            report.gaps.len(),
-            1,
-            "non-test specs should still be analysed for gaps",
         );
     }
 }
