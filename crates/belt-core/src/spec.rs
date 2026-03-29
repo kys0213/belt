@@ -89,6 +89,7 @@ impl fmt::Display for SpecStatus {
 /// - Completing -> Completed (HITL final approval)
 /// - Completing -> Active (gap found during re-check or test failure)
 /// - Draft | Active | Paused | Completing -> Archived (soft delete)
+/// - Completed -> Archived (final archive after completion)
 /// - Archived -> Active (restore)
 pub fn is_valid_spec_transition(from: SpecStatus, to: SpecStatus) -> bool {
     use SpecStatus::*;
@@ -104,6 +105,7 @@ pub fn is_valid_spec_transition(from: SpecStatus, to: SpecStatus) -> bool {
             | (Active, Archived)
             | (Paused, Archived)
             | (Completing, Archived)
+            | (Completed, Archived)
             | (Archived, Active)
     )
 }
@@ -676,8 +678,9 @@ mod tests {
         assert!(transit_spec(Completed, Completing).is_err());
         assert!(transit_spec(Completing, Draft).is_err());
         assert!(transit_spec(Completing, Paused).is_err());
+        // Completed -> Archived is now valid (final archive)
+        assert!(transit_spec(Completed, Archived).is_ok());
         // Archived invalid transitions
-        assert!(transit_spec(Completed, Archived).is_err());
         assert!(transit_spec(Archived, Draft).is_err());
         assert!(transit_spec(Archived, Paused).is_err());
         assert!(transit_spec(Archived, Completing).is_err());
@@ -703,8 +706,8 @@ mod tests {
             .flat_map(|&from| statuses.iter().map(move |&to| (from, to)))
             .filter(|&(from, to)| is_valid_spec_transition(from, to))
             .count();
-        // 6 original + 5 archived (4 -> Archived, 1 Archived -> Active)
-        assert_eq!(valid_count, 11);
+        // 6 original + 6 archived (5 -> Archived, 1 Archived -> Active)
+        assert_eq!(valid_count, 12);
     }
 
     #[test]
