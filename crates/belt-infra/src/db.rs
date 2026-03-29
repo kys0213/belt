@@ -1855,6 +1855,51 @@ impl Database {
         })
     }
 
+    /// Aggregate token usage since a given cutoff timestamp, grouped by model.
+    ///
+    /// Returns a vec of `(model, input_tokens, output_tokens, executions)` tuples
+    /// ordered by total tokens descending.  The caller decides the cutoff (e.g.
+    /// 24 hours, 7 days, 30 days) so that daily/weekly/monthly views share a
+    /// single query path.
+    pub fn get_token_usage_since(
+        &self,
+        since: &DateTime<Utc>,
+    ) -> Result<Vec<(String, u64, u64, u64)>, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let cutoff = since.to_rfc3339();
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT model,
+                        SUM(input_tokens)  AS total_input,
+                        SUM(output_tokens) AS total_output,
+                        COUNT(*)           AS exec_count
+                 FROM token_usage
+                 WHERE created_at >= ?1
+                 GROUP BY model
+                 ORDER BY (SUM(input_tokens) + SUM(output_tokens)) DESC",
+            )
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                let model: String = row.get(0)?;
+                let input: i64 = row.get(1)?;
+                let output: i64 = row.get(2)?;
+                let count: i64 = row.get(3)?;
+                Ok((model, input as u64, output as u64, count as u64))
+            })
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        Ok(rows)
+    }
+
     /// Aggregate script execution statistics from the `history` table, grouped by state.
     ///
     /// Returns per-state (script) totals for success/failure counts and rates.
@@ -3680,5 +3725,41 @@ mod tests {
         let jobs = db.list_cron_jobs().unwrap();
         assert_eq!(jobs.len(), 1);
         assert!(!jobs[0].enabled);
+    }
+
+    #[test]
+    fn get_token_usage_since_empty() {
+        let db = test_db();
+        let since = Utc::now() - chrono::Duration::hours(24);
+        let rows = db.get_token_usage_since(&since).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn get_token_usage_since_groups_by_model() {
+        let db = test_db();
+        let usage = TokenUsage {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            ..Default::default()
+        };
+        db.record_token_usage("w1", "ws1", "claude", "opus", &usage, None)
+            .unwrap();
+        db.record_token_usage("w2", "ws1", "claude", "sonnet", &usage, None)
+            .unwrap();
+        db.record_token_usage("w3", "ws1", "claude", "opus", &usage, Some(200))
+            .unwrap();
+
+        let since = Utc::now() - chrono::Duration::hours(1);
+        let rows = db.get_token_usage_since(&since).unwrap();
+
+        assert_eq!(rows.len(), 2);
+        // Sorted by total tokens desc: opus (3000) > sonnet (1500)
+        assert_eq!(rows[0].0, "opus");
+        assert_eq!(rows[0].1, 2_000); // input
+        assert_eq!(rows[0].2, 1_000); // output
+        assert_eq!(rows[0].3, 2); // executions
+        assert_eq!(rows[1].0, "sonnet");
+        assert_eq!(rows[1].3, 1);
     }
 }
