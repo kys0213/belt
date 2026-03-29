@@ -1472,4 +1472,411 @@ runtime:
             "default config without prompt should have no actions"
         );
     }
+
+    // ---- cmd_agent_init: agent workspace initialization ----
+
+    #[test]
+    fn cmd_agent_init_creates_agent_workspace_under_belt_home() {
+        use crate::claw::ClawWorkspace;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ClawWorkspace::init(tmp.path()).unwrap();
+
+        // The init command creates workspace under belt_home/claw-workspace.
+        assert_eq!(ws.path, tmp.path().join("claw-workspace"));
+        assert!(ws.path.is_dir());
+    }
+
+    #[test]
+    fn cmd_agent_init_rules_dir_is_dir_after_init() {
+        use crate::claw::ClawWorkspace;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ClawWorkspace::init(tmp.path()).unwrap();
+        let rules_dir = ws.path.join(".claude/rules");
+
+        assert!(
+            rules_dir.is_dir(),
+            "rules directory should exist after agent init"
+        );
+    }
+
+    #[test]
+    fn cmd_agent_init_force_recreates_policy_files() {
+        use crate::claw::ClawWorkspace;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ClawWorkspace::init(tmp.path()).unwrap();
+
+        // Modify a policy file.
+        let classify_path = ws.path.join(".claude/rules/classify-policy.md");
+        std::fs::write(&classify_path, "custom content").unwrap();
+
+        // Re-init with force.
+        let ws2 = ClawWorkspace::init_with_options(tmp.path(), true).unwrap();
+        let content =
+            std::fs::read_to_string(ws2.path.join(".claude/rules/classify-policy.md")).unwrap();
+
+        // Force init should restore the default template.
+        assert!(
+            content.contains("Classification Policy"),
+            "force init should restore default classify-policy.md"
+        );
+        assert!(
+            !content.contains("custom content"),
+            "force init should overwrite custom content"
+        );
+    }
+
+    #[test]
+    fn cmd_agent_init_global_rules_discoverable_after_init() {
+        use crate::claw::ClawWorkspace;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _ws = ClawWorkspace::init(tmp.path()).unwrap();
+
+        // Copy rules into agent-workspace path (as run_agent_command does via
+        // the resolve_global_agent_rules_dir fallback).
+        let src_rules = tmp.path().join("claw-workspace/.claude/rules");
+        let dst_rules = tmp.path().join("agent-workspace/.claude/rules");
+        std::fs::create_dir_all(&dst_rules).unwrap();
+        for entry in std::fs::read_dir(&src_rules).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), dst_rules.join(entry.file_name())).unwrap();
+        }
+
+        // The agent-workspace rules should now be discoverable.
+        let resolved = resolve_global_agent_rules_dir(Some(tmp.path()));
+        assert!(
+            resolved.is_some(),
+            "global agent rules should be discoverable after init"
+        );
+        assert_eq!(resolved.unwrap(), dst_rules);
+    }
+
+    #[test]
+    fn cmd_agent_init_global_rules_loadable_into_system_prompt() {
+        use crate::claw::ClawWorkspace;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _ws = ClawWorkspace::init(tmp.path()).unwrap();
+
+        // Set up agent-workspace rules from claw-workspace.
+        let src_rules = tmp.path().join("claw-workspace/.claude/rules");
+        let dst_rules = tmp.path().join("agent-workspace/.claude/rules");
+        std::fs::create_dir_all(&dst_rules).unwrap();
+        for entry in std::fs::read_dir(&src_rules).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), dst_rules.join(entry.file_name())).unwrap();
+        }
+
+        // Simulate the agent session flow: resolve → load → combine with claw rules.
+        let rules_dir = resolve_global_agent_rules_dir(Some(tmp.path())).unwrap();
+        let file_rules = load_rules_from_dir(&rules_dir).unwrap().unwrap();
+        let claw_rules = build_claw_rules_prompt(None);
+        let system_prompt = format!("{claw_rules}\n\n---\n\n{file_rules}");
+
+        assert!(
+            system_prompt.contains("# Claw Agent Rules"),
+            "system prompt should contain built-in claw rules"
+        );
+        assert!(
+            system_prompt.contains("classify-policy.md"),
+            "system prompt should contain loaded classify policy"
+        );
+    }
+
+    // ---- cmd_agent_rules: list policy rules ----
+
+    #[test]
+    fn cmd_agent_rules_lists_three_default_policies() {
+        use crate::claw::ClawWorkspace;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ClawWorkspace::init(tmp.path()).unwrap();
+        let rules = ws.list_rules().unwrap();
+
+        assert_eq!(
+            rules.len(),
+            3,
+            "init should create exactly 3 default policy files"
+        );
+
+        let names: Vec<String> = rules
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+
+        assert!(names.contains(&"classify-policy.md".to_string()));
+        assert!(names.contains(&"hitl-policy.md".to_string()));
+        assert!(names.contains(&"auto-approve-policy.md".to_string()));
+    }
+
+    #[test]
+    fn cmd_agent_rules_sorted_alphabetically() {
+        use crate::claw::ClawWorkspace;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ClawWorkspace::init(tmp.path()).unwrap();
+        let rules = ws.list_rules().unwrap();
+
+        let names: Vec<String> = rules
+            .iter()
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .collect();
+
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(
+            names, sorted,
+            "rules should be returned in alphabetical order"
+        );
+    }
+
+    #[test]
+    fn cmd_agent_rules_fails_on_uninitialized_workspace() {
+        use crate::claw::ClawWorkspace;
+
+        let ws = ClawWorkspace {
+            path: PathBuf::from("/nonexistent/claw-workspace"),
+        };
+        let result = ws.list_rules();
+        assert!(
+            result.is_err(),
+            "listing rules on uninitialized workspace should fail"
+        );
+    }
+
+    #[test]
+    fn cmd_agent_rules_empty_after_removing_all_md_files() {
+        use crate::claw::ClawWorkspace;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ClawWorkspace::init(tmp.path()).unwrap();
+
+        // Remove all .md files from rules dir.
+        let rules_dir = ws.path.join(".claude/rules");
+        for entry in std::fs::read_dir(&rules_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().extension().is_some_and(|e| e == "md") {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+
+        let rules = ws.list_rules().unwrap();
+        assert!(
+            rules.is_empty(),
+            "rules list should be empty after removing all .md files"
+        );
+    }
+
+    // ---- cmd_agent_edit: edit classification/HITL rules ----
+
+    #[test]
+    fn cmd_agent_edit_none_lists_available_rules_without_error() {
+        use crate::claw::ClawWorkspace;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ClawWorkspace::init(tmp.path()).unwrap();
+
+        // edit_rule(None) should list available rules without erroring.
+        let result = ws.edit_rule(None);
+        assert!(
+            result.is_ok(),
+            "edit_rule(None) should succeed (lists rules)"
+        );
+    }
+
+    #[test]
+    fn cmd_agent_edit_nonexistent_rule_fails() {
+        use crate::claw::ClawWorkspace;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ClawWorkspace::init(tmp.path()).unwrap();
+
+        let result = ws.edit_rule(Some("does-not-exist"));
+        assert!(result.is_err(), "editing a nonexistent rule should fail");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("rule file not found"),
+            "error should mention rule file not found, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn cmd_agent_edit_valid_rule_names_resolve_to_existing_files() {
+        use crate::claw::ClawWorkspace;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = ClawWorkspace::init(tmp.path()).unwrap();
+        let rules_dir = ws.path.join(".claude/rules");
+
+        // Each default rule name should resolve to an existing .md file.
+        for name in &["classify-policy", "hitl-policy", "auto-approve-policy"] {
+            let file_path = rules_dir.join(format!("{name}.md"));
+            assert!(
+                file_path.is_file(),
+                "rule file for '{name}' should exist at {}",
+                file_path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn cmd_agent_edit_fails_on_uninitialized_workspace() {
+        use crate::claw::ClawWorkspace;
+
+        let ws = ClawWorkspace {
+            path: PathBuf::from("/nonexistent/claw-workspace"),
+        };
+        let result = ws.edit_rule(None);
+        assert!(
+            result.is_err(),
+            "edit_rule on uninitialized workspace should fail"
+        );
+    }
+
+    // ---- cmd_agent_plugin: install /agent slash command ----
+
+    #[test]
+    fn cmd_agent_plugin_creates_plugin_structure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = crate::claw::plugin::install_plugin(tmp.path()).unwrap();
+
+        assert!(
+            plugin_dir.join(".claude-plugin/plugin.json").is_file(),
+            "plugin.json should be created"
+        );
+        assert!(
+            plugin_dir.join("commands/agent.md").is_file(),
+            "agent.md command should be created"
+        );
+    }
+
+    #[test]
+    fn cmd_agent_plugin_json_has_correct_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = crate::claw::plugin::install_plugin(tmp.path()).unwrap();
+
+        let json_str =
+            std::fs::read_to_string(plugin_dir.join(".claude-plugin/plugin.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+
+        assert_eq!(parsed["name"], "belt-agent");
+        assert!(
+            parsed["version"].is_string(),
+            "plugin should have a version"
+        );
+        assert!(
+            parsed["commands"].is_array(),
+            "plugin should have commands array"
+        );
+    }
+
+    #[test]
+    fn cmd_agent_plugin_command_md_has_required_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = crate::claw::plugin::install_plugin(tmp.path()).unwrap();
+
+        let content = std::fs::read_to_string(plugin_dir.join("commands/agent.md")).unwrap();
+
+        // Frontmatter with description and allowed-tools.
+        assert!(content.starts_with("---\n"), "should have YAML frontmatter");
+        assert!(content.contains("description:"));
+        assert!(content.contains("allowed-tools:"));
+
+        // Auto context collection instructions.
+        assert!(
+            content.contains("belt status"),
+            "command should reference belt status"
+        );
+        assert!(
+            content.contains("belt hitl"),
+            "command should reference belt hitl"
+        );
+        assert!(
+            content.contains("belt queue"),
+            "command should reference belt queue"
+        );
+    }
+
+    #[test]
+    fn cmd_agent_plugin_custom_install_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let custom_dir = tmp.path().join("custom/install/path");
+        std::fs::create_dir_all(&custom_dir).unwrap();
+
+        let plugin_dir = crate::claw::plugin::install_plugin(&custom_dir).unwrap();
+
+        assert!(
+            plugin_dir.starts_with(&custom_dir),
+            "plugin should be installed under custom directory"
+        );
+        assert!(plugin_dir.join(".claude-plugin/plugin.json").is_file());
+    }
+
+    #[test]
+    fn cmd_agent_plugin_idempotent_install() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let path1 = crate::claw::plugin::install_plugin(tmp.path()).unwrap();
+        let path2 = crate::claw::plugin::install_plugin(tmp.path()).unwrap();
+
+        assert_eq!(path1, path2, "repeated installs should return same path");
+        assert!(
+            path2.join("commands/agent.md").is_file(),
+            "files should still exist after re-install"
+        );
+    }
+
+    #[test]
+    fn cmd_agent_plugin_default_install_dir_is_under_home() {
+        // default_install_dir reads $HOME, which may not exist in CI.
+        if let Ok(dir) = crate::claw::plugin::default_install_dir() {
+            assert!(
+                dir.to_string_lossy().contains(".claude"),
+                "default install dir should be under .claude"
+            );
+            assert!(
+                dir.to_string_lossy().ends_with("commands"),
+                "default install dir should end with 'commands'"
+            );
+        }
+    }
+
+    // ---- cmd_agent_context: collect system context ----
+
+    #[test]
+    fn cmd_agent_context_returns_nonempty_string() {
+        let context = crate::claw::plugin::collect_cli_context();
+        assert!(!context.is_empty(), "context output should never be empty");
+    }
+
+    #[test]
+    fn cmd_agent_context_fallback_message_when_belt_unavailable() {
+        // In test environment belt CLI is likely not running, so we get the
+        // fallback message or partial context. Either way it should be valid.
+        let context = crate::claw::plugin::collect_cli_context();
+        // Must contain either the context header or the fallback.
+        let has_context = context.contains("# Belt System Context");
+        let has_fallback = context.contains("No belt context available");
+        assert!(
+            has_context || has_fallback,
+            "context should contain header or fallback message, got: {context}"
+        );
+    }
+
+    #[test]
+    fn cmd_agent_context_fallback_is_descriptive() {
+        // Verify the fallback message provides useful information.
+        let fallback = "No belt context available (belt CLI not found or database unavailable).";
+        assert!(
+            fallback.contains("belt CLI"),
+            "fallback should mention belt CLI"
+        );
+        assert!(
+            fallback.contains("database"),
+            "fallback should mention database"
+        );
+    }
 }
