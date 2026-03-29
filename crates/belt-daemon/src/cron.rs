@@ -1078,9 +1078,16 @@ impl GapDetectionJob {
     /// transition spec statuses, or perform any other side effects.  Use it
     /// in tests or when you need programmatic access to gap results.
     pub fn analyze_gaps(&self) -> Result<GapAnalysisReport, BeltError> {
-        let active_specs = self
+        let all_active = self
             .db
             .list_specs(None, Some(belt_core::spec::SpecStatus::Active))?;
+
+        // Skip test-only specs (labeled "test") to prevent spurious gap
+        // issues for specs that exist solely as test fixtures.
+        let active_specs: Vec<_> = all_active
+            .into_iter()
+            .filter(|s| !s.is_test_only())
+            .collect();
 
         if active_specs.is_empty() {
             return Ok(GapAnalysisReport {
@@ -6016,6 +6023,70 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
                 .covered_spec_ids
                 .contains(&"spec-full-auth-mw".to_string()),
             "spec-full-auth-mw should be in covered list",
+        );
+    }
+
+    // ---- GapDetectionJob skips test-only specs ----------------------------
+
+    #[test]
+    fn gap_detection_skips_test_only_specs() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Code that does NOT cover spec keywords.
+        std::fs::write(tmp.path().join("main.rs"), "fn unrelated() {}").unwrap();
+
+        // Insert an active spec with the "test" label — should be skipped.
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-test-only".into(),
+            "ws".into(),
+            "Test Only Spec".into(),
+            "implement authorization middleware for secure endpoints".into(),
+        );
+        spec.status = belt_core::spec::SpecStatus::Active;
+        spec.labels = Some("test".into());
+        db.insert_spec(&spec).unwrap();
+
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+        assert!(
+            report.gaps.is_empty(),
+            "test-only specs should be excluded from gap detection, got: {:?}",
+            report.gaps,
+        );
+        assert!(
+            report.covered_spec_ids.is_empty(),
+            "test-only specs should not appear in covered list either",
+        );
+    }
+
+    #[test]
+    fn gap_detection_does_not_skip_non_test_specs() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Code that does NOT cover spec keywords.
+        std::fs::write(tmp.path().join("main.rs"), "fn unrelated() {}").unwrap();
+
+        // Insert an active spec WITHOUT the "test" label.
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-real".into(),
+            "ws".into(),
+            "Real Spec".into(),
+            "implement authorization middleware for secure endpoints".into(),
+        );
+        spec.status = belt_core::spec::SpecStatus::Active;
+        spec.labels = Some("feature,priority-high".into());
+        db.insert_spec(&spec).unwrap();
+
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+        assert_eq!(
+            report.gaps.len(),
+            1,
+            "non-test specs should still be analysed for gaps",
         );
     }
 }
