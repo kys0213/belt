@@ -12,7 +12,7 @@ use belt_core::workspace::WorkspaceConfig;
 /// GitHub DataSource — gh CLI를 통해 이슈/PR을 스캔.
 pub struct GitHubDataSource {
     source_url: String,
-    last_scan: Option<chrono::DateTime<chrono::Utc>>,
+    last_collected_at: Option<std::time::Instant>,
 }
 
 impl GitHubDataSource {
@@ -20,7 +20,7 @@ impl GitHubDataSource {
     pub fn new(source_url: &str) -> Self {
         Self {
             source_url: source_url.to_string(),
-            last_scan: None,
+            last_collected_at: None,
         }
     }
 
@@ -359,6 +359,19 @@ impl DataSource for GitHubDataSource {
             None => return Ok(Vec::new()),
         };
 
+        // Enforce scan_interval_secs: skip this tick if not enough time has passed.
+        if let Some(last) = self.last_collected_at {
+            let interval = std::time::Duration::from_secs(github_config.scan_interval_secs);
+            if last.elapsed() < interval {
+                tracing::debug!(
+                    elapsed_secs = last.elapsed().as_secs(),
+                    interval_secs = github_config.scan_interval_secs,
+                    "skipping GitHub scan — scan_interval_secs not yet elapsed"
+                );
+                return Ok(Vec::new());
+            }
+        }
+
         let repo_name = Self::extract_repo_name(&github_config.url)
             .unwrap_or_else(|| "unknown/repo".to_string());
 
@@ -435,7 +448,7 @@ impl DataSource for GitHubDataSource {
             items.extend(review_items);
         }
 
-        self.last_scan = Some(chrono::Utc::now());
+        self.last_collected_at = Some(std::time::Instant::now());
         Ok(items)
     }
 
@@ -610,9 +623,9 @@ sources:
     }
 
     #[test]
-    fn new_sets_last_scan_to_none() {
+    fn new_sets_last_collected_at_to_none() {
         let ds = GitHubDataSource::new("https://github.com/org/repo");
-        assert!(ds.last_scan.is_none());
+        assert!(ds.last_collected_at.is_none());
     }
 
     #[test]
@@ -629,6 +642,63 @@ sources:
         let workspace = make_workspace_without_github();
         let items = ds.collect(&workspace).await.unwrap();
         assert!(items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_skips_when_scan_interval_not_elapsed() {
+        let mut ds = GitHubDataSource::new("https://github.com/org/repo");
+        // Simulate a recent collection by setting last_collected_at to now.
+        ds.last_collected_at = Some(std::time::Instant::now());
+        // Default scan_interval_secs is 300 — far from elapsed.
+        let workspace = make_workspace_with_github(
+            "https://github.com/org/repo",
+            "analyze",
+            Some("belt:analyze"),
+        );
+        let items = ds.collect(&workspace).await.unwrap();
+        assert!(
+            items.is_empty(),
+            "should skip scan when interval not elapsed"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_proceeds_when_scan_interval_elapsed() {
+        let mut ds = GitHubDataSource::new("https://github.com/org/repo");
+        // Set last_collected_at far enough in the past (> 300s default).
+        ds.last_collected_at =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(301));
+        let workspace = make_workspace_with_github(
+            "https://github.com/org/repo",
+            "analyze",
+            Some("belt:analyze"),
+        );
+        // gh CLI unavailable in test env, so no items returned, but the method
+        // must proceed past the interval check and update last_collected_at.
+        let _items = ds.collect(&workspace).await.unwrap();
+        // last_collected_at should have been refreshed to a very recent instant.
+        let elapsed = ds.last_collected_at.unwrap().elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "last_collected_at should be updated after successful collection"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_proceeds_on_first_call_without_last_collected_at() {
+        let mut ds = GitHubDataSource::new("https://github.com/org/repo");
+        assert!(ds.last_collected_at.is_none());
+        let workspace = make_workspace_with_github(
+            "https://github.com/org/repo",
+            "analyze",
+            Some("belt:analyze"),
+        );
+        let _items = ds.collect(&workspace).await.unwrap();
+        // After first collect, last_collected_at must be set.
+        assert!(
+            ds.last_collected_at.is_some(),
+            "first collect should set last_collected_at"
+        );
     }
 
     #[tokio::test]
