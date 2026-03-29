@@ -1850,8 +1850,26 @@ async fn decompose_spec_with_llm(
 }
 
 /// Create a GitHub issue via the `gh` CLI and return the issue URL on success.
-fn create_github_issue(title: &str, body: &str) -> Option<String> {
-    create_github_issue_with_labels(title, body, &["autopilot:ready"])
+///
+/// Uses the provided `trigger_label` (from workspace config) as the issue label.
+fn create_github_issue(title: &str, body: &str, trigger_label: &str) -> Option<String> {
+    create_github_issue_with_labels(title, body, &[trigger_label])
+}
+
+/// Resolve the trigger label from the workspace configuration.
+///
+/// Iterates over all sources and their states to find the first `trigger.label`
+/// value. Returns `"autopilot:ready"` as a fallback when no trigger label is
+/// configured.
+fn resolve_trigger_label(config: &belt_core::workspace::WorkspaceConfig) -> String {
+    for source in config.sources.values() {
+        for state in source.states.values() {
+            if let Some(ref label) = state.trigger.label {
+                return label.clone();
+            }
+        }
+    }
+    "autopilot:ready".to_string()
 }
 
 /// Create a GitHub issue with the given title, body, and labels via the `gh` CLI.
@@ -2464,7 +2482,34 @@ async fn main() -> anyhow::Result<()> {
                     // Extract acceptance criteria for decomposition.
                     let criteria = belt_core::spec::extract_acceptance_criteria(&spec.content);
 
-                    // Auto-create GitHub parent issue with autopilot:ready label.
+                    // Resolve trigger label from workspace config (fall back to
+                    // "autopilot:ready" when unavailable).
+                    let trigger_label = match db.get_workspace(&workspace) {
+                        Ok((_name, config_path, _created_at)) => {
+                            match belt_infra::workspace_loader::load_workspace_config(
+                                std::path::Path::new(&config_path),
+                            ) {
+                                Ok(config) => resolve_trigger_label(&config),
+                                Err(e) => {
+                                    eprintln!(
+                                        "warning: could not load workspace config: {e}, \
+                                         using default label"
+                                    );
+                                    "autopilot:ready".to_string()
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "warning: could not find workspace '{}': {e}, \
+                                 using default label",
+                                workspace
+                            );
+                            "autopilot:ready".to_string()
+                        }
+                    };
+
+                    // Auto-create GitHub parent issue with trigger label from config.
                     let parent_body = if decompose && !criteria.is_empty() {
                         // Append a placeholder for child issue links that will be
                         // filled in after child issues are created.
@@ -2476,7 +2521,7 @@ async fn main() -> anyhow::Result<()> {
                         spec.content.clone()
                     };
 
-                    let parent_url = create_github_issue(&spec.name, &parent_body);
+                    let parent_url = create_github_issue(&spec.name, &parent_body, &trigger_label);
 
                     // Store parent issue URL as a spec link for traceability.
                     if let Some(ref url) = parent_url {
@@ -2538,7 +2583,7 @@ async fn main() -> anyhow::Result<()> {
                                 if let Some(url) = create_github_issue_with_labels(
                                     &issue.title,
                                     &issue.body,
-                                    &["autopilot:ready", "autopilot:trigger"],
+                                    &[&trigger_label, "autopilot:trigger"],
                                 ) {
                                     println!("  child issue created: {url}");
                                     if let Some(num) = extract_issue_number(&url) {
