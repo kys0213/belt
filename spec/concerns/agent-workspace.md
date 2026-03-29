@@ -1,14 +1,14 @@
-# Claw — 대화형 에이전트
+# Agent — 대화형 에이전트
 
-> Claw = `/claw` 세션. 자연어로 시스템을 조회하고 조작하는 대화형 인터페이스.
+> `belt agent` = 대화형 + 비대화형 LLM 세션. 자연어로 시스템을 조회하고 조작하는 통합 인터페이스.
 >
-> 분류(Done or HITL)는 **코어 evaluate cron**이 담당한다. Claw는 분류기가 아니다.
+> 분류(Done or HITL)는 **코어 evaluate cron**이 담당한다. Agent는 분류기가 아니다.
 
 ---
 
 ## 코어 evaluate (참고)
 
-분류 로직은 코어에 속한다. Claw와 무관.
+분류 로직은 코어에 속한다. Agent와 무관.
 
 ```
 handler 전부 성공 → Completed
@@ -34,14 +34,56 @@ evaluate의 판단 입력: `belt context $WORK_ID --json` (queue 메타데이터
 
 ---
 
-## 대화형 에이전트 (/claw 세션)
+## CLI 통합 설계
+
+`belt agent`는 서브커맨드 유무에 따라 동작이 결정된다.
+
+### 사용법
+
+```bash
+# 대화형 세션 (서브커맨드 없이 실행)
+belt agent                                         # 글로벌 rules 로드, 대화형 세션 시작
+belt agent --workspace workspace.yaml              # workspace 지정 대화형 세션
+
+# 비대화형 실행 (evaluate cron이 호출)
+belt agent -p "프롬프트"                            # 글로벌 rules로 비대화형 실행
+belt agent --workspace workspace.yaml -p "프롬프트"  # workspace 지정 비대화형 실행
+
+# 실행 계획
+belt agent --plan                                  # 실행 계획만 출력
+belt agent --workspace workspace.yaml --plan       # workspace 지정 실행 계획
+
+# 워크스페이스 관리
+belt agent init [--force]                          # agent 워크스페이스 초기화
+belt agent rules                                   # 규칙 조회
+belt agent edit [rule]                             # 규칙 편집
+
+# 플러그인
+belt agent plugin [--install-dir]                  # /agent 슬래시 커맨드 설치
+belt agent context                                 # 시스템 컨텍스트 수집
+```
+
+### --workspace 옵션 동작
+
+| --workspace | -p | 동작 |
+|---|---|---|
+| 없음 | 없음 | 글로벌 rules → 대화형 세션 |
+| 없음 | 있음 | 글로벌 rules → 비대화형 실행 |
+| 있음 | 없음 | workspace rules → 대화형 세션 |
+| 있음 | 있음 | workspace rules → 비대화형 실행 |
+
+> `--workspace`가 없으면 글로벌 agent 워크스페이스(`~/.belt/agent-workspace/`)의 rules를 로드한다.
+
+---
+
+## 대화형 세션 (/agent)
 
 어디서든 실행 가능한 대화형 인터페이스.
 
 ### 진입 경험
 
 ```
-/claw 실행 →
+belt agent 실행 →
 
 Step 1: 상태 수집
   belt status --json
@@ -83,7 +125,7 @@ Step 3: 자연어 대화
 ## 워크스페이스 구조
 
 ```
-~/.belt/claw-workspace/
+~/.belt/agent-workspace/
 ├── CLAUDE.md                         # 판단 원칙
 ├── .claude/rules/
 │   ├── classify-policy.md            # Done vs HITL 분류 기준
@@ -95,7 +137,7 @@ Step 3: 자연어 대화
     └── prioritize/
 ```
 
-Per-workspace 오버라이드: `~/.belt/workspaces/<name>/claw/`
+Per-workspace 오버라이드: `~/.belt/workspaces/<name>/agent/system/`
 
 ---
 
@@ -105,7 +147,7 @@ Per-workspace 오버라이드: `~/.belt/workspaces/<name>/claw/`
 v4 (15개) → v5 (3개):
   /auto   — 데몬 제어 (start/stop/setup/config/dashboard/update)
   /spec   — 스펙 CRUD (add/update/list/status/remove/pause/resume)
-  /claw   — 대화 세션 (조회/조작/모니터링을 자연어로, 읽기 전용 CLI 흡수)
+  /agent  — 대화 세션 (조회/조작/모니터링을 자연어로, 읽기 전용 CLI 흡수)
 ```
 
 ### 실행 컨텍스트
@@ -114,37 +156,25 @@ v4 (15개) → v5 (3개):
 |---------|----------|------|
 | `/auto` | 어디서든 | Daemon 제어, workspace 등록 |
 | `/spec` | 레포의 Claude 세션 | 해당 레포의 스펙 CRUD |
-| `/claw` | 어디서든 | 대화형 에이전트 (전체 workspace 조회/조작) |
+| `/agent` | 어디서든 | 대화형 에이전트 (전체 workspace 조회/조작) |
 
 ---
 
-## `belt agent` 실행 메커니즘
-
-evaluate cron과 `/claw` 세션의 공통 실행 경로.
-
-### 사용법
-
-```bash
-belt agent --workspace workspace.yaml -p "프롬프트"   # 비대화형 (evaluate cron이 호출)
-belt agent --workspace workspace.yaml                 # 대화형 세션
-belt agent --workspace workspace.yaml --plan          # 실행 계획만 출력
-```
-
-### 실행 흐름
+## 실행 흐름
 
 ```
-1. workspace.yaml 로드 → WorkspaceConfig 파싱
-2. RuntimeRegistry 구성 (workspace yaml의 runtime 설정 기반)
+1. --workspace 옵션에 따라 workspace 결정 (위 "--workspace 옵션 동작" 테이블 참조)
+2. RuntimeRegistry 구성 (workspace yaml의 runtime 설정 기반, 없으면 기본 ClaudeRuntime)
 3. Rules 로딩 (아래 우선순위)
-4. System prompt = built-in Claw rules + workspace rules
-5. ActionExecutor로 prompt 실행 (ClaudeRuntime 사용)
+4. System prompt = built-in agent rules + workspace rules
+5. -p 있으면 ActionExecutor로 비대화형 실행, 없으면 대화형 세션 시작
 ```
 
 ### Rules 로딩 우선순위
 
-1. `claw_config.rules_path` — workspace yaml에서 명시적 지정
-2. `~/.belt/workspaces/<name>/claw/system/` — per-workspace 오버라이드
-3. `~/.belt/claw-workspace/.claude/rules/` — 글로벌 기본값
+1. `agent_config.rules_path` — workspace yaml에서 명시적 지정
+2. `~/.belt/workspaces/<name>/agent/system/` — per-workspace 오버라이드
+3. `~/.belt/agent-workspace/.claude/rules/` — 글로벌 기본값
 
 디렉토리 내 모든 `.md` 파일을 concat하여 system prompt에 주입한다.
 
@@ -193,9 +223,9 @@ Priority 3: $BELT_HOME/claw-workspace/.claude/rules/    (global, belt claw init)
 | `belt context $WORK_ID --json` | 아이템 정보 조회 | evaluate 판단 입력 |
 | `belt queue done $WORK_ID` | Done 판정 | evaluate 결과 |
 | `belt queue hitl $WORK_ID --reason "..."` | HITL 판정 | evaluate 결과 |
-| `belt status --json` | 시스템 상태 조회 | /claw 세션 |
-| `belt hitl list --json` | HITL 목록 조회 | /claw 세션 |
-| `belt queue list --json` | 큐 목록 조회 | /claw 세션 |
+| `belt status --json` | 시스템 상태 조회 | 대화형 세션 |
+| `belt hitl list --json` | HITL 목록 조회 | 대화형 세션 |
+| `belt queue list --json` | 큐 목록 조회 | 대화형 세션 |
 
 ### evaluate cron과의 관계
 

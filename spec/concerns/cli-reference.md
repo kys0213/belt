@@ -8,7 +8,7 @@
 
 ```
 Layer 1: Slash Command (3개, thin wrapper)
-  /auto, /spec, /claw
+  /auto, /spec, /agent
 
 Layer 2: DataSource + AgentRuntime (OCP 확장점)
   → 외부 시스템 워크플로우 + LLM 실행 추상화
@@ -26,7 +26,7 @@ Layer 3: belt CLI (SSOT)
 |----|-----|
 | /auto, /auto-setup, /auto-config, /auto-dashboard, /update | /auto (서브커맨드) |
 | /add-spec, /update-spec, /spec | /spec (서브커맨드) |
-| /status, /board, /decisions, /hitl, /repo, /claw, /cron | /claw (자연어) |
+| /status, /board, /decisions, /hitl, /repo, /claw, /cron | /agent (자연어) |
 
 ---
 
@@ -54,30 +54,33 @@ belt
 │   ├── hitl <work_id> [--reason <msg>]     ← evaluate가 호출: Completed → HITL
 │   ├── retry-script <work_id>              ← Failed 아이템의 on_done script 재실행
 │   └── dependency add / remove
-├── context <work_id> [--json]               ← NEW: script용 정보 조회
+├── context <work_id> [--json]               ← script용 정보 조회
 ├── hitl
 │   ├── list / show / respond / timeout
 ├── cron
 │   ├── list / add / update
 │   ├── pause / resume / remove / trigger
-├── claw
-│   ├── init / rules / edit
-├── agent [--workspace <name>] [-p <prompt>]
-│         # Claw 워크스페이스의 rules를 로드한 LLM 세션을 실행.
-│         # evaluate cron이 내부적으로 호출하여 Completed 아이템을 분류.
-│         # --workspace: 대상 workspace 지정 (해당 workspace의 context 접근 가능)
-│         # -p: 프롬프트 전달 (비대화형 실행, 결과 출력 후 종료)
-│         # 인자 없이 실행 시 대화형 세션 시작 (/claw와 동일)
+├── agent                                    ← 서브커맨드 없이 실행 시 대화형 세션 시작
+│   ├── [default]                            # 대화형 세션 (글로벌 rules 로드)
+│   ├── [-p <prompt>]                        # 비대화형 실행 (evaluate cron이 호출)
+│   ├── [--workspace <name>]                 # 대상 workspace 지정
+│   ├── [--plan]                             # 실행 계획만 출력
+│   ├── [--json]                             # JSON 출력
+│   ├── init [--force]                       # agent 워크스페이스 초기화
+│   ├── rules                                # 규칙 조회
+│   ├── edit [rule]                          # 규칙 편집
+│   ├── plugin [--install-dir]               # /agent 슬래시 커맨드 설치
+│   └── context                              # 시스템 컨텍스트 수집 (agent injection용)
 ```
 
-> **v4 대비 변경**: `queue advance` 제거 (Pending→Ready 자동 전이), `context` 서브커맨드 추가, `repo` → `workspace` 리네이밍.
+> **v4 대비 변경**: `queue advance` 제거 (Pending→Ready 자동 전이), `context` 서브커맨드 추가, `repo` → `workspace` 리네이밍. `claw` + `agent` → `agent`로 통합.
 
-### Phase 2: /claw 위임 (읽기 전용)
+### Phase 2: /agent 위임 (읽기 전용)
 
-아래 커맨드는 `/claw` 세션에서 자연어로 접근. 별도 CLI 구현은 `/claw`가 안정화된 후 필요 시 추가.
+아래 커맨드는 `/agent` 세션에서 자연어로 접근. 별도 CLI 구현은 `/agent`가 안정화된 후 필요 시 추가.
 
 ```
-# /claw가 내부적으로 호출하는 조회 커맨드 (구현 우선순위 낮음)
+# /agent가 내부적으로 호출하는 조회 커맨드 (구현 우선순위 낮음)
 ├── decisions list / show
 ├── board [--format text|json|rich]
 ├── convention
@@ -85,7 +88,7 @@ belt
 ├── logs / usage / report
 ```
 
-> `/claw`는 `belt status --json`, `belt queue list --json` 등 Phase 1 CLI의 JSON 출력을 파싱하여 자연어로 표시한다. Phase 2 커맨드도 동일한 패턴으로, `/claw`가 먼저 커버하고 독립 CLI는 수요가 확인되면 추가.
+> `/agent`는 `belt status --json`, `belt queue list --json` 등 Phase 1 CLI의 JSON 출력을 파싱하여 자연어로 표시한다. Phase 2 커맨드도 동일한 패턴으로, `/agent`가 먼저 커버하고 독립 CLI는 수요가 확인되면 추가.
 
 모든 서브커맨드는 `--json` 또는 `--format json` 출력 지원.
 
@@ -114,4 +117,4 @@ context 스키마는 DataSource별로 다르다. 상세는 [DataSource](./dataso
 
 - [DESIGN-v5](../DESIGN-v5.md) — 전체 아키텍처
 - [DataSource](./datasource.md) — context 스키마
-- [Claw](./claw-workspace.md) — /claw 세션
+- [Agent](./agent-workspace.md) — /agent 세션

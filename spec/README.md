@@ -28,7 +28,7 @@
 | [Daemon](./concerns/daemon.md) | 실행 루프 의사코드, concurrency, graceful shutdown |
 | [DataSource](./concerns/datasource.md) | 외부 시스템 추상화 trait + context CLI + 워크플로우 yaml |
 | [AgentRuntime](./concerns/agent-runtime.md) | LLM 실행 추상화 trait + Registry |
-| [Claw 워크스페이스](./concerns/claw-workspace.md) | 대화형 에이전트 + evaluate + slash command |
+| [Agent 워크스페이스](./concerns/agent-workspace.md) | 대화형 에이전트 + evaluate + slash command |
 | [Cron 엔진](./concerns/cron-engine.md) | 주기 실행 + 품질 루프 + force trigger |
 | [CLI 레퍼런스](./concerns/cli-reference.md) | 3-layer SSOT + `belt context` + 전체 커맨드 트리 |
 
@@ -42,4 +42,4 @@
 | 02 | [스펙 생명주기](./flows/02-spec-lifecycle.md) | 스펙 등록 → 이슈 분해 → 완료 판정 |
 | 03 | [이슈 파이프라인](./flows/03-issue-pipeline.md) | handlers 실행 → evaluate → on_done |
 | 04 | [실패 복구와 HITL](./flows/04-failure-and-hitl.md) | escalation → on_fail → 사람 개입 |
-| 05 | [모니터링](./flows/05-monitoring.md) | TUI + CLI + /claw 시각화 |
+| 05 | [모니터링](./flows/05-monitoring.md) | TUI + CLI + /agent 시각화 |

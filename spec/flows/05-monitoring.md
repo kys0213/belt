@@ -1,6 +1,6 @@
 # Flow 5: 모니터링 — 칸반 보드 + 시각화
 
-> 사용자가 다수 workspace x 다수 스펙의 전체 진행 상황을 TUI, CLI, /claw 세션에서 일관되게 확인한다.
+> 사용자가 다수 workspace x 다수 스펙의 전체 진행 상황을 TUI, CLI, /agent 세션에서 일관되게 확인한다.
 
 ---
 
@@ -10,9 +10,9 @@
 |--------|------|------|
 | TUI Dashboard | `belt dashboard` | ratatui, 실시간 갱신, 키보드 네비게이션 |
 | CLI 출력 | `belt status --format rich` | 정적 스냅샷, 코어 CLI |
-| Claw 세션 | `/claw` → "보드 보여줘" | 자연어, 읽기 전용 조회의 주 인터페이스 |
+| Agent 세션 | `belt agent` → "보드 보여줘" | 자연어, 읽기 전용 조회의 주 인터페이스 |
 
-> **Phase 구분**: `status`, `spec status` 등 코어 CLI는 Phase 1로 직접 구현. `board`, `decisions`, `logs` 등 읽기 전용 조회는 `/claw`가 흡수 (Phase 2, 필요 시 독립 CLI 추가).
+> **Phase 구분**: `status`, `spec status` 등 코어 CLI는 Phase 1로 직접 구현. `board`, `decisions`, `logs` 등 읽기 전용 조회는 `/agent`가 흡수 (Phase 2, 필요 시 독립 CLI 추가).
 
 ---
 
@@ -116,7 +116,7 @@
 | 값 | 용도 |
 |---|------|
 | `text` | 기본 텍스트 (기존 호환) |
-| `json` | 구조화된 JSON (Claw 파싱용) |
+| `json` | 구조화된 JSON (Agent 파싱용) |
 | `rich` | 색상 + 박스 + 진행률 바 (터미널용) |
 
 모든 CLI 서브커맨드(status, board, spec list, spec status, queue list 등)에 적용.
@@ -192,7 +192,7 @@ HITL 이벤트가 생성되면 사용자에게 다음 경로로 알린다:
 |------|------|
 | TUI Dashboard | HITL 카운터 실시간 갱신 (`HITL: 1 pending ⚠`) |
 | CLI | `belt status`에 경고 표시, `belt hitl list`로 조회 |
-| /claw 세션 | 진입 시 HITL 대기 목록 자동 표시 |
+| /agent 세션 | 진입 시 HITL 대기 목록 자동 표시 |
 | on_fail script | escalation=hitl 시 실행 — GitHub 코멘트 등으로 외부 알림 가능 |
 
 별도 push 알림(Slack, email)은 on_fail/on_done script에서 직접 구현한다 (webhook 호출 등).

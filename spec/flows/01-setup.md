@@ -1,4 +1,4 @@
-# Flow 1: 온보딩 — workspace 등록 → DataSource 설정 → Claw 초기화
+# Flow 1: 온보딩 — workspace 등록 → DataSource 설정 → Agent 초기화
 
 > 사용자가 workspace를 등록하고, DataSource별 워크플로우를 설정하면 자동화가 시작된다.
 
@@ -84,7 +84,7 @@ workspace는 하나의 외부 레포와 1:1로 대응한다. GitHub 기준으로
 3. DataSource 인스턴스 생성 + Daemon에 등록
 4. AgentRuntime 바인딩 (RuntimeRegistry 구성)
 5. per-workspace cron seed (evaluate, gap-detection, knowledge-extract)
-6. Claw 워크스페이스 초기화 확인
+6. Agent 워크스페이스 초기화 확인
 ```
 
 ---
@@ -115,5 +115,5 @@ belt workspace remove <name>    # cascade 삭제 (외부 시스템 데이터는 
 
 - [DataSource](../concerns/datasource.md) — 상태 기반 워크플로우 정의
 - [AgentRuntime](../concerns/agent-runtime.md) — RuntimeRegistry 구성
-- [Claw](../concerns/claw-workspace.md) — Claw 워크스페이스 초기화
+- [Agent](../concerns/agent-workspace.md) — Agent 워크스페이스 초기화
 - [Cron 엔진](../concerns/cron-engine.md) — per-workspace cron seed
