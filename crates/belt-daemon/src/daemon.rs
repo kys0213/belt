@@ -1042,9 +1042,7 @@ impl Daemon {
                             QueuePhase::Hitl,
                             QueuePhase::Failed,
                             "handler",
-                            Some(
-                                "hitl respond: done (on_done script failed)".to_string(),
-                            ),
+                            Some("hitl respond: done (on_done script failed)".to_string()),
                         );
                     }
                     Err(e) => {
@@ -3473,12 +3471,14 @@ sources:
         item.hitl_notes = Some("original failure reason".into());
         daemon.push_item(item);
 
-        let result = daemon.respond_hitl(
-            "s1:analyze",
-            HitlRespondAction::Replan,
-            Some("reviewer".into()),
-            None,
-        ).await;
+        let result = daemon
+            .respond_hitl(
+                "s1:analyze",
+                HitlRespondAction::Replan,
+                Some("reviewer".into()),
+                None,
+            )
+            .await;
         assert!(result.is_ok());
 
         // Original item should be rolled back to Pending with replan_count = 1.
@@ -3520,12 +3520,14 @@ sources:
         item.replan_count = 1; // Already replanned once.
         daemon.push_item(item);
 
-        let result = daemon.respond_hitl(
-            "s1:analyze",
-            HitlRespondAction::Replan,
-            None,
-            Some("second failure".into()),
-        ).await;
+        let result = daemon
+            .respond_hitl(
+                "s1:analyze",
+                HitlRespondAction::Replan,
+                None,
+                Some("second failure".into()),
+            )
+            .await;
         assert!(result.is_ok());
 
         let original = daemon.get_item("s1:analyze").unwrap();
@@ -3547,7 +3549,9 @@ sources:
         item.replan_count = 3; // Already at max.
         daemon.push_item(item);
 
-        let result = daemon.respond_hitl("s1:analyze", HitlRespondAction::Replan, None, None).await;
+        let result = daemon
+            .respond_hitl("s1:analyze", HitlRespondAction::Replan, None, None)
+            .await;
         assert!(result.is_ok());
 
         // Should transition to Failed, not Pending.
@@ -3568,7 +3572,9 @@ sources:
         // Item is in Pending, not Hitl.
         daemon.push_item(test_item("s1", "analyze"));
 
-        let result = daemon.respond_hitl("s1:analyze", HitlRespondAction::Replan, None, None).await;
+        let result = daemon
+            .respond_hitl("s1:analyze", HitlRespondAction::Replan, None, None)
+            .await;
         assert!(result.is_err());
     }
 
@@ -3582,12 +3588,14 @@ sources:
         item.phase = QueuePhase::Hitl;
         daemon.push_item(item);
 
-        let result = daemon.respond_hitl(
-            "s1:analyze",
-            HitlRespondAction::Done,
-            Some("reviewer".into()),
-            None,
-        ).await;
+        let result = daemon
+            .respond_hitl(
+                "s1:analyze",
+                HitlRespondAction::Done,
+                Some("reviewer".into()),
+                None,
+            )
+            .await;
         assert!(result.is_ok());
         assert_eq!(
             daemon.get_item("s1:analyze").unwrap().phase,
@@ -3951,12 +3959,14 @@ sources:
         daemon.push_item(item);
 
         // Approve (Done) the HITL item.
-        let result = daemon.respond_hitl(
-            "spec-completion:spec-42:hitl",
-            HitlRespondAction::Done,
-            Some("reviewer".into()),
-            None,
-        ).await;
+        let result = daemon
+            .respond_hitl(
+                "spec-completion:spec-42:hitl",
+                HitlRespondAction::Done,
+                Some("reviewer".into()),
+                None,
+            )
+            .await;
         assert!(result.is_ok());
 
         // Queue item should be Done.
@@ -4002,12 +4012,14 @@ sources:
         daemon.push_item(item);
 
         // Reject (Skip) the HITL item.
-        let result = daemon.respond_hitl(
-            "spec-completion:spec-43:hitl",
-            HitlRespondAction::Skip,
-            Some("reviewer".into()),
-            None,
-        ).await;
+        let result = daemon
+            .respond_hitl(
+                "spec-completion:spec-43:hitl",
+                HitlRespondAction::Skip,
+                Some("reviewer".into()),
+                None,
+            )
+            .await;
         assert!(result.is_ok());
 
         // Queue item should be Skipped.
@@ -4053,12 +4065,14 @@ sources:
         daemon.push_item(item);
 
         // Retry (additional modifications needed) the HITL item.
-        let result = daemon.respond_hitl(
-            "spec-completion:spec-44:hitl",
-            HitlRespondAction::Retry,
-            Some("reviewer".into()),
-            None,
-        ).await;
+        let result = daemon
+            .respond_hitl(
+                "spec-completion:spec-44:hitl",
+                HitlRespondAction::Retry,
+                Some("reviewer".into()),
+                None,
+            )
+            .await;
         assert!(result.is_ok());
 
         // Queue item should be Pending (retried).
@@ -4588,12 +4602,14 @@ sources:
         item.phase = QueuePhase::Hitl;
         daemon.push_item(item);
 
-        let result = daemon.respond_hitl(
-            "s1:analyze",
-            HitlRespondAction::Retry,
-            Some("reviewer".into()),
-            Some("retrying after fix".into()),
-        ).await;
+        let result = daemon
+            .respond_hitl(
+                "s1:analyze",
+                HitlRespondAction::Retry,
+                Some("reviewer".into()),
+                Some("retrying after fix".into()),
+            )
+            .await;
         assert!(result.is_ok());
 
         let item = daemon.get_item("s1:analyze").unwrap();
@@ -4612,12 +4628,14 @@ sources:
         item.phase = QueuePhase::Hitl;
         daemon.push_item(item);
 
-        let result = daemon.respond_hitl(
-            "s1:analyze",
-            HitlRespondAction::Skip,
-            Some("admin".into()),
-            None,
-        ).await;
+        let result = daemon
+            .respond_hitl(
+                "s1:analyze",
+                HitlRespondAction::Skip,
+                Some("admin".into()),
+                None,
+            )
+            .await;
         assert!(result.is_ok());
 
         let item = daemon.get_item("s1:analyze").unwrap();
@@ -4631,7 +4649,9 @@ sources:
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
-        let result = daemon.respond_hitl("nonexistent", HitlRespondAction::Done, None, None).await;
+        let result = daemon
+            .respond_hitl("nonexistent", HitlRespondAction::Done, None, None)
+            .await;
         assert!(result.is_err());
     }
 
