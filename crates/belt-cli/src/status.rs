@@ -8,7 +8,7 @@ use std::io::{self, Write};
 
 use belt_core::phase::QueuePhase;
 use belt_infra::db::{Database, RuntimeStats};
-use chrono::Utc;
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use crossterm::style::{self, Stylize};
 use crossterm::terminal;
 use serde::Serialize;
@@ -55,6 +55,9 @@ pub struct SystemStatus {
     /// Token usage aggregation across daily/weekly/monthly periods.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_usage_aggregation: Option<TokenUsageAggregation>,
+    /// Seconds until the next evaluate cron job fires, if available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_evaluate_secs: Option<i64>,
 }
 
 /// Per-workspace item summary for the system status table.
@@ -289,6 +292,9 @@ pub fn gather_status(db: &Database) -> anyhow::Result<SystemStatus> {
     // Token usage aggregation (daily / weekly / monthly)
     let token_usage_aggregation = gather_token_usage_aggregation(db);
 
+    // Next evaluate countdown
+    let next_evaluate_secs = compute_next_evaluate_secs(db);
+
     Ok(SystemStatus {
         total_items,
         hitl_count,
@@ -300,7 +306,158 @@ pub fn gather_status(db: &Database) -> anyhow::Result<SystemStatus> {
         error_items,
         hitl_items,
         token_usage_aggregation,
+        next_evaluate_secs,
     })
+}
+
+/// Compute the smallest number of seconds until the next evaluate cron job
+/// fires across all workspaces.  Returns `None` when no evaluate job exists
+/// or the schedule cannot be interpreted.
+fn compute_next_evaluate_secs(db: &Database) -> Option<i64> {
+    let jobs = db.list_cron_jobs().ok()?;
+    let now = Utc::now();
+    let mut best: Option<i64> = None;
+    for job in &jobs {
+        if !job.enabled || !job.name.ends_with(":evaluate") {
+            continue;
+        }
+        let last_run: Option<DateTime<Utc>> = job
+            .last_run_at
+            .as_deref()
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok());
+        if let Some(secs) = cron_expression_next_secs(&job.schedule, last_run, now) {
+            best = Some(best.map_or(secs, |b: i64| b.min(secs)));
+        }
+    }
+    best
+}
+
+/// Compute seconds until the next fire of a 5-field cron expression,
+/// searching up to 1440 minutes (24 hours) ahead from `now`.
+///
+/// Returns `None` for unparseable expressions or when no match is found
+/// within the search window.
+fn cron_expression_next_secs(
+    expr: &str,
+    last_run: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+) -> Option<i64> {
+    use chrono::Duration;
+
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    if fields.len() != 5 {
+        return None;
+    }
+    // Build matchers for each field.
+    let matchers: Vec<Vec<u32>> = fields
+        .iter()
+        .zip([59u32, 23, 31, 12, 7])
+        .map(|(f, max)| expand_cron_field(f, max))
+        .collect();
+    if matchers.iter().any(Vec::is_empty) {
+        return None;
+    }
+
+    // Start scanning from the next whole minute.
+    let start = (now + Duration::seconds(60)).with_second(0).unwrap_or(now);
+
+    for i in 0..1440i64 {
+        let candidate = start + Duration::minutes(i);
+        let vals = [
+            candidate.minute(),
+            candidate.hour(),
+            candidate.day(),
+            candidate.month(),
+            candidate.weekday().num_days_from_sunday(),
+        ];
+        let matches = matchers.iter().zip(vals.iter()).all(|(m, v)| m.contains(v));
+        if !matches {
+            continue;
+        }
+        // Skip if this candidate is the same minute the job last ran.
+        if let Some(last) = last_run
+            && candidate.date_naive() == last.date_naive()
+            && candidate.hour() == last.hour()
+            && candidate.minute() == last.minute()
+        {
+            continue;
+        }
+        let delta = candidate.signed_duration_since(now).num_seconds();
+        return Some(delta.max(0));
+    }
+    None
+}
+
+/// Expand a single cron field into the set of matching integer values.
+///
+/// Supports `*`, ranges (`1-5`), step values (`*/10`, `1-30/5`), and
+/// comma-separated lists (`1,3,5`).
+fn expand_cron_field(field: &str, max: u32) -> Vec<u32> {
+    let mut result = Vec::new();
+    for part in field.split(',') {
+        if let Some((range, step_str)) = part.split_once('/') {
+            let step: u32 = match step_str.parse() {
+                Ok(s) if s > 0 => s,
+                _ => return vec![],
+            };
+            let (start, end) = if range == "*" {
+                (0, max)
+            } else if let Some((a, b)) = range.split_once('-') {
+                match (a.parse::<u32>(), b.parse::<u32>()) {
+                    (Ok(a), Ok(b)) => (a, b),
+                    _ => return vec![],
+                }
+            } else {
+                match range.parse::<u32>() {
+                    Ok(a) => (a, max),
+                    _ => return vec![],
+                }
+            };
+            let mut v = start;
+            while v <= end {
+                result.push(v);
+                v += step;
+            }
+        } else if part == "*" {
+            for v in 0..=max {
+                result.push(v);
+            }
+        } else if let Some((a, b)) = part.split_once('-') {
+            match (a.parse::<u32>(), b.parse::<u32>()) {
+                (Ok(a), Ok(b)) => {
+                    for v in a..=b {
+                        result.push(v);
+                    }
+                }
+                _ => return vec![],
+            }
+        } else {
+            match part.parse::<u32>() {
+                Ok(v) => result.push(v),
+                _ => return vec![],
+            }
+        }
+    }
+    result
+}
+
+/// Format a countdown in seconds to a human-friendly string.
+///
+/// Examples: `"45s"`, `"5m 30s"`, `"2h 15m"`.
+fn format_countdown(total_secs: i64) -> String {
+    if total_secs <= 0 {
+        return "now".to_string();
+    }
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 /// Gather spec (workspace) status from the database.
@@ -721,6 +878,20 @@ fn print_rich_status(status: &SystemStatus, daemon_running: Option<bool>) {
             hitl_str.yellow(),
             "",
             hpad = hpad,
+        );
+    }
+
+    // Next evaluate countdown
+    if let Some(secs) = status.next_evaluate_secs {
+        let countdown = format_countdown(secs);
+        let label = "Next evaluate: ";
+        let epad = w - 2 - label.len() - countdown.len();
+        let _ = writeln!(
+            stdout,
+            "\u{2502} {label}{}{:epad$} \u{2502}",
+            countdown.cyan(),
+            "",
+            epad = epad,
         );
     }
 
@@ -2045,6 +2216,7 @@ mod tests {
             error_items: vec![],
             hitl_items: vec![],
             token_usage_aggregation: None,
+            next_evaluate_secs: None,
         };
         // Should not panic
         super::print_rich_status(&status, None);
@@ -2197,6 +2369,7 @@ mod tests {
             error_items: vec![],
             hitl_items: vec![],
             token_usage_aggregation: None,
+            next_evaluate_secs: None,
         };
         // Calling print_status with "rich" should not panic.
         super::print_status(&status, "rich", None).unwrap();
@@ -2250,6 +2423,7 @@ mod tests {
             error_items: vec![],
             hitl_items: vec![],
             token_usage_aggregation: None,
+            next_evaluate_secs: None,
         }
     }
 
@@ -2265,6 +2439,7 @@ mod tests {
             error_items: vec![],
             hitl_items: vec![],
             token_usage_aggregation: None,
+            next_evaluate_secs: None,
         }
     }
 
@@ -2483,6 +2658,7 @@ mod tests {
                 updated_at: "2026-03-25T12:00:00Z".to_string(),
             }],
             token_usage_aggregation: None,
+            next_evaluate_secs: None,
         };
         // Exercises workspace summary, error items, and HITL items branches.
         print_rich_status(&status, None);
@@ -3111,5 +3287,103 @@ mod tests {
         assert_eq!(period.total_tokens, 0);
         assert_eq!(period.executions, 0);
         assert!(period.by_model.is_empty());
+    }
+
+    // ---- format_countdown tests ---------------------------------------------
+
+    #[test]
+    fn format_countdown_zero_returns_now() {
+        assert_eq!(format_countdown(0), "now");
+    }
+
+    #[test]
+    fn format_countdown_negative_returns_now() {
+        assert_eq!(format_countdown(-5), "now");
+    }
+
+    #[test]
+    fn format_countdown_seconds_only() {
+        assert_eq!(format_countdown(45), "45s");
+    }
+
+    #[test]
+    fn format_countdown_minutes_and_seconds() {
+        assert_eq!(format_countdown(125), "2m 05s");
+    }
+
+    #[test]
+    fn format_countdown_hours_and_minutes() {
+        assert_eq!(format_countdown(3661), "1h 01m");
+    }
+
+    // ---- expand_cron_field tests -------------------------------------------
+
+    #[test]
+    fn expand_cron_field_wildcard() {
+        let result = expand_cron_field("*", 5);
+        assert_eq!(result, vec![0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn expand_cron_field_step() {
+        let result = expand_cron_field("*/6", 23);
+        assert_eq!(result, vec![0, 6, 12, 18]);
+    }
+
+    #[test]
+    fn expand_cron_field_range() {
+        let result = expand_cron_field("1-4", 10);
+        assert_eq!(result, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn expand_cron_field_list() {
+        let result = expand_cron_field("1,3,5", 10);
+        assert_eq!(result, vec![1, 3, 5]);
+    }
+
+    #[test]
+    fn expand_cron_field_range_step() {
+        let result = expand_cron_field("0-10/3", 59);
+        assert_eq!(result, vec![0, 3, 6, 9]);
+    }
+
+    // ---- cron_expression_next_secs tests ------------------------------------
+
+    #[test]
+    fn cron_expression_next_secs_every_six_hours() {
+        use chrono::TimeZone;
+        // At 01:30 UTC, next "0 */6 * * *" should be at 06:00.
+        let now = Utc.with_ymd_and_hms(2026, 3, 29, 1, 30, 0).unwrap();
+        let secs = cron_expression_next_secs("0 */6 * * *", None, now).unwrap();
+        // 06:00 - 01:30 = 4h30m = 16200s
+        assert_eq!(secs, 16200);
+    }
+
+    #[test]
+    fn cron_expression_next_secs_skips_last_run() {
+        use chrono::TimeZone;
+        // At 05:59, next "0 */6 * * *" is 06:00.
+        // But if last_run was 06:00, it should skip to 12:00.
+        let now = Utc.with_ymd_and_hms(2026, 3, 29, 5, 59, 30).unwrap();
+        let last = Utc.with_ymd_and_hms(2026, 3, 29, 6, 0, 0).unwrap();
+        let secs = cron_expression_next_secs("0 */6 * * *", Some(last), now).unwrap();
+        // 12:00 - 05:59:30 ≈ 6h 0m 30s = 21630s (from the next whole minute 06:00 + 6h)
+        assert!(secs > 21000 && secs < 22000, "got {secs}");
+    }
+
+    #[test]
+    fn cron_expression_next_secs_invalid_returns_none() {
+        let now = Utc::now();
+        assert!(cron_expression_next_secs("bad", None, now).is_none());
+    }
+
+    // ---- print_rich_status with countdown -----------------------------------
+
+    #[test]
+    fn print_rich_status_with_countdown_does_not_panic() {
+        let mut status = sample_system_status();
+        status.next_evaluate_secs = Some(120);
+        print_rich_status(&status, Some(true));
     }
 }
