@@ -293,6 +293,27 @@ impl Spec {
     pub fn is_decomposed(&self) -> bool {
         self.decomposed_issues.is_some()
     }
+
+    /// Parse the comma-separated `labels` field into individual labels.
+    pub fn label_list(&self) -> Vec<&str> {
+        match &self.labels {
+            Some(l) => l
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Returns `true` if this spec is marked as test-only.
+    ///
+    /// A spec is considered test-only when its `labels` field contains the
+    /// `test` label.  Test-only specs are excluded from production gap
+    /// detection to prevent spurious issue creation.
+    pub fn is_test_only(&self) -> bool {
+        self.label_list().contains(&"test")
+    }
 }
 
 /// Type of overlap detected between specs.
@@ -1342,5 +1363,77 @@ mod tests {
     fn build_decomposed_issues_from_llm_empty_input() {
         let issues = build_decomposed_issues_from_llm(&[], Some("50"));
         assert!(issues.is_empty());
+    }
+
+    // ---- label_list / is_test_only tests ------------------------------------
+
+    #[test]
+    fn label_list_parses_comma_separated() {
+        let mut spec = Spec::new(
+            "s1".into(),
+            "ws".into(),
+            "name".into(),
+            "content".into(),
+        );
+        spec.labels = Some("feature, test, priority-high".into());
+        assert_eq!(spec.label_list(), vec!["feature", "test", "priority-high"]);
+    }
+
+    #[test]
+    fn label_list_empty_when_none() {
+        let spec = Spec::new(
+            "s1".into(),
+            "ws".into(),
+            "name".into(),
+            "content".into(),
+        );
+        assert!(spec.label_list().is_empty());
+    }
+
+    #[test]
+    fn is_test_only_true_when_labeled_test() {
+        let mut spec = Spec::new(
+            "s1".into(),
+            "ws".into(),
+            "name".into(),
+            "content".into(),
+        );
+        spec.labels = Some("test".into());
+        assert!(spec.is_test_only());
+    }
+
+    #[test]
+    fn is_test_only_true_among_other_labels() {
+        let mut spec = Spec::new(
+            "s1".into(),
+            "ws".into(),
+            "name".into(),
+            "content".into(),
+        );
+        spec.labels = Some("feature, test, high".into());
+        assert!(spec.is_test_only());
+    }
+
+    #[test]
+    fn is_test_only_false_without_test_label() {
+        let mut spec = Spec::new(
+            "s1".into(),
+            "ws".into(),
+            "name".into(),
+            "content".into(),
+        );
+        spec.labels = Some("feature, priority-high".into());
+        assert!(!spec.is_test_only());
+    }
+
+    #[test]
+    fn is_test_only_false_when_no_labels() {
+        let spec = Spec::new(
+            "s1".into(),
+            "ws".into(),
+            "name".into(),
+            "content".into(),
+        );
+        assert!(!spec.is_test_only());
     }
 }
