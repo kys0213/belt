@@ -731,9 +731,24 @@ impl Daemon {
             on_enter_result,
         } = exec_result;
 
-        // Record token usage from on_enter execution if present.
+        // Record token usage and transition event from on_enter execution if present.
         if let Some(ref r) = on_enter_result {
             self.try_record_token_usage(&item, r);
+            let status = if r.success() { "success" } else { "failure" };
+            Self::record_transition(
+                &self.db,
+                &item.work_id,
+                &item.source_id,
+                QueuePhase::Running,
+                QueuePhase::Running,
+                "on_enter",
+                Some(format!(
+                    "status={} duration_ms={} exit_code={}",
+                    status,
+                    r.duration.as_millis(),
+                    r.exit_code,
+                )),
+            );
         }
 
         match outcome {
@@ -770,6 +785,9 @@ impl Daemon {
                 if let Some(ref r) = result {
                     self.try_record_token_usage(&item, r);
                 }
+                let handler_detail = result
+                    .as_ref()
+                    .map(|r| format!("status=success duration_ms={}", r.duration.as_millis()));
                 Self::record_transition(
                     &self.db,
                     &item.work_id,
@@ -777,7 +795,7 @@ impl Daemon {
                     QueuePhase::Running,
                     QueuePhase::Completed,
                     "handler",
-                    None,
+                    handler_detail,
                 );
                 self.record_history(&item, "completed", None);
                 self.record_history_event(&item, "completed", None);
@@ -796,6 +814,26 @@ impl Daemon {
                 if let Some(ref r) = result {
                     self.try_record_token_usage(&item, r);
                 }
+                let handler_detail = result.as_ref().map_or_else(
+                    || format!("status=failure error={error}"),
+                    |r| {
+                        format!(
+                            "status=failure duration_ms={} exit_code={} error={}",
+                            r.duration.as_millis(),
+                            r.exit_code,
+                            error,
+                        )
+                    },
+                );
+                Self::record_transition(
+                    &self.db,
+                    &item.work_id,
+                    &item.source_id,
+                    QueuePhase::Running,
+                    QueuePhase::Failed,
+                    "handler",
+                    Some(handler_detail),
+                );
                 Self::record_transition(
                     &self.db,
                     &item.work_id,
@@ -1496,6 +1534,25 @@ impl Daemon {
 
         match eval_result {
             Ok(result) if result.success() => {
+                // Record evaluate success transition event for each completed item.
+                let eval_detail = result.action_result.as_ref().map_or_else(
+                    || "status=success".to_string(),
+                    |r| format!("status=success duration_ms={}", r.duration.as_millis()),
+                );
+                for work_id in &completed {
+                    if let Some(item) = self.queue.iter().find(|i| i.work_id == *work_id) {
+                        Self::record_transition(
+                            &self.db,
+                            &item.work_id,
+                            &item.source_id,
+                            QueuePhase::Completed,
+                            QueuePhase::Completed,
+                            "evaluate",
+                            Some(eval_detail.clone()),
+                        );
+                    }
+                }
+
                 // Evaluator 성공 -- on_done을 거쳐 Done으로 전이.
                 for work_id in &completed {
                     self.evaluator.clear_eval_failures(work_id);
@@ -1518,6 +1575,39 @@ impl Daemon {
                     result.exit_code,
                     result.stderr.trim()
                 );
+
+                // Record evaluate failure transition event for each completed item.
+                let eval_detail = result.action_result.as_ref().map_or_else(
+                    || {
+                        format!(
+                            "status=failure exit_code={} error={}",
+                            result.exit_code,
+                            result.stderr.trim(),
+                        )
+                    },
+                    |r| {
+                        format!(
+                            "status=failure duration_ms={} exit_code={} error={}",
+                            r.duration.as_millis(),
+                            result.exit_code,
+                            result.stderr.trim(),
+                        )
+                    },
+                );
+                for work_id in &completed {
+                    if let Some(item) = self.queue.iter().find(|i| i.work_id == *work_id) {
+                        Self::record_transition(
+                            &self.db,
+                            &item.work_id,
+                            &item.source_id,
+                            QueuePhase::Completed,
+                            QueuePhase::Completed,
+                            "evaluate",
+                            Some(eval_detail.clone()),
+                        );
+                    }
+                }
+
                 tracing::info!(
                     "evaluator returned non-zero ({}), evaluating {} items for escalation",
                     result.exit_code,
@@ -1575,6 +1665,23 @@ impl Daemon {
             Err(e) => {
                 // Evaluator 실행 자체가 실패 -- per-item failure tracking with escalation.
                 let error_msg = format!("evaluator execution error: {e}");
+
+                // Record evaluate error transition event for each completed item.
+                let eval_detail = format!("status=failure error={e}");
+                for work_id in &completed {
+                    if let Some(item) = self.queue.iter().find(|i| i.work_id == *work_id) {
+                        Self::record_transition(
+                            &self.db,
+                            &item.work_id,
+                            &item.source_id,
+                            QueuePhase::Completed,
+                            QueuePhase::Completed,
+                            "evaluate",
+                            Some(eval_detail.clone()),
+                        );
+                    }
+                }
+
                 tracing::warn!(
                     "evaluator failed for {} completed items: {e}",
                     completed.len()
