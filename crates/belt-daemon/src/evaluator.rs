@@ -283,7 +283,6 @@ belt agent --workspace "{ws}" -p \
         let action = Action::prompt(&self.build_evaluate_prompt());
         executor.execute_one(&action, env).await
     }
-
 }
 
 #[derive(Debug)]
