@@ -79,7 +79,7 @@ impl GitHubDataSource {
 
     /// `gh` CLI로 해당 이슈에 연결된 PR을 조회한다.
     ///
-    /// title, body, author, state, draft, branch, labels, merge status를 포함한다.
+    /// title, body, author, state, draft, branch, labels, merge status, reviews를 포함한다.
     async fn fetch_linked_pr(repo: &str, issue_number: i64) -> Option<PrContext> {
         let output = tokio::process::Command::new("gh")
             .args([
@@ -90,7 +90,7 @@ impl GitHubDataSource {
                 "--search",
                 &format!("linked:issue:{issue_number}"),
                 "--json",
-                "number,title,body,author,state,isDraft,headRefName,baseRefName,labels,mergeable",
+                "number,title,body,author,state,isDraft,headRefName,baseRefName,labels,mergeable,reviews",
                 "--limit",
                 "1",
             ])
@@ -120,9 +120,31 @@ impl GitHubDataSource {
             })
             .unwrap_or_default();
 
-        // Fetch reviews for this PR
-        let reviews = Self::fetch_pr_reviews(repo, number)
-            .await
+        // Parse reviews from the gh pr list response
+        let reviews = pr["reviews"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|r| {
+                        let reviewer = r["author"]["login"].as_str().unwrap_or("").to_string();
+                        let state = r["state"].as_str().unwrap_or("").to_string();
+                        let body = r["body"].as_str().and_then(|s| {
+                            if s.is_empty() {
+                                None
+                            } else {
+                                Some(s.to_string())
+                            }
+                        });
+                        let submitted_at = r["submittedAt"].as_str().map(|s| s.to_string());
+                        ReviewContext {
+                            reviewer,
+                            state,
+                            body,
+                            submitted_at,
+                        }
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
 
         Some(PrContext {
