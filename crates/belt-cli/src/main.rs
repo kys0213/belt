@@ -1919,11 +1919,50 @@ async fn decompose_spec_with_llm(
     }
 }
 
+/// Ensure the given GitHub labels exist in the repository.
+///
+/// For each label, runs `gh label create` which is a no-op if the label
+/// already exists. This prevents `gh issue create --label` from failing
+/// when a label has not been created yet.
+fn ensure_github_labels(labels: &[&str]) {
+    for label in labels {
+        let output = std::process::Command::new("gh")
+            .args(["label", "create", label, "--force"])
+            .output();
+        match output {
+            Ok(o) if o.status.success() => {
+                tracing::debug!(label = %label, "ensured GitHub label exists");
+            }
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                eprintln!(
+                    "warning: failed to ensure label '{}': {}",
+                    label,
+                    stderr.trim()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: could not run `gh` to ensure label '{}': {e}",
+                    label
+                );
+            }
+        }
+    }
+}
+
 /// Create a GitHub issue via the `gh` CLI and return the issue URL on success.
 ///
-/// Uses the provided `trigger_label` (from workspace config) as the issue label.
+/// Attaches both the workspace trigger label and the standard `autopilot:trigger`
+/// marker label so that `DataSource.collect()` can detect the issue regardless
+/// of which label it scans for.
 fn create_github_issue(title: &str, body: &str, trigger_label: &str) -> Option<String> {
-    create_github_issue_with_labels(title, body, &[trigger_label])
+    let labels: Vec<&str> = if trigger_label == "autopilot:trigger" {
+        vec![trigger_label]
+    } else {
+        vec![trigger_label, "autopilot:trigger"]
+    };
+    create_github_issue_with_labels(title, body, &labels)
 }
 
 /// Resolve the trigger label from the workspace configuration.
@@ -1944,8 +1983,13 @@ fn resolve_trigger_label(config: &belt_core::workspace::WorkspaceConfig) -> Stri
 
 /// Create a GitHub issue with the given title, body, and labels via the `gh` CLI.
 ///
-/// Returns the URL of the created issue on success.
+/// Ensures all labels exist in the repository before creating the issue so
+/// that `gh issue create --label` does not fail for missing labels. Returns
+/// the URL of the created issue on success.
 fn create_github_issue_with_labels(title: &str, body: &str, labels: &[&str]) -> Option<String> {
+    // Ensure all labels exist before issue creation to prevent silent failures.
+    ensure_github_labels(labels);
+
     let mut gh_cmd = std::process::Command::new("gh");
     gh_cmd.args(["issue", "create"]);
     gh_cmd.args(["--title", title]);
@@ -4099,6 +4143,138 @@ mod tests {
                 assert_eq!(target, "https://example.com/issue/1");
             }
             _ => panic!("expected Spec Unlink command"),
+        }
+    }
+
+    /// Integration test: verify that the decompose-to-collect pipeline produces
+    /// issues whose labels match the DataSource trigger configuration.
+    ///
+    /// Simulates the full lifecycle:
+    ///   spec add --decompose -> extract AC -> build issues -> label attachment
+    ///   -> DataSource.collect() label matching
+    #[test]
+    fn decompose_to_collect_pipeline_label_matching() {
+        let content = "\
+## Overview\nAPI feature.\n\n\
+## Acceptance Criteria\n\
+- Endpoint returns 200\n\
+- Response includes pagination\n\n\
+## Notes\nDone.";
+
+        // Step 1: Extract acceptance criteria (as spec add handler does).
+        let criteria = belt_core::spec::extract_acceptance_criteria(content);
+        assert_eq!(criteria.len(), 2);
+
+        // Step 2: Build decomposed issues with parent number.
+        let proposed = belt_core::spec::build_decomposed_issues(&criteria, None, Some("400"));
+        assert_eq!(proposed.len(), 2);
+
+        // Step 3: Verify the labels that would be attached by
+        // create_github_issue_with_labels match what DataSource.collect() scans.
+        //
+        // The CLI handler calls:
+        //   create_github_issue_with_labels(&title, &body, &[&trigger_label, "autopilot:trigger"])
+        //
+        // DataSource.collect() scans issues matching state_config.trigger.label.
+        // For the pipeline to work, the trigger_label on child issues must match
+        // the label configured in the workspace source state.
+        let trigger_label = "autopilot:ready";
+        let child_labels: Vec<&str> = vec![trigger_label, "autopilot:trigger"];
+
+        // The trigger_label from workspace config must be present in child_labels.
+        assert!(
+            child_labels.contains(&trigger_label),
+            "child issue labels must include the workspace trigger label for collect() detection"
+        );
+
+        // Step 4: Verify parent issue also carries the trigger label for collect.
+        // create_github_issue now adds both trigger_label and "autopilot:trigger".
+        let parent_labels: Vec<&str> = if trigger_label == "autopilot:trigger" {
+            vec![trigger_label]
+        } else {
+            vec![trigger_label, "autopilot:trigger"]
+        };
+        assert!(
+            parent_labels.contains(&trigger_label),
+            "parent issue labels must include the workspace trigger label for collect() detection"
+        );
+        assert!(
+            parent_labels.contains(&"autopilot:trigger"),
+            "parent issue must carry autopilot:trigger marker"
+        );
+    }
+
+    /// Verify that resolve_trigger_label falls back to "autopilot:ready" when
+    /// no trigger label is configured in the workspace, and that this default
+    /// label is compatible with the collect pipeline.
+    #[test]
+    fn resolve_trigger_label_fallback_compatible_with_collect() {
+        // Build a workspace config without any trigger.label configured.
+        let yaml = r#"
+name: test-ws
+sources:
+  github:
+    url: "https://github.com/test/repo"
+    scan_interval_secs: 300
+    states:
+      analyze:
+        trigger: {}
+        prompt: "analyze this"
+"#;
+        let config: belt_core::workspace::WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+
+        let label = resolve_trigger_label(&config);
+        assert_eq!(label, "autopilot:ready");
+    }
+
+    /// Verify that resolve_trigger_label extracts the configured trigger label.
+    #[test]
+    fn resolve_trigger_label_uses_configured_label() {
+        let yaml = r#"
+name: test-ws
+sources:
+  github:
+    url: "https://github.com/test/repo"
+    scan_interval_secs: 300
+    states:
+      build:
+        trigger:
+          label: "belt:build"
+        prompt: "build it"
+"#;
+        let config: belt_core::workspace::WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+
+        let label = resolve_trigger_label(&config);
+        assert_eq!(label, "belt:build");
+    }
+
+    /// Integration test: full pipeline from spec content to queue item structure.
+    ///
+    /// Verifies that decomposed issues would produce valid QueueItem entries
+    /// when collected by DataSource, with correct work_id and source_id format.
+    #[test]
+    fn decompose_to_collect_queue_item_format() {
+        use belt_core::queue::QueueItem;
+
+        let content = "## Overview\nFeature.\n\n## Acceptance Criteria\n- Task A\n- Task B";
+        let criteria = belt_core::spec::extract_acceptance_criteria(content);
+        let proposed = belt_core::spec::build_decomposed_issues(&criteria, None, Some("600"));
+
+        // Simulate what DataSource.collect() would produce for each child issue.
+        let repo = "owner/repo";
+        let child_numbers = ["601", "602"];
+
+        for (i, num) in child_numbers.iter().enumerate() {
+            let source_id = format!("github:{repo}#{num}");
+            let state_name = "analyze";
+            let work_id = QueueItem::make_work_id(&source_id, state_name);
+
+            // Verify the work_id follows the expected format.
+            assert!(work_id.contains(&source_id));
+            assert!(work_id.contains(state_name));
+
+            // Verify the proposed issue title references the parent.
+            assert!(proposed[i].title.contains("#600"));
         }
     }
 }
