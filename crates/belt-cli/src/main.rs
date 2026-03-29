@@ -922,18 +922,23 @@ async fn cmd_queue_done(work_id: &str) -> anyhow::Result<()> {
         })
         .unwrap_or_default();
 
+    // Set up worktree manager for cleanup after transition.
+    let belt_home = belt_home()?;
+    let worktree_base = belt_home.join("worktrees");
+    let repo_path = std::path::PathBuf::from(".");
+    let worktree_mgr = GitWorktreeManager::new(worktree_base, repo_path);
+
     if on_done_actions.is_empty() {
         db.update_phase(work_id, QueuePhase::Done)?;
+        // Cleanup worktree (matches daemon pattern: warn on failure, don't abort).
+        if let Err(e) = worktree_mgr.cleanup(work_id) {
+            tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue done, continuing");
+        }
         println!("Marked {work_id} as done.");
         return Ok(());
     }
 
     // Set up execution environment.
-    let belt_home = belt_home()?;
-    let worktree_base = belt_home.join("worktrees");
-    let repo_path = std::path::PathBuf::from(".");
-    let worktree_mgr = belt_infra::worktree::GitWorktreeManager::new(worktree_base, repo_path);
-
     let worktree_path = worktree_mgr.create_or_reuse(work_id)?;
     let env = belt_daemon::executor::ActionEnv::new(work_id, &worktree_path);
 
@@ -957,6 +962,10 @@ async fn cmd_queue_done(work_id: &str) -> anyhow::Result<()> {
     match result {
         Some(r) if r.success() => {
             db.update_phase(work_id, QueuePhase::Done)?;
+            // Cleanup worktree (matches daemon pattern: warn on failure, don't abort).
+            if let Err(e) = worktree_mgr.cleanup(work_id) {
+                tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue done, continuing");
+            }
             println!("on_done scripts succeeded. Marked '{work_id}' as done.");
         }
         Some(r) => {
@@ -968,6 +977,10 @@ async fn cmd_queue_done(work_id: &str) -> anyhow::Result<()> {
         }
         None => {
             db.update_phase(work_id, QueuePhase::Done)?;
+            // Cleanup worktree (matches daemon pattern: warn on failure, don't abort).
+            if let Err(e) = worktree_mgr.cleanup(work_id) {
+                tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue done, continuing");
+            }
             println!("Marked '{work_id}' as done.");
         }
     }
@@ -991,6 +1004,16 @@ fn cmd_queue_hitl(work_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
 fn cmd_queue_skip(work_id: &str) -> anyhow::Result<()> {
     let db = open_db()?;
     db.update_phase(work_id, QueuePhase::Skipped)?;
+
+    // Cleanup worktree (matches daemon pattern: warn on failure, don't abort).
+    let belt_home = belt_home()?;
+    let worktree_base = belt_home.join("worktrees");
+    let repo_path = std::path::PathBuf::from(".");
+    let worktree_mgr = GitWorktreeManager::new(worktree_base, repo_path);
+    if let Err(e) = worktree_mgr.cleanup(work_id) {
+        tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue skip, continuing");
+    }
+
     println!("Skipped {work_id}.");
     Ok(())
 }
@@ -1565,6 +1588,23 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
                     belt_core::queue::HitlRespondAction::Replan => unreachable!(),
                 };
                 db.update_phase(item_id, target_phase)?;
+
+                // Cleanup worktree on Done/Skipped (matches daemon pattern).
+                if matches!(target_phase, QueuePhase::Done | QueuePhase::Skipped)
+                    && let Ok(home) = belt_home()
+                {
+                    let wt_base = home.join("worktrees");
+                    let repo_path = std::path::PathBuf::from(".");
+                    let wt_mgr = GitWorktreeManager::new(wt_base, repo_path);
+                    if let Err(e) = wt_mgr.cleanup(item_id) {
+                        tracing::warn!(
+                            work_id = item_id,
+                            error = %e,
+                            "worktree cleanup failed on hitl respond, continuing"
+                        );
+                    }
+                }
+
                 if let Some(n) = &notes {
                     println!("Notes recorded: {n}");
                 }
@@ -3265,6 +3305,22 @@ async fn main() -> anyhow::Result<()> {
                                 belt_core::queue::HitlRespondAction::Replan => {
                                     unreachable!()
                                 }
+                            }
+                        }
+
+                        // Cleanup worktree on Done/Skipped (matches daemon pattern).
+                        if matches!(target_phase, QueuePhase::Done | QueuePhase::Skipped)
+                            && let Ok(home) = belt_home()
+                        {
+                            let wt_base = home.join("worktrees");
+                            let repo_path = std::path::PathBuf::from(".");
+                            let wt_mgr = GitWorktreeManager::new(wt_base, repo_path);
+                            if let Err(e) = wt_mgr.cleanup(&item_id) {
+                                tracing::warn!(
+                                    work_id = %item_id,
+                                    error = %e,
+                                    "worktree cleanup failed on hitl respond, continuing"
+                                );
                             }
                         }
 
