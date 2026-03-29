@@ -473,7 +473,11 @@ mod tests {
             .as_array()
             .expect("history must be an array");
 
-        assert_eq!(history_arr.len(), 4, "all 4 history entries must be present");
+        assert_eq!(
+            history_arr.len(),
+            4,
+            "all 4 history entries must be present"
+        );
 
         // Verify each entry has the expected state and status.
         assert_eq!(history_arr[0]["state"], "analyze");
