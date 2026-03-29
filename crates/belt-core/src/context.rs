@@ -102,6 +102,7 @@ pub struct IssueContext {
     pub body: Option<String>,
     pub labels: Vec<String>,
     pub author: String,
+    pub state: String,
 }
 
 /// PR context including review information, branch details, and labels.
@@ -290,6 +291,7 @@ mod tests {
                 body: Some("Implement JWT".to_string()),
                 labels: vec!["autodev:implement".to_string()],
                 author: "irene".to_string(),
+                state: "open".to_string(),
             }),
             pr: None,
             history,

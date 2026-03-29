@@ -43,7 +43,7 @@ impl GitHubDataSource {
     async fn fetch_issue(
         repo: &str,
         number: i64,
-    ) -> Option<(String, Option<String>, Vec<String>, String)> {
+    ) -> Option<(String, Option<String>, Vec<String>, String, String)> {
         let output = tokio::process::Command::new("gh")
             .args([
                 "issue",
@@ -72,8 +72,9 @@ impl GitHubDataSource {
             })
             .unwrap_or_default();
         let author = val["author"]["login"].as_str().unwrap_or("").to_string();
+        let state = val["state"].as_str().unwrap_or("open").to_string();
 
-        Some((title, body, labels, author))
+        Some((title, body, labels, author, state))
     }
 
     /// `gh` CLI로 해당 이슈에 연결된 PR을 조회한다.
@@ -457,12 +458,13 @@ impl DataSource for GitHubDataSource {
             Self::fetch_default_branch(&repo_name),
         );
 
-        let (title, body, labels, author) = issue_data.unwrap_or_else(|| {
+        let (title, body, labels, author, issue_state) = issue_data.unwrap_or_else(|| {
             (
                 item.title.clone().unwrap_or_default(),
                 None,
                 vec![],
                 String::new(),
+                "open".to_string(),
             )
         });
 
@@ -485,6 +487,7 @@ impl DataSource for GitHubDataSource {
                 body,
                 labels,
                 author,
+                state: issue_state,
             }),
             pr: pr_data,
             history: vec![],
