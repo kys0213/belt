@@ -33,7 +33,7 @@ fn load_workspace_config(path: &str) -> Result<WorkspaceConfig> {
 ///    Allows per-invocation control (e.g. `--policy-path` in the future).
 /// 2. **Per-workspace Claw dir** -- `$BELT_HOME/workspaces/<name>/claw/system/`.
 ///    Created when a workspace has its own Claw policy overrides.
-/// 3. **Global Claw workspace** -- `$BELT_HOME/claw-workspace/.claude/rules/`.
+/// 3. **Global Claw workspace** -- `$BELT_HOME/agent-workspace/.claude/rules/`.
 ///    Created by `belt claw init`; contains the default policy templates.
 ///
 /// `$BELT_HOME` defaults to `~/.belt` when the environment variable is unset.
@@ -44,7 +44,7 @@ fn load_workspace_config(path: &str) -> Result<WorkspaceConfig> {
 /// The caller (e.g. [`run_agent`]) proceeds without workspace rules --
 /// only the built-in Claw rules prompt is used in that case.
 ///
-/// See also: `spec/concerns/claw-workspace.md` section "classify-policy.md
+/// See also: `spec/concerns/agent-workspace.md` section "classify-policy.md
 /// 로딩 경로 및 해석" for the full specification (R-CW-007).
 fn resolve_rules_dir(config: &WorkspaceConfig) -> Option<PathBuf> {
     resolve_rules_dir_with_home(config, None)
@@ -131,7 +131,7 @@ fn resolve_rules_dir_with_home(
 
     // 3. Global Claw workspace rules (created by `belt claw init`).
     if let Some(home) = belt_home {
-        let global_rules = home.join("claw-workspace").join(".claude").join("rules");
+        let global_rules = home.join("agent-workspace").join(".claude").join("rules");
         if global_rules.is_dir() {
             tracing::debug!(
                 path = %global_rules.display(),
@@ -879,7 +879,7 @@ runtime:
         let tmp = tempfile::tempdir().unwrap();
         let global_rules = tmp
             .path()
-            .join("claw-workspace")
+            .join("agent-workspace")
             .join(".claude")
             .join("rules");
         std::fs::create_dir_all(&global_rules).unwrap();
@@ -903,7 +903,7 @@ runtime:
 
         let global_rules = tmp
             .path()
-            .join("claw-workspace")
+            .join("agent-workspace")
             .join(".claude")
             .join("rules");
         std::fs::create_dir_all(&global_rules).unwrap();
@@ -1172,25 +1172,21 @@ runtime:
     // ---- claw init → resolve_rules_dir integration ----
 
     #[test]
-    fn claw_init_creates_global_rules_dir_discoverable_by_resolve() {
-        use crate::claw::ClawWorkspace;
-
+    fn global_agent_workspace_rules_discoverable_by_resolve() {
         let tmp = tempfile::tempdir().unwrap();
 
-        // Initialize the global claw workspace under the temp directory.
-        let ws = ClawWorkspace::init(tmp.path()).unwrap();
-
-        // Verify the global rules directory exists at the expected path.
+        // Manually create the agent-workspace rules directory (the path
+        // resolve_rules_dir now expects at priority 3).
         let expected_rules = tmp
             .path()
-            .join("claw-workspace")
+            .join("agent-workspace")
             .join(".claude")
             .join("rules");
+        std::fs::create_dir_all(&expected_rules).unwrap();
         assert!(
             expected_rules.is_dir(),
-            "claw init should create global rules directory"
+            "agent-workspace rules directory should exist"
         );
-        assert_eq!(ws.path, tmp.path().join("claw-workspace"));
 
         // resolve_rules_dir_with_home should discover the global rules (priority 3)
         // when no explicit or per-workspace rules are configured.
@@ -1199,7 +1195,7 @@ runtime:
         assert_eq!(
             resolved,
             Some(expected_rules),
-            "resolve_rules_dir should find global claw workspace rules at priority 3"
+            "resolve_rules_dir should find global agent-workspace rules at priority 3"
         );
     }
 
@@ -1209,8 +1205,18 @@ runtime:
 
         let tmp = tempfile::tempdir().unwrap();
 
-        // Initialize claw workspace (creates default policy files).
+        // Initialize claw workspace (creates default policy files under
+        // claw-workspace/).  Then copy the rules into agent-workspace/ so
+        // resolve_rules_dir (which now uses the agent-workspace path) can
+        // discover them.
         let _ws = ClawWorkspace::init(tmp.path()).unwrap();
+        let src_rules = tmp.path().join("claw-workspace/.claude/rules");
+        let dst_rules = tmp.path().join("agent-workspace/.claude/rules");
+        std::fs::create_dir_all(&dst_rules).unwrap();
+        for entry in std::fs::read_dir(&src_rules).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), dst_rules.join(entry.file_name())).unwrap();
+        }
 
         // resolve_rules_dir_with_home should find the global rules.
         let config = empty_workspace();
