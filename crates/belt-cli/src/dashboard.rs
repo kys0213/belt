@@ -738,6 +738,10 @@ fn run_loop(
                         &per_ws_kanban_columns,
                     );
                 }
+                // Manual refresh: skip the poll timeout and re-fetch data immediately.
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -954,7 +958,7 @@ fn render_tab_bar(active: DashboardTab) -> Paragraph<'static> {
 
     spans.push(Span::raw("    "));
     spans.push(Span::styled(
-        "[h] Help  [Tab/Shift+Tab] Cycle",
+        "[r] Refresh  [h] Help  [Tab/Shift+Tab] Cycle",
         Style::default().fg(Color::DarkGray),
     ));
 
@@ -2378,6 +2382,10 @@ fn render_help_overlay(frame: &mut ratatui::Frame) {
         Line::from(vec![
             Span::styled("  ?       ", Style::default().fg(Color::Yellow)),
             Span::raw("Show this help"),
+        ]),
+        Line::from(vec![
+            Span::styled("  r/R     ", Style::default().fg(Color::Yellow)),
+            Span::raw("Refresh data immediately"),
         ]),
         Line::from(""),
         Line::from(vec![
