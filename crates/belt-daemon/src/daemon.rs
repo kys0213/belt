@@ -1843,14 +1843,14 @@ impl Daemon {
 
         for work_id in running_work_ids {
             if let Err(e) =
-                self.mark_failed(&work_id, "graceful shutdown timeout exceeded".to_string())
+                self.mark_failed(&work_id, "forced shutdown via second SIGINT".to_string())
             {
                 tracing::error!("failed to force-fail {}: {e}", work_id);
                 continue;
             }
             self.tracker.release(&ws_name);
             tracing::error!(
-                "force-failed {} due to shutdown timeout (worktree preserved)",
+                "force-failed {} due to second SIGINT (worktree preserved)",
                 work_id
             );
         }
@@ -2452,7 +2452,7 @@ sources:
     }
 
     #[test]
-    fn force_fail_running_multiple_items() {
+    fn force_fail_running_multiple_items_on_second_sigint() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
@@ -2477,7 +2477,7 @@ sources:
         assert_eq!(daemon.items_in_phase(QueuePhase::Pending).len(), 0);
         assert_eq!(daemon.items_in_phase(QueuePhase::Failed).len(), 2);
 
-        // History events should record the forced failure.
+        // History events should record the forced shutdown via second SIGINT.
         assert_eq!(daemon.history_events().len(), 2);
         for event in daemon.history_events() {
             assert_eq!(event.status, "failed");
@@ -2486,13 +2486,13 @@ sources:
                     .error
                     .as_ref()
                     .unwrap()
-                    .contains("shutdown timeout exceeded")
+                    .contains("forced shutdown via second SIGINT")
             );
         }
     }
 
     #[test]
-    fn force_fail_running_transitions_to_failed_with_history() {
+    fn force_fail_running_transitions_to_failed_with_history_on_second_sigint() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
@@ -2514,12 +2514,12 @@ sources:
         assert_eq!(event.status, "failed");
         assert_eq!(
             event.error.as_deref().unwrap(),
-            "graceful shutdown timeout exceeded"
+            "forced shutdown via second SIGINT"
         );
     }
 
     #[test]
-    fn force_fail_running_is_noop_when_no_running_items() {
+    fn force_fail_running_is_noop_when_no_running_items_on_second_sigint() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
@@ -4458,7 +4458,7 @@ sources:
         assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
         assert_eq!(daemon.items_in_phase(QueuePhase::Failed).len(), 3);
 
-        // Each failed item should have a history event with shutdown timeout error.
+        // Each failed item should have a history event with second SIGINT error.
         let events = daemon.history_events();
         assert_eq!(events.len(), 3);
         for event in events {
@@ -4467,7 +4467,7 @@ sources:
                 event
                     .error
                     .as_ref()
-                    .is_some_and(|err| err.contains("shutdown timeout exceeded"))
+                    .is_some_and(|err| err.contains("forced shutdown via second SIGINT"))
             );
         }
     }
