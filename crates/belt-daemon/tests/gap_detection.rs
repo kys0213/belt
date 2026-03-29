@@ -55,6 +55,64 @@ fn detects_gap_when_authorization_keywords_missing() {
     db.insert_spec(&spec).unwrap();
 
     let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+
+    // Verify analyze_gaps() detects the gap with correct fields.
+    let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+    assert_eq!(
+        report.gaps.len(),
+        1,
+        "expected exactly one gap for spec-gap, got: {:?}",
+        report.gaps,
+    );
+    let gap = &report.gaps[0];
+    assert_eq!(
+        gap.spec_id, "spec-gap",
+        "gap should reference the correct spec id"
+    );
+    assert_eq!(
+        gap.spec_name, "Auth Gap",
+        "gap should carry the correct spec name"
+    );
+    assert!(
+        gap.coverage_score < 0.5,
+        "coverage score {:.2} should be below the default threshold \
+         because the workspace code does not cover the spec keywords",
+        gap.coverage_score,
+    );
+    assert!(
+        !gap.missing_items.is_empty(),
+        "missing_items should list uncovered keywords from the spec"
+    );
+
+    // Verify that key concepts from the spec appear in the missing items.
+    // The items may come from keyword-based analysis (exact keywords) or
+    // LLM-based analysis (descriptive sentences), so we check for root
+    // word stems that appear in both modes.
+    let joined = gap.missing_items.join(" ").to_lowercase();
+    assert!(
+        joined.contains("authoriz"),
+        "missing_items should reference 'authorization', got: {:?}",
+        gap.missing_items,
+    );
+    assert!(
+        joined.contains("middleware"),
+        "missing_items should reference 'middleware', got: {:?}",
+        gap.missing_items,
+    );
+    assert!(
+        joined.contains("secure") || joined.contains("endpoint"),
+        "missing_items should reference 'secure' or 'endpoint', got: {:?}",
+        gap.missing_items,
+    );
+
+    assert!(
+        report.covered_spec_ids.is_empty(),
+        "no spec should be marked as covered when keywords are absent from the code"
+    );
+
+    // Also verify the full execute() path completes without error.
+    let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
     assert!(job.execute(&ctx()).is_ok(), "gap detection should succeed");
 }
 
