@@ -1588,6 +1588,16 @@ fn has_existing_gap_issue(spec_name: &str) -> bool {
     }
 }
 
+/// Extract the issue number from a GitHub issue URL.
+///
+/// `gh issue create` prints a URL like `https://github.com/owner/repo/issues/123`.
+/// This function returns `Some(123)` for such URLs, or `None` if parsing fails.
+fn parse_issue_number_from_url(url: &str) -> Option<u64> {
+    // The URL ends with `/issues/<number>`.
+    let path = url.rsplit('/').next()?;
+    path.parse::<u64>().ok()
+}
+
 /// Create a HITL queue item for final human confirmation before Completing -> Completed.
 fn create_spec_completion_hitl(db: &Database, spec: &belt_core::spec::Spec, detail: &str) {
     let work_id = format!("spec-completion:{}:hitl", spec.id);
@@ -1770,11 +1780,55 @@ impl CronHandler for GapDetectionJob {
             match result {
                 Ok(output) if output.status.success() => {
                     let url = String::from_utf8_lossy(&output.stdout);
+                    let url_trimmed = url.trim();
                     tracing::info!(
                         spec_id = %gap.spec_id,
-                        issue_url = %url.trim(),
+                        issue_url = %url_trimmed,
                         "GapDetectionJob: created gap issue"
                     );
+
+                    // Record the created issue as a spec link so that
+                    // `all_linked_issues_done` can track it and the
+                    // Completing transition waits for it to close.
+                    if let Some(issue_number) = parse_issue_number_from_url(url_trimmed) {
+                        let link_id = format!("gap-{}-issue-{issue_number}", gap.spec_id);
+                        let link = belt_core::spec::SpecLink::new(
+                            link_id,
+                            gap.spec_id.clone(),
+                            url_trimmed.to_string(),
+                        );
+                        match self.db.insert_spec_link(&link) {
+                            Ok(()) => {
+                                tracing::info!(
+                                    spec_id = %gap.spec_id,
+                                    issue_number = issue_number,
+                                    "GapDetectionJob: recorded gap issue as spec link"
+                                );
+                            }
+                            Err(BeltError::Database(ref msg))
+                                if msg.contains("UNIQUE constraint") =>
+                            {
+                                tracing::debug!(
+                                    spec_id = %gap.spec_id,
+                                    issue_number = issue_number,
+                                    "GapDetectionJob: spec link already exists, skipping"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    spec_id = %gap.spec_id,
+                                    error = %e,
+                                    "GapDetectionJob: failed to record gap issue as spec link"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            spec_id = %gap.spec_id,
+                            url = %url_trimmed,
+                            "GapDetectionJob: could not parse issue number from gh output"
+                        );
+                    }
                 }
                 Ok(output) => {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4488,6 +4542,33 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         // We test with a name that is extremely unlikely to match any real issue.
         let result = has_existing_gap_issue("__belt_test_nonexistent_spec_42__");
         assert!(!result);
+    }
+
+    // -- parse_issue_number_from_url tests --
+
+    #[test]
+    fn parse_issue_number_from_github_url() {
+        let url = "https://github.com/owner/repo/issues/573";
+        assert_eq!(parse_issue_number_from_url(url), Some(573));
+    }
+
+    #[test]
+    fn parse_issue_number_from_url_trailing_whitespace() {
+        // gh CLI output sometimes includes trailing newline; callers trim
+        // before passing, but the function should still handle a clean URL.
+        let url = "https://github.com/owner/repo/issues/42";
+        assert_eq!(parse_issue_number_from_url(url), Some(42));
+    }
+
+    #[test]
+    fn parse_issue_number_from_url_non_numeric() {
+        let url = "https://github.com/owner/repo/pulls/abc";
+        assert_eq!(parse_issue_number_from_url(url), None);
+    }
+
+    #[test]
+    fn parse_issue_number_from_url_empty() {
+        assert_eq!(parse_issue_number_from_url(""), None);
     }
 
     // -- HitlTimeoutJob::execute() terminal branching: replan --
