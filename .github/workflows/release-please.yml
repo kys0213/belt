@@ -22,7 +22,7 @@ jobs:
       tag_name: ${{ steps.rp.outputs.tag_name }}
     steps:
       - id: rp
-        uses: googleapis/release-please-action@8bb7a2ed0f90c9802c83129a9488d235a1f31a7c # v4 + release-please 17.3.0
+        uses: googleapis/release-please-action@c3fc4de07084f75a2b61a5b933069bda6edf3d5c # v4.4.0
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
