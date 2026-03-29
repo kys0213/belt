@@ -60,14 +60,15 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn default_shell_executor_can_run_command() {
+    #[tokio::test]
+    async fn default_shell_executor_can_run_command() {
         let executor = default_shell_executor();
         let tmp = tempfile::tempdir().unwrap();
         let env = std::collections::HashMap::new();
 
         let output = executor
             .execute("echo factory_test", tmp.path(), &env)
+            .await
             .unwrap();
         assert!(output.success());
         assert!(output.stdout.contains("factory_test"));

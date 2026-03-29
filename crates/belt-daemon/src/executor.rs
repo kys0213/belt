@@ -169,14 +169,7 @@ impl ActionExecutor {
             env_vars.insert(k.clone(), v.clone());
         }
 
-        let shell = Arc::clone(&self.shell);
-        let command = command.to_string();
-        let working_dir = env.worktree.clone();
-
-        let output =
-            tokio::task::spawn_blocking(move || shell.execute(&command, &working_dir, &env_vars))
-                .await
-                .map_err(|e| anyhow::anyhow!("shell task join error: {e}"))?;
+        let output = self.shell.execute(command, &env.worktree, &env_vars).await;
 
         let duration = start.elapsed();
 

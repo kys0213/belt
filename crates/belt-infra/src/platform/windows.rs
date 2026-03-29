@@ -5,7 +5,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
+
+use async_trait::async_trait;
+use tokio::process::Command;
 
 use belt_core::error::BeltError;
 use belt_core::platform::{DaemonNotifier, ShellExecutor, ShellOutput};
@@ -14,8 +16,9 @@ use belt_core::platform::{DaemonNotifier, ShellExecutor, ShellOutput};
 #[derive(Debug, Default, Clone)]
 pub struct WindowsShellExecutor;
 
+#[async_trait]
 impl ShellExecutor for WindowsShellExecutor {
-    fn execute(
+    async fn execute(
         &self,
         command: &str,
         working_dir: &Path,
@@ -27,6 +30,7 @@ impl ShellExecutor for WindowsShellExecutor {
             .current_dir(working_dir)
             .envs(env_vars)
             .output()
+            .await
             .map_err(|e| {
                 BeltError::Runtime(format!("failed to spawn shell command '{command}': {e}"))
             })?;
@@ -76,20 +80,23 @@ mod tests {
     // These tests execute cmd.exe and only run on Windows.
 
     #[cfg(target_os = "windows")]
-    #[test]
-    fn execute_echo_command() {
+    #[tokio::test]
+    async fn execute_echo_command() {
         let executor = WindowsShellExecutor;
         let tmp = tempfile::tempdir().unwrap();
         let env = HashMap::new();
 
-        let output = executor.execute("echo hello", tmp.path(), &env).unwrap();
+        let output = executor
+            .execute("echo hello", tmp.path(), &env)
+            .await
+            .unwrap();
         assert!(output.success());
         assert!(output.stdout.contains("hello"));
     }
 
     #[cfg(target_os = "windows")]
-    #[test]
-    fn execute_with_env_vars() {
+    #[tokio::test]
+    async fn execute_with_env_vars() {
         let executor = WindowsShellExecutor;
         let tmp = tempfile::tempdir().unwrap();
         let mut env = HashMap::new();
@@ -97,32 +104,37 @@ mod tests {
 
         let output = executor
             .execute("echo %BELT_TEST_VAR%", tmp.path(), &env)
+            .await
             .unwrap();
         assert!(output.success());
         assert!(output.stdout.contains("test_value"));
     }
 
     #[cfg(target_os = "windows")]
-    #[test]
-    fn execute_failing_command() {
+    #[tokio::test]
+    async fn execute_failing_command() {
         let executor = WindowsShellExecutor;
         let tmp = tempfile::tempdir().unwrap();
         let env = HashMap::new();
 
-        let output = executor.execute("exit /b 42", tmp.path(), &env).unwrap();
+        let output = executor
+            .execute("exit /b 42", tmp.path(), &env)
+            .await
+            .unwrap();
         assert!(!output.success());
         assert_eq!(output.exit_code, Some(42));
     }
 
     #[cfg(target_os = "windows")]
-    #[test]
-    fn execute_captures_stderr() {
+    #[tokio::test]
+    async fn execute_captures_stderr() {
         let executor = WindowsShellExecutor;
         let tmp = tempfile::tempdir().unwrap();
         let env = HashMap::new();
 
         let output = executor
             .execute("echo error_msg >&2", tmp.path(), &env)
+            .await
             .unwrap();
         assert!(output.stderr.contains("error_msg"));
     }
@@ -131,13 +143,13 @@ mod tests {
     // On non-Windows, cmd.exe is unavailable so we verify that execute returns an error.
 
     #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn execute_fails_on_non_windows() {
+    #[tokio::test]
+    async fn execute_fails_on_non_windows() {
         let executor = WindowsShellExecutor;
         let tmp = tempfile::tempdir().unwrap();
         let env = HashMap::new();
 
-        let result = executor.execute("echo hello", tmp.path(), &env);
+        let result = executor.execute("echo hello", tmp.path(), &env).await;
         assert!(
             result.is_err(),
             "cmd.exe should not be available on non-Windows"

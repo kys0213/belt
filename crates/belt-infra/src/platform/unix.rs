@@ -5,7 +5,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
+
+use async_trait::async_trait;
+use tokio::process::Command;
 
 use belt_core::error::BeltError;
 use belt_core::platform::{DaemonNotifier, ShellExecutor, ShellOutput};
@@ -14,8 +16,9 @@ use belt_core::platform::{DaemonNotifier, ShellExecutor, ShellOutput};
 #[derive(Debug, Default, Clone)]
 pub struct UnixShellExecutor;
 
+#[async_trait]
 impl ShellExecutor for UnixShellExecutor {
-    fn execute(
+    async fn execute(
         &self,
         command: &str,
         working_dir: &Path,
@@ -27,6 +30,7 @@ impl ShellExecutor for UnixShellExecutor {
             .current_dir(working_dir)
             .envs(env_vars)
             .output()
+            .await
             .map_err(|e| {
                 BeltError::Runtime(format!("failed to spawn shell command '{command}': {e}"))
             })?;
@@ -63,54 +67,59 @@ impl DaemonNotifier for UnixDaemonNotifier {
 mod tests {
     use super::*;
 
-    #[test]
-    fn execute_echo() {
+    #[tokio::test]
+    async fn execute_echo() {
         let executor = UnixShellExecutor;
         let result = executor
             .execute("echo hello", Path::new("/tmp"), &HashMap::new())
+            .await
             .unwrap();
         assert!(result.success());
         assert!(result.stdout.contains("hello"));
     }
 
-    #[test]
-    fn execute_with_env_vars() {
+    #[tokio::test]
+    async fn execute_with_env_vars() {
         let executor = UnixShellExecutor;
         let mut env = HashMap::new();
         env.insert("MY_TEST_VAR".to_string(), "test_value".to_string());
         let result = executor
             .execute("echo $MY_TEST_VAR", Path::new("/tmp"), &env)
+            .await
             .unwrap();
         assert!(result.success());
         assert!(result.stdout.contains("test_value"));
     }
 
-    #[test]
-    fn execute_failing_command() {
+    #[tokio::test]
+    async fn execute_failing_command() {
         let executor = UnixShellExecutor;
         let result = executor
             .execute("exit 42", Path::new("/tmp"), &HashMap::new())
+            .await
             .unwrap();
         assert!(!result.success());
         assert_eq!(result.exit_code, Some(42));
     }
 
-    #[test]
-    fn execute_captures_stderr() {
+    #[tokio::test]
+    async fn execute_captures_stderr() {
         let executor = UnixShellExecutor;
         let result = executor
             .execute("echo err_msg >&2", Path::new("/tmp"), &HashMap::new())
+            .await
             .unwrap();
         assert!(result.success());
         assert!(result.stderr.contains("err_msg"));
     }
 
-    #[test]
-    fn execute_respects_working_dir() {
+    #[tokio::test]
+    async fn execute_respects_working_dir() {
         let executor = UnixShellExecutor;
         let tmp = tempfile::tempdir().unwrap();
         let result = executor
             .execute("pwd", tmp.path(), &HashMap::new())
+            .await
             .unwrap();
         assert!(result.success());
         // Resolve symlinks for macOS /tmp -> /private/tmp
