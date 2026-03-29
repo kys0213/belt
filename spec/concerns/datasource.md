@@ -72,7 +72,7 @@ Daemon이 주입하는 환경변수는 **2개만**:
   "work_id": "github:org/repo#42:implement",
   "workspace": "auth-project",
   "queue": {
-    "phase": "Running",
+    "phase": "running",
     "state": "implement",
     "source_id": "github:org/repo#42"
   },
@@ -120,7 +120,7 @@ FAILURES=$(echo $CTX | jq '[.history[] | select(.status=="failed" and .state=="i
   "work_id": "jira:BE-123:analyze",
   "workspace": "backend-tasks",
   "queue": {
-    "phase": "Running",
+    "phase": "running",
     "state": "analyze",
     "source_id": "jira:BE-123"
   },
