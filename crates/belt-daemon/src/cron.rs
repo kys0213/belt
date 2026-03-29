@@ -641,19 +641,17 @@ impl CronHandler for HitlTimeoutJob {
                     }
                     phase
                 }
-                ResolvedTerminalAction::Replan => {
-                    match execute_replan(&self.db, item) {
-                        Ok(phase) => phase,
-                        Err(e) => {
-                            tracing::warn!(
-                                work_id = %item.work_id,
-                                error = %e,
-                                "failed to execute replan for expired HITL item"
-                            );
-                            continue;
-                        }
+                ResolvedTerminalAction::Replan => match execute_replan(&self.db, item) {
+                    Ok(phase) => phase,
+                    Err(e) => {
+                        tracing::warn!(
+                            work_id = %item.work_id,
+                            error = %e,
+                            "failed to execute replan for expired HITL item"
+                        );
+                        continue;
                     }
-                }
+                },
             };
 
             // Clean up the associated worktree for terminal phases.
@@ -4591,16 +4589,20 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             Some(belt_core::queue::HitlReason::SpecModificationProposed)
         );
         assert_eq!(replan_item.replan_count, 1);
-        assert!(replan_item
-            .title
-            .as_deref()
-            .unwrap()
-            .contains("spec-modification-proposed"));
-        assert!(replan_item
-            .hitl_notes
-            .as_deref()
-            .unwrap()
-            .contains("original failure reason"));
+        assert!(
+            replan_item
+                .title
+                .as_deref()
+                .unwrap()
+                .contains("spec-modification-proposed")
+        );
+        assert!(
+            replan_item
+                .hitl_notes
+                .as_deref()
+                .unwrap()
+                .contains("original failure reason")
+        );
     }
 
     #[test]
