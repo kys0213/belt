@@ -1369,71 +1369,41 @@ mod tests {
 
     #[test]
     fn label_list_parses_comma_separated() {
-        let mut spec = Spec::new(
-            "s1".into(),
-            "ws".into(),
-            "name".into(),
-            "content".into(),
-        );
+        let mut spec = Spec::new("s1".into(), "ws".into(), "name".into(), "content".into());
         spec.labels = Some("feature, test, priority-high".into());
         assert_eq!(spec.label_list(), vec!["feature", "test", "priority-high"]);
     }
 
     #[test]
     fn label_list_empty_when_none() {
-        let spec = Spec::new(
-            "s1".into(),
-            "ws".into(),
-            "name".into(),
-            "content".into(),
-        );
+        let spec = Spec::new("s1".into(), "ws".into(), "name".into(), "content".into());
         assert!(spec.label_list().is_empty());
     }
 
     #[test]
     fn is_test_only_true_when_labeled_test() {
-        let mut spec = Spec::new(
-            "s1".into(),
-            "ws".into(),
-            "name".into(),
-            "content".into(),
-        );
+        let mut spec = Spec::new("s1".into(), "ws".into(), "name".into(), "content".into());
         spec.labels = Some("test".into());
         assert!(spec.is_test_only());
     }
 
     #[test]
     fn is_test_only_true_among_other_labels() {
-        let mut spec = Spec::new(
-            "s1".into(),
-            "ws".into(),
-            "name".into(),
-            "content".into(),
-        );
+        let mut spec = Spec::new("s1".into(), "ws".into(), "name".into(), "content".into());
         spec.labels = Some("feature, test, high".into());
         assert!(spec.is_test_only());
     }
 
     #[test]
     fn is_test_only_false_without_test_label() {
-        let mut spec = Spec::new(
-            "s1".into(),
-            "ws".into(),
-            "name".into(),
-            "content".into(),
-        );
+        let mut spec = Spec::new("s1".into(), "ws".into(), "name".into(), "content".into());
         spec.labels = Some("feature, priority-high".into());
         assert!(!spec.is_test_only());
     }
 
     #[test]
     fn is_test_only_false_when_no_labels() {
-        let spec = Spec::new(
-            "s1".into(),
-            "ws".into(),
-            "name".into(),
-            "content".into(),
-        );
+        let spec = Spec::new("s1".into(), "ws".into(), "name".into(), "content".into());
         assert!(!spec.is_test_only());
     }
 }
