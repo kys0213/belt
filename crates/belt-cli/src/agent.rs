@@ -486,8 +486,12 @@ mod tests {
 
     /// Build a minimal `WorkspaceConfig` without any sources.
     fn empty_workspace() -> WorkspaceConfig {
+        empty_workspace_named("test-ws")
+    }
+
+    fn empty_workspace_named(name: &str) -> WorkspaceConfig {
         WorkspaceConfig {
-            name: "test-ws".to_string(),
+            name: name.to_string(),
             concurrency: 1,
             sources: HashMap::new(),
             runtime: RuntimeConfig::default(),
@@ -856,15 +860,16 @@ runtime:
     #[test]
     fn resolve_rules_dir_falls_back_to_per_workspace_claw_dir() {
         let tmp = tempfile::tempdir().unwrap();
+        let ws_name = "test-ws-fallback-per-ws";
         let ws_rules = tmp
             .path()
             .join("workspaces")
-            .join("test-ws")
+            .join(ws_name)
             .join("claw")
             .join("system");
         std::fs::create_dir_all(&ws_rules).unwrap();
 
-        let config = empty_workspace();
+        let config = empty_workspace_named(ws_name);
         let resolved = resolve_rules_dir_with_home(&config, Some(tmp.path()));
         assert_eq!(resolved, Some(ws_rules));
     }
@@ -879,7 +884,7 @@ runtime:
             .join("rules");
         std::fs::create_dir_all(&global_rules).unwrap();
 
-        let config = empty_workspace();
+        let config = empty_workspace_named("test-ws-fallback-global");
         let resolved = resolve_rules_dir_with_home(&config, Some(tmp.path()));
         assert_eq!(resolved, Some(global_rules));
     }
@@ -887,10 +892,11 @@ runtime:
     #[test]
     fn resolve_rules_dir_per_workspace_takes_priority_over_global() {
         let tmp = tempfile::tempdir().unwrap();
+        let ws_name = "test-ws-priority";
         let ws_rules = tmp
             .path()
             .join("workspaces")
-            .join("test-ws")
+            .join(ws_name)
             .join("claw")
             .join("system");
         std::fs::create_dir_all(&ws_rules).unwrap();
@@ -902,7 +908,7 @@ runtime:
             .join("rules");
         std::fs::create_dir_all(&global_rules).unwrap();
 
-        let config = empty_workspace();
+        let config = empty_workspace_named(ws_name);
         let resolved = resolve_rules_dir_with_home(&config, Some(tmp.path()));
         // Per-workspace (priority 2) should win over global (priority 3).
         assert_eq!(resolved, Some(ws_rules));
@@ -911,18 +917,19 @@ runtime:
     #[test]
     fn resolve_rules_dir_explicit_path_takes_priority_over_belt_home() {
         let tmp = tempfile::tempdir().unwrap();
+        let ws_name = "test-ws-explicit-path";
         let explicit_dir = tmp.path().join("explicit-rules");
         std::fs::create_dir_all(&explicit_dir).unwrap();
 
         let ws_rules = tmp
             .path()
             .join("workspaces")
-            .join("test-ws")
+            .join(ws_name)
             .join("claw")
             .join("system");
         std::fs::create_dir_all(&ws_rules).unwrap();
 
-        let mut config = empty_workspace();
+        let mut config = empty_workspace_named(ws_name);
         config.claw_config = Some(belt_core::workspace::ClawConfig {
             rules_path: Some(explicit_dir.to_string_lossy().to_string()),
             ..Default::default()
@@ -1240,15 +1247,16 @@ runtime:
         let _ws = ClawWorkspace::init(tmp.path()).unwrap();
 
         // Also create per-workspace rules (priority 2).
+        let ws_name = "test-ws-claw-init-override";
         let ws_rules = tmp
             .path()
             .join("workspaces")
-            .join("test-ws")
+            .join(ws_name)
             .join("claw")
             .join("system");
         std::fs::create_dir_all(&ws_rules).unwrap();
 
-        let config = empty_workspace();
+        let config = empty_workspace_named(ws_name);
         let resolved = resolve_rules_dir_with_home(&config, Some(tmp.path()));
         assert_eq!(
             resolved,
