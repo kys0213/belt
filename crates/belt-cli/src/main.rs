@@ -2869,6 +2869,11 @@ async fn main() -> anyhow::Result<()> {
             description,
             create_pr,
         } => {
+            // --create-pr requires --llm
+            if create_pr && !llm {
+                anyhow::bail!("--create-pr requires --llm flag");
+            }
+
             // When --llm is set without a custom rules_dir, use the interactive LLM path.
             if llm && rules_dir.is_none() {
                 let workspace_root = match &workspace {
