@@ -811,7 +811,7 @@ fn print_text_status(status: &SystemStatus) {
     if status.hitl_count > 0 {
         println!();
         println!(
-            "\x1b[33m\u{26a0}\u{fe0f} {} items require human intervention. Run 'belt claw' to review.\x1b[0m",
+            "\x1b[33m\u{26a0}\u{fe0f} {} items require human intervention. Run 'belt agent' to review.\x1b[0m",
             status.hitl_count
         );
     }
@@ -1068,7 +1068,7 @@ fn print_rich_status(status: &SystemStatus, daemon_running: Option<bool>) {
             stdout,
             "  {}",
             format!(
-                "{} items require human intervention. Run 'belt claw' to review.",
+                "{} items require human intervention. Run 'belt agent' to review.",
                 status.hitl_items.len()
             )
             .yellow(),
@@ -1079,7 +1079,7 @@ fn print_rich_status(status: &SystemStatus, daemon_running: Option<bool>) {
             stdout,
             "  {}",
             format!(
-                "{} items require human intervention. Run 'belt claw' to review.",
+                "{} items require human intervention. Run 'belt agent' to review.",
                 status.hitl_count
             )
             .yellow(),

@@ -92,20 +92,10 @@ enum Commands {
         #[arg(long)]
         field: Option<String>,
     },
-    /// Run an LLM agent session.
+    /// Agent workspace and session management.
     Agent {
-        /// Path to workspace.yaml config file.
-        #[arg(long)]
-        workspace: Option<String>,
-        /// Non-interactive prompt (for cron/evaluate calls).
-        #[arg(short, long)]
-        prompt: Option<String>,
-        /// Plan mode: show execution plan without running.
-        #[arg(long)]
-        plan: bool,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
+        #[command(subcommand)]
+        command: AgentCommands,
     },
     /// Spec lifecycle management.
     Spec {
@@ -117,10 +107,10 @@ enum Commands {
         #[command(subcommand)]
         command: HitlCommands,
     },
-    /// Claw interactive management session.
+    /// Claw interactive management session (deprecated, use `belt agent`).
     Claw {
         #[command(subcommand)]
-        command: ClawCommands,
+        command: AgentCommands,
     },
     /// Manage the /auto slash command plugin for Claude Code.
     Auto {
@@ -194,8 +184,8 @@ enum AutoPluginCommands {
 }
 
 #[derive(Subcommand)]
-enum ClawCommands {
-    /// Initialize Claw workspace.
+enum AgentCommands {
+    /// Initialize agent workspace.
     Init {
         /// Overwrite existing files.
         #[arg(long)]
@@ -208,9 +198,22 @@ enum ClawCommands {
         /// Rule file to edit (classify-policy, hitl-policy, auto-approve-policy).
         rule: Option<String>,
     },
-    /// Open interactive session.
-    Session,
-    /// Install /claw slash command plugin for Claude Code.
+    /// Run an LLM agent session.
+    Session {
+        /// Path to workspace.yaml config file.
+        #[arg(long)]
+        workspace: Option<String>,
+        /// Non-interactive prompt (for cron/evaluate calls).
+        #[arg(short, long)]
+        prompt: Option<String>,
+        /// Plan mode: show execution plan without running.
+        #[arg(long)]
+        plan: bool,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install /agent slash command plugin for Claude Code.
     Plugin {
         /// Custom installation directory (defaults to ~/.claude/commands/).
         #[arg(long)]
@@ -2091,6 +2094,73 @@ fn update_github_issue_body(issue_number: &str, body: &str) {
 }
 
 // ---------------------------------------------------------------------------
+/// Handle `belt agent` (and legacy `belt claw`) subcommands.
+async fn run_agent_command(command: AgentCommands) -> anyhow::Result<()> {
+    match command {
+        AgentCommands::Init { force } => {
+            let belt_home = belt_home()?;
+            let ws = if force {
+                claw::ClawWorkspace::init_with_options(&belt_home, true)?
+            } else {
+                claw::ClawWorkspace::init(&belt_home)?
+            };
+            let rules_dir = ws.path.join(".claude/rules");
+            tracing::info!(
+                path = %ws.path.display(),
+                rules_dir = %rules_dir.display(),
+                rules_exist = rules_dir.is_dir(),
+                "agent workspace initialized with global rules directory"
+            );
+        }
+        AgentCommands::Rules => {
+            let belt_home = belt_home()?;
+            let ws = claw::ClawWorkspace {
+                path: belt_home.join("claw-workspace"),
+            };
+            let rules = ws.list_rules()?;
+            for rule in &rules {
+                println!("{}", rule.display());
+            }
+        }
+        AgentCommands::Edit { rule } => {
+            let belt_home = belt_home()?;
+            let ws = claw::ClawWorkspace {
+                path: belt_home.join("claw-workspace"),
+            };
+            ws.edit_rule(rule.as_deref())?;
+        }
+        AgentCommands::Session {
+            workspace,
+            prompt,
+            plan,
+            json,
+        } => {
+            let exit_code = agent::run_agent(workspace, prompt, plan, json).await?;
+            if exit_code != 0 {
+                std::process::exit(exit_code);
+            }
+        }
+        AgentCommands::Plugin { install_dir } => {
+            let dir = if let Some(ref custom) = install_dir {
+                std::path::PathBuf::from(custom)
+            } else {
+                claw::plugin::default_install_dir()?
+            };
+            let plugin_path = claw::plugin::install_plugin(&dir)?;
+            println!(
+                "Installed /agent slash command plugin to: {}",
+                plugin_path.display()
+            );
+            println!("Restart Claude Code to activate the /agent command.");
+        }
+        AgentCommands::Context => {
+            let context = claw::plugin::collect_cli_context();
+            println!("{context}");
+        }
+    }
+    Ok(())
+}
+
 // Main
 // ---------------------------------------------------------------------------
 
@@ -2475,16 +2545,8 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Agent {
-            workspace,
-            prompt,
-            plan,
-            json,
-        } => {
-            let exit_code = agent::run_agent(workspace, prompt, plan, json).await?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
-            }
+        Commands::Agent { command } | Commands::Claw { command } => {
+            run_agent_command(command).await?;
         }
         Commands::Spec { command } => {
             let belt_home = belt_home()?;
@@ -3427,69 +3489,7 @@ async fn main() -> anyhow::Result<()> {
             },
         },
 
-        Commands::Claw { command } => match command {
-            ClawCommands::Init { force } => {
-                let belt_home = belt_home()?;
-                let ws = if force {
-                    claw::ClawWorkspace::init_with_options(&belt_home, true)?
-                } else {
-                    claw::ClawWorkspace::init(&belt_home)?
-                };
-                let rules_dir = ws.path.join(".claude/rules");
-                tracing::info!(
-                    path = %ws.path.display(),
-                    rules_dir = %rules_dir.display(),
-                    rules_exist = rules_dir.is_dir(),
-                    "claw workspace initialized with global rules directory"
-                );
-            }
-            ClawCommands::Rules => {
-                let belt_home = belt_home()?;
-                let ws = claw::ClawWorkspace {
-                    path: belt_home.join("claw-workspace"),
-                };
-                let rules = ws.list_rules()?;
-                for rule in &rules {
-                    println!("{}", rule.display());
-                }
-            }
-            ClawCommands::Edit { rule } => {
-                let belt_home = belt_home()?;
-                let ws = claw::ClawWorkspace {
-                    path: belt_home.join("claw-workspace"),
-                };
-                ws.edit_rule(rule.as_deref())?;
-            }
-            ClawCommands::Session => {
-                let belt_home = belt_home()?;
-                let claw_workspace = claw::ClawWorkspace::init(&belt_home)?;
-                let runtime: Arc<dyn belt_core::runtime::AgentRuntime> =
-                    Arc::new(ClaudeRuntime::new(None));
-                let config = claw::session::SessionConfig {
-                    workspace: None,
-                    claw_workspace,
-                    runtime: Some(runtime),
-                };
-                claw::session::run_interactive(config).await?;
-            }
-            ClawCommands::Plugin { install_dir } => {
-                let dir = if let Some(ref custom) = install_dir {
-                    std::path::PathBuf::from(custom)
-                } else {
-                    claw::plugin::default_install_dir()?
-                };
-                let plugin_path = claw::plugin::install_plugin(&dir)?;
-                println!(
-                    "Installed /claw slash command plugin to: {}",
-                    plugin_path.display()
-                );
-                println!("Restart Claude Code to activate the /claw command.");
-            }
-            ClawCommands::Context => {
-                let context = claw::plugin::collect_cli_context();
-                println!("{context}");
-            }
-        },
+        // Commands::Claw is handled above via the `|` pattern with Commands::Agent
     }
 
     Ok(())
