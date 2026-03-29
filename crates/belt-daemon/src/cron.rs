@@ -2607,83 +2607,23 @@ impl CronHandler for EvaluateJob {
 
                 match eval_result {
                     Ok(result) if result.success() => {
-                        // 6a. LLM call succeeded -- parse verdict from stdout.
-                        let verdict = crate::evaluator::EvalVerdict::parse(&result.stdout);
-                        let decision = match &verdict {
-                            Some(v) if v.is_pass() => crate::evaluator::EvalDecision::Done,
-                            Some(v) => crate::evaluator::EvalDecision::Hitl {
-                                reason: v
-                                    .reason
-                                    .clone()
-                                    .unwrap_or_else(|| "LLM evaluation found issues".to_string()),
-                            },
-                            None => {
-                                // Subprocess succeeded but no parseable verdict.
-                                // Default to Done (backward-compatible behavior).
+                        // 6a. CLI direct call succeeded (exit 0) — the evaluate
+                        // subprocess already executed `belt queue done` or
+                        // `belt queue hitl` via the CLI, so we simply mark Done.
+                        match self.db.update_phase(&item.work_id, QueuePhase::Done) {
+                            Ok(()) => {
+                                evaluated_count += 1;
+                                tracing::info!(
+                                    work_id = %item.work_id,
+                                    workspace = %workspace,
+                                    "EvaluateJob: item evaluated as Done"
+                                );
+                            }
+                            Err(e) => {
                                 tracing::warn!(
                                     work_id = %item.work_id,
-                                    "EvaluateJob: no parseable verdict from LLM, defaulting to Done"
-                                );
-                                crate::evaluator::EvalDecision::Done
-                            }
-                        };
-
-                        // Log suggestions if present.
-                        if let Some(v) = &verdict
-                            && !v.suggestions.is_empty()
-                        {
-                            tracing::info!(
-                                work_id = %item.work_id,
-                                suggestions = ?v.suggestions,
-                                "EvaluateJob: LLM evaluation suggestions"
-                            );
-                        }
-
-                        match &decision {
-                            crate::evaluator::EvalDecision::Done => {
-                                match self.db.update_phase(&item.work_id, QueuePhase::Done) {
-                                    Ok(()) => {
-                                        evaluated_count += 1;
-                                        tracing::info!(
-                                            work_id = %item.work_id,
-                                            workspace = %workspace,
-                                            "EvaluateJob: item evaluated as Done"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            work_id = %item.work_id,
-                                            error = %e,
-                                            "EvaluateJob: failed to update item phase to Done"
-                                        );
-                                    }
-                                }
-                            }
-                            crate::evaluator::EvalDecision::Hitl { reason } => {
-                                if let Err(e) = self.db.escalate_to_hitl(
-                                    &item.work_id,
-                                    "evaluate_issues",
-                                    reason,
-                                ) {
-                                    tracing::warn!(
-                                        work_id = %item.work_id,
-                                        error = %e,
-                                        "EvaluateJob: failed to escalate item to HITL"
-                                    );
-                                } else {
-                                    tracing::info!(
-                                        work_id = %item.work_id,
-                                        reason = %reason,
-                                        "EvaluateJob: item escalated to HITL due to evaluation issues"
-                                    );
-                                }
-                                evaluated_count += 1;
-                            }
-                            crate::evaluator::EvalDecision::Retry => {
-                                // Should not occur in this path, but handle gracefully.
-                                tracing::debug!(
-                                    work_id = %item.work_id,
-                                    "EvaluateJob: item stays in Completed for retry"
+                                    error = %e,
+                                    "EvaluateJob: failed to update item phase to Done"
                                 );
                             }
                         }
