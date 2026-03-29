@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -5,7 +6,7 @@ use anyhow::{Context, Result, bail};
 
 use belt_core::action::Action;
 use belt_core::runtime::RuntimeRegistry;
-use belt_core::workspace::WorkspaceConfig;
+use belt_core::workspace::{RuntimeConfig, WorkspaceConfig};
 use belt_daemon::executor::{ActionEnv, ActionExecutor};
 use belt_infra::runtimes::claude::ClaudeRuntime;
 use belt_infra::runtimes::codex::CodexRuntime;
@@ -352,7 +353,70 @@ fn print_plan(
     Ok(())
 }
 
+/// Global agent workspace directory name under `$BELT_HOME`.
+const GLOBAL_AGENT_WORKSPACE_DIR: &str = "agent-workspace";
+
+/// Build a default `WorkspaceConfig` for interactive agent sessions without
+/// an explicit workspace file.
+///
+/// Uses `"agent"` as the workspace name and defaults to the `claude` runtime.
+/// No sources are configured -- the caller is expected to supply a prompt
+/// override or start an interactive session.
+fn default_agent_config() -> WorkspaceConfig {
+    WorkspaceConfig {
+        name: "agent".to_string(),
+        concurrency: 1,
+        sources: HashMap::new(),
+        runtime: RuntimeConfig::default(),
+        claw_config: None,
+    }
+}
+
+/// Resolve the global agent-workspace rules directory.
+///
+/// Returns `$BELT_HOME/agent-workspace/.claude/rules/` when the directory
+/// exists on disk. When `belt_home` is `None`, reads the `BELT_HOME`
+/// environment variable (falling back to `~/.belt`).
+fn resolve_global_agent_rules_dir(belt_home: Option<&Path>) -> Option<PathBuf> {
+    let owned_home: Option<PathBuf>;
+    let belt_home = match belt_home {
+        Some(p) => Some(p),
+        None => {
+            owned_home = std::env::var("BELT_HOME")
+                .map(PathBuf::from)
+                .ok()
+                .or_else(|| dirs::home_dir().map(|h| h.join(".belt")));
+            owned_home.as_deref()
+        }
+    };
+
+    if let Some(home) = belt_home {
+        let rules_dir = home
+            .join(GLOBAL_AGENT_WORKSPACE_DIR)
+            .join(".claude")
+            .join("rules");
+        if rules_dir.is_dir() {
+            tracing::debug!(
+                path = %rules_dir.display(),
+                "resolved global agent-workspace rules directory"
+            );
+            return Some(rules_dir);
+        }
+        tracing::debug!(
+            path = %rules_dir.display(),
+            "global agent-workspace rules directory does not exist"
+        );
+    }
+
+    None
+}
+
 /// Entry point for `belt agent` command.
+///
+/// When `workspace_path` is `Some`, loads the workspace config from that file.
+/// When `None`, uses a default agent config and loads rules from the global
+/// agent-workspace path (`~/.belt/agent-workspace/.claude/rules/`), enabling
+/// interactive sessions without an explicit `--workspace` flag.
 ///
 /// Returns the exit code from the agent execution (0 on success).
 pub async fn run_agent(
@@ -361,18 +425,28 @@ pub async fn run_agent(
     plan: bool,
     json_output: bool,
 ) -> Result<i32> {
-    let workspace_path =
-        workspace_path.ok_or_else(|| anyhow::anyhow!("--workspace is required"))?;
-
-    let config = load_workspace_config(&workspace_path)?;
+    let (config, use_global_rules) = match workspace_path {
+        Some(ref path) => (load_workspace_config(path)?, false),
+        None => (default_agent_config(), true),
+    };
     let actions = collect_actions(&config, prompt.as_deref());
+
+    // When no workspace and no prompt are given, start an interactive Claude
+    // session with the global agent-workspace rules loaded as system prompt.
+    if actions.is_empty() && use_global_rules {
+        return run_interactive_session(&config).await;
+    }
 
     if actions.is_empty() {
         bail!("no actions found in workspace config");
     }
 
     if plan {
-        let rules_dir = resolve_rules_dir(&config);
+        let rules_dir = if use_global_rules {
+            resolve_global_agent_rules_dir(None)
+        } else {
+            resolve_rules_dir(&config)
+        };
         print_plan(&config, &actions, rules_dir.as_deref(), json_output)?;
         return Ok(0);
     }
@@ -396,7 +470,13 @@ pub async fn run_agent(
         .and_then(|c| c.max_conversation_turns);
     let claw_rules = build_claw_rules_prompt(max_turns);
 
-    let file_rules = if let Some(rules_dir) = resolve_rules_dir(&config) {
+    let resolved_rules_dir = if use_global_rules {
+        resolve_global_agent_rules_dir(None)
+    } else {
+        resolve_rules_dir(&config)
+    };
+
+    let file_rules = if let Some(rules_dir) = resolved_rules_dir {
         match load_rules_from_dir(&rules_dir) {
             Ok(Some(rules)) => {
                 tracing::info!(
@@ -471,6 +551,69 @@ pub async fn run_agent(
             bail!("no actions were executed");
         }
     }
+}
+
+/// Start an interactive Claude session with the global agent-workspace rules.
+///
+/// Spawns the `claude` CLI without `-p` (non-interactive pipe mode), allowing
+/// the user to interact directly. The global agent-workspace rules are passed
+/// via `--append-system-prompt` so the LLM has project context.
+///
+/// Returns the exit code from the `claude` process.
+async fn run_interactive_session(config: &WorkspaceConfig) -> Result<i32> {
+    let max_turns = config
+        .claw_config
+        .as_ref()
+        .and_then(|c| c.max_conversation_turns);
+    let claw_rules = build_claw_rules_prompt(max_turns);
+
+    let file_rules =
+        resolve_global_agent_rules_dir(None).and_then(|dir| match load_rules_from_dir(&dir) {
+            Ok(Some(rules)) => {
+                tracing::info!(
+                    rules_dir = %dir.display(),
+                    "loaded global agent-workspace rules"
+                );
+                Some(rules)
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    rules_dir = %dir.display(),
+                    "global agent-workspace rules directory has no .md files"
+                );
+                None
+            }
+            Err(e) => {
+                tracing::warn!(
+                    rules_dir = %dir.display(),
+                    error = %e,
+                    "failed to load global agent-workspace rules"
+                );
+                None
+            }
+        });
+
+    let system_prompt = match file_rules {
+        Some(file_prompt) => format!("{claw_rules}\n\n---\n\n{file_prompt}"),
+        None => claw_rules,
+    };
+
+    tracing::info!("starting interactive agent session");
+
+    let mut cmd = tokio::process::Command::new("claude");
+    cmd.arg("--append-system-prompt").arg(&system_prompt);
+
+    // Inherit stdio so the user can interact directly with the Claude CLI.
+    cmd.stdin(std::process::Stdio::inherit());
+    cmd.stdout(std::process::Stdio::inherit());
+    cmd.stderr(std::process::Stdio::inherit());
+
+    let status = cmd
+        .status()
+        .await
+        .context("failed to start claude CLI for interactive session")?;
+
+    Ok(status.code().unwrap_or(-1))
 }
 
 #[cfg(test)]
@@ -1268,6 +1411,65 @@ runtime:
             resolved,
             Some(ws_rules),
             "per-workspace rules (priority 2) should override global claw init rules (priority 3)"
+        );
+    }
+
+    #[test]
+    fn default_agent_config_uses_expected_defaults() {
+        let config = default_agent_config();
+        assert_eq!(config.name, "agent");
+        assert_eq!(config.concurrency, 1);
+        assert!(config.sources.is_empty());
+        assert_eq!(config.runtime.default, "claude");
+        assert!(config.claw_config.is_none());
+    }
+
+    #[test]
+    fn resolve_global_agent_rules_dir_returns_none_for_missing_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = resolve_global_agent_rules_dir(Some(tmp.path()));
+        assert!(
+            result.is_none(),
+            "should return None when agent-workspace dir does not exist"
+        );
+    }
+
+    #[test]
+    fn resolve_global_agent_rules_dir_returns_path_when_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rules_dir = tmp
+            .path()
+            .join(GLOBAL_AGENT_WORKSPACE_DIR)
+            .join(".claude")
+            .join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+
+        let result = resolve_global_agent_rules_dir(Some(tmp.path()));
+        assert_eq!(
+            result,
+            Some(rules_dir),
+            "should return the agent-workspace rules directory"
+        );
+    }
+
+    #[test]
+    fn collect_actions_with_prompt_override_on_default_config() {
+        let config = default_agent_config();
+        let actions = collect_actions(&config, Some("hello"));
+        assert_eq!(
+            actions.len(),
+            1,
+            "prompt override should produce one action"
+        );
+    }
+
+    #[test]
+    fn collect_actions_without_prompt_on_default_config_returns_empty() {
+        let config = default_agent_config();
+        let actions = collect_actions(&config, None);
+        assert!(
+            actions.is_empty(),
+            "default config without prompt should have no actions"
         );
     }
 }
