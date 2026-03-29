@@ -356,7 +356,14 @@ main() {
 
             if [ "$YES_FLAG" = true ]; then
                 # Auto-add to profile when --yes is specified
-                if [ -f "$_profile" ] || [ "$YES_FLAG" = true ]; then
+                # Idempotency guard: skip if the exact PATH line already exists
+                if [ -f "$_profile" ] && grep -qF "$_path_line" "$_profile"; then
+                    say "PATH entry already exists in ${_profile}, skipping"
+                else
+                    # Create profile file if it doesn't exist
+                    if [ "$_shell_name" = "fish" ]; then
+                        mkdir -p "$(dirname "$_profile")"
+                    fi
                     echo "$_path_line" >> "$_profile"
                     say "added belt to PATH in ${_profile}"
                     say "restart your shell or run: source ${_profile}"
