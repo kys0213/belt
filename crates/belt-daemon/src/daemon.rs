@@ -349,19 +349,38 @@ impl Daemon {
             }
         }
 
-        // Ready -> Running (respecting concurrency)
+        // Ready -> Running (respecting concurrency + queue_dependencies)
         let ws_id = &self.config.name;
         let ws_concurrency = self.config.concurrency;
 
-        for item in self.queue.iter_mut() {
-            if item.phase == QueuePhase::Ready
-                && self.tracker.can_spawn_in_workspace(ws_id, ws_concurrency)
-                && transit(item, QueuePhase::Running).is_ok()
-            {
+        let ready_indices: Vec<usize> = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.phase == QueuePhase::Ready)
+            .map(|(i, _)| i)
+            .collect();
+
+        for idx in ready_indices {
+            if !self.tracker.can_spawn_in_workspace(ws_id, ws_concurrency) {
+                break;
+            }
+
+            // Queue dependency gate: check if all dependency work_ids are Done.
+            // Gate-open on error to avoid blocking items when DB is unavailable.
+            if !self.check_queue_dependency_gate(&self.queue[idx].work_id.clone()) {
+                tracing::debug!(
+                    "queue dependency gate blocked: {} (waiting for dependencies)",
+                    self.queue[idx].work_id,
+                );
+                continue;
+            }
+
+            if transit(&mut self.queue[idx], QueuePhase::Running).is_ok() {
                 Self::record_transition(
                     &self.db,
-                    &item.work_id,
-                    &item.source_id,
+                    &self.queue[idx].work_id,
+                    &self.queue[idx].source_id,
                     QueuePhase::Ready,
                     QueuePhase::Running,
                     "phase_enter",
@@ -448,6 +467,55 @@ impl Daemon {
         }
 
         result.is_ready()
+    }
+
+    /// Check whether a queue item's queue_dependencies are all Done.
+    ///
+    /// Uses the database to look up dependencies by `work_id`. If no database
+    /// is configured or the lookup fails, the gate is open (returns `true`)
+    /// to avoid blocking items unnecessarily.
+    fn check_queue_dependency_gate(&self, work_id: &str) -> bool {
+        let db = match &self.db {
+            Some(db) => db,
+            None => return true,
+        };
+
+        let dep_work_ids = match db.list_queue_dependencies(work_id) {
+            Ok(deps) => deps,
+            Err(_) => return true, // Gate open on error.
+        };
+
+        if dep_work_ids.is_empty() {
+            return true;
+        }
+
+        // Check each dependency's phase in the in-memory queue.
+        for dep_id in &dep_work_ids {
+            let dep_phase = self
+                .queue
+                .iter()
+                .find(|item| item.work_id == *dep_id)
+                .map(|item| item.phase);
+
+            match dep_phase {
+                Some(QueuePhase::Done) => {} // Dependency satisfied.
+                Some(phase) => {
+                    tracing::trace!(
+                        work_id = %work_id,
+                        dependency = %dep_id,
+                        dependency_phase = %phase.as_str(),
+                        "queue dependency not done"
+                    );
+                    return false;
+                }
+                None => {
+                    // Dependency not found in queue — gate open (may have been
+                    // removed or completed in a previous run).
+                }
+            }
+        }
+
+        true
     }
 
     /// Check whether a queue item's associated spec has entry_point conflicts
