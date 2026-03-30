@@ -7,6 +7,7 @@ use anyhow::Result;
 use belt_core::action::Action;
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
+use belt_core::runtime::TokenUsage;
 
 use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
 
@@ -301,9 +302,62 @@ pub struct EvaluateResult {
     pub ipc_result: Option<serde_json::Value>,
 }
 
+/// Token usage and runtime metadata parsed from subprocess IPC JSON output.
+#[derive(Debug, Clone)]
+pub struct IpcTokenUsage {
+    pub token_usage: TokenUsage,
+    pub runtime_name: String,
+    pub model: Option<String>,
+    pub duration_ms: Option<u64>,
+}
+
 impl EvaluateResult {
     pub fn success(&self) -> bool {
         self.exit_code == 0
+    }
+
+    /// Parse token usage from the subprocess IPC JSON output.
+    ///
+    /// When the evaluate subprocess is invoked with `--json`, the stdout
+    /// contains a JSON object with optional `token_usage`, `runtime_name`,
+    /// and `model` fields. This method extracts those fields into an
+    /// [`IpcTokenUsage`] for DB recording.
+    ///
+    /// Returns `None` if `ipc_result` is absent, or if `token_usage` or
+    /// `runtime_name` is missing from the JSON.
+    pub fn parse_ipc_token_usage(&self) -> Option<IpcTokenUsage> {
+        let json = self.ipc_result.as_ref()?;
+        let tu = json.get("token_usage")?;
+        if tu.is_null() {
+            return None;
+        }
+        let runtime_name = json.get("runtime_name")?.as_str()?;
+        if runtime_name.is_empty() {
+            return None;
+        }
+
+        let input_tokens = tu.get("input_tokens")?.as_u64()?;
+        let output_tokens = tu.get("output_tokens")?.as_u64()?;
+        let cache_read_tokens = tu.get("cache_read_tokens").and_then(|v| v.as_u64());
+        let cache_write_tokens = tu.get("cache_write_tokens").and_then(|v| v.as_u64());
+
+        let model = json
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let duration_ms = json.get("duration_ms").and_then(|v| v.as_u64());
+
+        Some(IpcTokenUsage {
+            token_usage: TokenUsage {
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cache_write_tokens,
+            },
+            runtime_name: runtime_name.to_string(),
+            model,
+            duration_ms,
+        })
     }
 }
 
@@ -1759,5 +1813,166 @@ exit {exit_code}
         );
         let child_output = result.unwrap().unwrap();
         assert_eq!(child_output.status.code().unwrap(), 0);
+    }
+
+    // --- Tests for parse_ipc_token_usage ---
+
+    #[test]
+    fn parse_ipc_token_usage_extracts_full_fields() {
+        let json = serde_json::json!({
+            "exit_code": 0,
+            "token_usage": {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "cache_read_tokens": 50,
+                "cache_write_tokens": 25,
+            },
+            "runtime_name": "claude",
+            "model": "opus-4",
+            "duration_ms": 3200,
+        });
+        let result = EvaluateResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            action_result: None,
+            ipc_result: Some(json),
+        };
+
+        let ipc_usage = result
+            .parse_ipc_token_usage()
+            .expect("should parse token usage from IPC JSON");
+        assert_eq!(ipc_usage.token_usage.input_tokens, 1000);
+        assert_eq!(ipc_usage.token_usage.output_tokens, 500);
+        assert_eq!(ipc_usage.token_usage.cache_read_tokens, Some(50));
+        assert_eq!(ipc_usage.token_usage.cache_write_tokens, Some(25));
+        assert_eq!(ipc_usage.runtime_name, "claude");
+        assert_eq!(ipc_usage.model.as_deref(), Some("opus-4"));
+        assert_eq!(ipc_usage.duration_ms, Some(3200));
+    }
+
+    #[test]
+    fn parse_ipc_token_usage_returns_none_without_ipc_result() {
+        let result = EvaluateResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            action_result: None,
+            ipc_result: None,
+        };
+        assert!(result.parse_ipc_token_usage().is_none());
+    }
+
+    #[test]
+    fn parse_ipc_token_usage_returns_none_when_token_usage_null() {
+        let json = serde_json::json!({
+            "exit_code": 0,
+            "token_usage": null,
+            "runtime_name": "claude",
+        });
+        let result = EvaluateResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            action_result: None,
+            ipc_result: Some(json),
+        };
+        assert!(result.parse_ipc_token_usage().is_none());
+    }
+
+    #[test]
+    fn parse_ipc_token_usage_returns_none_when_runtime_name_missing() {
+        let json = serde_json::json!({
+            "exit_code": 0,
+            "token_usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+            },
+        });
+        let result = EvaluateResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            action_result: None,
+            ipc_result: Some(json),
+        };
+        assert!(result.parse_ipc_token_usage().is_none());
+    }
+
+    #[test]
+    fn parse_ipc_token_usage_returns_none_when_runtime_name_empty() {
+        let json = serde_json::json!({
+            "exit_code": 0,
+            "token_usage": {
+                "input_tokens": 100,
+                "output_tokens": 50,
+            },
+            "runtime_name": "",
+        });
+        let result = EvaluateResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            action_result: None,
+            ipc_result: Some(json),
+        };
+        assert!(result.parse_ipc_token_usage().is_none());
+    }
+
+    #[test]
+    fn parse_ipc_token_usage_handles_optional_cache_tokens() {
+        let json = serde_json::json!({
+            "exit_code": 0,
+            "token_usage": {
+                "input_tokens": 200,
+                "output_tokens": 100,
+                "cache_read_tokens": null,
+                "cache_write_tokens": null,
+            },
+            "runtime_name": "gemini",
+            "duration_ms": 1500,
+        });
+        let result = EvaluateResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            action_result: None,
+            ipc_result: Some(json),
+        };
+
+        let ipc_usage = result
+            .parse_ipc_token_usage()
+            .expect("should parse even with null cache tokens");
+        assert_eq!(ipc_usage.token_usage.input_tokens, 200);
+        assert_eq!(ipc_usage.token_usage.output_tokens, 100);
+        assert!(ipc_usage.token_usage.cache_read_tokens.is_none());
+        assert!(ipc_usage.token_usage.cache_write_tokens.is_none());
+        assert_eq!(ipc_usage.runtime_name, "gemini");
+        assert!(ipc_usage.model.is_none());
+    }
+
+    #[test]
+    fn parse_ipc_token_usage_without_model_and_duration() {
+        let json = serde_json::json!({
+            "token_usage": {
+                "input_tokens": 50,
+                "output_tokens": 25,
+            },
+            "runtime_name": "codex",
+        });
+        let result = EvaluateResult {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            action_result: None,
+            ipc_result: Some(json),
+        };
+
+        let ipc_usage = result
+            .parse_ipc_token_usage()
+            .expect("should parse without model and duration");
+        assert_eq!(ipc_usage.runtime_name, "codex");
+        assert!(ipc_usage.model.is_none());
+        assert!(ipc_usage.duration_ms.is_none());
     }
 }

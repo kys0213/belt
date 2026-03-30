@@ -535,6 +535,8 @@ pub async fn run_agent(
                         "cache_read_tokens": u.cache_read_tokens,
                         "cache_write_tokens": u.cache_write_tokens,
                     })),
+                    "runtime_name": action_result.runtime_name,
+                    "model": action_result.model,
                 });
                 println!("{}", serde_json::to_string_pretty(&output)?);
             } else {

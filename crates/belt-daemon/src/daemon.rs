@@ -1596,7 +1596,20 @@ impl Daemon {
                     Err(e) => Err(e),
                 }
             } else {
-                self.evaluator.run_evaluate(&self.belt_home).await
+                let result = self.evaluator.run_evaluate(&self.belt_home).await;
+
+                // Parse and record token usage from subprocess IPC JSON output.
+                if let Ok(ref eval_result) = result
+                    && let Some(ref ipc_usage) = eval_result.parse_ipc_token_usage()
+                {
+                    for work_id in &completed {
+                        if let Some(item) = self.queue.iter().find(|i| i.work_id == *work_id) {
+                            self.try_record_ipc_token_usage(item, ipc_usage);
+                        }
+                    }
+                }
+
+                result
             }
         };
 
@@ -2221,6 +2234,41 @@ impl Daemon {
                     item.work_id,
                     usage.input_tokens,
                     usage.output_tokens
+                );
+            }
+        }
+    }
+
+    /// Record token usage parsed from evaluate subprocess IPC JSON output.
+    ///
+    /// When the evaluate subprocess runs via `belt agent --json`, the stdout
+    /// JSON may contain `token_usage`, `runtime_name`, and `model` fields.
+    /// This method extracts those and records them to the DB.
+    fn try_record_ipc_token_usage(
+        &self,
+        item: &QueueItem,
+        ipc_usage: &crate::evaluator::IpcTokenUsage,
+    ) {
+        if let Some(ref db) = self.db {
+            let model = ipc_usage.model.as_deref().unwrap_or("unknown");
+            if let Err(e) = db.record_token_usage(
+                &item.work_id,
+                &self.config.name,
+                &ipc_usage.runtime_name,
+                model,
+                &ipc_usage.token_usage,
+                ipc_usage.duration_ms,
+            ) {
+                tracing::warn!(
+                    "failed to record evaluate IPC token usage for {}: {e}",
+                    item.work_id
+                );
+            } else {
+                tracing::debug!(
+                    "recorded evaluate IPC token usage for {}: input={}, output={}",
+                    item.work_id,
+                    ipc_usage.token_usage.input_tokens,
+                    ipc_usage.token_usage.output_tokens
                 );
             }
         }
@@ -4461,6 +4509,84 @@ sources:
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].model, "unknown");
+    }
+
+    // ---------------------------------------------------------------
+    // IPC token usage recording tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn try_record_ipc_token_usage_saves_to_db() {
+        use belt_core::runtime::TokenUsage;
+        use belt_infra::db::Database;
+
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let db = Database::open_in_memory().unwrap();
+        let daemon = setup_daemon(&tmp, source, vec![]).with_db(db);
+
+        let item = test_item("github:org/repo#10", "analyze");
+        let ipc_usage = crate::evaluator::IpcTokenUsage {
+            token_usage: TokenUsage {
+                input_tokens: 800,
+                output_tokens: 400,
+                cache_read_tokens: Some(30),
+                cache_write_tokens: None,
+            },
+            runtime_name: "claude".to_string(),
+            model: Some("opus-4".to_string()),
+            duration_ms: Some(2500),
+        };
+
+        daemon.try_record_ipc_token_usage(&item, &ipc_usage);
+
+        let rows = daemon
+            .db
+            .as_ref()
+            .unwrap()
+            .get_token_usage_by_work_id("github:org/repo#10:analyze")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].input_tokens, 800);
+        assert_eq!(rows[0].output_tokens, 400);
+        assert_eq!(rows[0].model, "opus-4");
+        assert_eq!(rows[0].runtime, "claude");
+    }
+
+    #[test]
+    fn try_record_ipc_token_usage_uses_unknown_model_when_absent() {
+        use belt_core::runtime::TokenUsage;
+        use belt_infra::db::Database;
+
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let db = Database::open_in_memory().unwrap();
+        let daemon = setup_daemon(&tmp, source, vec![]).with_db(db);
+
+        let item = test_item("github:org/repo#11", "analyze");
+        let ipc_usage = crate::evaluator::IpcTokenUsage {
+            token_usage: TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+            },
+            runtime_name: "gemini".to_string(),
+            model: None,
+            duration_ms: None,
+        };
+
+        daemon.try_record_ipc_token_usage(&item, &ipc_usage);
+
+        let rows = daemon
+            .db
+            .as_ref()
+            .unwrap()
+            .get_token_usage_by_work_id("github:org/repo#11:analyze")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].model, "unknown");
+        assert_eq!(rows[0].runtime, "gemini");
     }
 
     // ---------------------------------------------------------------
