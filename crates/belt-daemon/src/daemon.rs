@@ -2087,19 +2087,30 @@ impl Daemon {
                 }
 
                 // Persist worktree state to DB so it survives restart.
-                if let Some(db) = &self.db
-                    && let Err(e) = db.update_item_worktree_state(
+                // Items collected from DataSource live in-memory only and may
+                // not yet exist in the DB. Ensure the row exists before updating.
+                if let Some(db) = &self.db {
+                    if db.get_item(&item.work_id).is_err()
+                        && let Err(e) = db.insert_item(item)
+                    {
+                        tracing::warn!(
+                            work_id = %item.work_id,
+                            error = %e,
+                            "failed to insert item into DB during rollback"
+                        );
+                    }
+                    if let Err(e) = db.update_item_worktree_state(
                         &item.work_id,
                         QueuePhase::Pending,
                         item.worktree_preserved,
                         item.previous_worktree_path.as_deref(),
-                    )
-                {
-                    tracing::warn!(
-                        work_id = %item.work_id,
-                        error = %e,
-                        "failed to persist worktree state to DB during rollback"
-                    );
+                    ) {
+                        tracing::warn!(
+                            work_id = %item.work_id,
+                            error = %e,
+                            "failed to persist worktree state to DB during rollback"
+                        );
+                    }
                 }
 
                 self.tracker.release(&ws_name);
@@ -4690,6 +4701,94 @@ sources:
                     .is_some_and(|err| err.contains("forced shutdown via second SIGINT"))
             );
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Worktree continuity across graceful shutdown (issue #679)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn rollback_inserts_item_into_db_when_not_present() {
+        // Items collected from DataSource live in-memory only.
+        // rollback_running_to_pending must insert the item into the DB
+        // before updating its worktree state so the path survives restart.
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![]);
+
+        let db = Database::open_in_memory().unwrap();
+        let mut daemon = daemon.with_db(db);
+
+        // Create the worktree directory so rollback registers it.
+        let ws_path = daemon.worktree_mgr.path("test-ws");
+        std::fs::create_dir_all(&ws_path).unwrap();
+
+        let mut item = test_item("github:org/repo#99", "analyze");
+        item.phase = QueuePhase::Running;
+        daemon.push_item(item);
+
+        // Item is NOT in the DB yet (only in-memory queue).
+        assert!(
+            daemon
+                .db
+                .as_ref()
+                .unwrap()
+                .get_item("github:org/repo#99:analyze")
+                .is_err()
+        );
+
+        daemon.rollback_running_to_pending();
+
+        // After rollback, item should exist in DB with previous_worktree_path.
+        let db_item = daemon
+            .db
+            .as_ref()
+            .unwrap()
+            .get_item("github:org/repo#99:analyze")
+            .expect("item should be inserted into DB during rollback");
+        assert_eq!(db_item.phase, QueuePhase::Pending);
+        assert!(db_item.worktree_preserved);
+        assert_eq!(
+            db_item.previous_worktree_path.as_deref(),
+            Some(ws_path.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn rollback_updates_existing_db_item_worktree_state() {
+        // When the item already exists in the DB (e.g., from a cron job),
+        // rollback should update its worktree state without inserting a
+        // duplicate.
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![]);
+
+        let db = Database::open_in_memory().unwrap();
+        // Pre-insert the item into DB.
+        let pre_item = test_item("github:org/repo#100", "analyze");
+        db.insert_item(&pre_item).unwrap();
+        let mut daemon = daemon.with_db(db);
+
+        // Create the worktree directory so rollback registers it.
+        let ws_path = daemon.worktree_mgr.path("test-ws");
+        std::fs::create_dir_all(&ws_path).unwrap();
+
+        let mut item = test_item("github:org/repo#100", "analyze");
+        item.phase = QueuePhase::Running;
+        daemon.push_item(item);
+
+        daemon.rollback_running_to_pending();
+
+        // DB should have the updated worktree state.
+        let db_item = daemon
+            .db
+            .as_ref()
+            .unwrap()
+            .get_item("github:org/repo#100:analyze")
+            .unwrap();
+        assert_eq!(db_item.phase, QueuePhase::Pending);
+        assert!(db_item.worktree_preserved);
+        assert!(db_item.previous_worktree_path.is_some());
     }
 
     // ---------------------------------------------------------------
