@@ -5344,7 +5344,7 @@ sources:
         assert_eq!(proposed.len(), 3);
 
         // Step 3: Store decomposed_issues (simulating GitHub issue creation).
-        let child_numbers = vec!["801".to_string(), "802".to_string(), "803".to_string()];
+        let child_numbers = ["801".to_string(), "802".to_string(), "803".to_string()];
         spec.decomposed_issues = Some(child_numbers.join(","));
         db.update_spec(&spec).unwrap();
 
