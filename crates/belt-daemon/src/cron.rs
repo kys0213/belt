@@ -1256,15 +1256,73 @@ impl GapDetectionJob {
     }
 }
 
-/// Check whether all linked GitHub issues for a spec are in a closed/done state.
+/// Check whether a single GitHub issue reference is in a closed state.
 ///
-/// Iterates over the spec's linked targets (from the `spec_links` table).
-/// For each target that looks like a GitHub issue reference (contains `#`),
-/// queries the `gh` CLI to check whether the issue is closed.
+/// Uses `gh issue view` to query the issue state. Returns `true` when the
+/// issue is closed, `false` otherwise (including on error — safe default).
+fn is_github_issue_closed(spec_id: &str, issue_ref: &str) -> bool {
+    let result = std::process::Command::new("gh")
+        .args([
+            "issue", "view", issue_ref, "--json", "state", "--jq", ".state",
+        ])
+        .output();
+
+    match result {
+        Ok(output) if output.status.success() => {
+            let state = String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .to_uppercase();
+            if state != "CLOSED" {
+                tracing::info!(
+                    spec_id = %spec_id,
+                    issue = %issue_ref,
+                    state = %state,
+                    "linked issue is not closed"
+                );
+                return false;
+            }
+            true
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            tracing::warn!(
+                spec_id = %spec_id,
+                issue = %issue_ref,
+                stderr = %stderr.trim(),
+                "failed to check linked issue status, treating as not-done"
+            );
+            false
+        }
+        Err(e) => {
+            tracing::warn!(
+                spec_id = %spec_id,
+                error = %e,
+                "failed to invoke gh CLI for linked issue check"
+            );
+            // When gh is unavailable, err on safe side: do not auto-advance.
+            false
+        }
+    }
+}
+
+/// Check whether all linked and decomposed GitHub issues for a spec are in
+/// a closed/done state.
 ///
-/// Returns `true` when there are no linked issues or all linked issues are closed.
-/// Returns `false` if any linked issue is still open.
+/// This performs two checks:
+///
+/// 1. **Spec links** — iterates over the spec's linked targets (from the
+///    `spec_links` table). For each target that looks like a GitHub issue
+///    reference (contains `#` or `/issues/`), queries the `gh` CLI to check
+///    whether the issue is closed.
+///
+/// 2. **Decomposed issues** — if the spec has `decomposed_issues` set
+///    (comma-separated issue numbers), verifies that every decomposed issue
+///    is closed via `gh issue view`.
+///
+/// Returns `true` when there are no linked/decomposed issues or all are
+/// closed. Returns `false` if any issue is still open.
 fn all_linked_issues_done(db: &Database, spec_id: &str) -> bool {
+    // --- Part 1: Check spec_links ---
     let links = match db.list_spec_links(spec_id) {
         Ok(links) => links,
         Err(e) => {
@@ -1276,11 +1334,6 @@ fn all_linked_issues_done(db: &Database, spec_id: &str) -> bool {
             return false;
         }
     };
-
-    // If no linked issues, condition is satisfied.
-    if links.is_empty() {
-        return true;
-    }
 
     for link in &links {
         let target = &link.target;
@@ -1317,45 +1370,39 @@ fn all_linked_issues_done(db: &Database, spec_id: &str) -> bool {
             target.clone()
         };
 
-        // Use `gh issue view` to check status.
-        let result = std::process::Command::new("gh")
-            .args([
-                "issue", "view", &issue_ref, "--json", "state", "--jq", ".state",
-            ])
-            .output();
+        if !is_github_issue_closed(spec_id, &issue_ref) {
+            return false;
+        }
+    }
 
-        match result {
-            Ok(output) if output.status.success() => {
-                let state = String::from_utf8_lossy(&output.stdout)
-                    .trim()
-                    .to_uppercase();
-                if state != "CLOSED" {
-                    tracing::info!(
-                        spec_id = %spec_id,
-                        issue = %issue_ref,
-                        state = %state,
-                        "linked issue is not closed"
-                    );
-                    return false;
-                }
-            }
-            Ok(output) => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                tracing::warn!(
+    // --- Part 2: Check decomposed issues ---
+    let spec = match db.get_spec(spec_id) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                spec_id = %spec_id,
+                error = %e,
+                "failed to load spec for decomposed issues check, treating as not-all-done"
+            );
+            return false;
+        }
+    };
+
+    let decomposed_numbers = spec.decomposed_issue_numbers();
+    if !decomposed_numbers.is_empty() {
+        tracing::debug!(
+            spec_id = %spec_id,
+            decomposed = ?decomposed_numbers,
+            "checking decomposed issues for completion"
+        );
+
+        for issue_number in &decomposed_numbers {
+            if !is_github_issue_closed(spec_id, issue_number) {
+                tracing::info!(
                     spec_id = %spec_id,
-                    issue = %issue_ref,
-                    stderr = %stderr.trim(),
-                    "failed to check linked issue status, treating as not-done"
+                    issue_number = %issue_number,
+                    "decomposed issue is not closed"
                 );
-                return false;
-            }
-            Err(e) => {
-                tracing::warn!(
-                    spec_id = %spec_id,
-                    error = %e,
-                    "failed to invoke gh CLI for linked issue check"
-                );
-                // When gh is unavailable, err on safe side: do not auto-advance.
                 return false;
             }
         }
@@ -1861,9 +1908,9 @@ impl CronHandler for GapDetectionJob {
             }
         }
 
-        // Step 5: For fully-covered specs, verify linked issues are all Done,
-        // then transition Active -> Completing, run test commands, and create
-        // HITL items for final confirmation.
+        // Step 5: For fully-covered specs, verify linked and decomposed issues
+        // are all Done, then transition Active -> Completing, run test commands,
+        // and create HITL items for final confirmation.
         let mut completing_count = 0usize;
         for spec_id in covered_spec_ids {
             // Skip if there is already an open queue item for this spec
@@ -1876,11 +1923,11 @@ impl CronHandler for GapDetectionJob {
                 continue;
             }
 
-            // 5a: Check all linked GitHub issues are closed/done.
+            // 5a: Check all linked and decomposed GitHub issues are closed/done.
             if !all_linked_issues_done(&self.db, spec_id) {
                 tracing::info!(
                     spec_id = %spec_id,
-                    "GapDetectionJob: skipping spec — not all linked issues are done"
+                    "GapDetectionJob: skipping spec — not all linked/decomposed issues are done"
                 );
                 continue;
             }
@@ -1900,7 +1947,7 @@ impl CronHandler for GapDetectionJob {
 
             tracing::info!(
                 spec_id = %spec_id,
-                "GapDetectionJob: spec transitioned to Completing (no gaps, all linked issues done)"
+                "GapDetectionJob: spec transitioned to Completing (no gaps, all linked/decomposed issues done)"
             );
             completing_count += 1;
 
@@ -6274,6 +6321,25 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         );
     }
 
+    // -- all_linked_issues_done tests --
+
+    #[test]
+    fn all_linked_issues_done_returns_true_when_no_links_and_no_decomposed() {
+        let db = Database::open_in_memory().unwrap();
+        let spec = belt_core::spec::Spec::new(
+            "spec-no-links".into(),
+            "ws".into(),
+            "No Links".into(),
+            "a spec with no links".into(),
+        );
+        db.insert_spec(&spec).unwrap();
+
+        assert!(
+            all_linked_issues_done(&db, "spec-no-links"),
+            "should return true when no links and no decomposed issues"
+        );
+    }
+
     #[test]
     fn gap_detection_execute_no_issue_when_all_specs_covered() {
         // When all active specs are fully covered, execute() should skip
@@ -6378,6 +6444,28 @@ fn middleware(request: Request, secret: &[u8], rules: &[Rule]) -> Response {
         assert!(
             job.execute(&ctx).is_ok(),
             "execute should succeed when no gaps exist",
+        );
+    }
+
+    #[test]
+    fn all_linked_issues_done_returns_false_when_decomposed_issues_present() {
+        // When decomposed issues are set, the function attempts to check them
+        // via `gh issue view`. In the test environment `gh` is typically not
+        // available or has no repo context, so `is_github_issue_closed` will
+        // return false — the safe default.
+        let db = Database::open_in_memory().unwrap();
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-decomposed".into(),
+            "ws".into(),
+            "Decomposed".into(),
+            "a spec with decomposed issues".into(),
+        );
+        spec.decomposed_issues = Some("100,101".to_string());
+        db.insert_spec(&spec).unwrap();
+
+        assert!(
+            !all_linked_issues_done(&db, "spec-decomposed"),
+            "should return false when decomposed issues cannot be verified as closed"
         );
     }
 
@@ -6580,6 +6668,18 @@ fn middleware(request: Request, secret: &[u8], rules: &[Rule]) -> Response {
         assert!(
             job.execute(&ctx).is_ok(),
             "execute should succeed when no Active specs exist",
+        );
+    }
+
+    #[test]
+    fn all_linked_issues_done_returns_false_when_spec_not_found() {
+        let db = Database::open_in_memory().unwrap();
+        // Spec "nonexistent" does not exist in the DB.
+        // The function should fail to load the spec and return false.
+        // First, we need no spec links to pass the first check.
+        assert!(
+            !all_linked_issues_done(&db, "nonexistent"),
+            "should return false when spec cannot be loaded"
         );
     }
 }
