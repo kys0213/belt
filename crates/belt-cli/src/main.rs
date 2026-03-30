@@ -4807,4 +4807,601 @@ sources:
         let final_item = db.get_item("retry-timeout-1").unwrap();
         assert_eq!(final_item.phase, QueuePhase::Failed);
     }
+
+    // --- Spec decompose: build_decomposed_issues_from_llm tests ---
+
+    /// Verify that build_decomposed_issues_from_llm produces correct titles,
+    /// bodies, and parent references from structured LLM output.
+    #[test]
+    fn decompose_from_llm_structured_output() {
+        use belt_core::spec::{LlmDecomposedIssue, build_decomposed_issues_from_llm};
+
+        let llm_issues = vec![
+            LlmDecomposedIssue {
+                title: "Add OAuth2 token refresh endpoint".to_string(),
+                description: "Implement the /auth/refresh endpoint.".to_string(),
+                acceptance_criteria: vec![
+                    "Refresh token is validated".to_string(),
+                    "New access token is issued".to_string(),
+                ],
+            },
+            LlmDecomposedIssue {
+                title: "Add logout endpoint".to_string(),
+                description: "Clear session on logout.".to_string(),
+                acceptance_criteria: vec!["Session is invalidated".to_string()],
+            },
+        ];
+
+        let issues = build_decomposed_issues_from_llm(&llm_issues, Some("99"));
+        assert_eq!(issues.len(), 2);
+
+        // Title format: [sub] #<parent> AC<index>: <title>
+        assert!(issues[0].title.contains("#99"));
+        assert!(issues[0].title.contains("AC1"));
+        assert!(
+            issues[0]
+                .title
+                .contains("Add OAuth2 token refresh endpoint")
+        );
+
+        assert!(issues[1].title.contains("AC2"));
+        assert!(issues[1].title.contains("Add logout endpoint"));
+
+        // Body includes parent reference.
+        assert!(issues[0].body.contains("Parent: #99"));
+        assert!(issues[1].body.contains("Parent: #99"));
+
+        // Body includes description.
+        assert!(
+            issues[0]
+                .body
+                .contains("Implement the /auth/refresh endpoint.")
+        );
+        assert!(issues[1].body.contains("Clear session on logout."));
+
+        // Body includes acceptance criteria as checklist.
+        assert!(issues[0].body.contains("- [ ] Refresh token is validated"));
+        assert!(issues[0].body.contains("- [ ] New access token is issued"));
+        assert!(issues[1].body.contains("- [ ] Session is invalidated"));
+
+        // Criterion field stores the LLM title.
+        assert_eq!(issues[0].criterion, "Add OAuth2 token refresh endpoint");
+    }
+
+    /// Verify build_decomposed_issues_from_llm without parent number uses
+    /// placeholder text.
+    #[test]
+    fn decompose_from_llm_without_parent_number() {
+        use belt_core::spec::{LlmDecomposedIssue, build_decomposed_issues_from_llm};
+
+        let llm_issues = vec![LlmDecomposedIssue {
+            title: "Setup CI pipeline".to_string(),
+            description: "Configure GitHub Actions.".to_string(),
+            acceptance_criteria: vec![],
+        }];
+
+        let issues = build_decomposed_issues_from_llm(&llm_issues, None);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].title.contains("#?"));
+        assert!(issues[0].body.contains("Parent: (pending)"));
+        // Empty acceptance_criteria should not produce an AC section.
+        assert!(!issues[0].body.contains("## Acceptance Criteria"));
+    }
+
+    /// Verify build_decomposed_issues_from_llm with empty input returns empty vec.
+    #[test]
+    fn decompose_from_llm_empty_input() {
+        use belt_core::spec::build_decomposed_issues_from_llm;
+
+        let issues = build_decomposed_issues_from_llm(&[], Some("1"));
+        assert!(issues.is_empty());
+    }
+
+    // --- Spec collect: all_decomposed_issues_closed tests ---
+
+    /// Verify all_decomposed_issues_closed returns true when all issues are closed.
+    #[test]
+    fn collect_all_decomposed_issues_closed_all_closed() {
+        let states = vec![
+            ("101".to_string(), true),
+            ("102".to_string(), true),
+            ("103".to_string(), true),
+        ];
+        assert!(belt_core::spec::all_decomposed_issues_closed(&states));
+    }
+
+    /// Verify all_decomposed_issues_closed returns false when any issue is open.
+    #[test]
+    fn collect_all_decomposed_issues_closed_some_open() {
+        let states = vec![
+            ("101".to_string(), true),
+            ("102".to_string(), false),
+            ("103".to_string(), true),
+        ];
+        assert!(!belt_core::spec::all_decomposed_issues_closed(&states));
+    }
+
+    /// Verify all_decomposed_issues_closed returns false for empty input.
+    #[test]
+    fn collect_all_decomposed_issues_closed_empty() {
+        let states: Vec<(String, bool)> = vec![];
+        assert!(!belt_core::spec::all_decomposed_issues_closed(&states));
+    }
+
+    // --- Spec lifecycle: full transition chain tests ---
+
+    /// Verify the full spec lifecycle: Draft -> Active -> Paused -> Active ->
+    /// Completing -> Completed, with DB persistence at each step.
+    #[test]
+    fn spec_lifecycle_full_transition_chain() {
+        use belt_core::spec::{Spec, SpecStatus};
+
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+        let id = "spec-lifecycle-full";
+        let mut spec = Spec::new(
+            id.to_string(),
+            "ws-lifecycle".to_string(),
+            "Lifecycle Test".to_string(),
+            "## Overview\nTest.\n\n## Acceptance Criteria\n- Done".to_string(),
+        );
+        db.insert_spec(&spec).unwrap();
+        assert_eq!(spec.status, SpecStatus::Draft);
+
+        // Draft -> Active
+        spec.transition_to(SpecStatus::Active).unwrap();
+        db.update_spec_status(&spec.id, spec.status).unwrap();
+        let stored = db.get_spec(id).unwrap();
+        assert_eq!(stored.status, SpecStatus::Active);
+
+        // Active -> Paused
+        spec.transition_to(SpecStatus::Paused).unwrap();
+        db.update_spec_status(&spec.id, spec.status).unwrap();
+        let stored = db.get_spec(id).unwrap();
+        assert_eq!(stored.status, SpecStatus::Paused);
+
+        // Paused -> Active (resume)
+        spec.transition_to(SpecStatus::Active).unwrap();
+        db.update_spec_status(&spec.id, spec.status).unwrap();
+        let stored = db.get_spec(id).unwrap();
+        assert_eq!(stored.status, SpecStatus::Active);
+
+        // Active -> Completing
+        spec.transition_to(SpecStatus::Completing).unwrap();
+        db.update_spec_status(&spec.id, spec.status).unwrap();
+        let stored = db.get_spec(id).unwrap();
+        assert_eq!(stored.status, SpecStatus::Completing);
+
+        // Completing -> Completed
+        spec.transition_to(SpecStatus::Completed).unwrap();
+        db.update_spec_status(&spec.id, spec.status).unwrap();
+        let stored = db.get_spec(id).unwrap();
+        assert_eq!(stored.status, SpecStatus::Completed);
+
+        // Completed is terminal.
+        assert!(stored.status.is_terminal());
+    }
+
+    /// Verify that invalid spec transitions are rejected.
+    #[test]
+    fn spec_lifecycle_invalid_transitions() {
+        use belt_core::spec::{Spec, SpecStatus};
+
+        let mut spec = Spec::new(
+            "spec-invalid".to_string(),
+            "ws".to_string(),
+            "Invalid".to_string(),
+            "content".to_string(),
+        );
+        assert_eq!(spec.status, SpecStatus::Draft);
+
+        // Draft -> Completed is not valid (must go through Active, Completing).
+        assert!(spec.transition_to(SpecStatus::Completed).is_err());
+        // Draft -> Paused is not valid.
+        assert!(spec.transition_to(SpecStatus::Paused).is_err());
+        // Draft -> Completing is not valid.
+        assert!(spec.transition_to(SpecStatus::Completing).is_err());
+
+        // Transition to Active first.
+        spec.transition_to(SpecStatus::Active).unwrap();
+        // Active -> Completed is not valid (must go through Completing).
+        assert!(spec.transition_to(SpecStatus::Completed).is_err());
+    }
+
+    /// Verify Completing -> Active rollback transition (gap found during re-check).
+    #[test]
+    fn spec_lifecycle_completing_rollback_to_active() {
+        use belt_core::spec::{Spec, SpecStatus};
+
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+        let id = "spec-rollback";
+        let mut spec = Spec::new(
+            id.to_string(),
+            "ws-rb".to_string(),
+            "Rollback".to_string(),
+            "content".to_string(),
+        );
+        db.insert_spec(&spec).unwrap();
+
+        // Draft -> Active -> Completing
+        spec.transition_to(SpecStatus::Active).unwrap();
+        spec.transition_to(SpecStatus::Completing).unwrap();
+        db.update_spec_status(&spec.id, spec.status).unwrap();
+        assert_eq!(db.get_spec(id).unwrap().status, SpecStatus::Completing);
+
+        // Completing -> Active (rollback due to gap or test failure)
+        spec.transition_to(SpecStatus::Active).unwrap();
+        db.update_spec_status(&spec.id, spec.status).unwrap();
+        assert_eq!(db.get_spec(id).unwrap().status, SpecStatus::Active);
+    }
+
+    /// Verify archive transition from various states.
+    #[test]
+    fn spec_lifecycle_archive_from_multiple_states() {
+        use belt_core::spec::{Spec, SpecStatus};
+
+        // Draft -> Archived
+        let mut s1 = Spec::new(
+            "s1".to_string(),
+            "ws".to_string(),
+            "S1".to_string(),
+            "c".to_string(),
+        );
+        assert!(s1.transition_to(SpecStatus::Archived).is_ok());
+
+        // Active -> Archived
+        let mut s2 = Spec::new(
+            "s2".to_string(),
+            "ws".to_string(),
+            "S2".to_string(),
+            "c".to_string(),
+        );
+        s2.transition_to(SpecStatus::Active).unwrap();
+        assert!(s2.transition_to(SpecStatus::Archived).is_ok());
+
+        // Paused -> Archived
+        let mut s3 = Spec::new(
+            "s3".to_string(),
+            "ws".to_string(),
+            "S3".to_string(),
+            "c".to_string(),
+        );
+        s3.transition_to(SpecStatus::Active).unwrap();
+        s3.transition_to(SpecStatus::Paused).unwrap();
+        assert!(s3.transition_to(SpecStatus::Archived).is_ok());
+
+        // Archived -> Active (restore)
+        assert!(s3.transition_to(SpecStatus::Active).is_ok());
+    }
+
+    // --- Spec decompose: acceptance criteria extraction edge cases ---
+
+    /// Verify extract_acceptance_criteria handles asterisk bullets.
+    #[test]
+    fn decompose_extract_ac_with_asterisk_bullets() {
+        let content = "\
+## Overview\nFeature.\n\n\
+## Acceptance Criteria\n\
+* First criterion\n\
+* Second criterion\n\n\
+## Notes\nEnd.";
+        let criteria = belt_core::spec::extract_acceptance_criteria(content);
+        assert_eq!(criteria.len(), 2);
+        assert_eq!(criteria[0], "First criterion");
+        assert_eq!(criteria[1], "Second criterion");
+    }
+
+    /// Verify extract_acceptance_criteria handles short "AC" header.
+    #[test]
+    fn decompose_extract_ac_with_short_header() {
+        let content = "## AC\n- Criterion A\n- Criterion B";
+        let criteria = belt_core::spec::extract_acceptance_criteria(content);
+        assert_eq!(criteria.len(), 2);
+        assert_eq!(criteria[0], "Criterion A");
+        assert_eq!(criteria[1], "Criterion B");
+    }
+
+    /// Verify extract_acceptance_criteria stops at the next section heading.
+    #[test]
+    fn decompose_extract_ac_stops_at_next_section() {
+        let content = "\
+## Acceptance Criteria\n\
+- AC one\n\
+- AC two\n\
+## Implementation\n\
+- This is not an AC";
+        let criteria = belt_core::spec::extract_acceptance_criteria(content);
+        assert_eq!(criteria.len(), 2);
+    }
+
+    /// Verify extract_acceptance_criteria skips empty bullet lines.
+    #[test]
+    fn decompose_extract_ac_skips_empty_bullets() {
+        let content = "## Acceptance Criteria\n- \n- Valid AC\n-  \n- Another AC";
+        let criteria = belt_core::spec::extract_acceptance_criteria(content);
+        assert_eq!(criteria.len(), 2);
+        assert_eq!(criteria[0], "Valid AC");
+        assert_eq!(criteria[1], "Another AC");
+    }
+
+    // --- Spec decompose: format_decomposition_preview tests ---
+
+    /// Verify format_decomposition_preview with LLM-generated issues.
+    #[test]
+    fn decompose_preview_format_with_llm_issues() {
+        use belt_core::spec::{LlmDecomposedIssue, build_decomposed_issues_from_llm};
+
+        let llm_issues = vec![
+            LlmDecomposedIssue {
+                title: "Setup database".to_string(),
+                description: "Create schema.".to_string(),
+                acceptance_criteria: vec!["Schema created".to_string()],
+            },
+            LlmDecomposedIssue {
+                title: "Add API routes".to_string(),
+                description: "REST endpoints.".to_string(),
+                acceptance_criteria: vec![],
+            },
+        ];
+
+        let issues = build_decomposed_issues_from_llm(&llm_issues, Some("50"));
+        let preview = belt_core::spec::format_decomposition_preview(&issues);
+
+        assert!(preview.contains("2 child issue(s)"));
+        assert!(preview.contains("AC1"));
+        assert!(preview.contains("AC2"));
+        assert!(preview.contains("Setup database"));
+        assert!(preview.contains("Add API routes"));
+    }
+
+    // --- Spec collect: decomposed spec readiness check with DB ---
+
+    /// Integration test: verify that decomposed spec transitions to Completing
+    /// only when all child issues are closed.
+    #[test]
+    fn collect_decomposed_spec_completing_readiness() {
+        use belt_core::spec::{Spec, SpecStatus};
+
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+        let id = "spec-collect-ready";
+        let mut spec = Spec::new(
+            id.to_string(),
+            "ws-collect".to_string(),
+            "Collect Test".to_string(),
+            "## Acceptance Criteria\n- Task A\n- Task B".to_string(),
+        );
+        spec.decomposed_issues = Some("701,702".to_string());
+        db.insert_spec(&spec).unwrap();
+        spec.transition_to(SpecStatus::Active).unwrap();
+        db.update_spec_status(&spec.id, spec.status).unwrap();
+
+        // Simulate: one issue open, one closed.
+        let states_partial = vec![("701".to_string(), true), ("702".to_string(), false)];
+        assert!(!belt_core::spec::all_decomposed_issues_closed(
+            &states_partial
+        ));
+        // Spec should NOT transition to Completing yet.
+
+        // Simulate: all issues closed.
+        let states_all = vec![("701".to_string(), true), ("702".to_string(), true)];
+        assert!(belt_core::spec::all_decomposed_issues_closed(&states_all));
+
+        // Now spec can transition to Completing.
+        spec.transition_to(SpecStatus::Completing).unwrap();
+        db.update_spec_status(&spec.id, spec.status).unwrap();
+        assert_eq!(db.get_spec(id).unwrap().status, SpecStatus::Completing);
+    }
+
+    // --- Spec decompose: extract_issue_number edge cases ---
+
+    /// Verify extract_issue_number returns None for non-numeric trailing segment.
+    #[test]
+    fn decompose_extract_issue_number_non_numeric() {
+        assert_eq!(
+            extract_issue_number("https://github.com/o/r/issues/abc"),
+            None
+        );
+    }
+
+    /// Verify extract_issue_number returns None for URL ending with slash.
+    #[test]
+    fn decompose_extract_issue_number_trailing_slash() {
+        // rsplit('/').next() returns empty string for trailing slash.
+        assert_eq!(extract_issue_number("https://github.com/o/r/issues/"), None);
+    }
+
+    /// Verify extract_issue_number works with plain number path.
+    #[test]
+    fn decompose_extract_issue_number_plain_number() {
+        assert_eq!(extract_issue_number("42"), Some("42".to_string()));
+    }
+
+    // --- Spec collect: workspace trigger label with multiple sources ---
+
+    /// Verify resolve_trigger_label picks the first trigger label from
+    /// multiple sources and states.
+    #[test]
+    fn collect_resolve_trigger_label_multiple_sources() {
+        let yaml = r#"
+name: multi-source-ws
+sources:
+  github:
+    url: "https://github.com/test/repo"
+    scan_interval_secs: 300
+    states:
+      analyze:
+        trigger:
+          label: "custom:analyze"
+        prompt: "analyze"
+      build:
+        trigger:
+          label: "custom:build"
+        prompt: "build"
+"#;
+        let config: belt_core::workspace::WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let label = resolve_trigger_label(&config);
+        // Should return one of the configured labels (first found).
+        assert!(
+            label == "custom:analyze" || label == "custom:build",
+            "expected a configured trigger label, got: {label}"
+        );
+    }
+
+    // --- Spec decompose: conflict detection during decompose ---
+
+    /// Verify that ConflictDetector detects file-level overlap between specs
+    /// sharing the same entry_point.
+    #[test]
+    fn decompose_conflict_detection_file_overlap() {
+        use belt_core::spec::{ConflictDetector, OverlapType, Spec};
+
+        let mut existing = Spec::new(
+            "spec-existing".to_string(),
+            "ws".to_string(),
+            "Existing".to_string(),
+            "content".to_string(),
+        );
+        existing.entry_point = Some("src/auth/mod.rs".to_string());
+
+        let mut new_spec = Spec::new(
+            "spec-new".to_string(),
+            "ws".to_string(),
+            "New".to_string(),
+            "content".to_string(),
+        );
+        new_spec.entry_point = Some("src/auth/mod.rs".to_string());
+
+        let conflicts = ConflictDetector::detect(&new_spec, &[existing]);
+        assert!(!conflicts.is_empty());
+        assert_eq!(conflicts[0].overlap_type, OverlapType::File);
+        assert_eq!(conflicts[0].path, "src/auth/mod.rs");
+    }
+
+    /// Verify that ConflictDetector finds no conflicts when entry_points
+    /// do not overlap.
+    #[test]
+    fn decompose_conflict_detection_no_overlap() {
+        use belt_core::spec::{ConflictDetector, Spec};
+
+        let mut existing = Spec::new(
+            "spec-a".to_string(),
+            "ws".to_string(),
+            "A".to_string(),
+            "c".to_string(),
+        );
+        existing.entry_point = Some("src/auth/mod.rs".to_string());
+
+        let mut new_spec = Spec::new(
+            "spec-b".to_string(),
+            "ws".to_string(),
+            "B".to_string(),
+            "c".to_string(),
+        );
+        new_spec.entry_point = Some("src/api/handler.rs".to_string());
+
+        let conflicts = ConflictDetector::detect(&new_spec, &[existing]);
+        assert!(conflicts.is_empty());
+    }
+
+    // --- Spec lifecycle: decompose + collect end-to-end pipeline ---
+
+    /// Integration test: full pipeline from spec creation with decompose
+    /// through collect readiness, simulating the complete lifecycle.
+    ///
+    /// 1. Insert spec with AC
+    /// 2. Extract AC and build decomposed issues
+    /// 3. Store decomposed_issues in DB
+    /// 4. Transition Draft -> Active
+    /// 5. Simulate all child issues closed
+    /// 6. Transition Active -> Completing -> Completed
+    #[test]
+    fn spec_lifecycle_decompose_to_collect_to_complete() {
+        use belt_core::spec::{Spec, SpecStatus};
+
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+        let content = "\
+## Overview\nPayment system.\n\n\
+## Acceptance Criteria\n\
+- Process credit card payments\n\
+- Generate payment receipts\n\
+- Handle refunds\n\n\
+## Implementation\nStripe integration.";
+
+        let id = "spec-e2e-pipeline";
+        let mut spec = Spec::new(
+            id.to_string(),
+            "ws-e2e".to_string(),
+            "Payment System".to_string(),
+            content.to_string(),
+        );
+        db.insert_spec(&spec).unwrap();
+
+        // Step 1: Extract AC.
+        let criteria = belt_core::spec::extract_acceptance_criteria(&spec.content);
+        assert_eq!(criteria.len(), 3);
+
+        // Step 2: Build decomposed issues.
+        let proposed = belt_core::spec::build_decomposed_issues(&criteria, None, Some("800"));
+        assert_eq!(proposed.len(), 3);
+
+        // Step 3: Store decomposed_issues (simulating GitHub issue creation).
+        let child_numbers = vec!["801".to_string(), "802".to_string(), "803".to_string()];
+        spec.decomposed_issues = Some(child_numbers.join(","));
+        db.update_spec(&spec).unwrap();
+
+        // Step 4: Draft -> Active.
+        spec.transition_to(SpecStatus::Active).unwrap();
+        db.update_spec_status(&spec.id, spec.status).unwrap();
+
+        let stored = db.get_spec(id).unwrap();
+        assert_eq!(stored.status, SpecStatus::Active);
+        assert!(stored.is_decomposed());
+        assert_eq!(stored.decomposed_issue_numbers(), vec!["801", "802", "803"]);
+
+        // Step 5: Simulate child issues closing progressively.
+        let partial = vec![
+            ("801".to_string(), true),
+            ("802".to_string(), true),
+            ("803".to_string(), false),
+        ];
+        assert!(!belt_core::spec::all_decomposed_issues_closed(&partial));
+
+        let all_closed = vec![
+            ("801".to_string(), true),
+            ("802".to_string(), true),
+            ("803".to_string(), true),
+        ];
+        assert!(belt_core::spec::all_decomposed_issues_closed(&all_closed));
+
+        // Step 6: Active -> Completing -> Completed.
+        spec.transition_to(SpecStatus::Completing).unwrap();
+        db.update_spec_status(&spec.id, spec.status).unwrap();
+        assert_eq!(db.get_spec(id).unwrap().status, SpecStatus::Completing);
+
+        spec.transition_to(SpecStatus::Completed).unwrap();
+        db.update_spec_status(&spec.id, spec.status).unwrap();
+        let final_spec = db.get_spec(id).unwrap();
+        assert_eq!(final_spec.status, SpecStatus::Completed);
+        assert!(final_spec.status.is_terminal());
+    }
+
+    /// Verify that decomposed_issue_numbers returns empty vec when
+    /// decomposed_issues is None.
+    #[test]
+    fn spec_decomposed_issue_numbers_none() {
+        let spec = belt_core::spec::Spec::new(
+            "s".to_string(),
+            "w".to_string(),
+            "n".to_string(),
+            "c".to_string(),
+        );
+        assert!(spec.decomposed_issue_numbers().is_empty());
+        assert!(!spec.is_decomposed());
+    }
+
+    /// Verify format_decomposition_preview with empty input.
+    #[test]
+    fn decompose_preview_empty() {
+        let preview = belt_core::spec::format_decomposition_preview(&[]);
+        assert!(preview.contains("0 child issue(s)"));
+    }
 }
