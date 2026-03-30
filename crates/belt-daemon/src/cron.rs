@@ -1061,7 +1061,8 @@ impl CronHandler for DailyReportJob {
 
 /// Cleans up old worktrees that exceed the TTL (7 days).
 ///
-/// Scans terminal-phase items (Done, Skipped) and checks their `updated_at`
+/// Scans terminal-phase items (Done, Skipped) and stalled items with
+/// preserved worktrees (Hitl, Failed), checking their `updated_at`
 /// timestamp. Worktrees older than the TTL are removed.
 pub struct LogCleanupJob {
     db: Arc<Database>,
@@ -1075,11 +1076,17 @@ impl CronHandler for LogCleanupJob {
         let threshold = ctx.now - chrono::Duration::days(WORKTREE_TTL_DAYS);
         let mut cleaned_count = 0u32;
 
-        // Clean up worktrees for terminal-phase items older than TTL.
+        // Clean up worktrees for terminal-phase items and stalled items older than TTL.
         let done_items = self.db.list_items(Some(QueuePhase::Done), None)?;
         let skipped_items = self.db.list_items(Some(QueuePhase::Skipped), None)?;
+        let hitl_items = self.db.list_items(Some(QueuePhase::Hitl), None)?;
+        let failed_items = self.db.list_items(Some(QueuePhase::Failed), None)?;
 
-        let candidates = done_items.iter().chain(skipped_items.iter());
+        let candidates = done_items
+            .iter()
+            .chain(skipped_items.iter())
+            .chain(hitl_items.iter())
+            .chain(failed_items.iter());
 
         for item in candidates {
             let updated = DateTime::parse_from_rfc3339(&item.updated_at)
