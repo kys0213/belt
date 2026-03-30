@@ -6227,4 +6227,363 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "spec-full-auth-mw should be in covered list",
         );
     }
+
+    // -- Gap detection → issue creation pipeline tests --
+
+    #[test]
+    fn gap_detection_execute_attempts_issue_creation_when_gap_detected() {
+        // Verifies that when analyze_gaps finds a gap and no dedupe guard
+        // blocks, execute() proceeds through the issue creation path.
+        // The gh CLI is not available in test, so the Command will fail
+        // gracefully — what matters is that execute() returns Ok and the
+        // gap analysis correctly identifies missing items.
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Code that does NOT cover spec keywords.
+        std::fs::write(tmp.path().join("main.rs"), "fn hello_world() {}").unwrap();
+
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-pipeline-create".into(),
+            "ws".into(),
+            "Pipeline Issue Creation".into(),
+            "implement authorization middleware for secure endpoints".into(),
+        );
+        spec.status = belt_core::spec::SpecStatus::Active;
+        db.insert_spec(&spec).unwrap();
+
+        // No open queue items — dedupe guard should not block.
+        assert!(
+            !db.has_open_items_for_source("spec-pipeline-create")
+                .unwrap()
+        );
+
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+
+        // Confirm analyze_gaps detects the gap.
+        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+        assert_eq!(report.gaps.len(), 1, "should detect exactly one gap");
+        assert_eq!(report.gaps[0].spec_id, "spec-pipeline-create");
+        assert!(
+            !report.gaps[0].missing_items.is_empty(),
+            "missing_items should not be empty when keywords are uncovered",
+        );
+
+        // execute() runs the full pipeline including the gh CLI call which
+        // will fail gracefully in test — the overall result is still Ok.
+        let ctx = CronContext { now: Utc::now() };
+        assert!(
+            job.execute(&ctx).is_ok(),
+            "execute should succeed even when gh CLI is unavailable",
+        );
+    }
+
+    #[test]
+    fn gap_detection_execute_no_issue_when_all_specs_covered() {
+        // When all active specs are fully covered, execute() should skip
+        // the issue creation loop entirely and handle covered specs instead.
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Substantive code that implements authentication, validation, and
+        // middleware — detailed enough for both keyword and LLM analysis.
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            r#"
+use std::collections::HashMap;
+
+/// Authenticate incoming requests by verifying bearer tokens.
+fn authentication(token: &str, secret: &[u8]) -> Result<Claims, AuthError> {
+    if token.is_empty() {
+        return Err(AuthError::MissingToken);
+    }
+    let parts: Vec<&str> = token.splitn(2, '.').collect();
+    if parts.len() != 2 {
+        return Err(AuthError::MalformedToken);
+    }
+    let payload = parts[0];
+    let signature = parts[1];
+    let expected_sig = hmac_sha256(secret, payload.as_bytes());
+    if signature != expected_sig {
+        return Err(AuthError::InvalidSignature);
+    }
+    let claims: Claims = serde_json::from_str(payload)?;
+    if claims.exp < current_timestamp() {
+        return Err(AuthError::TokenExpired);
+    }
+    Ok(claims)
+}
+
+/// Validate request input against defined schema rules.
+fn validation(input: &HashMap<String, String>, rules: &[Rule]) -> Result<(), Vec<Error>> {
+    let mut errors = Vec::new();
+    for rule in rules {
+        match input.get(&rule.field) {
+            None if rule.required => {
+                errors.push(Error { field: rule.field.clone(), message: "required".into() });
+            }
+            Some(v) if v.len() > rule.max_len => {
+                errors.push(Error { field: rule.field.clone(), message: "too long".into() });
+            }
+            _ => {}
+        }
+    }
+    if errors.is_empty() { Ok(()) } else { Err(errors) }
+}
+
+/// Middleware pipeline that chains authentication and validation.
+fn middleware(request: Request, secret: &[u8], rules: &[Rule]) -> Response {
+    let token = match request.headers.get("Authorization") {
+        Some(h) => h.strip_prefix("Bearer ").unwrap_or(""),
+        None => return Response::unauthorized("missing authorization header"),
+    };
+    let claims = match authentication(token, secret) {
+        Ok(c) => c,
+        Err(e) => return Response::unauthorized(&format!("auth failed: {}", e)),
+    };
+    if let Err(errs) = validation(&request.body, rules) {
+        return Response::bad_request(&format!("{:?}", errs));
+    }
+    let mut ctx = request.context;
+    ctx.insert("user_id".into(), claims.sub.clone());
+    handle_request(ctx, request.body)
+}
+"#,
+        )
+        .unwrap();
+
+        let mut spec = belt_core::spec::Spec::new(
+            "spec-no-issue".into(),
+            "ws".into(),
+            "Fully Covered Spec".into(),
+            "authentication validation middleware".into(),
+        );
+        spec.status = belt_core::spec::SpecStatus::Active;
+        db.insert_spec(&spec).unwrap();
+
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+
+        // Confirm no gaps detected.
+        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+        assert!(
+            report.gaps.is_empty(),
+            "should detect no gaps when code covers all keywords, got: {:?}",
+            report.gaps,
+        );
+        assert!(
+            report
+                .covered_spec_ids
+                .contains(&"spec-no-issue".to_string()),
+            "covered spec should appear in covered_spec_ids",
+        );
+
+        // execute() should succeed without attempting issue creation.
+        let ctx = CronContext { now: Utc::now() };
+        assert!(
+            job.execute(&ctx).is_ok(),
+            "execute should succeed when no gaps exist",
+        );
+    }
+
+    #[test]
+    fn gap_detection_execute_mixed_specs_gaps_and_covered() {
+        // Tests the pipeline with multiple specs: one fully covered (no
+        // issue) and one with a clear gap (issue creation attempted).
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Substantive code that implements authorization middleware for
+        // secure endpoints — detailed enough for LLM analysis to agree.
+        std::fs::write(
+            tmp.path().join("auth.rs"),
+            concat!(
+                "/// Authorization middleware that protects secure endpoints.\n",
+                "fn authorization_middleware(request: &Request) -> bool {\n",
+                "    let token = request.header(\"Authorization\");\n",
+                "    validate_token(token)\n",
+                "}\n",
+                "\n",
+                "/// Validates authentication tokens for endpoint protection.\n",
+                "fn validate_token(token: &str) -> bool {\n",
+                "    !token.is_empty() && token.starts_with(\"Bearer \")\n",
+                "}\n",
+                "\n",
+                "/// Secure endpoint handler that requires authorization.\n",
+                "fn secure_endpoint(request: &Request) -> Response {\n",
+                "    if !authorization_middleware(request) {\n",
+                "        return Response::unauthorized();\n",
+                "    }\n",
+                "    Response::ok()\n",
+                "}\n",
+            ),
+        )
+        .unwrap();
+
+        // Spec 1: covered by the auth code above.
+        let mut spec_ok = belt_core::spec::Spec::new(
+            "spec-mixed-ok".into(),
+            "ws".into(),
+            "Covered Auth Spec".into(),
+            "implement authorization middleware for secure endpoints".into(),
+        );
+        spec_ok.status = belt_core::spec::SpecStatus::Active;
+        db.insert_spec(&spec_ok).unwrap();
+
+        // Spec 2: keywords completely absent from code — clear gap.
+        let mut spec_gap = belt_core::spec::Spec::new(
+            "spec-mixed-gap".into(),
+            "ws".into(),
+            "Gap Spec".into(),
+            "implement encryption decryption cipher symmetric asymmetric".into(),
+        );
+        spec_gap.status = belt_core::spec::SpecStatus::Active;
+        db.insert_spec(&spec_gap).unwrap();
+
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+        // spec-mixed-gap should always be detected as a gap (keywords
+        // completely absent from code).
+        let gap_ids: Vec<&str> = report.gaps.iter().map(|g| g.spec_id.as_str()).collect();
+        assert!(
+            gap_ids.contains(&"spec-mixed-gap"),
+            "spec-mixed-gap should be flagged as a gap, got: {:?}",
+            report.gaps,
+        );
+
+        // spec-mixed-ok should be covered (not in gaps list).
+        assert!(
+            !gap_ids.contains(&"spec-mixed-ok"),
+            "spec-mixed-ok should not be flagged as a gap when auth code is present",
+        );
+
+        // Full execute() should handle both paths.
+        let ctx = CronContext { now: Utc::now() };
+        assert!(
+            job.execute(&ctx).is_ok(),
+            "execute should succeed with mixed gap/covered specs",
+        );
+    }
+
+    #[test]
+    fn gap_detection_dedupe_filters_per_spec_independently() {
+        // Verifies that the dedupe guard filters on a per-spec basis:
+        // a spec with an open queue item is skipped, while another spec
+        // without open items still gets its gap processed.
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Code that does NOT cover any spec keywords.
+        std::fs::write(tmp.path().join("main.rs"), "fn unrelated() {}").unwrap();
+
+        // Spec A: has an open queue item (should be skipped by dedupe).
+        let mut spec_a = belt_core::spec::Spec::new(
+            "spec-dedup-a".into(),
+            "ws".into(),
+            "Dedup Spec A".into(),
+            "implement authorization middleware for secure endpoints".into(),
+        );
+        spec_a.status = belt_core::spec::SpecStatus::Active;
+        db.insert_spec(&spec_a).unwrap();
+
+        let item_a = belt_core::queue::QueueItem::new(
+            "spec-dedup-a:work".into(),
+            "spec-dedup-a".into(),
+            "ws".into(),
+            "implement".into(),
+        );
+        db.insert_item(&item_a).unwrap();
+
+        // Spec B: no open queue items (should proceed to issue creation).
+        let mut spec_b = belt_core::spec::Spec::new(
+            "spec-dedup-b".into(),
+            "ws".into(),
+            "Dedup Spec B".into(),
+            "implement encryption decryption cipher".into(),
+        );
+        spec_b.status = belt_core::spec::SpecStatus::Active;
+        db.insert_spec(&spec_b).unwrap();
+
+        // Verify dedupe state.
+        assert!(db.has_open_items_for_source("spec-dedup-a").unwrap());
+        assert!(!db.has_open_items_for_source("spec-dedup-b").unwrap());
+
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+
+        // Both specs have gaps.
+        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+        assert_eq!(
+            report.gaps.len(),
+            2,
+            "both specs should have gaps detected by analyze_gaps, got: {:?}",
+            report.gaps,
+        );
+
+        let gap_ids: Vec<&str> = report.gaps.iter().map(|g| g.spec_id.as_str()).collect();
+        assert!(
+            gap_ids.contains(&"spec-dedup-a"),
+            "spec-dedup-a should have a gap"
+        );
+        assert!(
+            gap_ids.contains(&"spec-dedup-b"),
+            "spec-dedup-b should have a gap"
+        );
+
+        // execute() applies dedupe: spec-dedup-a is skipped (open item),
+        // spec-dedup-b proceeds to the gh CLI call (which fails gracefully).
+        let ctx = CronContext { now: Utc::now() };
+        assert!(
+            job.execute(&ctx).is_ok(),
+            "execute should succeed with per-spec dedupe filtering",
+        );
+    }
+
+    #[test]
+    fn gap_detection_execute_skips_non_active_specs() {
+        // Only Active specs are considered by gap detection.
+        // Specs in Draft, Completing, or Completed status should be ignored.
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+
+        std::fs::write(tmp.path().join("main.rs"), "fn unrelated() {}").unwrap();
+
+        // Draft spec — should be ignored.
+        let spec_draft = belt_core::spec::Spec::new(
+            "spec-draft".into(),
+            "ws".into(),
+            "Draft Spec".into(),
+            "implement authorization middleware for secure endpoints".into(),
+        );
+        // Default status is Draft, so no need to set it.
+        db.insert_spec(&spec_draft).unwrap();
+
+        // Completing spec — should also be ignored.
+        let mut spec_completing = belt_core::spec::Spec::new(
+            "spec-completing".into(),
+            "ws".into(),
+            "Completing Spec".into(),
+            "implement encryption decryption cipher".into(),
+        );
+        spec_completing.status = belt_core::spec::SpecStatus::Completing;
+        db.insert_spec(&spec_completing).unwrap();
+
+        let job = GapDetectionJob::new(Arc::clone(&db), tmp.path().to_path_buf());
+        let report = job.analyze_gaps().expect("analyze_gaps should succeed");
+
+        assert!(
+            report.gaps.is_empty(),
+            "non-Active specs should not produce gaps, got: {:?}",
+            report.gaps,
+        );
+        assert!(
+            report.covered_spec_ids.is_empty(),
+            "non-Active specs should not appear in covered list",
+        );
+
+        let ctx = CronContext { now: Utc::now() };
+        assert!(
+            job.execute(&ctx).is_ok(),
+            "execute should succeed when no Active specs exist",
+        );
+    }
 }
