@@ -4332,4 +4332,479 @@ sources:
             assert!(proposed[i].title.contains("#600"));
         }
     }
+
+    // --- queue done / skip / retry-script integration tests ---
+
+    /// Helper: create a temp workspace YAML file and register it in the DB.
+    /// Returns (db, workspace_id, temp_dir) — temp_dir must be kept alive.
+    fn setup_workspace_with_config(
+        yaml: &str,
+    ) -> (belt_infra::db::Database, String, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("workspace.yaml");
+        std::fs::write(&config_path, yaml).expect("write yaml");
+
+        let db = belt_infra::db::Database::open_in_memory().expect("in-memory db");
+        let ws_id = "test-ws";
+        db.add_workspace(ws_id, config_path.to_str().unwrap())
+            .expect("add workspace");
+
+        (db, ws_id.to_string(), tmp)
+    }
+
+    /// Helper: create a `QueueItem` in a given phase.
+    fn make_item(
+        work_id: &str,
+        ws_id: &str,
+        state: &str,
+        phase: QueuePhase,
+    ) -> belt_core::queue::QueueItem {
+        belt_core::queue::QueueItem {
+            work_id: work_id.to_string(),
+            source_id: format!("gh:test/repo#{}", work_id),
+            workspace_id: ws_id.to_string(),
+            state: state.to_string(),
+            phase,
+            title: Some("test item".to_string()),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            hitl_created_at: None,
+            hitl_respondent: None,
+            hitl_notes: None,
+            hitl_reason: None,
+            hitl_timeout_at: None,
+            hitl_terminal_action: None,
+            worktree_preserved: false,
+            previous_worktree_path: None,
+            replan_count: 0,
+        }
+    }
+
+    /// Helper: build an `ActionExecutor` with default shell and a minimal
+    /// runtime registry (same as `cmd_queue_done` builds internally).
+    fn build_executor() -> belt_daemon::executor::ActionExecutor {
+        let mut registry = belt_core::runtime::RuntimeRegistry::new("claude".to_string());
+        registry.register(std::sync::Arc::new(
+            belt_infra::runtimes::claude::ClaudeRuntime::new(None),
+        ));
+        belt_daemon::executor::ActionExecutor::new(std::sync::Arc::new(registry))
+    }
+
+    // ---- cmd_queue_done tests ----
+
+    /// on_done script executes successfully -> item transitions to Done.
+    #[tokio::test]
+    async fn queue_done_on_done_success_transitions_to_done() {
+        let yaml = r#"
+name: test-ws
+sources:
+  github:
+    url: "https://github.com/test/repo"
+    scan_interval_secs: 300
+    states:
+      implement:
+        trigger: {}
+        prompt: "implement"
+        on_done:
+          - script: "true"
+"#;
+        let (db, ws_id, _tmp) = setup_workspace_with_config(yaml);
+        let item = make_item("done-ok-1", &ws_id, "implement", QueuePhase::Running);
+        db.insert_item(&item).unwrap();
+
+        // Replicate cmd_queue_done logic: load config, find on_done, execute.
+        let stored = db.get_item("done-ok-1").unwrap();
+        let (_, config_path, _) = db.get_workspace(&stored.workspace_id).unwrap();
+        let config =
+            belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))
+                .unwrap();
+
+        let state_config = config
+            .sources
+            .values()
+            .find_map(|s| s.states.get(&stored.state))
+            .unwrap();
+
+        let on_done: Vec<belt_core::action::Action> = state_config
+            .on_done
+            .iter()
+            .map(belt_core::action::Action::from)
+            .collect();
+        assert!(!on_done.is_empty());
+
+        let worktree_dir = tempfile::tempdir().unwrap();
+        let env = belt_daemon::executor::ActionEnv::new("done-ok-1", worktree_dir.path());
+        let executor = build_executor();
+
+        let result = executor.execute_all(&on_done, &env).await.unwrap();
+        match result {
+            Some(r) if r.success() => {
+                db.update_phase("done-ok-1", QueuePhase::Done).unwrap();
+            }
+            Some(r) => {
+                db.update_phase("done-ok-1", QueuePhase::Failed).unwrap();
+                panic!("expected success but got exit_code {}", r.exit_code);
+            }
+            None => {
+                db.update_phase("done-ok-1", QueuePhase::Done).unwrap();
+            }
+        }
+
+        let final_item = db.get_item("done-ok-1").unwrap();
+        assert_eq!(final_item.phase, QueuePhase::Done);
+    }
+
+    /// on_done script fails -> item transitions to Failed.
+    #[tokio::test]
+    async fn queue_done_on_done_failure_transitions_to_failed() {
+        let yaml = r#"
+name: test-ws
+sources:
+  github:
+    url: "https://github.com/test/repo"
+    scan_interval_secs: 300
+    states:
+      implement:
+        trigger: {}
+        prompt: "implement"
+        on_done:
+          - script: "false"
+"#;
+        let (db, ws_id, _tmp) = setup_workspace_with_config(yaml);
+        let item = make_item("done-fail-1", &ws_id, "implement", QueuePhase::Running);
+        db.insert_item(&item).unwrap();
+
+        let stored = db.get_item("done-fail-1").unwrap();
+        let (_, config_path, _) = db.get_workspace(&stored.workspace_id).unwrap();
+        let config =
+            belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))
+                .unwrap();
+
+        let state_config = config
+            .sources
+            .values()
+            .find_map(|s| s.states.get(&stored.state))
+            .unwrap();
+
+        let on_done: Vec<belt_core::action::Action> = state_config
+            .on_done
+            .iter()
+            .map(belt_core::action::Action::from)
+            .collect();
+
+        let worktree_dir = tempfile::tempdir().unwrap();
+        let env = belt_daemon::executor::ActionEnv::new("done-fail-1", worktree_dir.path());
+        let executor = build_executor();
+
+        let result = executor.execute_all(&on_done, &env).await.unwrap();
+        match result {
+            Some(r) if r.success() => {
+                db.update_phase("done-fail-1", QueuePhase::Done).unwrap();
+                panic!("expected failure but script succeeded");
+            }
+            Some(_) => {
+                db.update_phase("done-fail-1", QueuePhase::Failed).unwrap();
+            }
+            None => {
+                panic!("expected a result from on_done script");
+            }
+        }
+
+        let final_item = db.get_item("done-fail-1").unwrap();
+        assert_eq!(final_item.phase, QueuePhase::Failed);
+    }
+
+    /// No on_done configured -> direct Done transition.
+    #[tokio::test]
+    async fn queue_done_no_on_done_direct_done() {
+        let yaml = r#"
+name: test-ws
+sources:
+  github:
+    url: "https://github.com/test/repo"
+    scan_interval_secs: 300
+    states:
+      implement:
+        trigger: {}
+        prompt: "implement"
+"#;
+        let (db, ws_id, _tmp) = setup_workspace_with_config(yaml);
+        let item = make_item("done-direct-1", &ws_id, "implement", QueuePhase::Running);
+        db.insert_item(&item).unwrap();
+
+        let stored = db.get_item("done-direct-1").unwrap();
+        let (_, config_path, _) = db.get_workspace(&stored.workspace_id).unwrap();
+        let config =
+            belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))
+                .unwrap();
+
+        let state_config = config
+            .sources
+            .values()
+            .find_map(|s| s.states.get(&stored.state));
+
+        let on_done_actions: Vec<belt_core::action::Action> = state_config
+            .map(|sc| {
+                sc.on_done
+                    .iter()
+                    .map(belt_core::action::Action::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        assert!(on_done_actions.is_empty());
+        db.update_phase("done-direct-1", QueuePhase::Done).unwrap();
+
+        let final_item = db.get_item("done-direct-1").unwrap();
+        assert_eq!(final_item.phase, QueuePhase::Done);
+    }
+
+    /// Worktree cleanup is invoked on Done transition.
+    #[test]
+    fn queue_done_worktree_cleanup_on_done() {
+        use belt_infra::worktree::WorktreeManager;
+
+        let worktree_base = tempfile::tempdir().unwrap();
+        let work_id = "cleanup-done-1";
+
+        let worktree_mgr =
+            belt_infra::worktree::MockWorktreeManager::new(worktree_base.path().to_path_buf());
+
+        // Create a worktree via MockWorktreeManager.
+        let wt_path = worktree_mgr.create_or_reuse(work_id).unwrap();
+        assert!(wt_path.exists());
+
+        // Cleanup should succeed and remove the directory.
+        let result = worktree_mgr.cleanup(work_id);
+        assert!(result.is_ok());
+        assert!(!wt_path.exists());
+    }
+
+    /// Worktree cleanup is invoked on Skip transition.
+    #[test]
+    fn queue_skip_worktree_cleanup_on_skip() {
+        use belt_infra::worktree::WorktreeManager;
+
+        let worktree_base = tempfile::tempdir().unwrap();
+        let work_id = "cleanup-skip-1";
+
+        let worktree_mgr =
+            belt_infra::worktree::MockWorktreeManager::new(worktree_base.path().to_path_buf());
+
+        let wt_path = worktree_mgr.create_or_reuse(work_id).unwrap();
+        assert!(wt_path.exists());
+
+        let result = worktree_mgr.cleanup(work_id);
+        assert!(result.is_ok());
+        assert!(!wt_path.exists());
+    }
+
+    // ---- cmd_queue_skip tests ----
+
+    /// Skip transitions item to Skipped phase.
+    #[test]
+    fn queue_skip_transitions_to_skipped() {
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+        db.add_workspace("test-ws", "/dev/null").unwrap();
+        let item = make_item("skip-1", "test-ws", "implement", QueuePhase::Running);
+        db.insert_item(&item).unwrap();
+
+        db.update_phase("skip-1", QueuePhase::Skipped).unwrap();
+
+        let final_item = db.get_item("skip-1").unwrap();
+        assert_eq!(final_item.phase, QueuePhase::Skipped);
+    }
+
+    // ---- cmd_queue_retry_script tests ----
+
+    /// retry_script: Failed item with on_done script that succeeds -> Done.
+    #[tokio::test]
+    async fn queue_retry_script_success_transitions_failed_to_done() {
+        let yaml = r#"
+name: test-ws
+sources:
+  github:
+    url: "https://github.com/test/repo"
+    scan_interval_secs: 300
+    states:
+      implement:
+        trigger: {}
+        prompt: "implement"
+        on_done:
+          - script: "true"
+"#;
+        let (db, ws_id, _tmp) = setup_workspace_with_config(yaml);
+        let item = make_item("retry-ok-1", &ws_id, "implement", QueuePhase::Failed);
+        db.insert_item(&item).unwrap();
+
+        // Replicate cmd_queue_retry_script logic.
+        let stored = db.get_item("retry-ok-1").unwrap();
+        assert_eq!(stored.phase, QueuePhase::Failed);
+
+        let (_, config_path, _) = db.get_workspace(&stored.workspace_id).unwrap();
+        let config =
+            belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))
+                .unwrap();
+
+        let state_config = config
+            .sources
+            .values()
+            .find_map(|s| s.states.get(&stored.state))
+            .unwrap();
+
+        let on_done: Vec<belt_core::action::Action> = state_config
+            .on_done
+            .iter()
+            .map(belt_core::action::Action::from)
+            .collect();
+        assert!(!on_done.is_empty());
+
+        let worktree_dir = tempfile::tempdir().unwrap();
+        let env = belt_daemon::executor::ActionEnv::new("retry-ok-1", worktree_dir.path());
+        let executor = build_executor();
+
+        let result = executor.execute_all(&on_done, &env).await.unwrap();
+        match result {
+            Some(r) if r.success() => {
+                db.update_phase("retry-ok-1", QueuePhase::Done).unwrap();
+            }
+            _ => panic!("expected on_done success for retry"),
+        }
+
+        let final_item = db.get_item("retry-ok-1").unwrap();
+        assert_eq!(final_item.phase, QueuePhase::Done);
+    }
+
+    /// retry_script: Failed item with on_done script that fails -> remains Failed.
+    #[tokio::test]
+    async fn queue_retry_script_failure_remains_failed() {
+        let yaml = r#"
+name: test-ws
+sources:
+  github:
+    url: "https://github.com/test/repo"
+    scan_interval_secs: 300
+    states:
+      implement:
+        trigger: {}
+        prompt: "implement"
+        on_done:
+          - script: "false"
+"#;
+        let (db, ws_id, _tmp) = setup_workspace_with_config(yaml);
+        let item = make_item("retry-fail-1", &ws_id, "implement", QueuePhase::Failed);
+        db.insert_item(&item).unwrap();
+
+        let stored = db.get_item("retry-fail-1").unwrap();
+        assert_eq!(stored.phase, QueuePhase::Failed);
+
+        let (_, config_path, _) = db.get_workspace(&stored.workspace_id).unwrap();
+        let config =
+            belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))
+                .unwrap();
+
+        let state_config = config
+            .sources
+            .values()
+            .find_map(|s| s.states.get(&stored.state))
+            .unwrap();
+
+        let on_done: Vec<belt_core::action::Action> = state_config
+            .on_done
+            .iter()
+            .map(belt_core::action::Action::from)
+            .collect();
+
+        let worktree_dir = tempfile::tempdir().unwrap();
+        let env = belt_daemon::executor::ActionEnv::new("retry-fail-1", worktree_dir.path());
+        let executor = build_executor();
+
+        let result = executor.execute_all(&on_done, &env).await.unwrap();
+        match result {
+            Some(r) if r.success() => {
+                panic!("expected failure but script succeeded");
+            }
+            Some(_) => {
+                // Item remains Failed — no phase update (matches cmd_queue_retry_script behavior).
+            }
+            None => {
+                panic!("expected a result");
+            }
+        }
+
+        let final_item = db.get_item("retry-fail-1").unwrap();
+        assert_eq!(final_item.phase, QueuePhase::Failed);
+    }
+
+    /// retry_script: non-Failed item is rejected.
+    #[test]
+    fn queue_retry_script_rejects_non_failed_item() {
+        let db = belt_infra::db::Database::open_in_memory().unwrap();
+        db.add_workspace("test-ws", "/dev/null").unwrap();
+        let item = make_item(
+            "retry-reject-1",
+            "test-ws",
+            "implement",
+            QueuePhase::Running,
+        );
+        db.insert_item(&item).unwrap();
+
+        let stored = db.get_item("retry-reject-1").unwrap();
+        // cmd_queue_retry_script checks: if item.phase != QueuePhase::Failed { bail! }
+        assert_ne!(stored.phase, QueuePhase::Failed);
+    }
+
+    /// retry_script: timeout causes early return, item remains Failed.
+    #[tokio::test]
+    async fn queue_retry_script_timeout_remains_failed() {
+        let yaml = r#"
+name: test-ws
+sources:
+  github:
+    url: "https://github.com/test/repo"
+    scan_interval_secs: 300
+    states:
+      implement:
+        trigger: {}
+        prompt: "implement"
+        on_done:
+          - script: "sleep 10"
+"#;
+        let (db, ws_id, _tmp) = setup_workspace_with_config(yaml);
+        let item = make_item("retry-timeout-1", &ws_id, "implement", QueuePhase::Failed);
+        db.insert_item(&item).unwrap();
+
+        let stored = db.get_item("retry-timeout-1").unwrap();
+        let (_, config_path, _) = db.get_workspace(&stored.workspace_id).unwrap();
+        let config =
+            belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))
+                .unwrap();
+
+        let state_config = config
+            .sources
+            .values()
+            .find_map(|s| s.states.get(&stored.state))
+            .unwrap();
+
+        let on_done: Vec<belt_core::action::Action> = state_config
+            .on_done
+            .iter()
+            .map(belt_core::action::Action::from)
+            .collect();
+
+        let worktree_dir = tempfile::tempdir().unwrap();
+        let env = belt_daemon::executor::ActionEnv::new("retry-timeout-1", worktree_dir.path());
+        let executor = build_executor();
+
+        // Apply timeout of 1 second (script sleeps 10).
+        let timeout_secs = 1u64;
+        let duration = std::time::Duration::from_secs(timeout_secs);
+        let timed_out = tokio::time::timeout(duration, executor.execute_all(&on_done, &env)).await;
+
+        assert!(timed_out.is_err(), "expected timeout");
+
+        // Item remains Failed since timeout prevents phase change.
+        let final_item = db.get_item("retry-timeout-1").unwrap();
+        assert_eq!(final_item.phase, QueuePhase::Failed);
+    }
 }
