@@ -68,21 +68,29 @@ pub struct StagnationDetection {
 }
 ```
 
-### ExecutionHistory
+### PatternDetector trait
 
-outputs와 errors를 **별도 필드**로 분리한다. Ouroboros와 동일하게 각 데이터 소스를 독립적으로 검사.
+각 패턴 탐지기가 DB에서 자기 관심사에 맞는 데이터를 직접 조회한다. 중간 구조체(`ExecutionHistory`) 없이, 각 detector가 필요한 쿼리만 수행.
 
 ```rust
-pub struct ExecutionHistory {
-    pub outputs: Vec<String>,       // handler 출력 (history.summary)
-    pub errors: Vec<String>,        // 에러 메시지 (history.error) — 별도 검사
-    pub drift_scores: Vec<f64>,     // 진행 점수 (optional)
+/// 정체 패턴을 탐지하는 단일 알고리즘.
+/// 각 impl이 DB에서 자기 관심사에 맞는 데이터를 직접 조회한다.
+#[async_trait]
+pub trait PatternDetector: Send + Sync {
+    fn pattern(&self) -> StagnationPattern;
+    async fn detect(&self, source_id: &str, state: &str, db: &dyn Db) -> Result<StagnationDetection>;
 }
 ```
 
-- `outputs`: history 테이블의 `summary` 필드. 최근 N개 sliding window.
-- `errors`: history 테이블의 `error` 필드. 별도로 sliding window.
-- `drift_scores`: 정량적 진행 지표. Phase 2에서 도입.
+| Detector | DB 조회 | 구현 시점 |
+|----------|---------|----------|
+| `SpinningDetector` | `history.summary`, `history.error` (최근 N개) | v6 |
+| `OscillationDetector` | `history.summary` (최근 2N개) | v6 |
+| `DriftDetector` | `history.summary` + `source_data` (목표 vs 결과) | Phase 2 |
+| `DiminishingDetector` | drift score 이력 | Phase 2 |
+
+- v6: SPINNING + OSCILLATION — 텍스트 유사도 기반, DB에 데이터 이미 있음
+- Phase 2: NO_DRIFT + DIMINISHING — drift score 산출 파이프라인 구축 후 detector impl 추가, 코어 변경 0
 
 ---
 
@@ -209,36 +217,45 @@ impl SimilarityJudge for Ncd {
 
 ---
 
-## StagnationDetector
+## StagnationDetector — PatternDetector 컴포지트
 
 ```rust
 pub struct StagnationDetector {
-    pub judge: Box<dyn SimilarityJudge>,  // Composite 또는 단일 Judge
+    pub detectors: Vec<Box<dyn PatternDetector>>,
     pub config: StagnationConfig,
 }
 
 impl StagnationDetector {
-    pub fn detect(&self, history: &ExecutionHistory) -> Vec<StagnationDetection>;
+    /// 등록된 모든 PatternDetector를 실행하고 결과를 합산.
+    pub async fn detect(&self, source_id: &str, state: &str, db: &dyn Db)
+        -> Result<Vec<StagnationDetection>>;
 }
 ```
 
-Detector는 `SimilarityJudge` trait 하나만 의존. Composite인지 단일 Judge인지 모른다.
+v6에서는 `SpinningDetector` + `OscillationDetector`만 등록. Phase 2에서 `DriftDetector` + `DiminishingDetector`를 추가하면 코어 변경 없이 동작한다.
+
+각 PatternDetector는 내부적으로 `SimilarityJudge`를 사용할 수 있다 (SPINNING, OSCILLATION). drift 기반 detector는 SimilarityJudge 불필요.
 
 ### 탐지 알고리즘
 
-#### SPINNING — 유사 출력 반복
+#### SpinningDetector (v6) — 유사 출력 반복
 
-outputs와 errors를 **별도로** 검사한다. 어느 쪽이든 감지되면 SPINNING.
+DB에서 summaries와 errors를 **별도로** 조회·검사한다. 어느 쪽이든 감지되면 SPINNING.
 
 ```
-detect_spinning(history):
-  // 1. outputs 검사
-  recent_outputs = history.outputs[-threshold..]
+SpinningDetector.detect(source_id, state, db):
+  // 1. outputs 검사 — DB에서 직접 조회
+  recent_outputs = db.query("SELECT summary FROM history
+      WHERE source_id=? AND state=? ORDER BY created_at DESC LIMIT ?",
+      source_id, state, spinning_threshold)
   if all_pairs_similar(recent_outputs, judge, similarity_threshold):
       return SPINNING(source: "outputs")
 
-  // 2. errors 검사
-  recent_errors = history.errors[-threshold..]
+  // 2. errors 검사 — DB에서 직접 조회
+  recent_errors = db.query("SELECT error FROM history
+      WHERE source_id=? AND state=? AND error IS NOT NULL
+      ORDER BY created_at DESC LIMIT ?",
+      source_id, state, spinning_threshold)
   if all_pairs_similar(recent_errors, judge, similarity_threshold):
       return SPINNING(source: "errors")
 
@@ -253,11 +270,13 @@ all_pairs_similar(items, judge, threshold):
 - 유사도 기준: `similarity_threshold` (기본 0.8)
 - confidence: 유사도 점수의 평균값
 
-#### OSCILLATION — 교대 반복
+#### OscillationDetector (v6) — 교대 반복
 
 ```
-detect_oscillation(history):
-  recent = history.outputs[-(cycles * 2)..]
+OscillationDetector.detect(source_id, state, db):
+  recent = db.query("SELECT summary FROM history
+      WHERE source_id=? AND state=? ORDER BY created_at DESC LIMIT ?",
+      source_id, state, cycles * 2)
   
   // 짝수 그룹 내 유사
   even_similar = all_pairs_similar(recent[::2], judge, similarity_threshold)
@@ -270,25 +289,31 @@ detect_oscillation(history):
       return OSCILLATION
 ```
 
-#### NO_DRIFT / DIMINISHING_RETURNS — 수치 기반
+#### DriftDetector / DiminishingDetector (Phase 2) — drift score 기반
 
-drift score 기반. SimilarityJudge 불필요, 기존 알고리즘 유지.
+Phase 2에서 `PatternDetector` impl로 추가. SimilarityJudge 불필요.
+
+DB에서 작업 결과(history.summary)와 원래 목표(source_data)를 조회하여 goal_drift를 산출한다. Ouroboros의 가중 합산 모델을 차용:
 
 ```
-detect_no_drift(history):
-  scores = history.drift_scores[-iterations..]
-  deltas = consecutive_abs_deltas(scores)
-  if all(d < epsilon for d in deltas):
-      confidence = 1.0 - (avg(deltas) / epsilon)
-      return NO_DRIFT
+combined_drift = (goal_drift × 0.5) + (constraint_drift × 0.3) + (ontology_drift × 0.2)
+```
 
-detect_diminishing(history):
-  scores = history.drift_scores[-(iterations+1)..]
-  improvements = consecutive_diffs(scores)  // lower = better
-  if all(imp < threshold for imp in improvements):
-      is_decreasing = monotonically_decreasing(improvements)
-      confidence = if is_decreasing { 0.8 } else { 0.6 }
-      return DIMINISHING_RETURNS
+- **goal_drift**: 원래 목표(이슈 본문) vs 현재 결과(summary)의 Jaccard 거리
+- **constraint_drift**: 제약 위반 추적 (workspace별 이력 필요)
+- **ontology_drift**: 개념 공간 변화 (workspace별 이력 필요)
+
+v6에서는 trait 경계만 정의하고 impl 없음 — `StagnationDetector`에 등록되지 않으므로 동작하지 않는다. Phase 2에서 impl 추가 시 코어 변경 0.
+
+```
+DriftDetector.detect(source_id, state, db):
+  summaries = db.query("SELECT summary FROM history WHERE ...")
+  source_data = db.query("SELECT source_data FROM queue_items WHERE ...")
+  goal = extract_goal(source_data)  // 이슈 본문 등
+  drift = compute_goal_drift(goal, summaries.last())
+  store_drift_score(db, source_id, state, drift)
+  // NO_DRIFT: 최근 N개 drift 변화량 < epsilon
+  // DIMINISHING: 개선폭이 감소 추세
 ```
 
 ---
@@ -438,15 +463,16 @@ handler/on_enter 실행 실패
              persona, lateral_plan, judge_scores }
 ```
 
-### 데이터 소스
+### 데이터 소스 — 각 Detector가 DB에서 직접 조회
 
-| 데이터 | 출처 | 용도 |
-|--------|------|------|
-| handler 출력 | `history.summary` | SPINNING, OSCILLATION (outputs) |
-| 에러 메시지 | `history.error` | SPINNING (errors, 별도 검사) |
-| 시도 번호 | `history.attempt` | sliding window 범위 결정 |
-| drift score | (Phase 2) `belt context` 확장 | NO_DRIFT, DIMINISHING_RETURNS |
-| 이전 lateral | `transition_events` (stagnation) | 페르소나 중복 제외 |
+| 데이터 | DB 테이블/컬럼 | Detector | 구현 시점 |
+|--------|---------------|----------|----------|
+| handler 출력 | `history.summary` | SpinningDetector, OscillationDetector | v6 |
+| 에러 메시지 | `history.error` | SpinningDetector (별도 검사) | v6 |
+| 시도 번호 | `history.attempt` | sliding window 범위 결정 | v6 |
+| 원래 목표 | `queue_items.source_data` | DriftDetector (goal_drift 산출) | Phase 2 |
+| drift score 이력 | (Phase 2 테이블) | DiminishingDetector | Phase 2 |
+| 이전 lateral | `transition_events` (stagnation) | 페르소나 중복 제외 | v6 |
 
 ### 이벤트 기록
 

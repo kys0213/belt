@@ -38,14 +38,15 @@ Stagnation Analyzer (항상 실행):
                     ▼
   ④ Escalation (failure_count 기반, lateral_plan 포함):
     │
-    ├── retry             → lateral_plan 주입, 재시도 (on_fail 안 함, worktree 보존)
-    ├── retry_with_comment → lateral_plan 주입, on_fail script 실행, 재시도 (worktree 보존)
-    └── hitl              → lateral_report 첨부, on_fail script 실행, HITL 이벤트 (worktree 보존)
+    ├── retry             → hook.on_escalation(retry), lateral_plan 주입, 재시도 (worktree 보존)
+    ├── retry_with_comment → hook.on_escalation + hook.on_fail, lateral_plan 주입, 재시도
+    └── hitl              → hook.on_escalation + hook.on_fail, lateral_report 첨부, HITL 이벤트
                               └── 사람 응답: done / retry / skip / replan
                               └── timeout → terminal 액션 (skip 또는 replan)
 ```
 
-`retry`만 on_fail을 실행하지 않는다. "조용한 재시도"로 외부 시스템에 노이즈를 주지 않는다.
+`retry`만 on_fail hook을 트리거하지 않는다. "조용한 재시도"로 외부 시스템에 노이즈를 주지 않는다.
+Daemon은 hook을 트리거만 하고, 실행 책임은 workspace의 LifecycleHook impl이 가진다.
 
 ---
 

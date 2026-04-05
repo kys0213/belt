@@ -27,7 +27,7 @@ DataSource.collect(): trigger 조건 매칭 (예: belt:analyze 라벨)
   Pending → Ready → Running (자동 전이, concurrency 제한)
     │
     │  ① worktree 생성 (인프라, 또는 retry 시 기존 보존분 재사용)
-    │  ② on_enter script 실행 (정의된 경우)
+    │  ② hook.on_enter() 트리거 (workspace의 LifecycleHook)
     │  ③ handlers 순차 실행:
     │       prompt → AgentRuntime.invoke() (worktree 안에서)
     │       script → bash (WORK_ID + WORKTREE 주입)
@@ -35,10 +35,10 @@ DataSource.collect(): trigger 조건 매칭 (예: belt:analyze 라벨)
     ├── 전부 성공 → Completed
     │     │
     │     ▼
-    │   evaluate cron (per-item, force_trigger로 즉시 실행 + 주기 폴링 하이브리드):
+    │   evaluate (per-item, concurrency slot 소비):
     │   "이 아이템의 결과가 충분한가?"
-    │     ├── Done → on_done script 실행 → worktree 정리
-    │     │           └── script 실패 → Failed (로그 기록, 재시도 가능)
+    │     ├── Done → hook.on_done() 트리거 → worktree 정리
+    │     │           └── hook 실패 → Failed (로그 기록)
     │     └── HITL → HITL 이벤트 생성 → 사람 대기 (worktree 보존)
     │
     └── 실패 (handler 또는 on_enter)

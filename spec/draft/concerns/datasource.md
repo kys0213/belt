@@ -8,17 +8,19 @@
 ## 역할
 
 ```
-DataSource가 소유하는 것:
-  1. 수집 — 어떤 조건에서 아이템을 감지하는가 (trigger)
-  2. 컨텍스트 — 해당 아이템의 외부 시스템 정보를 어떻게 조회하는가 (context)
+DataSource가 소유하는 것 (읽기):
+  1. 수집 — 어떤 조건에서 아이템을 감지하는가 (collect)
+  2. 컨텍스트 — 해당 아이템의 외부 시스템 정보를 어떻게 조회하는가 (get_context)
 
-코어/yaml이 소유하는 것:
-  3. 처리 — 감지된 아이템을 어떻게 처리하는가 (handlers: prompt/script)
-  4. 전이 — 처리 완료 후 다음에 뭘 트리거하는가 (on_done script)
-  5. 실패 반영 — 실패 시 외부 시스템에 어떻게 알리는가 (on_fail script)
-  6. 실패 정책 — 실패 시 어떻게 escalation하는가 (escalation)
+LifecycleHook이 소유하는 것 (쓰기/반응):
+  3. 상태 반응 — 상태 전이 시 외부 시스템에 어떻게 반영하는가 (on_enter/on_done/on_fail/on_escalation)
 
-코어는 DataSource 내부를 모른다. collect() 결과를 큐에 넣고, 상태 전이만 관리.
+yaml이 소유하는 것:
+  4. 처리 — 감지된 아이템을 어떻게 처리하는가 (handlers: prompt/script)
+  5. 실패 정책 — 실패 시 어떻게 escalation하는가 (escalation)
+
+코어는 DataSource/LifecycleHook 내부를 모른다. collect() 결과를 큐에 넣고, 상태 전이 시 hook을 트리거할 뿐.
+상세: [LifecycleHook](./lifecycle-hook.md)
 ```
 
 ---
@@ -40,9 +42,9 @@ pub trait DataSource: Send + Sync {
 ```
 
 v4 대비 대폭 축소. `on_phase_enter`, `on_failed`, `on_done`, `before_task`, `after_task` 모두 제거.
-- on_done/on_fail → yaml에 정의된 script가 처리 (gh CLI 등 직접 호출)
+- on_done/on_fail/on_enter/on_escalation → `LifecycleHook` trait으로 분리. 상세: [LifecycleHook](./lifecycle-hook.md)
 - worktree 셋업 → 인프라 레이어가 항상 처리
-- escalation → yaml의 escalation 정책을 코어가 실행
+- escalation → yaml의 escalation 정책을 코어가 결정, hook이 반응
 
 **v6 (#719)**: `get_context()`가 반환하는 `ItemContext`에 `source_data: serde_json::Value` 필드가 추가된다. DataSource는 자신의 고유 데이터를 `source_data`에 자유 스키마로 채운다.
 
@@ -251,36 +253,18 @@ handler 배열은 Running 상태에서 순차 실행. 하나라도 실패 시 on
 
 ---
 
-## on_done / on_fail / on_enter
+## Lifecycle Hook — LifecycleHook trait으로 분리
 
-모든 lifecycle hook은 **script 배열**로 정의. handler와 동일한 통합 액션 타입.
+v6에서 on_done/on_fail/on_enter/on_escalation은 `LifecycleHook` trait으로 분리된다. Daemon은 상태 전이 시 hook을 트리거만 하고, 실행 책임은 Hook impl이 가진다.
 
-```yaml
-states:
-  implement:
-    trigger: { label: "belt:implement" }
-    on_enter:                              # Running 진입 시 (선택)
-      - script: |
-          CTX=$(belt context $WORK_ID --json)
-          echo "시작: $(echo $CTX | jq -r '.source_data.issue.title // .issue.title')"
-    handlers:
-      - prompt: "이슈를 구현해줘"
-    on_done:                               # 성공 시
-      - script: |
-          CTX=$(belt context $WORK_ID --json)
-          # PR 생성, 라벨 전환 등
-    on_fail:                               # 실패 시 (escalation 전)
-      - script: |
-          CTX=$(belt context $WORK_ID --json)
-          ISSUE=$(echo $CTX | jq -r '.source_data.issue.number // .issue.number')
-          REPO=$(echo $CTX | jq -r '.source.url')
-          gh issue comment $ISSUE --body "구현 실패" -R $REPO
-```
+상세: [LifecycleHook](./lifecycle-hook.md)
 
-실행 주체: Daemon의 Executor 모듈이 상태 전이 시점에 직접 실행.
-- `on_enter`: Running 진입 후, handler 실행 전. **실패 시 handler를 실행하지 않고 즉시 escalation 정책을 적용**한다. on_enter 실패도 history에 failed 이벤트로 기록되며 failure_count에 포함된다.
-- `on_done`: evaluate가 Done 판정 후 (script 실패 시 → Failed 상태)
-- `on_fail`: handler 또는 on_enter 실패 시, escalation level에 따라 조건부 실행 (`retry`에서는 실행 안 함)
+| hook | 트리거 시점 | 실패 시 |
+|------|-----------|--------|
+| `on_enter` | Running 진입 후, handler 실행 전 | handler 건너뛰고 escalation |
+| `on_done` | evaluate가 Done 판정 후 | Failed 상태로 전이 |
+| `on_fail` | handler/on_enter 실패 시 (retry 제외) | — |
+| `on_escalation` | escalation 결정 후 | — |
 
 ---
 
@@ -302,7 +286,7 @@ escalation:
                           # 선택지: skip (종료) 또는 replan (스펙 수정 제안)
 ```
 
-> **v6 (#723) Stagnation 가속**: failure_count 기반 escalation에 stagnation detection 결과가 가속 요소로 적용된다. 예: 1회 실패인데 SPINNING이 감지되면 retry → retry_with_comment로 승격. OSCILLATION이면 → hitl로 즉시 승격. 상세: [Stagnation Detection](./stagnation.md)
+> **v6 Stagnation과 Escalation의 관계**: escalation은 failure_count 기반으로 결정되고, stagnation은 lateral_plan 주입에 집중한다. 두 관심사는 직교한다 — escalation이 "언제 멈출지"를 결정하고, stagnation이 "다르게 시도할지"를 결정한다. escalation 발생 시 `LifecycleHook.on_escalation()`이 DataSource별 반응을 처리한다. 상세: [LifecycleHook](./lifecycle-hook.md)
 
 ### on_fail 실행 조건
 
@@ -345,8 +329,9 @@ queue_items 테이블:
 ### 관련 문서
 
 - [DESIGN-v6](../DESIGN-v6.md) — 전체 아키텍처
+- [LifecycleHook](./lifecycle-hook.md) — 상태 전이 반응 trait
 - [AgentRuntime](./agent-runtime.md) — handler prompt 실행
-- [Stagnation Detection](./stagnation.md) — escalation 가속
+- [Stagnation Detection](./stagnation.md) — 실패 패턴 감지
 - [Cron 엔진](./cron-engine.md) — 품질 루프
 - [CLI 레퍼런스](./cli-reference.md) — belt context CLI
 - [Data Model](./data-model.md) — source_data 마이그레이션 전략

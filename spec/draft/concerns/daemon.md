@@ -1,7 +1,8 @@
-# Daemon — Orchestrator
+# Daemon — State Machine CPU
 
-> Daemon은 yaml에 정의된 prompt/script를 호출하는 단순 실행기.
-> GitHub 라벨, PR 생성 같은 도메인 로직을 모른다.
+> Daemon은 상태 머신을 틱마다 순회하며 전이를 결정하고, hook을 트리거하는 CPU.
+> handler(prompt/script)를 실행하고, 상태 전이 시 workspace의 LifecycleHook을 트리거한다.
+> GitHub 라벨, PR 생성 같은 도메인 로직을 모른다 — hook.on_*()의 Result만 받을 뿐.
 > 내부는 Advancer·Executor·HitlService 모듈로 분리. 실패 시 StagnationDetector + LateralAnalyzer가 사고를 전환하여 재시도한다.
 
 ---
@@ -11,25 +12,29 @@
 ```
 1. 수집: DataSource.collect() → Pending에 넣기
 2. 전이: Pending → Ready → Running (자동, concurrency 제한)
-3. 실행: yaml에 정의된 prompt/script 호출
-4. 완료: handler 성공 → Completed 전이
-5. 분류: evaluate cron이 Completed → Done or HITL 판정 (per-item, CLI 도구 호출)
-6. 반영: on_done/on_fail script 실행
-7. 스케줄: Cron engine으로 주기 작업 실행
+3. 트리거: Running 진입 시 hook.on_enter() 트리거
+4. 실행: yaml에 정의된 handler(prompt/script) 실행
+5. 완료: handler 성공 → Completed 전이
+6. 분류: evaluate가 Completed → Done or HITL 판정 (per-item)
+7. 반응: 상태 전이 시 hook.on_done/on_fail/on_escalation 트리거
+8. 스케줄: Cron engine으로 주기 작업 실행
+
+Daemon이 아는 것: 상태 머신 + 언제 어떤 hook을 트리거할지
+Daemon이 모르는 것: hook이 실제로 무엇을 하는지 (Result만 받음)
 ```
 
 ---
 
 ## 내부 모듈 구조 (#717)
 
-Daemon은 실행 루프와 모듈 조율만 담당하는 Orchestrator이다.
+Daemon은 상태 머신을 순회하며 전이를 결정하고 hook을 트리거하는 CPU이다.
 
 ```
-Daemon (Orchestrator)
+Daemon (CPU)
   loop {
     collector.collect()
     advancer.advance()
-    executor.execute()
+    executor.execute()       // handler 실행 + hook 트리거
     cron_engine.tick()
   }
 ```
@@ -37,7 +42,7 @@ Daemon (Orchestrator)
 | 모듈 | 책임 | 소유하는 상태 |
 |------|------|-------------|
 | **Advancer** | Pending→Ready→Running 전이, dependency gate (DB), conflict 검출 | queue, ConcurrencyTracker |
-| **Executor** | handler/lifecycle 실행, 실패 시 stagnation 분석 + lateral plan + escalation | ActionExecutor, StagnationDetector, LateralAnalyzer |
+| **Executor** | handler 실행 + hook 트리거, 실패 시 stagnation 분석 + lateral plan + escalation | ActionExecutor, StagnationDetector, LateralAnalyzer |
 | **Evaluator** | Completed → Done/HITL 분류 (per-item, 이미 분리됨) | eval_failure_counts |
 | **HitlService** | HITL 응답 처리, timeout 만료, terminal action 적용 | — (DB 직접 조회) |
 | **CronEngine** | cron tick, force_trigger (이미 분리됨) | CronJob 목록 |
@@ -47,7 +52,13 @@ Daemon (Orchestrator)
 ```
 Executor
   │
-  ├── ActionExecutor          handler/script 실행
+  ├── ActionExecutor          handler(prompt/script) 실행
+  │
+  ├── hook: &dyn LifecycleHook   상태 전이 시 트리거 (실행 책임은 Hook impl)
+  │     ├── on_enter()
+  │     ├── on_done()
+  │     ├── on_fail()
+  │     └── on_escalation()
   │
   ├── StagnationDetector      실패 시 패턴 탐지
   │     └── judge: Box<dyn SimilarityJudge>
@@ -103,23 +114,32 @@ Advancer는 `Ready → Running` 전이 시 두 제한을 모두 확인한다.
 ```
 loop {
     // 1. 수집
-    for source in workspace.sources:
-        items = source.collect()
-        queue.push(Pending, items)
+    for binding in workspace_bindings:
+        for source in binding.sources:
+            items = source.collect()
+            queue.push(Pending, items)
 
-    // 2. 자동 전이 (Advancer)
+    // 2. 판정 (Evaluator) — 실행보다 먼저
+    //    Completed 아이템을 비용 순으로 판정: Mechanical → Semantic → (Consensus)
+    //    Ready 아이템 중 이전 기록으로 판정 가능한 것은 handler 실행 없이 판정
+    evaluator.evaluate()
+
+    // 3. 자동 전이 (Advancer)
     advancer.advance_pending_to_ready()         // spec dep gate (DB)
     advancer.advance_ready_to_running(limit)    // queue dep gate (DB) + concurrency
 
-    // 3. 실행 (Executor)
+    // 4. 실행 (Executor)
     for item in queue.get_new(Running):
+        binding = lookup_workspace_binding(item)
+        hook = binding.hook                     // 이 workspace의 LifecycleHook
         state = lookup_state(item)
         worktree = create_or_reuse_worktree(item)
+        ctx = build_hook_context(item, worktree)
 
-        // on_enter (실패 시 handler 건너뛰고 실패 경로)
-        result = executor.run_actions(state.on_enter, WORK_ID=item.id, WORKTREE=worktree)
+        // on_enter hook 트리거 (실패 시 handler 건너뛰고 실패 경로)
+        result = hook.on_enter(&ctx)
         if result.failed:
-            executor.handle_failure(item, state)
+            executor.handle_failure(item, hook)
             continue
 
         // handlers 순차 실행 (lateral_plan 있으면 prompt에 주입)
@@ -127,33 +147,26 @@ loop {
             result = executor.execute(action, WORK_ID=item.id, WORKTREE=worktree,
                                       lateral_plan=item.lateral_plan)
             if result.failed:
-                executor.handle_failure(item, state)
+                executor.handle_failure(item, hook)
                 break
         else:
             item.transit(Completed)
-            force_trigger("evaluate")
 
-    // 4. cron tick
+    // 5. cron tick (품질 루프: gap-detection, knowledge-extract 등)
     cron_engine.tick()
 }
 ```
 
-### Executor.handle_failure — Stagnation + Lateral + Escalation
+### Executor.handle_failure — Stagnation + Lateral + Hook 트리거
 
 ```
-fn handle_failure(item, state):
-    // ① ExecutionHistory 구성 (outputs/errors 별도)
-    execution_history = ExecutionHistory {
-        outputs: db.recent_summaries(item.source_id, item.state, limit=N),
-        errors:  db.recent_errors(item.source_id, item.state, limit=N),
-        drifts:  db.recent_drift_scores(item.source_id, item.state),
-    }
-
-    // ② Stagnation Detection (항상 실행)
-    detections = stagnation_detector.detect(execution_history)
+fn handle_failure(item, hook):
+    // ① Stagnation Detection (항상 실행)
+    //    각 PatternDetector가 DB에서 자기 관심사 데이터를 직접 조회
+    detections = stagnation_detector.detect(item.source_id, item.state, db)
     active = detections.filter(|d| d.detected && d.confidence >= threshold)
 
-    // ③ Lateral Plan 생성 (패턴 감지 시)
+    // ② Lateral Plan 생성 (패턴 감지 시)
     lateral_plan = None
     if active.is_not_empty() && lateral_config.enabled:
         tried = db.get_tried_personas(item.source_id, item.state)
@@ -161,32 +174,31 @@ fn handle_failure(item, state):
         if persona.is_some():
             lateral_plan = lateral_analyzer.analyze(
                 detection=active[0],
-                history=execution_history,
                 persona=persona,
                 workspace=item.workspace_id,
             )
 
-    // ④ transition_events에 stagnation 기록
+    // ③ transition_events에 stagnation 기록
     record_stagnation_event(item, detections, lateral_plan)
 
-    // ⑤ Escalation 적용 (failure_count 기반, 기존과 동일)
+    // ④ Escalation 결정 (failure_count 기반)
     failure_count = count_failures(item.source_id, item.state)
     escalation = lookup_escalation(failure_count)
 
-    match escalation:
-        retry:
-            // lateral_plan을 새 아이템에 전달
-            new_item = create_retry_item(item, lateral_plan)
-            // on_fail 실행 안 함, worktree 보존
+    // ⑤ Hook 트리거 — Daemon은 트리거만, 실행 책임은 Hook impl
+    ctx = build_hook_context(item, worktree)
+    hook.on_escalation(&ctx, escalation)
 
-        retry_with_comment:
-            run_actions(state.on_fail, WORK_ID=item.id, WORKTREE=worktree)
+    if escalation.should_run_on_fail():
+        hook.on_fail(&ctx)
+
+    // ⑥ 상태 전이
+    match escalation:
+        retry | retry_with_comment:
             new_item = create_retry_item(item, lateral_plan)
             // worktree 보존
 
         hitl:
-            run_actions(state.on_fail, WORK_ID=item.id, WORKTREE=worktree)
-            // lateral report (모든 시도 이력)를 hitl_notes에 첨부
             lateral_report = build_lateral_report(item.source_id, item.state)
             create_hitl_event(item, reason, hitl_notes=lateral_report)
             // worktree 보존
@@ -240,21 +252,29 @@ dependency phase 확인은 **DB 조회 기반**:
 
 ---
 
-## 통합 액션 타입
+## Handler와 Hook의 분리
+
+### Handler — yaml에 정의된 작업
 
 ```yaml
-- prompt: "..."    # → AgentRuntime.invoke() (LLM, worktree 안에서)
-- script: "..."    # → bash 실행 (결정적, WORK_ID + WORKTREE 주입)
+handlers:
+  - prompt: "..."    # → AgentRuntime.invoke() (LLM, worktree 안에서)
+  - script: "..."    # → bash 실행 (결정적, WORK_ID + WORKTREE 주입)
 ```
 
-| 위치 | prompt | script | 설명 |
-|------|:------:|:------:|------|
-| `handlers` | O | O | 워크플로우 핵심 작업 |
-| `on_enter` | X | O | Running 진입 시 사전 작업 |
-| `on_done` | X | O | 완료 후 외부 시스템 반영 |
-| `on_fail` | X | O | 실패 시 외부 시스템 알림 |
+handler는 Daemon Executor가 직접 실행한다. 작업의 핵심 로직.
 
-lifecycle hook은 **script만 허용**. LLM 호출은 handler에서만.
+### Hook — LifecycleHook trait impl
+
+| hook | 트리거 시점 | 실행 책임 |
+|------|-----------|----------|
+| `on_enter` | Running 진입 후, handler 실행 전 | Hook impl |
+| `on_done` | evaluate Done 판정 후 | Hook impl |
+| `on_fail` | 실패 시 (retry 제외) | Hook impl |
+| `on_escalation` | escalation 결정 후 | Hook impl |
+
+Daemon은 hook을 트리거만 한다. hook이 실제로 무엇을 하는지 모른다.
+상세: [LifecycleHook](./lifecycle-hook.md)
 
 ---
 
@@ -282,10 +302,15 @@ SIGINT → on_shutdown:
 
 ## 수용 기준
 
+### Daemon = CPU
+
+- [ ] Daemon은 상태 머신 순회 + hook 트리거만 담당한다
+- [ ] 상태 전이 시 workspace의 LifecycleHook.on_*()을 트리거한다
+- [ ] hook의 실행 결과(Result)만 받고, 구체적 동작을 모른다
+
 ### 내부 모듈 구조 (#717)
 
-- [ ] Daemon 구조체는 실행 루프와 모듈 조율만 담당한다
-- [ ] phase 전이는 Advancer, handler 실행+stagnation+lateral+escalation은 Executor, HITL은 HitlService
+- [ ] phase 전이는 Advancer, handler 실행+hook 트리거+stagnation+lateral은 Executor, HITL은 HitlService
 - [ ] 각 모듈은 독립적으로 단위 테스트 가능하다
 - [ ] 모듈 간 의존은 trait 또는 함수 파라미터로만 전달 (순환 참조 금지)
 
@@ -322,8 +347,9 @@ SIGINT → on_shutdown:
 ### 관련 문서
 
 - [DESIGN-v6](../DESIGN-v6.md) — 전체 상태 흐름 + 설계 철학
+- [LifecycleHook](./lifecycle-hook.md) — 상태 전이 반응 trait
 - [QueuePhase 상태 머신](./queue-state-machine.md) — 상태 전이 상세
 - [Stagnation Detection](./stagnation.md) — Composite Similarity + Lateral Thinking
-- [DataSource](./datasource.md) — 워크플로우 정의 + context 스키마
+- [DataSource](./datasource.md) — 수집/컨텍스트 추상화
 - [AgentRuntime](./agent-runtime.md) — LLM 실행 추상화
 - [Cron 엔진](./cron-engine.md) — evaluate cron + 품질 루프

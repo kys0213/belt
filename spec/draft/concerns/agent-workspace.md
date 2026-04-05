@@ -16,27 +16,24 @@
 handler 전부 성공 → Completed
     │
     ▼
-evaluate cron (force_trigger로 즉시 실행 가능):
-  for item in queue.get(Completed):
-    belt agent -p "아이템 {work_id}의 완료 여부를 판단해줘.
-      belt context {work_id} --json 으로 컨텍스트를 확인하고,
-      belt queue done {work_id} 또는 belt queue hitl {work_id} 를 실행해줘"
+Evaluator (Daemon tick에서 Executor보다 먼저 실행):
+  Progressive Pipeline:
+    Stage 1: Mechanical (cargo test 등, 비용 0)
+      → 실패 시 Retry (LLM 안 부름)
+    Stage 2: Semantic (LLM 1회, belt agent -p)
+      → LLM이 belt context로 컨텍스트 조회 후 판정
     │
-    │  LLM이 해당 아이템의 belt context로 컨텍스트 조회 후 CLI 도구로 결정:
+    ├── Done → hook.on_done() 트리거
+    │     ├── hook 성공 → Done (worktree 정리)
+    │     └── hook 실패 → Failed (worktree 보존)
     │
-    ├── belt queue done $WORK_ID
-    │     → Daemon이 on_done script 실행
-    │       ├── script 성공 → Done (worktree 정리)
-    │       └── script 실패 → Failed (worktree 보존, 로그 기록)
-    │
-    └── belt queue hitl $WORK_ID --reason "..."
-          → HITL 이벤트 생성 → 사람 대기 (worktree 보존)
+    └── HITL → HITL 이벤트 생성 → 사람 대기 (worktree 보존)
 ```
 
-- evaluate cron: `interval 60s + force_trigger on Completed 전이`
-- LLM이 JSON을 파싱하는 게 아니라, 직접 `belt queue done/hitl` CLI를 호출하여 상태를 전이한다
+- Evaluator는 Daemon tick의 정규 단계. 상세: [Evaluator](./evaluator.md)
+- SemanticStage에서 LLM이 `belt queue done/hitl` CLI를 직접 호출하여 상태를 전이한다
 - 개별 판정 실패 시 해당 아이템만 Completed에 머물고, 다른 아이템 판정에 영향 없다
-- `batch_size`로 한 tick에서 처리할 최대 아이템 수를 제한한다
+- evaluate LLM 호출도 `daemon.max_concurrent` slot을 소비한다
 
 ---
 
@@ -187,14 +184,9 @@ v4 (15개) → v5 (3개):
 ### classify-policy.md 로딩 경로 및 해석 (R-CW-007)
 
 `classify-policy.md`는 LLM 에이전트가 큐 아이템을 Done / HITL로 분류할 때
-참조하는 정책 문서다. 두 가지 형태로 존재한다:
+참조하는 자연어 정책 문서다. `.claude/rules/` 하위에 위치하며, system prompt에 주입된다.
 
-| 파일 | 위치 | 소비자 | 용도 |
-|------|------|--------|------|
-| `classify-policy.md` | `.claude/rules/` 하위 | LLM agent (system prompt) | 자연어 분류 기준 |
-| `classify-policy.yaml` | workspace root | daemon evaluator | machine-readable 라우팅 규칙 |
-
-#### 로딩 경로 (classify-policy.md)
+#### 로딩 경로
 
 `agent::resolve_rules_dir` 함수가 아래 우선순위로 **디렉토리**를 탐색한다.
 첫 번째로 존재하는 디렉토리 안의 **모든 `.md` 파일**이 로드된다.
@@ -231,14 +223,16 @@ Priority 3: $BELT_HOME/claw-workspace/.claude/rules/    (global, belt claw init)
 | `belt hitl list --json` | HITL 목록 조회 | 대화형 세션 |
 | `belt queue list --json` | 큐 목록 조회 | 대화형 세션 |
 
-### evaluate cron과의 관계
+### Evaluator와의 관계
 
-evaluate cron은 내부적으로 각 Completed 아이템에 대해 `belt agent --workspace <path> -p "<prompt>"`를 호출한다. 이때:
+Evaluator의 SemanticStage가 내부적으로 `belt agent -p`를 호출한다. 이때:
 - **per-item**: 각 아이템에 대해 개별 프롬프트 발행 (v6 #722)
 - LLM이 `belt context $WORK_ID`로 해당 아이템 정보를 조회
 - 판단 후 `belt queue done/hitl` CLI를 직접 호출하여 상태 전이
 - classify-policy.md의 state별 Done 조건이 판단 기준
-- 개별 실패는 해당 아이템만 영향, `batch_size`로 tick당 처리 수 제한
+- evaluate LLM 호출도 `daemon.max_concurrent` slot을 소비
+
+상세: [Evaluator](./evaluator.md)
 
 ---
 
