@@ -1,6 +1,6 @@
 # Data Model
 
-> 관련 문서: [DESIGN-v6](../DESIGN-v6.md), [QueuePhase 상태 머신](./queue-state-machine.md), [DataSource](./datasource.md), [Cron 엔진](./cron-engine.md), [Stagnation](./stagnation.md)
+> 관련 문서: [DESIGN-v6](../DESIGN-v6.md), [QueuePhase 상태 머신](./queue-state-machine.md), [DataSource](./datasource.md), [LifecycleHook](./lifecycle-hook.md), [Evaluator](./evaluator.md), [Cron 엔진](./cron-engine.md), [Stagnation](./stagnation.md)
 
 Belt의 모든 상태는 SQLite 단일 파일(`~/.belt/belt.db`)에 저장된다. 이 문서는 테이블 스키마, 도메인 모델, 직렬화 규칙을 한 곳에 정의한다.
 
@@ -77,6 +77,19 @@ CREATE TABLE history (
 );
 ```
 
+**QueuePhase ↔ history.status 매핑**:
+
+| QueuePhase | history.status | 비고 |
+|------------|---------------|------|
+| Pending | — | 시도 아님, 기록 안 함 |
+| Ready | — | 시도 아님, 기록 안 함 |
+| Running | `running` | handler 실행 중 |
+| Completed | — | 전이 상태, history에 기록 안 함 (`"completed"` 파싱 시 `Done`으로 매핑) |
+| Done | `done` | 완료 |
+| Hitl | `hitl` | 사람 대기 |
+| Failed | `failed` | 실패 |
+| Skipped | `skipped` | 건너뜀 |
+
 **파생 쿼리**:
 - `failure_count`: `SELECT COUNT(*) FROM history WHERE source_id = ? AND state = ? AND status = 'failed'`
 - `max_attempt`: `SELECT MAX(attempt) FROM history WHERE source_id = ? AND state = ?`
@@ -91,7 +104,7 @@ CREATE TABLE transition_events (
     id         TEXT PRIMARY KEY,        -- UUID
     work_id    TEXT NOT NULL,
     source_id  TEXT NOT NULL,
-    event_type TEXT NOT NULL,           -- 'phase_enter' | 'handler' | 'evaluate' | 'on_done' | 'on_fail' | 'stagnation'
+    event_type TEXT NOT NULL,           -- 'phase_enter' | 'handler' | 'evaluate' | 'hook' | 'stagnation'
     phase      TEXT,                    -- 진입한 phase
     from_phase TEXT,                    -- 이전 phase
     detail     TEXT,                    -- 사람이 읽을 수 있는 설명
@@ -99,7 +112,7 @@ CREATE TABLE transition_events (
 );
 ```
 
-**v6 변경 (#723)**: `event_type`에 `'stagnation'` 추가. `detail`에 탐지 패턴, confidence, evidence, 가속 결과를 JSON으로 기록한다.
+**v6 변경**: `event_type`에 `'stagnation'`과 `'hook'` 추가. 기존 `'on_done'`/`'on_fail'`은 `'hook'`으로 통합 — LifecycleHook 트리거 이벤트를 기록한다. `detail`에 hook 종류(on_enter/on_done/on_fail/on_escalation), 탐지 패턴, confidence, evidence를 JSON으로 기록한다.
 
 ### queue_dependencies
 
@@ -231,9 +244,9 @@ CREATE TABLE knowledge_base (
 | `Ready` | `"ready"` | No | 실행 준비 완료 (자동 전이) |
 | `Running` | `"running"` | No | worktree 생성 + handler 실행 중 |
 | `Completed` | `"completed"` | No | handler 성공, evaluate 대기 |
-| `Done` | `"done"` | **Yes** | evaluate 완료 + on_done 성공 |
+| `Done` | `"done"` | **Yes** | evaluate 완료 + hook.on_done() 성공 |
 | `Hitl` | `"hitl"` | No | 사람 판단 필요 |
-| `Failed` | `"failed"` | No | on_done 실패 또는 인프라 오류 |
+| `Failed` | `"failed"` | No | hook.on_done() 실패 또는 인프라 오류 |
 | `Skipped` | `"skipped"` | **Yes** | escalation skip 또는 preflight 실패 |
 
 **v6 (#718)**: `phase` 필드는 `pub(crate)` 가시성. 외부에서 직접 대입 불가, 반드시 `QueueItem::transit()` 경유. 상세: [QueuePhase 상태 머신](./queue-state-machine.md)
@@ -270,13 +283,15 @@ HITL 생성 경로. 직렬화 시 snake_case.
 
 failure_count별 대응. 직렬화 시 snake_case.
 
-| Variant | 직렬화 | on_fail 실행 | 설명 |
-|---------|--------|:------------:|------|
+| Variant | 직렬화 | hook.on_fail 트리거 | 설명 |
+|---------|--------|:------------------:|------|
 | `Retry` | `"retry"` | **No** | 조용한 재시도 |
-| `RetryWithComment` | `"retry_with_comment"` | Yes | on_fail + 재시도 |
-| `Hitl` | `"hitl"` | Yes | on_fail + HITL 생성 |
-| `Skip` | `"skip"` | Yes | on_fail + Skipped |
-| `Replan` | `"replan"` | Yes | on_fail + HITL(replan) |
+| `RetryWithComment` | `"retry_with_comment"` | Yes | hook.on_fail + 재시도 |
+| `Hitl` | `"hitl"` | Yes | hook.on_fail + HITL 생성 |
+| `Skip` | `"skip"` | Yes | hook.on_fail + Skipped |
+| `Replan` | `"replan"` | Yes | hook.on_fail + HITL(replan) |
+
+모든 EscalationAction에서 `hook.on_escalation(action)` 트리거. `on_fail`은 Retry 제외 시 추가 트리거.
 
 **v6 (#720)**: `EscalationAction`은 `FromStr` + `Display` impl을 가진다. `hitl_terminal_action` 필드 타입으로도 사용된다.
 
@@ -344,20 +359,23 @@ handlers:
   - script: "cargo test"
 ```
 
-### ScriptAction (yaml 설정)
+### ScriptAction (yaml 설정, v6 호환용)
 
-lifecycle hook(`on_enter`, `on_done`, `on_fail`)에서 사용. **script만 허용**.
+v6 Phase 1에서 기존 yaml과의 호환을 위해 유지. `ScriptLifecycleHook` 어댑터가 이를 소비한다. Phase 2에서 DataSource별 Hook impl로 대체 예정.
 
 ```yaml
+# v6 Phase 1: 기존 yaml 호환 (ScriptLifecycleHook 어댑터가 처리)
 on_done:
   - script: "gh pr create ..."
 on_fail:
   - script: "gh issue comment ..."
 ```
 
+> **v6 변경**: lifecycle 반응은 `LifecycleHook` trait으로 분리. yaml script는 어댑터를 통해 호환 유지. 상세: [LifecycleHook](./lifecycle-hook.md)
+
 ### Action (런타임 추상화)
 
-코어의 실행 단위. `HandlerConfig`와 `ScriptAction` 모두 `Action`으로 변환되어 실행된다.
+코어의 실행 단위. handler의 `HandlerConfig`가 `Action`으로 변환되어 Executor가 실행한다.
 
 ```
 HandlerConfig::Prompt  → Action::Prompt { text, runtime, model }

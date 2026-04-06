@@ -207,39 +207,15 @@ HITL 이벤트가 생성되면 사용자에게 다음 경로로 알린다:
 | /agent 세션 | 진입 시 HITL 대기 목록 자동 표시 |
 | on_fail script | escalation=hitl 시 실행 — GitHub 코멘트 등으로 외부 알림 가능 |
 
-별도 push 알림(Slack, email)은 on_fail/on_done script에서 직접 구현한다 (webhook 호출 등).
+별도 push 알림(Slack, email)은 LifecycleHook impl에서 처리한다 (webhook 호출 등).
 
-> **v6**: Stagnation으로 HITL에 진입한 경우 `HitlReason::StagnationDetected`와 함께 lateral report(시도한 페르소나, 각 분석 결과)가 표시되어 사용자가 지금까지의 접근 전환 이력을 참고할 수 있다.
+> **v6**: Stagnation으로 HITL에 진입한 경우, lateral report(시도한 접근법들, 각 분석 결과)가 표시되어 사용자가 지금까지의 접근 전환 이력을 참고할 수 있다.
 
 ---
 
 ## 6. 데이터 요구사항
 
-```sql
--- 아이템별 전이 이벤트 (append-only)
-transition_events (
-    id          TEXT PRIMARY KEY,
-    work_id     TEXT NOT NULL,
-    source_id   TEXT NOT NULL,       -- 계보 추적
-    event_type  TEXT NOT NULL,       -- phase_enter, handler, evaluate, on_done, on_fail, on_enter, stagnation
-    phase       TEXT,                -- Pending, Ready, Running, Completed, Done, HITL, Failed, Skipped
-    detail      TEXT,                -- script exit code, prompt result, error message, stagnation evidence
-    created_at  TEXT NOT NULL
-)
-
--- token 사용량 (AgentRuntime 실행마다 기록)
-token_usage (
-    id          TEXT PRIMARY KEY,
-    work_id     TEXT NOT NULL,
-    workspace   TEXT NOT NULL,
-    runtime     TEXT NOT NULL,       -- claude, gemini, codex
-    model       TEXT,                -- sonnet, opus, haiku
-    input_tokens  INTEGER,
-    output_tokens INTEGER,
-    duration_ms   INTEGER,
-    created_at  TEXT NOT NULL
-)
-```
+모든 전이 이벤트와 토큰 사용량은 DB에 기록된다. 스키마 상세: [Data Model](../concerns/data-model.md)
 
 ---
 

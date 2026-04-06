@@ -216,7 +216,7 @@ for item in queue.get(Completed):
 ```
 
 - 개별 판정 실패 시 해당 아이템만 Completed에 머물고, 다른 아이템 판정에 영향 없다
-- `batch_size`로 한 tick에서 처리할 최대 아이템 수를 제한한다
+- evaluate LLM 호출도 `daemon.max_concurrent` slot을 소비한다 — 별도 batch 제어 없음
 - 기존 `eval_failure_counts`는 이미 per-work_id로 관리됨 (설계 의도 일치)
 
 ### 실패 원칙
@@ -279,8 +279,9 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 - [DESIGN-v6](../DESIGN-v6.md) — 설계 철학
 - [Daemon](./daemon.md) — 내부 모듈 구조 + 실행 루프
-- [Stagnation Detection](./stagnation.md) — 반복 패턴 감지 + escalation 가속
-- [DataSource](./datasource.md) — escalation 정책 + on_fail script
+- [Stagnation Detection](./stagnation.md) — 반복 패턴 감지 + lateral thinking
+- [LifecycleHook](./lifecycle-hook.md) — 상태 전이 반응 trait
+- [DataSource](./datasource.md) — 수집/컨텍스트 + escalation 정책
 - [Cron 엔진](./cron-engine.md) — evaluate cron + force_trigger
 - [실패 복구와 HITL](../flows/04-failure-and-hitl.md) — 실패/HITL 시나리오
 - [Data Model](./data-model.md) — 테이블 스키마, 도메인 enum

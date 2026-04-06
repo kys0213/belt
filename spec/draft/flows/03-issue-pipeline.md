@@ -27,7 +27,7 @@ DataSource.collect(): trigger 조건 매칭 (예: belt:analyze 라벨)
   Pending → Ready → Running (자동 전이, concurrency 제한)
     │
     │  ① worktree 생성 (인프라, 또는 retry 시 기존 보존분 재사용)
-    │  ② on_enter script 실행 (정의된 경우)
+    │  ② hook.on_enter() 트리거 (workspace의 LifecycleHook)
     │  ③ handlers 순차 실행:
     │       prompt → AgentRuntime.invoke() (worktree 안에서)
     │       script → bash (WORK_ID + WORKTREE 주입)
@@ -35,27 +35,27 @@ DataSource.collect(): trigger 조건 매칭 (예: belt:analyze 라벨)
     ├── 전부 성공 → Completed
     │     │
     │     ▼
-    │   evaluate cron (per-item, force_trigger로 즉시 실행 + 주기 폴링 하이브리드):
+    │   evaluate (per-item, concurrency slot 소비):
     │   "이 아이템의 결과가 충분한가?"
-    │     ├── Done → on_done script 실행 → worktree 정리
-    │     │           └── script 실패 → Failed (로그 기록, 재시도 가능)
+    │     ├── Done → hook.on_done() 트리거 → worktree 정리
+    │     │           └── hook 실패 → Failed (로그 기록)
     │     └── HITL → HITL 이벤트 생성 → 사람 대기 (worktree 보존)
     │
     └── 실패 (handler 또는 on_enter)
           │
           ▼
-        Stagnation Analyzer (항상 실행):
-          CompositeSimilarity로 outputs/errors 유사도 분석
-          패턴 감지 시 → LateralAnalyzer가 페르소나로 대안 분석
-          → lateral_plan 생성
+        Stagnation 분석 (항상 실행):
+          이전 시도와 유사한 패턴인가? (반복, 교대 등)
+          패턴 감지 시 → 다른 접근법으로 전환하여 재시도
           │
           ▼
-        Escalation (failure_count 기반, lateral_plan 포함):
-          ├── retry             → lateral_plan 주입, 재시도, worktree 보존
-          ├── retry_with_comment → lateral_plan 주입, on_fail + 재시도
-          └── hitl              → lateral_report 첨부, on_fail + HITL 생성
-                                    └── 사람: done/retry/skip/replan
-                                    └── timeout → terminal (skip 또는 replan)
+        Escalation (실패 횟수 기반):
+          ├── 1회 → 조용히 재시도 (대안 접근법 주입)
+          ├── 2회 → 외부 시스템에 알림 + 재시도
+          └── 3회 → 사람에게 전달 (lateral report 첨부)
+                       └── 사람: done/retry/skip/replan
+                       └── timeout → terminal (skip 또는 replan)
+        상세: [실패 복구와 HITL](./04-failure-and-hitl.md)
 ```
 
 ---
@@ -102,9 +102,46 @@ DataSource.collect()가 changes-requested 감지
 
 ---
 
+## 인프라 오류와 Circuit Breaker
+
+handler 로직 실패(stagnation)와 인프라 오류는 다른 문제이다.
+
+| 구분 | 예시 | 대응 |
+|------|------|------|
+| **handler 실패** | 컴파일 에러, 테스트 실패 | stagnation 분석 → lateral thinking → escalation |
+| **인프라 오류** | GitHub API 장애, 디스크 부족, worktree 깨짐 | circuit breaker → 일시 중단 → 자동 복구 |
+
+### 인프라 오류 발생 시
+
+```
+인프라 오류 감지 (GitHub API 5xx, worktree 생성 실패 등)
+  │
+  ├── dashboard에 오류 상태 표시
+  │     "⚠ github:org/repo — GitHub API 503 (3/5 failures)"
+  │
+  ├── backoff retry (1s → 2s → 4s → ...)
+  │
+  └── Circuit Breaker:
+        closed (정상)
+          → N회 연속 인프라 오류 → open
+        open (중단)
+          → 해당 source/작업 일시 중단
+          → dashboard에 "🔴 circuit open" 표시
+          → cooldown 후 half-open
+        half-open (시험)
+          → 1건 시험 실행
+          → 성공 → closed (정상 복귀)
+          → 실패 → open (다시 중단)
+```
+
+circuit breaker는 source 단위로 동작한다. 한 source의 인프라 오류가 다른 workspace의 작업에 영향을 주지 않는다.
+
+---
+
 ### 관련 문서
 
 - [DataSource](../concerns/datasource.md) — 상태 기반 워크플로우 + context 스키마
+- [LifecycleHook](../concerns/lifecycle-hook.md) — 상태 전이 반응
 - [실패 복구와 HITL](./04-failure-and-hitl.md) — escalation 정책
 - [Stagnation Detection](../concerns/stagnation.md) — 실패 패턴 감지
-- [Cron 엔진](../concerns/cron-engine.md) — evaluate cron + 품질 루프
+- [Evaluator](../concerns/evaluator.md) — Progressive Evaluation Pipeline
