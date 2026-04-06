@@ -66,6 +66,9 @@ sources:
       3: hitl
       terminal: skip          # hitl timeout 시 적용 (skip 또는 replan)
 
+    # 참고: on_done/on_fail은 v6 Phase 1에서 ScriptLifecycleHook 어댑터로 처리됨.
+    # Phase 2에서 DataSource별 LifecycleHook impl로 대체 예정.
+
 runtime:
   default: claude
   claude:
@@ -86,6 +89,30 @@ workspace는 하나의 외부 레포와 1:1로 대응한다. GitHub 기준으로
 5. per-workspace cron seed (evaluate, gap-detection, knowledge-extract)
 6. Agent 워크스페이스 초기화 확인
 ```
+
+### 에러 시나리오
+
+CLI가 등록 전에 즉시 검증하고, 실패 시 구체적 에러 메시지를 표시한다.
+
+```
+belt workspace add --config workspace.yaml
+
+  yaml 파싱 실패:
+    → "Error: workspace.yaml:12 — 'handlers' 필드가 필요합니다"
+
+  repo 접근 불가:
+    → "Error: https://github.com/org/repo 접근 불가 (401 Unauthorized)"
+    → "hint: gh auth status로 인증 상태를 확인하세요"
+
+  workspace 이름 중복:
+    → "Error: workspace 'auth-project'가 이미 존재합니다"
+    → "hint: belt workspace remove auth-project로 기존 workspace를 삭제하세요"
+
+  DataSource 유형 미지원:
+    → "Error: 'jira' DataSource는 아직 지원되지 않습니다 (v7+)"
+```
+
+모든 검증은 DB 기록 전에 수행된다. 실패 시 부수효과 없음.
 
 ---
 

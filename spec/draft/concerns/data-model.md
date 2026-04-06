@@ -77,6 +77,19 @@ CREATE TABLE history (
 );
 ```
 
+**QueuePhase ↔ history.status 매핑**:
+
+| QueuePhase | history.status | 비고 |
+|------------|---------------|------|
+| Pending | — | 시도 아님, 기록 안 함 |
+| Ready | — | 시도 아님, 기록 안 함 |
+| Running | `running` | handler 실행 중 |
+| Completed | — | 전이 상태, history에 기록 안 함 (`"completed"` 파싱 시 `Done`으로 매핑) |
+| Done | `done` | 완료 |
+| Hitl | `hitl` | 사람 대기 |
+| Failed | `failed` | 실패 |
+| Skipped | `skipped` | 건너뜀 |
+
 **파생 쿼리**:
 - `failure_count`: `SELECT COUNT(*) FROM history WHERE source_id = ? AND state = ? AND status = 'failed'`
 - `max_attempt`: `SELECT MAX(attempt) FROM history WHERE source_id = ? AND state = ?`
