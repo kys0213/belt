@@ -7,22 +7,21 @@
 ## Spec Lifecycle
 
 ```
-Draft ──→ Analyzing ──→ Active ←──→ Paused
-              │              │
-              │ 문제 발견     ▼
-              └→ Draft    Completing
-                              │
-                              ▼
-                          Completed (terminal)
+Draft ──→ Active ←──→ Paused
+              │
+              ▼
+          Completing
+              │
+              ▼
+          Completed (terminal)
 
 Any ──→ Archived (soft delete)
 Archived ──resume──→ Active (복구)
 ```
 
-| 상태 | 가능한 전이 | CLI / 트리거 |
-|------|------------|-------------|
-| Draft | → Analyzing | `spec add` |
-| Analyzing | → Active(분석 통과), → Draft(문제 발견) | 자동 (LLM 분석) |
+| 상태 | 가능한 전이 | CLI |
+|------|------------|-----|
+| Draft | → Active | `spec add` |
 | Active | → Paused, → Completing(자동), → Archived | `spec pause`, `spec remove` |
 | Paused | → Active, → Archived | `spec resume`, `spec remove` |
 | Completing | → Active(gap 발견), → Completed(HITL 승인) | 자동 |
@@ -31,48 +30,15 @@ Archived ──resume──→ Active (복구)
 
 ---
 
-## 등록 → 분석 → 이슈 분해
+## 등록 → 이슈 분해
 
 ```
 /spec add [file]
-  → 필수 섹션 검증 (기계적: 개요, 요구사항, 아키텍처, 테스트, 수용 기준)
-  → DB에 저장 (status: Analyzing)
-  │
-  ▼
-Analyzing:
-  LLM이 스펙을 분석 (설정: ~/.belt/config.yaml)
-  ├── quality        — 섹션 완성도, AC 구체성
-  ├── decomposability — 이슈로 분해 가능한지
-  └── dependency      — 기존 스펙과 충돌/의존
-  │
-  ├── 분석 점수 >= auto_approve_threshold → Active로 자동 전이
-  ├── 점수 미달 → 사용자에게 피드백 + Draft로 복귀
-  │     "AC #3이 검증 불가능합니다. 구체적 기대 결과를 추가하세요"
-  │     "스펙 'auth-v2'와 의존 관계가 감지되었습니다"
-  └── 분석 실패 (LLM 오류) → Draft로 복귀 + 에러 표시
-  │
-  ▼
-Active:
+  → 필수 섹션 검증 (개요, 요구사항, 아키텍처, 테스트, 수용 기준)
+  → DB에 저장 (status: Active)
   → 스펙 분해 → 이슈 자동 생성
   → 각 이슈에 trigger 라벨 (예: belt:analyze) 부착
   → DataSource.collect()가 감지 → 파이프라인 진입
-```
-
-### 분석 설정
-
-`~/.belt/config.yaml`에서 글로벌 기본값을 정의하고, workspace yaml에서 오버라이드 가능하다.
-
-```yaml
-# ~/.belt/config.yaml
-spec:
-  analysis:
-    runtime: claude              # 분석에 사용할 LLM
-    model: sonnet
-    checks:                      # 활성화할 분석 항목
-      - quality                  # 섹션 완성도, AC 구체성
-      - decomposability          # 이슈로 분해 가능한지
-      - dependency               # 다른 스펙과 충돌/의존
-    auto_approve_threshold: 0.8  # 이 점수 이상이면 자동으로 Active 전이
 ```
 
 ### 스펙 분해 전략

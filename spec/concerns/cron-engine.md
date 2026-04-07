@@ -9,7 +9,9 @@
 
 ```
 1. 인프라 유지 — hitl-timeout, log-cleanup, daily-report (결정적)
-2. 품질 루프 — evaluate, gap-detection, knowledge-extract (LLM 사용)
+2. 품질 루프 — gap-detection, knowledge-extract (LLM 사용)
+
+※ evaluate는 Daemon tick 루프의 정규 단계로 이동. 상세: [Evaluator](./evaluator.md)
 ```
 
 ---
@@ -57,7 +59,6 @@ gap 발견 → DataSource에서 open 아이템 조회 (Pending/Ready/Running)
 
 | Job | 주기 | 동작 |
 |-----|------|------|
-| evaluate | 60초 | 완료 아이템 분류 (Done or HITL) — `belt agent -p` |
 | gap-detection | 1시간 | 스펙-코드 대조, gap 발견 시 이슈 생성 |
 | knowledge-extract | 1시간 | merged PR 지식 추출 |
 
@@ -70,39 +71,19 @@ gap 발견 → DataSource에서 open 아이템 조회 (Pending/Ready/Running)
 
 ---
 
-## Force Trigger (하이브리드 실행 모델)
+## Force Trigger
 
-evaluate는 **cron 주기 폴링 + force_trigger 즉시 실행**의 하이브리드 모델로 동작한다:
+force_trigger는 cron job을 다음 tick에서 우선 실행하도록 스케줄링한다.
 
 ```
-1. 주기 폴링: evaluate cron이 60초마다 Completed 아이템을 스캔
-2. 즉시 실행: handler 성공 → Completed 전이 → force_trigger("evaluate")
-               → last_run_at = NULL → 다음 tick(10초 이내)에서 즉시 실행
+force_trigger(job_name):
+  job.last_run_at = NULL → 다음 tick에서 즉시 실행
 ```
 
-- **force_trigger**는 동기적으로 evaluate를 실행하지 않는다. cron의 `last_run_at`을 리셋하여 다음 tick에서 우선 실행되도록 스케줄링한다.
-- evaluate LLM 호출도 concurrency slot을 소비한다 (`daemon.max_concurrent`에 `active_evaluate_count`가 포함됨).
-- 주기 폴링은 force_trigger가 누락된 경우(예: 프로세스 재시작)의 안전망 역할을 한다.
+- 동기적으로 실행하지 않는다. cron의 `last_run_at`을 리셋할 뿐.
+- gap-detection 등 품질 루프 job에 사용.
 
-> handler 실패 시에는 force_trigger 없이 즉시 escalation 정책이 적용된다 (evaluate 불필요).
-
----
-
-## 스크립트 구조
-
-Cron job의 스크립트도 `belt context`를 활용하여 필요한 정보를 조회한다.
-
-```bash
-#!/bin/bash
-# Guard: Completed 상태 아이템 있을 때만
-COMPLETED=$(belt queue list --workspace "$WORKSPACE" --phase completed --json | jq 'length')
-if [ "$COMPLETED" = "0" ]; then exit 0; fi
-
-# 실행: evaluate
-# LLM이 context를 조회하고 belt queue done/hitl CLI를 직접 호출
-belt agent --workspace "$WORKSPACE" -p \
-  "Completed 아이템의 완료 여부를 판단하고, belt queue done 또는 belt queue hitl 을 실행해줘"
-```
+> **evaluate는 v6에서 Daemon tick 정규 단계로 이동**. Completed 아이템은 Evaluator가 다음 tick에서 Progressive Pipeline으로 판정한다. 상세: [Evaluator](./evaluator.md)
 
 ---
 
@@ -132,6 +113,7 @@ Cron 스크립트에는 workspace 정보가 필요하므로 추가 변수를 주
 
 ### 관련 문서
 
-- [DESIGN-v5](../DESIGN-v5.md) — evaluate 아키텍처
+- [DESIGN-v6](../DESIGN-v6.md) — evaluate 아키텍처
 - [DataSource](./datasource.md) — belt context 스키마
 - [Agent](./agent-workspace.md) — evaluate와 Agent의 관계
+- [Stagnation Detection](./stagnation.md) — handler 실패 시 패턴 감지 (cron이 아닌 동기 실행)
