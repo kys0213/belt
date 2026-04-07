@@ -1,7 +1,7 @@
 # QueuePhase 상태 머신
 
 > 큐 아이템의 전체 생명주기를 정의한다.
-> 상위 설계는 [DESIGN-v6](../DESIGN-v6.md) 참조.
+> 상위 설계는 [DESIGN-v5](../DESIGN-v5.md) 참조.
 
 ---
 
@@ -17,46 +17,6 @@
 | **HITL** | evaluate가 사람 판단 필요로 분류 |
 | **Skipped** | escalation skip 또는 preflight 실패 |
 | **Failed** | on_done script 실패, 인프라 오류 등 |
-
----
-
-## Phase 전이 캡슐화 (v6 #718)
-
-`QueueItem.phase` 필드를 직접 대입하면 `can_transition_to()` 검증을 우회할 수 있다.
-v6에서는 모든 전이를 `QueueItem::transit()` 메서드로 강제한다.
-
-```rust
-impl QueueItem {
-    /// phase 필드는 pub(crate) — belt-core 외부에서 직접 대입 불가
-    /// 읽기는 pub getter: fn phase(&self) -> QueuePhase
-
-    pub fn transit(&mut self, to: QueuePhase) -> Result<QueuePhase, BeltError> {
-        let from = self.phase;
-        if !from.can_transition_to(&to) {
-            return Err(BeltError::InvalidTransition { from, to });
-        }
-        self.phase = to;
-        self.updated_at = Utc::now().to_rfc3339();
-        Ok(from)
-    }
-}
-```
-
-### 테스트 지원
-
-테스트에서 특정 phase의 아이템을 생성하려면 빌더를 사용한다:
-
-```rust
-// 테스트 전용 빌더 (cfg(test) 또는 #[doc(hidden)])
-QueueItem::builder()
-    .work_id("test:1:analyze")
-    .with_phase(QueuePhase::Running)  // 검증 없이 직접 설정
-    .build()
-```
-
-### DB 로드
-
-`belt-infra/db.rs`의 `from_row()`는 `pub(crate)` 접근 가능하므로 DB에서 로드 시 phase 직접 설정이 가능하다.
 
 ---
 
@@ -92,30 +52,20 @@ QueueItem::builder()
                            │            │
                            ▼            ▼
           ┌─────────────────┐    ┌─────────────────────────────┐
-          │    Completed     │    │  Stagnation Analyzer (항상 실행)│
-          │                  │    │                               │
-          │  handler 완료    │    │  ① CompositeSimilarity로     │
-          │  evaluate 대기   │    │    outputs/errors 유사도 분석 │
-          │                  │    │  ② 패턴 감지 시              │
-          │  force_trigger   │    │    LateralAnalyzer가         │
-          │  ("evaluate")    │    │    내장 페르소나로 대안 분석   │
-          └────────┬────────┘    │    → lateral_plan 생성        │
-                   │              │                               │
-                   │              │  Escalation (failure_count):  │
-                   │              │  1: retry                    │
-                   │              │     → lateral_plan 주입       │
-                   │              │     → 새 아이템 → Pending     │
-                   │              │     → worktree 보존          │
-                   │              │     → on_fail 실행 안 함      │
-                   │              │                               │
+          │    Completed     │    │     Escalation 정책 적용      │
+          │                  │    │     (history 기반 count)      │
+          │  handler 완료    │    │                               │
+          │  evaluate 대기   │    │  1: retry                    │
+          │                  │    │     → 새 아이템 → Pending     │
+          │  force_trigger   │    │     → worktree 보존          │
+          │  ("evaluate")    │    │     → on_fail 실행 안 함      │
+          └────────┬────────┘    │                               │
                    │              │  2: retry_with_comment        │
-                   │              │     → lateral_plan 주입       │
                    │              │     → on_fail script 실행     │
                    │              │     → 새 아이템 → Pending     │
                    │              │     → worktree 보존          │
                    │              │                               │
                    │              │  3: hitl                      │
-                   │              │     → lateral_report 첨부     │
                    │              │     → on_fail script 실행     │
                    │              │     → HITL 이벤트 생성 ───────┐│
                    │              │     → worktree 보존          ││
@@ -126,7 +76,7 @@ QueueItem::builder()
                    │              │     replan → HITL(replan) ────┤│  │
                    │              └───────────────────────────────┘│  │
                    │                                               │  │
-                   │  evaluate cron (per-item)                     │  │
+                   │  evaluate cron                                │  │
                    │  (LLM이 belt queue done/hitl CLI 호출)     │  │
                    │                                               │  │
               ┌────┴────┐                                          │  │
@@ -189,8 +139,6 @@ QueueItem::builder()
 
 failure_count는 append-only history에서 계산한다: `history | filter(state, failed) | count`. on_enter 실패도 handler 실패와 동일하게 failure_count에 포함된다.
 
-> **v6 (#723)**: 모든 실패에서 StagnationDetector가 CompositeSimilarity로 유사도 분석을 수행한다. 패턴이 감지되면 LateralAnalyzer가 내장 페르소나(HACKER, ARCHITECT 등)로 대안 접근법을 분석하고, lateral_plan을 생성하여 retry 시 handler prompt에 주입한다. escalation 자체는 기존 failure_count 기반 그대로이되, **모든 retry가 lateral plan으로 강화**된다. 상세: [Stagnation Detection](./stagnation.md)
-
 ---
 
 ## Evaluate 원칙
@@ -201,23 +149,7 @@ failure_count는 append-only history에서 계산한다: `history | filter(state
 
 2. **"충분한가?"만 판단** — "이 handler의 결과물이 다음 단계로 넘어가기에 충분한가?"만 본다. 품질 판단(좋은 코드인가?)은 Cron 품질 루프가 담당한다.
 
-3. **state별 구체 기준은 agent-workspace rules에 위임** — `~/.belt/agent-workspace/.claude/rules/classify-policy.md`에 state별 Done 조건을 정의한다. 코어는 rules를 모르고, `belt agent`가 rules를 참조하여 판단한다.
-
-### Per-Item 판정 (v6 #722)
-
-evaluate는 **per-work_id 단위**로 LLM 판정을 실행한다. 각 Completed 아이템에 대해 개별 프롬프트를 발행하고, 해당 아이템의 context를 포함한다.
-
-```
-for item in queue.get(Completed):
-    belt_agent_p(workspace,
-        "아이템 {work_id}의 완료 여부를 판단해줘.
-         belt context {work_id} --json 으로 컨텍스트를 확인하고,
-         belt queue done {work_id} 또는 belt queue hitl {work_id} 를 실행해줘")
-```
-
-- 개별 판정 실패 시 해당 아이템만 Completed에 머물고, 다른 아이템 판정에 영향 없다
-- evaluate LLM 호출도 `daemon.max_concurrent` slot을 소비한다 — 별도 batch 제어 없음
-- 기존 `eval_failure_counts`는 이미 per-work_id로 관리됨 (설계 의도 일치)
+3. **state별 구체 기준은 agent-workspace rules에 위임** — `~/.belt/agent-workspace/.claude/rules/classify-policy.md`에 state별 Done 조건을 정의한다 (Agent 워크스페이스의 rules 파일, [Agent 워크스페이스](./agent-workspace.md) 참조). 코어는 rules를 모르고, `belt agent`가 rules를 참조하여 판단한다.
 
 ### 실패 원칙
 
@@ -232,14 +164,9 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 ---
 
+---
+
 ## 수용 기준
-
-### Phase 전이 캡슐화 (#718)
-
-- [ ] `QueueItem.phase` 필드는 `pub(crate)` 가시성으로, belt-core 외부에서 직접 대입 불가
-- [ ] 모든 phase 변경은 `QueueItem::transit(to)` 메서드를 경유한다
-- [ ] `transit()` 메서드는 내부에서 `can_transition_to()` 검증 + `updated_at` 갱신을 수행한다
-- [ ] 테스트 코드에서도 phase 직접 대입 대신 `transit()` 또는 테스트 헬퍼를 사용한다
 
 ### 상태 전이 규칙
 
@@ -255,13 +182,9 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 - [ ] failure_count=2일 때 `retry_with_comment`가 적용되면 on_fail 실행 후 새 아이템으로 재시도한다
 - [ ] failure_count=3일 때 `hitl`이 적용되면 on_fail 실행 후 HITL 이벤트가 생성된다
 - [ ] on_enter 실패도 failure_count에 포함된다
-- [ ] 모든 실패에서 stagnation 분석이 실행되고, 패턴 감지 시 lateral_plan이 retry에 주입된다
 
-### Evaluate (per-item, #722)
+### Evaluate 실패 시 재시도
 
-- [ ] evaluate는 per-work_id 단위로 LLM 판정을 실행한다
-- [ ] 각 판정에 해당 아이템의 context가 포함된다
-- [ ] 개별 판정 실패 시 해당 아이템만 Completed에 머물고, 다른 아이템에 영향 없다
 - [ ] evaluate LLM 오류 시 아이템은 Completed에 머무르고, 다음 cron tick에서 재시도된다
 - [ ] evaluate 반복 실패(N회)로 HITL 에스컬레이션 시 HitlReason::EvaluateFailure가 기록된다
 - [ ] on_done script 실패 시 Failed 전이되고, on_fail은 실행하지 않는다
@@ -277,11 +200,8 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 ### 관련 문서
 
-- [DESIGN-v6](../DESIGN-v6.md) — 설계 철학
-- [Daemon](./daemon.md) — 내부 모듈 구조 + 실행 루프
-- [Stagnation Detection](./stagnation.md) — 반복 패턴 감지 + lateral thinking
-- [LifecycleHook](./lifecycle-hook.md) — 상태 전이 반응 trait
-- [DataSource](./datasource.md) — 수집/컨텍스트 + escalation 정책
+- [DESIGN-v5](../DESIGN-v5.md) — 설계 철학
+- [DataSource](./datasource.md) — escalation 정책 + on_fail script
 - [Cron 엔진](./cron-engine.md) — evaluate cron + force_trigger
 - [실패 복구와 HITL](../flows/04-failure-and-hitl.md) — 실패/HITL 시나리오
 - [Data Model](./data-model.md) — 테이블 스키마, 도메인 enum

@@ -46,11 +46,12 @@
 │   ⚠ #39 Auth refactor (failed)      ││   evaluate 대기        │
 │   ⏳ #46 Missing tests               ││                        │
 ├──────────────────────────────────────┤├────────────────────────┤
-│ Orphan: 0 | HITL: 1 pending         ││ Logs                   │
+│ Orphan: 0 | HITL: 1 | Stag: 0       ││ Logs                   │
 │ Kanban: 0P | 0Re | 1Ru | 1C | 2D   ││ ...                    │
 └──────────────────────────────────────┘└────────────────────────┘
 ```
 
+> **v6**: Stagnation 카운터 추가 — 현재 stagnation이 감지된 아이템 수를 표시.
 > **Kanban 약어**: P=Pending, Re=Ready, Ru=Running, C=Completed, D=Done, H=HITL, S=Skipped, F=Failed
 
 ### 전이 타임라인 (ItemDetail 오버레이, Enter)
@@ -73,24 +74,32 @@
 └───────────────────────────────────────────────┘
 ```
 
-### 실패 아이템 타임라인
+### 실패 + Lateral Thinking 타임라인 (v6)
 
 ```
 ┌─ #39 Auth refactor ──────────────────────────┐
-│ Phase: Failed | Runtime: claude/sonnet       │
+│ Phase: HITL | Runtime: claude/sonnet         │
+│ Stagnation: SPINNING (score: 0.95)           │
 │                                               │
 │ Timeline:                                     │
 │  13:00 ○ Pending  ← github.collect()         │
-│  13:00 ○ Running                              │
-│         └ handler: claude/sonnet (2.1K, 8m)  │
-│  13:08 ○ Completed                            │
-│  13:08 ○ evaluate  → Done                    │
-│  13:08 ✗ on_done script (exit 1, 0.5s)       │
-│         └ error: gh pr create rate limited    │
-│  13:08 ● Failed                              │
-│         └ worktree 보존: /tmp/belt/auth-39 │
+│  13:00 ○ Running  (attempt 1)                │
+│         └ handler: compile error              │
+│  13:08 ⟳ SPINNING detected (score: 0.95)     │
+│         └ lateral: HACKER 페르소나            │
+│         └ plan: tower-sessions crate 시도     │
+│  13:08 ○ Running  (attempt 2, lateral)       │
+│         └ handler: 다른 에러 (progress!)      │
+│  13:18 ⟳ retry_with_comment (2/3)            │
+│         └ lateral: CONTRARIAN 페르소나        │
+│         └ plan: trait object 접근             │
+│  13:18 ○ Running  (attempt 3, lateral)       │
+│         └ handler: 컴파일 성공, 테스트 실패    │
+│  13:28 ● HITL     (3/3)                      │
+│         └ lateral report 첨부                 │
+│         └ 2회 사고 전환 후에도 미해결          │
 │                                               │
-│ Actions: [r] retry-script  [s] skip          │
+│ Actions: [d] done  [r] retry  [s] skip       │
 └───────────────────────────────────────────────┘
 ```
 
@@ -127,12 +136,13 @@
 ● belt daemon (uptime 2h 15m)
 
 Workspaces:
-  auth-project  ● active   queue: 1P 1R 1C 2D 1F   specs: 2/3
+  auth-project  ● active   queue: 1P 1R 1C 2D 1F   specs: 2/3   stag: 0
   backend-tasks ● active   queue: 0P 0R 0C 5D       specs: 1/1 ✓
 
 Runtime: claude/sonnet (45.2K tokens/1h)
 HITL: 1 pending ⚠
 Failed: 1 ⚠
+Stagnation: 0
 Next evaluate: 25s
 ```
 
@@ -179,6 +189,8 @@ Dependencies:
 │ on_enter        3 ok             │
 │ evaluate       12 ok  1 hitl     │
 │ ⚠ on_done       1 failed        │
+│ stagnation      2 detected       │
+│ lateral         2 plans          │
 └──────────────────────────────────┘
 ```
 
@@ -195,43 +207,22 @@ HITL 이벤트가 생성되면 사용자에게 다음 경로로 알린다:
 | /agent 세션 | 진입 시 HITL 대기 목록 자동 표시 |
 | on_fail script | escalation=hitl 시 실행 — GitHub 코멘트 등으로 외부 알림 가능 |
 
-별도 push 알림(Slack, email)은 on_fail/on_done script에서 직접 구현한다 (webhook 호출 등).
+별도 push 알림(Slack, email)은 LifecycleHook impl에서 처리한다 (webhook 호출 등).
+
+> **v6**: Stagnation으로 HITL에 진입한 경우, lateral report(시도한 접근법들, 각 분석 결과)가 표시되어 사용자가 지금까지의 접근 전환 이력을 참고할 수 있다.
 
 ---
 
 ## 6. 데이터 요구사항
 
-```sql
--- 아이템별 전이 이벤트 (append-only)
-transition_events (
-    id          TEXT PRIMARY KEY,
-    work_id     TEXT NOT NULL,
-    source_id   TEXT NOT NULL,       -- 계보 추적
-    event_type  TEXT NOT NULL,       -- phase_enter, handler, evaluate, on_done, on_fail, on_enter
-    phase       TEXT,                -- Pending, Ready, Running, Completed, Done, HITL, Failed, Skipped
-    detail      TEXT,                -- script exit code, prompt result, error message
-    created_at  TEXT NOT NULL
-)
-
--- token 사용량 (AgentRuntime 실행마다 기록)
-token_usage (
-    id          TEXT PRIMARY KEY,
-    work_id     TEXT NOT NULL,
-    workspace   TEXT NOT NULL,
-    runtime     TEXT NOT NULL,       -- claude, gemini, codex
-    model       TEXT,                -- sonnet, opus, haiku
-    input_tokens  INTEGER,
-    output_tokens INTEGER,
-    duration_ms   INTEGER,
-    created_at  TEXT NOT NULL
-)
-```
+모든 전이 이벤트와 토큰 사용량은 DB에 기록된다. 스키마 상세: [Data Model](../concerns/data-model.md)
 
 ---
 
 ### 관련 문서
 
-- [DESIGN-v5](../DESIGN-v5.md) — QueuePhase 상태 머신
+- [DESIGN-v6](../DESIGN-v6.md) — QueuePhase 상태 머신
+- [Stagnation Detection](../concerns/stagnation.md) — 반복 패턴 감지 시각화
 - [스펙 생명주기](./02-spec-lifecycle.md) — 스펙 진행률
 - [실패 복구와 HITL](./04-failure-and-hitl.md) — HITL 오버레이
 - [CLI 레퍼런스](../concerns/cli-reference.md) — 전체 커맨드 트리
