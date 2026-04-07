@@ -126,7 +126,7 @@ QueueItem::builder()
                    │              │     replan → HITL(replan) ────┤│  │
                    │              └───────────────────────────────┘│  │
                    │                                               │  │
-                   │  evaluate cron (per-item)                     │  │
+                   │  Evaluator (per-item, Daemon tick)             │  │
                    │  (LLM이 belt queue done/hitl CLI 호출)     │  │
                    │                                               │  │
               ┌────┴────┐                                          │  │
@@ -225,7 +225,7 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 | 실패 유형 | 동작 | 상태 |
 |-----------|------|------|
-| evaluate LLM 오류/timeout | Completed 유지, 다음 cron tick에서 재시도 | Completed |
+| evaluate LLM 오류/timeout | Completed 유지, 다음 Daemon tick에서 재시도 | Completed |
 | evaluate 반복 실패 (N회) | HITL로 에스컬레이션 | → HITL |
 | CLI 호출 실패 (`belt queue done/hitl`) | Completed 유지 + 에러 로그, 다음 tick 재시도 | Completed |
 | on_done script 실패 | Failed 상태 (on_fail은 실행하지 않음 — handler 실패가 아니므로) | → Failed |
@@ -282,6 +282,6 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 - [Stagnation Detection](./stagnation.md) — 반복 패턴 감지 + lateral thinking
 - [LifecycleHook](./lifecycle-hook.md) — 상태 전이 반응 trait
 - [DataSource](./datasource.md) — 수집/컨텍스트 + escalation 정책
-- [Cron 엔진](./cron-engine.md) — evaluate cron + force_trigger
+- [Cron 엔진](./cron-engine.md) — 품질 루프 (gap-detection 등)
 - [실패 복구와 HITL](../flows/04-failure-and-hitl.md) — 실패/HITL 시나리오
 - [Data Model](./data-model.md) — 테이블 스키마, 도메인 enum

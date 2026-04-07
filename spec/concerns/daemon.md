@@ -33,6 +33,7 @@ Daemon은 상태 머신을 순회하며 전이를 결정하고 hook을 트리거
 Daemon (CPU)
   loop {
     collector.collect()
+    evaluator.evaluate()     // 판정 — 실행보다 먼저
     advancer.advance()
     executor.execute()       // handler 실행 + hook 트리거
     cron_engine.tick()
@@ -103,7 +104,7 @@ max_concurrent: 4
 ```
 
 - **workspace.concurrency**: workspace yaml 루트에 정의. "이 프로젝트에 동시에 몇 개까지 돌릴까". 모든 source의 아이템 합산 기준.
-- **daemon.max_concurrent**: "머신 리소스 한계" (evaluate cron의 LLM 호출도 slot을 소비)
+- **daemon.max_concurrent**: "머신 리소스 한계" (Evaluator의 LLM 호출도 slot을 소비)
 
 Advancer는 `Ready → Running` 전이 시 두 제한을 모두 확인한다.
 
@@ -352,4 +353,4 @@ SIGINT → on_shutdown:
 - [Stagnation Detection](./stagnation.md) — Composite Similarity + Lateral Thinking
 - [DataSource](./datasource.md) — 수집/컨텍스트 추상화
 - [AgentRuntime](./agent-runtime.md) — LLM 실행 추상화
-- [Cron 엔진](./cron-engine.md) — evaluate cron + 품질 루프
+- [Cron 엔진](./cron-engine.md) — 품질 루프 (gap-detection 등)
