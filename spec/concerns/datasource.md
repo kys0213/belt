@@ -328,7 +328,7 @@ queue_items 테이블:
 
 ### 관련 문서
 
-- [DESIGN-v6](../DESIGN-v6.md) — 전체 아키텍처
+- [DESIGN](../DESIGN.md) — 전체 아키텍처
 - [LifecycleHook](./lifecycle-hook.md) — 상태 전이 반응 trait
 - [AgentRuntime](./agent-runtime.md) — handler prompt 실행
 - [Stagnation Detection](./stagnation.md) — 실패 패턴 감지

@@ -197,7 +197,12 @@ impl SimilarityJudge for Ncd {
     ExactHash:        0.0 × 0.5 = 0.0
     TokenFingerprint: 1.0 × 0.3 = 0.3
     NCD:              0.92 × 0.2 = 0.184
-    composite score = 0.484 / 1.0 = 0.484  → threshold 0.8 미달
+    composite score = 0.484 / 1.0 = 0.484  → threshold 0.8 미달 → 비유사
+    ※ 이 두 문자열은 구조적으로 동일하지만 ExactHash가 0.0을 반환하여
+       composite score가 낮아진다. SpinningDetector는 all_pairs_similar로
+       모든 쌍을 검사하므로, 이 경우 SPINNING으로 감지되지 않는다.
+       TokenFingerprint 단독으로 판단하려면 가중치를 조정하거나
+       threshold를 낮춰야 한다.
 
   "error line 42" vs "error line 42"
     ExactHash:        1.0 × 0.5 = 0.5
@@ -369,10 +374,10 @@ pub struct LateralAnalyzer;
 impl LateralAnalyzer {
     /// 감지된 패턴에 대해 lateral plan을 생성
     /// 내부적으로 belt agent -p를 호출하여 LLM이 분석
+    /// 필요한 이력은 DB에서 직접 조회 (ExecutionHistory 중간 구조체 없음)
     pub async fn analyze(
         &self,
         detection: &StagnationDetection,
-        history: &ExecutionHistory,
         persona: Persona,
         workspace: &str,
     ) -> Result<LateralPlan>;
@@ -435,13 +440,8 @@ HITL Event:
 handler/on_enter 실행 실패
     │
     ▼
-① ExecutionHistory 구성
-   outputs = DB에서 최근 N개 history.summary
-   errors  = DB에서 최근 N개 history.error (별도)
-   drifts  = (Phase 2) drift scores
-    │
-    ▼
-② StagnationDetector.detect(history)
+① StagnationDetector.detect(source_id, state, db)
+   각 PatternDetector가 DB에서 자기 관심사 데이터를 직접 조회
    내부: CompositeSimilarity로 유사도 판단
    → Vec<StagnationDetection>
     │
@@ -473,6 +473,19 @@ handler/on_enter 실행 실패
 | 원래 목표 | `queue_items.source_data` | DriftDetector (goal_drift 산출) | Phase 2 |
 | drift score 이력 | (Phase 2 테이블) | DiminishingDetector | Phase 2 |
 | 이전 lateral | `transition_events` (stagnation) | 페르소나 중복 제외 | v6 |
+
+### tried personas 조회
+
+이전에 시도한 페르소나 목록은 `transition_events`에서 조회한다:
+
+```sql
+SELECT DISTINCT json_extract(detail, '$.persona') AS persona
+FROM transition_events
+WHERE source_id = ? AND event_type = 'stagnation'
+  AND json_extract(detail, '$.persona') IS NOT NULL
+```
+
+결과를 `Vec<Persona>`로 변환하여 `select_persona(pattern, tried)`에 전달한다.
 
 ### 이벤트 기록
 
@@ -616,7 +629,7 @@ crates/belt-core/src/stagnation/
 
 ### 관련 문서
 
-- [DESIGN-v6](../DESIGN-v6.md) — 설계 철학 #11
+- [DESIGN](../DESIGN.md) — 설계 철학 #11
 - [Daemon](./daemon.md) — 실행 루프 통합 지점
 - [QueuePhase 상태 머신](./queue-state-machine.md) — escalation 정책
 - [Data Model](./data-model.md) — StagnationPattern enum, HitlReason 확장

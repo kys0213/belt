@@ -106,6 +106,8 @@ max_concurrent: 4
 - **workspace.concurrency**: workspace yaml 루트에 정의. "이 프로젝트에 동시에 몇 개까지 돌릴까". 모든 source의 아이템 합산 기준.
 - **daemon.max_concurrent**: "머신 리소스 한계" (Evaluator의 LLM 호출도 slot을 소비)
 
+> **LateralAnalyzer의 LLM 호출**: handler 실패 경로에서 `belt agent -p`를 호출하여 lateral_plan을 생성한다. 이 호출은 해당 아이템이 이미 점유한 Running slot 안에서 수행되므로 추가 slot을 소비하지 않는다.
+
 Advancer는 `Ready → Running` 전이 시 두 제한을 모두 확인한다.
 
 ---
@@ -347,7 +349,7 @@ SIGINT → on_shutdown:
 
 ### 관련 문서
 
-- [DESIGN-v6](../DESIGN-v6.md) — 전체 상태 흐름 + 설계 철학
+- [DESIGN](../DESIGN.md) — 전체 상태 흐름 + 설계 철학
 - [LifecycleHook](./lifecycle-hook.md) — 상태 전이 반응 trait
 - [QueuePhase 상태 머신](./queue-state-machine.md) — 상태 전이 상세
 - [Stagnation Detection](./stagnation.md) — Composite Similarity + Lateral Thinking

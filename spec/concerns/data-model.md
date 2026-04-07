@@ -1,6 +1,6 @@
 # Data Model
 
-> 관련 문서: [DESIGN-v6](../DESIGN-v6.md), [QueuePhase 상태 머신](./queue-state-machine.md), [DataSource](./datasource.md), [LifecycleHook](./lifecycle-hook.md), [Evaluator](./evaluator.md), [Cron 엔진](./cron-engine.md), [Stagnation](./stagnation.md)
+> 관련 문서: [DESIGN](../DESIGN.md), [QueuePhase 상태 머신](./queue-state-machine.md), [DataSource](./datasource.md), [LifecycleHook](./lifecycle-hook.md), [Evaluator](./evaluator.md), [Cron 엔진](./cron-engine.md), [Stagnation](./stagnation.md)
 
 Belt의 모든 상태는 SQLite 단일 파일(`~/.belt/belt.db`)에 저장된다. 이 문서는 테이블 스키마, 도메인 모델, 직렬화 규칙을 한 곳에 정의한다.
 
@@ -246,18 +246,19 @@ CREATE TABLE knowledge_base (
 | `Completed` | `"completed"` | No | handler 성공, evaluate 대기 |
 | `Done` | `"done"` | **Yes** | evaluate 완료 + hook.on_done() 성공 |
 | `Hitl` | `"hitl"` | No | 사람 판단 필요 |
-| `Failed` | `"failed"` | No | hook.on_done() 실패 또는 인프라 오류 |
+| `Failed` | `"failed"` | No | hook.on_done() 실패 또는 인프라 오류. 수동 해소 가능 (→ Done, → Skipped) |
 | `Skipped` | `"skipped"` | **Yes** | escalation skip 또는 preflight 실패 |
 
 **v6 (#718)**: `phase` 필드는 `pub(crate)` 가시성. 외부에서 직접 대입 불가, 반드시 `QueueItem::transit()` 경유. 상세: [QueuePhase 상태 머신](./queue-state-machine.md)
 
 ### SpecStatus
 
-6개 상태. 직렬화 시 lowercase.
+7개 상태. 직렬화 시 lowercase.
 
 | Variant | 직렬화 | 설명 |
 |---------|--------|------|
 | `Draft` | `"draft"` | 초기 상태 |
+| `Analyzing` | `"analyzing"` | LLM 분석 중 (quality, decomposability, dependency) |
 | `Active` | `"active"` | 활성 (이슈 생성/처리 진행) |
 | `Paused` | `"paused"` | 일시 중단 |
 | `Completing` | `"completing"` | 모든 이슈 Done + gap 없음, HITL 대기 |
