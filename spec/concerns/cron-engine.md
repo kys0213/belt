@@ -113,7 +113,7 @@ Cron 스크립트에는 workspace 정보가 필요하므로 추가 변수를 주
 
 ### 관련 문서
 
-- [DESIGN-v6](../DESIGN-v6.md) — evaluate 아키텍처
+- [DESIGN-v6](../DESIGN.md) — evaluate 아키텍처
 - [DataSource](./datasource.md) — belt context 스키마
 - [Agent](./agent-workspace.md) — evaluate와 Agent의 관계
 - [Stagnation Detection](./stagnation.md) — handler 실패 시 패턴 감지 (cron이 아닌 동기 실행)

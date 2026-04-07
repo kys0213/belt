@@ -173,8 +173,10 @@ fn handle_failure(item, hook):
         tried = db.get_tried_personas(item.source_id, item.state)
         persona = select_persona(active[0].pattern, tried)
         if persona.is_some():
+            history = db.get_execution_history(item.source_id, item.state)
             lateral_plan = lateral_analyzer.analyze(
                 detection=active[0],
+                history=history,
                 persona=persona,
                 workspace=item.workspace_id,
             )
@@ -347,7 +349,7 @@ SIGINT → on_shutdown:
 
 ### 관련 문서
 
-- [DESIGN-v6](../DESIGN-v6.md) — 전체 상태 흐름 + 설계 철학
+- [DESIGN-v6](../DESIGN.md) — 전체 상태 흐름 + 설계 철학
 - [LifecycleHook](./lifecycle-hook.md) — 상태 전이 반응 trait
 - [QueuePhase 상태 머신](./queue-state-machine.md) — 상태 전이 상세
 - [Stagnation Detection](./stagnation.md) — Composite Similarity + Lateral Thinking

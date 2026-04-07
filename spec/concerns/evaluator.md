@@ -39,9 +39,9 @@ evaluator.evaluate():
     for item in queue.get(Completed):
         decision = pipeline.evaluate(item)
         match decision:
-            Done → hook.on_done(), transit(Done)
-            Hitl → create_hitl_event()
-            NeedMoreWork → transit(Ready)  // 재실행 필요
+            Done → transit(Done), hook.on_done()
+            Hitl → transit(Hitl), create_hitl_event()
+            Retry → create_retry_item(item)  // 새 아이템 → Pending (재실행 필요)
 
     // 2. Ready 아이템 → 사전 검증 (이력 기반)
     for item in queue.get(Ready):
@@ -49,10 +49,12 @@ evaluator.evaluate():
             // handler 실행 없이 판정 (비용 0)
             decision = pipeline.evaluate_from_history(item)
             match decision:
-                Done → hook.on_done(), transit(Done)
-                Hitl → create_hitl_event()
+                Done → transit(Running), transit(Completed), transit(Done), hook.on_done()
+                Hitl → transit(Running), transit(Completed), transit(Hitl), create_hitl_event()
                 Inconclusive → pass  // Advancer가 Running으로 전이
 ```
+
+> **Note**: Ready에서 사전 검증으로 완료 판정 시, 상태 머신 규칙을 준수하여 `Ready → Running → Completed → Done` 전이를 순차 수행한다. 역방향 전이(`Completed → Ready`)는 허용하지 않으며, 재실행이 필요한 경우 새 아이템을 생성하여 Pending에 넣는다.
 
 ---
 
@@ -104,7 +106,7 @@ pub trait EvaluationStage: Send + Sync {
 pub enum EvalDecision {
     Done,                     // 충분 — hook.on_done() 트리거
     Hitl { reason: String },  // 사람 필요 — HITL 이벤트 생성
-    Retry,                    // Stage 1 실패 — handler 재실행
+    Retry,                    // Stage 1 실패 — 새 아이템 생성하여 재실행
     Inconclusive,             // 이 단계에서 판정 불가 — 다음 단계로
 }
 ```
@@ -265,7 +267,7 @@ Evaluator는 cron job이 아닌 **Daemon tick 루프의 정규 단계**이다. �
 
 ### 관련 문서
 
-- [DESIGN-v6](../DESIGN-v6.md) — Daemon tick 순서
+- [DESIGN-v6](../DESIGN.md) — Daemon tick 순서
 - [Daemon](./daemon.md) — 실행 루프
 - [Agent Workspace](./agent-workspace.md) — classify-policy.md (SemanticStage 기준)
 - [Stagnation Detection](./stagnation.md) — PatternDetector (유사도 판단 재사용)

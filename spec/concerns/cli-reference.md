@@ -50,9 +50,9 @@ belt
 │   ├── status <id> / verify <id>
 ├── queue
 │   ├── list [--phase <phase>] / show / skip
-│   ├── done <work_id>                      ← evaluate가 호출: Completed → Done (on_done 실행)
+│   ├── done <work_id>                      ← evaluate가 호출: Completed → Done (hook.on_done() 실행)
 │   ├── hitl <work_id> [--reason <msg>]     ← evaluate가 호출: Completed → HITL
-│   ├── retry-script <work_id>              ← Failed 아이템의 on_done script 재실행
+│   ├── retry-script <work_id>              ← Failed 아이템의 hook.on_done() script 재실행
 │   └── dependency add / remove
 ├── context <work_id> [--json]               ← script용 정보 조회
 ├── hitl
@@ -114,7 +114,7 @@ belt
 script가 아이템 정보를 조회하는 유일한 방법.
 
 ```bash
-# 기본 사용 (on_done/on_fail script 내에서)
+# 기본 사용 (hook.on_done()/hook.on_fail() script 내에서)
 CTX=$(belt context $WORK_ID --json)
 ISSUE=$(echo $CTX | jq -r '.issue.number')
 REPO=$(echo $CTX | jq -r '.source.url')
@@ -199,6 +199,6 @@ belt auto plugin status
 
 ### 관련 문서
 
-- [DESIGN-v5](../DESIGN-v5.md) — 전체 아키텍처
+- [DESIGN-v5](../archive/v5/DESIGN-v5.md) — 전체 아키텍처
 - [DataSource](./datasource.md) — context 스키마
 - [Agent](./agent-workspace.md) — /agent 세션

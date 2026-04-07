@@ -1,6 +1,6 @@
 # Data Model
 
-> 관련 문서: [DESIGN-v6](../DESIGN-v6.md), [QueuePhase 상태 머신](./queue-state-machine.md), [DataSource](./datasource.md), [LifecycleHook](./lifecycle-hook.md), [Evaluator](./evaluator.md), [Cron 엔진](./cron-engine.md), [Stagnation](./stagnation.md)
+> 관련 문서: [DESIGN-v6](../DESIGN.md), [QueuePhase 상태 머신](./queue-state-machine.md), [DataSource](./datasource.md), [LifecycleHook](./lifecycle-hook.md), [Evaluator](./evaluator.md), [Cron 엔진](./cron-engine.md), [Stagnation](./stagnation.md)
 
 Belt의 모든 상태는 SQLite 단일 파일(`~/.belt/belt.db`)에 저장된다. 이 문서는 테이블 스키마, 도메인 모델, 직렬화 규칙을 한 곳에 정의한다.
 
@@ -47,6 +47,9 @@ CREATE TABLE queue_items (
     hitl_reason          TEXT,                    -- HitlReason enum (snake_case)
     hitl_timeout_at      TEXT,                    -- 만료 시각 (RFC3339)
     hitl_terminal_action TEXT,                    -- EscalationAction enum (snake_case) ← v6: Option<String> → Option<EscalationAction>
+
+    -- DataSource 확장 필드 (v6 #719)
+    source_data          TEXT,                        -- JSON (serde_json::Value), DataSource별 추가 데이터
 
     -- 추적 필드
     replan_count         INTEGER NOT NULL DEFAULT 0,  -- 재계획 횟수 (max 3)
@@ -180,7 +183,7 @@ CREATE TABLE workspaces (
 
 ### cron_jobs
 
-예약 작업. built-in(evaluate, hitl-timeout 등)과 사용자 정의 모두 저장.
+예약 작업. built-in(hitl-timeout, gap-detection 등)과 사용자 정의 모두 저장. evaluate는 v6에서 Daemon tick 정규 단계로 이동하여 cron job에서 제외.
 
 ```sql
 CREATE TABLE cron_jobs (

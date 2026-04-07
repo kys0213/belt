@@ -1,7 +1,7 @@
 # QueuePhase 상태 머신
 
 > 큐 아이템의 전체 생명주기를 정의한다.
-> 상위 설계는 [DESIGN-v6](../DESIGN-v6.md) 참조.
+> 상위 설계는 [DESIGN-v6](../DESIGN.md) 참조.
 
 ---
 
@@ -13,10 +13,10 @@
 | **Ready** | 실행 준비 완료 (자동 전이) |
 | **Running** | worktree 생성 + handler 실행 중 |
 | **Completed** | handler 전부 성공, evaluate 대기 |
-| **Done** | evaluate 완료 판정 + on_done script 성공 |
+| **Done** | evaluate 완료 판정 + hook.on_done() 성공 |
 | **HITL** | evaluate가 사람 판단 필요로 분류 |
 | **Skipped** | escalation skip 또는 preflight 실패 |
-| **Failed** | on_done script 실패, 인프라 오류 등 |
+| **Failed** | hook.on_done() 실패, 인프라 오류 등 |
 
 ---
 
@@ -82,7 +82,7 @@ QueueItem::builder()
                     │           Running              │
                     │                                │
                     │  ① worktree 생성 (or 재사용)    │
-                    │  ② on_enter script             │
+                    │  ② hook.on_enter()             │
                     │  ③ handlers 순차 실행           │
                     │     prompt → LLM (worktree)    │
                     │     script → bash              │
@@ -106,17 +106,17 @@ QueueItem::builder()
                    │              │     → lateral_plan 주입       │
                    │              │     → 새 아이템 → Pending     │
                    │              │     → worktree 보존          │
-                   │              │     → on_fail 실행 안 함      │
+                   │              │     → hook.on_fail() 실행 안 함      │
                    │              │                               │
                    │              │  2: retry_with_comment        │
                    │              │     → lateral_plan 주입       │
-                   │              │     → on_fail script 실행     │
+                   │              │     → hook.on_fail() 실행     │
                    │              │     → 새 아이템 → Pending     │
                    │              │     → worktree 보존          │
                    │              │                               │
                    │              │  3: hitl                      │
                    │              │     → lateral_report 첨부     │
-                   │              │     → on_fail script 실행     │
+                   │              │     → hook.on_fail() 실행     │
                    │              │     → HITL 이벤트 생성 ───────┐│
                    │              │     → worktree 보존          ││
                    │              │                               ││
@@ -135,12 +135,12 @@ QueueItem::builder()
               │         │                                          │  │
               ▼         ▼                                          │  │
     ┌──────────┐    ┌──────────────────────────────────────┐       │  │
-    │ on_done  │    │                HITL                   │◄──────┘  │
-    │ script   │    │                                      │          │
+    │hook.on_  │    │                HITL                   │◄──────┘  │
+    │ done()   │    │                                      │          │
     │ 실행     │    │  사람 대기 (worktree 보존)             │          │
     └──┬───┬──┘    │                                      │          │
        │   │       │  응답 경로:                            │          │
-    성공  실패     │    "done"  → on_done → Done           │          │
+    성공  실패     │    "done"  → hook.on_done() → Done    │          │
        │   │       │    "retry" → 새 아이템 → Pending      │          │
        ▼   ▼       │    "skip"  → Skipped                 │          │
   ┌──────┐┌─────┐  │    "replan"→ 스펙 수정 제안           │          │
@@ -228,7 +228,7 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 | evaluate LLM 오류/timeout | Completed 유지, 다음 Daemon tick에서 재시도 | Completed |
 | evaluate 반복 실패 (N회) | HITL로 에스컬레이션 | → HITL |
 | CLI 호출 실패 (`belt queue done/hitl`) | Completed 유지 + 에러 로그, 다음 tick 재시도 | Completed |
-| on_done script 실패 | Failed 상태 (on_fail은 실행하지 않음 — handler 실패가 아니므로) | → Failed |
+| hook.on_done() 실패 | Failed 상태 (hook.on_fail()은 실행하지 않음 — handler 실패가 아니므로) | → Failed |
 
 ---
 
@@ -262,9 +262,9 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 - [ ] evaluate는 per-work_id 단위로 LLM 판정을 실행한다
 - [ ] 각 판정에 해당 아이템의 context가 포함된다
 - [ ] 개별 판정 실패 시 해당 아이템만 Completed에 머물고, 다른 아이템에 영향 없다
-- [ ] evaluate LLM 오류 시 아이템은 Completed에 머무르고, 다음 cron tick에서 재시도된다
+- [ ] evaluate LLM 오류 시 아이템은 Completed에 머무르고, 다음 Daemon tick에서 재시도된다
 - [ ] evaluate 반복 실패(N회)로 HITL 에스컬레이션 시 HitlReason::EvaluateFailure가 기록된다
-- [ ] on_done script 실패 시 Failed 전이되고, on_fail은 실행하지 않는다
+- [ ] hook.on_done() 실패 시 Failed 전이되고, hook.on_fail()은 실행하지 않는다
 
 ### Worktree 생명주기
 
@@ -277,7 +277,7 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 ### 관련 문서
 
-- [DESIGN-v6](../DESIGN-v6.md) — 설계 철학
+- [DESIGN-v6](../DESIGN.md) — 설계 철학
 - [Daemon](./daemon.md) — 내부 모듈 구조 + 실행 루프
 - [Stagnation Detection](./stagnation.md) — 반복 패턴 감지 + lateral thinking
 - [LifecycleHook](./lifecycle-hook.md) — 상태 전이 반응 trait

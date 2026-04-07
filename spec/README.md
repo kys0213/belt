@@ -8,7 +8,7 @@
 
 - **LifecycleHook 분리**: on_done/on_fail/on_enter를 yaml script에서 `LifecycleHook` trait으로 분리. handler(작업)와 hook(반응) 관심사 분리. DataSource별 impl, workspace별 바인딩, lazy 로딩
 - **Daemon = CPU**: yaml script 실행기 → 상태 머신 CPU. hook 트리거만, 실행 책임은 Hook impl이 소유
-- **Stagnation Detection**: 실패 횟수가 아니라 실패 패턴(SPINNING, OSCILLATION)을 감지
+- **Stagnation Detection**: 실패 횟수가 아니라 실패 패턴(SPINNING, OSCILLATION, NO_DRIFT, DIMINISHING_RETURNS)을 감지
 - **Daemon 모듈 분리**: 단일 daemon.rs → Advancer + Executor + HitlService + StagnationDetector 모듈
 - **Phase 전이 캡슐화**: `item.phase` 직접 대입 금지, `QueueItem::transit()` 메서드 강제
 - **ItemContext 확장**: `source_data: serde_json::Value` 추가 — 새 DataSource 추가 시 코어 변경 0
@@ -18,7 +18,7 @@
 
 ## 설계 문서
 
-- **[DESIGN-v6.md](./DESIGN-v6.md)** — 설계 철학 + 전체 구조 개요 (간결)
+- **[DESIGN-v6.md](./DESIGN.md)** — 설계 철학 + 전체 구조 개요 (간결)
 
 ## 관심사별 상세 스펙 (concerns/)
 

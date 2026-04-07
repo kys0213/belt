@@ -616,7 +616,7 @@ crates/belt-core/src/stagnation/
 
 ### 관련 문서
 
-- [DESIGN-v6](../DESIGN-v6.md) — 설계 철학 #11
+- [DESIGN-v6](../DESIGN.md) — 설계 철학 #11
 - [Daemon](./daemon.md) — 실행 루프 통합 지점
 - [QueuePhase 상태 머신](./queue-state-machine.md) — escalation 정책
 - [Data Model](./data-model.md) — StagnationPattern enum, HitlReason 확장

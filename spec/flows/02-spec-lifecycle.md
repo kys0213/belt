@@ -7,13 +7,13 @@
 ## Spec Lifecycle
 
 ```
-Draft ──→ Analyzing ──→ Active ←──→ Paused
-              │              │
-              │ 문제 발견     ▼
-              └→ Draft    Completing
-                              │
-                              ▼
-                          Completed (terminal)
+Draft ──→ Active ←──→ Paused
+              │
+              ▼
+          Completing
+              │
+              ▼
+          Completed (terminal)
 
 Any ──→ Archived (soft delete)
 Archived ──resume──→ Active (복구)
@@ -21,8 +21,7 @@ Archived ──resume──→ Active (복구)
 
 | 상태 | 가능한 전이 | CLI / 트리거 |
 |------|------------|-------------|
-| Draft | → Analyzing | `spec add` |
-| Analyzing | → Active(분석 통과), → Draft(문제 발견) | 자동 (LLM 분석) |
+| Draft | → Active | `spec add` (LLM 분석 통과 시 자동 전이) |
 | Active | → Paused, → Completing(자동), → Archived | `spec pause`, `spec remove` |
 | Paused | → Active, → Archived | `spec resume`, `spec remove` |
 | Completing | → Active(gap 발견), → Completed(HITL 승인) | 자동 |
@@ -36,20 +35,20 @@ Archived ──resume──→ Active (복구)
 ```
 /spec add [file]
   → 필수 섹션 검증 (기계적: 개요, 요구사항, 아키텍처, 테스트, 수용 기준)
-  → DB에 저장 (status: Analyzing)
+  → DB에 저장 (status: Draft)
   │
   ▼
-Analyzing:
+Draft → Active 전이 (LLM 분석):
   LLM이 스펙을 분석 (설정: ~/.belt/config.yaml)
   ├── quality        — 섹션 완성도, AC 구체성
   ├── decomposability — 이슈로 분해 가능한지
   └── dependency      — 기존 스펙과 충돌/의존
   │
-  ├── 분석 점수 >= auto_approve_threshold → Active로 자동 전이
-  ├── 점수 미달 → 사용자에게 피드백 + Draft로 복귀
+  ├── 분석 점수 >= auto_approve_threshold → Active로 전이
+  ├── 점수 미달 → 사용자에게 피드백 + Draft 유지
   │     "AC #3이 검증 불가능합니다. 구체적 기대 결과를 추가하세요"
   │     "스펙 'auth-v2'와 의존 관계가 감지되었습니다"
-  └── 분석 실패 (LLM 오류) → Draft로 복귀 + 에러 표시
+  └── 분석 실패 (LLM 오류) → Draft 유지 + 에러 표시
   │
   ▼
 Active:

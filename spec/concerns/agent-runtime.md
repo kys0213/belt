@@ -134,5 +134,5 @@ states:
 
 ### 관련 문서
 
-- [DESIGN-v5](../DESIGN-v5.md) — 전체 아키텍처
+- [DESIGN-v5](../archive/v5/DESIGN-v5.md) — 전체 아키텍처
 - [DataSource](./datasource.md) — handler에서 AgentRuntime 사용
