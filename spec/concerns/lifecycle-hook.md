@@ -193,11 +193,14 @@ loop {
             items = source.collect()
             queue.push(Pending, items)
 
-    // 2. 전이 (Advancer) — 변경 없음
+    // 2. 판정 (Evaluator) — 실행보다 먼저
+    evaluator.evaluate()
+
+    // 3. 전이 (Advancer) — 변경 없음
     advancer.advance_pending_to_ready()
     advancer.advance_ready_to_running(limit)
 
-    // 3. 실행 (Executor)
+    // 4. 실행 (Executor)
     for item in queue.get_new(Running):
         binding = lookup_workspace_binding(item)
         hook = binding.hook
@@ -216,9 +219,8 @@ loop {
                 break
         else:
             item.transit(Completed)
-            force_trigger("evaluate")
 
-    // 4. cron tick — 변경 없음
+    // 5. cron tick — 변경 없음
     cron_engine.tick()
 }
 

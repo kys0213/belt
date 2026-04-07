@@ -62,7 +62,7 @@ belt
 │   ├── pause / resume / remove / trigger
 ├── agent                                    ← 서브커맨드 없이 실행 시 대화형 세션 시작
 │   ├── [default]                            # 대화형 세션 (글로벌 rules 로드)
-│   ├── [-p <prompt>]                        # 비대화형 실행 (evaluate cron이 호출)
+│   ├── [-p <prompt>]                        # 비대화형 실행 (Evaluator가 호출)
 │   ├── [--workspace <name>]                 # 대상 workspace 지정
 │   ├── [--plan]                             # 실행 계획만 출력
 │   ├── [--json]                             # JSON 출력
