@@ -133,7 +133,7 @@ impl EvaluationPipeline {
 }
 ```
 
-v6에서는 `MechanicalStage` + `SemanticStage`만 등록. Phase 2에서 `ConsensusStage`를 추가하면 코어 변경 0.
+**v6 범위**: `MechanicalStage` + `SemanticStage`만 등록. Phase 2(v7+)에서 `ConsensusStage`를 추가하면 코어 변경 0 (OCP).
 
 ---
 
@@ -187,7 +187,9 @@ impl EvaluationStage for SemanticStage {
 }
 ```
 
-### Stage 3: ConsensusStage (Phase 2)
+### Stage 3: ConsensusStage (Phase 2, v7+)
+
+> **v6 범위 아님** — trait 경계만 정의. v6에서는 Stage 1·2만 등록된다.
 
 다중 LLM 투표. 트리거 조건 충족 시에만 실행.
 

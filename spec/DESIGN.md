@@ -195,6 +195,21 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
                    └──────────────────────────────────────────────┘
 ```
 
+### Tick 순서와 Evaluator 위치
+
+```
+매 tick:
+  ① collect    — DataSource에서 새 아이템 수집 → Pending
+  ② evaluate   — Completed 아이템을 Done/HITL로 판정 (concurrency slot 해제)
+  ③ advance    — Pending→Ready→Running 전이 (slot 확보)
+  ④ execute    — Running 아이템의 handler 실행 + hook 트리거
+  ⑤ cron.tick  — 품질 루프 (gap-detection 등)
+```
+
+> **Evaluate before Execute**: Evaluator가 Executor보다 먼저 동작한다.
+> 이전 tick에서 Completed된 아이템이 현재 tick에서 판정(Done/HITL)되어 concurrency slot이 해제된 후,
+> Advancer가 새 아이템을 Running으로 전이시킨다. 이 순서가 뒤바뀌면 slot 부족으로 불필요한 대기가 발생한다.
+
 ### 상태별 소유 모듈
 
 | Phase | 소유 모듈 | 핵심 동작 | Hook 트리거 |

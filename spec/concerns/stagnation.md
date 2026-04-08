@@ -232,7 +232,7 @@ impl StagnationDetector {
 }
 ```
 
-v6에서는 `SpinningDetector` + `OscillationDetector`만 등록. Phase 2에서 `DriftDetector` + `DiminishingDetector`를 추가하면 코어 변경 없이 동작한다.
+**v6 범위**: `SpinningDetector` + `OscillationDetector`만 등록. Phase 2(v7+)에서 `DriftDetector` + `DiminishingDetector`를 추가하면 코어 변경 없이 동작한다 (OCP).
 
 각 PatternDetector는 내부적으로 `SimilarityJudge`를 사용할 수 있다 (SPINNING, OSCILLATION). drift 기반 detector는 SimilarityJudge 불필요.
 
@@ -289,7 +289,9 @@ OscillationDetector.detect(source_id, state, db):
       return OSCILLATION
 ```
 
-#### DriftDetector / DiminishingDetector (Phase 2) — drift score 기반
+#### DriftDetector / DiminishingDetector (Phase 2, v7+) — drift score 기반
+
+> **v6 범위 아님** — trait 경계만 정의. v6에서는 SpinningDetector·OscillationDetector만 등록된다.
 
 Phase 2에서 `PatternDetector` impl로 추가. SimilarityJudge 불필요.
 
