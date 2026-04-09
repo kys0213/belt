@@ -2737,17 +2737,21 @@ impl CronHandler for KnowledgeExtractionJob {
 /// workspace via [`crate::evaluator::Evaluator::run_evaluate`], and
 /// updating item phases based on the result.
 ///
-/// The evaluate subprocess is invoked with:
-/// - **Workspace isolation**: `WORKSPACE`, `BELT_HOME`, `BELT_DB` env vars
-/// - **Timeout handling**: configurable timeout (default 5 min) with child kill
-/// - **IPC**: structured JSON result collected from subprocess stdout
+/// Periodic sentinel job that detects Completed items awaiting evaluation.
+///
+/// This job does **not** spawn LLM subprocesses itself. Evaluate LLM calls
+/// are handled exclusively by [`Daemon::evaluate_completed`], which properly
+/// consumes concurrency slots via [`ConcurrencyTracker`] (R-DM-008).
+///
+/// The cron schedule acts as a fallback trigger: when Completed items are
+/// found in the DB, this job logs a warning so the daemon tick loop picks
+/// them up. The primary trigger path is `force_trigger("evaluate")` on
+/// every Running -> Completed transition.
 ///
 /// Per-item failure tracking is persisted in the database via `replan_count`.
 /// After [`crate::evaluator::DEFAULT_MAX_EVAL_FAILURES`] consecutive failures
-/// for a single item, the item is automatically escalated to HITL.
-///
-/// The cron schedule ensures periodic evaluation, while `force_trigger("evaluate")`
-/// is called on every Completed transition for immediate evaluation.
+/// for a single item, the item is automatically escalated to HITL by the
+/// daemon's evaluate_completed method.
 pub struct EvaluateJob {
     db: Arc<Database>,
 }
@@ -2761,9 +2765,9 @@ impl EvaluateJob {
 
 impl CronHandler for EvaluateJob {
     fn execute(&self, _ctx: &CronContext) -> Result<(), BeltError> {
-        tracing::info!("EvaluateJob: triggering evaluate cycle for completed items");
-
-        // 1. Query completed items from DB.
+        // Query completed items from DB to report pending evaluations.
+        // Actual LLM evaluation is performed by Daemon::evaluate_completed()
+        // which enforces concurrency slot tracking (R-DM-008).
         let completed_items = self.db.list_items(Some(QueuePhase::Completed), None)?;
 
         if completed_items.is_empty() {
@@ -2771,172 +2775,29 @@ impl CronHandler for EvaluateJob {
             return Ok(());
         }
 
-        // 2. Apply batch size limit to avoid unbounded LLM calls per cycle.
         let batch_size = crate::evaluator::DEFAULT_EVAL_BATCH_SIZE;
-        let batch_items: Vec<_> = completed_items.into_iter().take(batch_size).collect();
+        let pending_count = completed_items.len().min(batch_size);
 
-        tracing::info!(
-            count = batch_items.len(),
-            batch_size,
-            "EvaluateJob: found completed items for evaluation"
-        );
-
-        // 3. Group by workspace for per-workspace evaluator configuration.
-        let mut by_workspace: HashMap<String, Vec<&belt_core::queue::QueueItem>> = HashMap::new();
-        for item in &batch_items {
-            by_workspace
-                .entry(item.workspace_id.clone())
-                .or_default()
-                .push(item);
-        }
-
-        let belt_home_path = match std::env::var("BELT_HOME") {
-            Ok(v) => std::path::PathBuf::from(v),
-            Err(_) => {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
-                std::path::PathBuf::from(home).join(".belt")
-            }
-        };
-        // Pre-load workspace config paths to avoid repeated DB queries per workspace.
-        let ws_config_map: HashMap<String, std::path::PathBuf> = self
-            .db
-            .list_workspaces()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(name, path, _)| (name, std::path::PathBuf::from(path)))
-            .collect();
-
-        let mut evaluated_count = 0u32;
-        let mut failed_count = 0u32;
-
-        for (workspace, items) in &by_workspace {
-            tracing::info!(
-                workspace = %workspace,
-                items = items.len(),
-                "EvaluateJob: running per-item LLM evaluation for workspace"
-            );
-
-            // 4. Resolve workspace config path for subprocess invocation.
-            let config_path = ws_config_map.get(workspace);
-
-            let mut evaluator = crate::evaluator::Evaluator::new(workspace);
-            if let Some(cp) = config_path {
-                evaluator = evaluator.with_workspace_config_path(cp.clone());
-            }
-
-            // 5. Evaluate each item individually via LLM subprocess.
-            for item in items {
-                let eval_result = std::thread::scope(|_| {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| BeltError::Runtime(e.to_string()))?;
-                    rt.block_on(evaluator.run_evaluate(&belt_home_path))
-                        .map_err(|e| BeltError::Runtime(e.to_string()))
-                });
-
-                match eval_result {
-                    Ok(result) if result.success() => {
-                        // 6a. CLI direct call succeeded (exit 0) — the evaluate
-                        // subprocess already executed `belt queue done` or
-                        // `belt queue hitl` via the CLI, so we simply mark Done.
-                        match self.db.update_phase(&item.work_id, QueuePhase::Done) {
-                            Ok(()) => {
-                                evaluated_count += 1;
-                                tracing::info!(
-                                    work_id = %item.work_id,
-                                    workspace = %workspace,
-                                    "EvaluateJob: item evaluated as Done"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    work_id = %item.work_id,
-                                    error = %e,
-                                    "EvaluateJob: failed to update item phase to Done"
-                                );
-                            }
-                        }
-                    }
-                    Ok(result) => {
-                        // 6b. Non-zero exit: record per-item failure via DB replan_count.
-                        let error_msg = format!(
-                            "evaluator exit_code={}: {}",
-                            result.exit_code,
-                            result.stderr.trim()
-                        );
-                        tracing::warn!(
-                            work_id = %item.work_id,
-                            exit_code = result.exit_code,
-                            "EvaluateJob: evaluator returned non-zero exit for item"
-                        );
-
-                        let failure_count = match self.db.increment_replan_count(&item.work_id) {
-                            Ok(count) => count,
-                            Err(e) => {
-                                tracing::warn!(
-                                    work_id = %item.work_id,
-                                    error = %e,
-                                    "EvaluateJob: failed to increment replan_count"
-                                );
-                                failed_count += 1;
-                                continue;
-                            }
-                        };
-
-                        if failure_count >= crate::evaluator::DEFAULT_MAX_EVAL_FAILURES {
-                            let notes = format!(
-                                "evaluate failed {} times (threshold={}): {}",
-                                failure_count,
-                                crate::evaluator::DEFAULT_MAX_EVAL_FAILURES,
-                                error_msg
-                            );
-                            if let Err(e) =
-                                self.db
-                                    .escalate_to_hitl(&item.work_id, "evaluate_failure", &notes)
-                            {
-                                tracing::warn!(
-                                    work_id = %item.work_id,
-                                    error = %e,
-                                    "EvaluateJob: failed to escalate item to HITL"
-                                );
-                            } else {
-                                tracing::error!(
-                                    work_id = %item.work_id,
-                                    failure_count,
-                                    "EvaluateJob: escalated to HITL after repeated evaluate failures"
-                                );
-                            }
-                        } else {
-                            tracing::info!(
-                                work_id = %item.work_id,
-                                failure_count,
-                                "EvaluateJob: evaluate failed, will retry on next cycle"
-                            );
-                        }
-                        failed_count += 1;
-                    }
-                    Err(e) => {
-                        // 6c. Subprocess spawn/timeout error for this item.
-                        tracing::error!(
-                            work_id = %item.work_id,
-                            workspace = %workspace,
-                            error = %e,
-                            "EvaluateJob: failed to run evaluator subprocess for item"
-                        );
-                        failed_count += 1;
-                    }
-                }
-            }
+        // Group by workspace for diagnostic logging.
+        let mut by_workspace: HashMap<String, usize> = HashMap::new();
+        for item in completed_items.iter().take(batch_size) {
+            *by_workspace.entry(item.workspace_id.clone()).or_default() += 1;
         }
 
         tracing::info!(
-            total = batch_items.len(),
-            evaluated = evaluated_count,
-            failed = failed_count,
+            pending = pending_count,
             workspaces = by_workspace.len(),
-            "EvaluateJob completed"
+            "EvaluateJob: completed items awaiting evaluation (handled by daemon tick)"
         );
+
+        for (workspace, count) in &by_workspace {
+            tracing::debug!(
+                workspace = %workspace,
+                items = count,
+                "EvaluateJob: pending evaluation items in workspace"
+            );
+        }
+
         Ok(())
     }
 }
@@ -4382,7 +4243,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
     }
 
     #[test]
-    fn evaluate_job_transitions_completed_items() {
+    fn evaluate_job_reports_completed_items_without_spawning() {
         let db = Arc::new(Database::open_in_memory().unwrap());
         // Insert a completed item.
         let mut item = belt_core::queue::testing::test_item("test-source", "evaluate");
@@ -4396,10 +4257,18 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
 
         let job = EvaluateJob::new(Arc::clone(&db));
         let ctx = CronContext { now: Utc::now() };
-        // The evaluator subprocess will fail (belt binary not available in test),
-        // but the job itself should not return an error — failures are handled
-        // per-item and logged.
+        // The sentinel job logs pending items without spawning LLM subprocesses.
+        // Actual evaluation is handled by Daemon::evaluate_completed with
+        // concurrency tracking.
         job.execute(&ctx).unwrap();
+
+        // Item should remain in Completed phase (not transitioned by cron job).
+        let items_after = db.list_items(Some(QueuePhase::Completed), None).unwrap();
+        assert_eq!(
+            items_after.len(),
+            1,
+            "sentinel job should not transition items"
+        );
     }
 
     // -- seed_workspace_crons tests --
@@ -5636,10 +5505,10 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         assert_eq!(skipped, 0);
     }
 
-    // ---- EvaluateJob error paths and workspace grouping --------------------
+    // ---- EvaluateJob sentinel logging and workspace grouping ----------------
 
     #[test]
-    fn evaluate_job_groups_items_by_workspace() {
+    fn evaluate_job_sentinel_groups_items_by_workspace() {
         let db = Arc::new(Database::open_in_memory().unwrap());
 
         let mut item_a1 = belt_core::queue::QueueItem::new(
@@ -5671,8 +5540,16 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
 
         let job = EvaluateJob::new(Arc::clone(&db));
         let ctx = CronContext { now: Utc::now() };
-        // Subprocess may fail but errors are handled internally.
+        // Sentinel job logs workspace groups without spawning subprocesses.
         assert!(job.execute(&ctx).is_ok());
+
+        // Items should remain in Completed phase (sentinel does not transition).
+        let completed = db.list_items(Some(QueuePhase::Completed), None).unwrap();
+        assert_eq!(
+            completed.len(),
+            3,
+            "sentinel job should not transition items"
+        );
     }
 
     #[test]
