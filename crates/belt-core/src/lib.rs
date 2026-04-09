@@ -4,6 +4,7 @@ pub mod context;
 pub mod dependency;
 pub mod error;
 pub mod escalation;
+pub mod lifecycle;
 pub mod phase;
 pub mod platform;
 pub mod queue;
