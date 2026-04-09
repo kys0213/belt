@@ -181,7 +181,6 @@ impl Evaluator {
         })
     }
 
-
     pub fn filter_completed(items: &[QueueItem]) -> Vec<&QueueItem> {
         items
             .iter()
