@@ -1611,11 +1611,36 @@ pub struct GapAnalysisReport {
 
 /// Check whether an open GitHub issue already exists for a given spec's gap.
 ///
-/// Queries `gh issue list` for open issues with the `autopilot:gap` label
-/// whose title contains the spec name.  Returns `true` when a matching
-/// issue is found, meaning a new issue should **not** be created.
-fn has_existing_gap_issue(spec_name: &str) -> bool {
+/// Performs two searches via `gh issue list`:
+///
+/// 1. **Title-based** — looks for open issues with the `autopilot:gap` label
+///    whose title contains the spec name (original behaviour).
+/// 2. **Spec-ID-based** — looks for the machine-readable fingerprint
+///    `<!-- gap-fingerprint: {spec_id} -->` in the issue body.  This catch
+///    covers cases where the spec was renamed but the spec_id stayed the same,
+///    or where the title format changed between versions.
+///
+/// Returns `true` when *either* search finds a match, meaning a new issue
+/// should **not** be created.
+fn has_existing_gap_issue(spec_name: &str, spec_id: &str) -> bool {
+    // Search 1: title-based (backwards-compatible).
     let search_title = format!("[Gap] Spec '{spec_name}'");
+    if gh_issue_search_matches(&search_title) {
+        return true;
+    }
+
+    // Search 2: spec-id fingerprint in body.
+    let fingerprint = format!("gap-fingerprint: {spec_id}");
+    if gh_issue_search_matches(&fingerprint) {
+        return true;
+    }
+
+    false
+}
+
+/// Run `gh issue list` with the given search query and return `true` if at
+/// least one open issue with the `autopilot:gap` label matches.
+fn gh_issue_search_matches(query: &str) -> bool {
     let result = std::process::Command::new("gh")
         .args([
             "issue",
@@ -1625,7 +1650,7 @@ fn has_existing_gap_issue(spec_name: &str) -> bool {
             "--state",
             "open",
             "--search",
-            &search_title,
+            query,
             "--json",
             "number",
             "--limit",
@@ -1785,7 +1810,7 @@ impl CronHandler for GapDetectionJob {
             }
 
             // Dedupe guard: skip if an open GitHub issue already exists for this gap.
-            if has_existing_gap_issue(&gap.spec_name) {
+            if has_existing_gap_issue(&gap.spec_name, &gap.spec_id) {
                 tracing::info!(
                     spec_id = %gap.spec_id,
                     spec_name = %gap.spec_name,
@@ -1815,7 +1840,8 @@ impl CronHandler for GapDetectionJob {
                  **Analysis Method:** {method}\n\n\
                  ### Missing / Incomplete Requirements\n\n\
                  {missing}\n\n\
-                 _This issue was automatically created by the gap-detection cron job._",
+                 _This issue was automatically created by the gap-detection cron job._\n\n\
+                 <!-- gap-fingerprint: {spec_id} -->",
                 spec_id = gap.spec_id,
                 spec_name = gap.spec_name,
                 score = gap.coverage_score,
@@ -4579,7 +4605,10 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         // (safe side: allow issue creation so gaps are not silently swallowed).
         // In test environments gh may not be configured, so this exercises
         // the error/fallback branch.
-        let result = has_existing_gap_issue("nonexistent-spec-name-xyz-12345");
+        let result = has_existing_gap_issue(
+            "nonexistent-spec-name-xyz-12345",
+            "nonexistent-spec-id-xyz-12345",
+        );
         // Should return false (either gh fails or no matching issue exists).
         assert!(!result);
     }
@@ -4587,10 +4616,22 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
     #[test]
     fn has_existing_gap_issue_constructs_correct_search_title() {
         // Verifies the search title format used internally.
-        // The function searches for "[Gap] Spec '{spec_name}'" in issue titles.
-        // We test with a name that is extremely unlikely to match any real issue.
-        let result = has_existing_gap_issue("__belt_test_nonexistent_spec_42__");
+        // The function searches for "[Gap] Spec '{spec_name}'" in issue titles
+        // AND for the fingerprint "gap-fingerprint: {spec_id}" in the body.
+        // We test with values that are extremely unlikely to match any real issue.
+        let result = has_existing_gap_issue(
+            "__belt_test_nonexistent_spec_42__",
+            "__belt_test_nonexistent_id_42__",
+        );
         assert!(!result);
+    }
+
+    #[test]
+    fn gh_issue_search_matches_returns_false_for_nonexistent() {
+        // Verify the extracted helper returns false when no match is found.
+        assert!(!gh_issue_search_matches(
+            "__belt_nonexistent_query_xyz_99__"
+        ));
     }
 
     // -- parse_issue_number_from_url tests --
