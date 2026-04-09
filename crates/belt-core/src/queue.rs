@@ -21,6 +21,8 @@ pub enum HitlReason {
     ManualEscalation,
     /// Spec 충돌 감지 — 파일 수준 overlap으로 사람의 판단 필요.
     SpecConflict,
+    /// 정체 감지 — 에이전트가 반복/진동/무진전 등의 stagnation 패턴을 보임.
+    StagnationDetected,
     /// spec Completing 단계 최종 확인 (gap-detection 통과 후 HITL 승인 대기).
     SpecCompletionReview,
     /// Claw 에이전트가 제안한 스펙 수정.
@@ -35,6 +37,7 @@ impl fmt::Display for HitlReason {
             HitlReason::Timeout => f.write_str("timeout"),
             HitlReason::ManualEscalation => f.write_str("manual_escalation"),
             HitlReason::SpecConflict => f.write_str("spec_conflict"),
+            HitlReason::StagnationDetected => f.write_str("stagnation_detected"),
             HitlReason::SpecCompletionReview => f.write_str("spec_completion_review"),
             HitlReason::SpecModificationProposed => f.write_str("spec_modification_proposed"),
         }
@@ -161,6 +164,9 @@ pub struct QueueItem {
     /// Replan 시도 횟수. 무한 루프 방지를 위해 최대 3회로 제한한다.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub replan_count: u32,
+    /// Lateral plan (serialized JSON) — stagnation 감지 시 LateralAnalyzer가 생성한 계획.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lateral_plan: Option<String>,
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -188,6 +194,7 @@ impl QueueItem {
             worktree_preserved: false,
             previous_worktree_path: None,
             replan_count: 0,
+            lateral_plan: None,
         }
     }
 
@@ -237,6 +244,7 @@ pub struct QueueItemRow {
     pub worktree_preserved: bool,
     pub previous_worktree_path: Option<String>,
     pub replan_count: u32,
+    pub lateral_plan: Option<String>,
 }
 
 impl QueueItem {
@@ -259,6 +267,7 @@ impl QueueItem {
             worktree_preserved: self.worktree_preserved,
             previous_worktree_path: self.previous_worktree_path.clone(),
             replan_count: self.replan_count,
+            lateral_plan: self.lateral_plan.clone(),
         }
     }
 
@@ -275,6 +284,7 @@ impl QueueItem {
                 "spec_conflict" => Ok(HitlReason::SpecConflict),
                 "spec_completion_review" => Ok(HitlReason::SpecCompletionReview),
                 "spec_modification_proposed" => Ok(HitlReason::SpecModificationProposed),
+                "stagnation_detected" => Ok(HitlReason::StagnationDetected),
                 other => Err(format!("invalid hitl_reason: {other}")),
             })
             .transpose()?;
@@ -301,6 +311,7 @@ impl QueueItem {
             worktree_preserved: row.worktree_preserved,
             previous_worktree_path: row.previous_worktree_path.clone(),
             replan_count: row.replan_count,
+            lateral_plan: row.lateral_plan.clone(),
         })
     }
 
@@ -337,6 +348,7 @@ pub mod testing {
             worktree_preserved: false,
             previous_worktree_path: None,
             replan_count: 0,
+            lateral_plan: None,
         }
     }
 }

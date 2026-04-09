@@ -2157,6 +2157,7 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
             "spec_modification_proposed" => {
                 Ok(belt_core::queue::HitlReason::SpecModificationProposed)
             }
+            "stagnation_detected" => Ok(belt_core::queue::HitlReason::StagnationDetected),
             other => Err(BeltError::Database(format!("unknown hitl_reason: {other}"))),
         })
         .transpose()?;
@@ -2182,6 +2183,7 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
         replan_count: row.get::<_, u32>(14).unwrap_or(0),
         worktree_preserved: col(row, 15)?,
         previous_worktree_path: col(row, 16)?,
+        lateral_plan: col(row, 17).unwrap_or(None),
     })
 }
 
@@ -2212,6 +2214,7 @@ mod tests {
             worktree_preserved: false,
             previous_worktree_path: None,
             replan_count: 0,
+            lateral_plan: None,
         }
     }
 

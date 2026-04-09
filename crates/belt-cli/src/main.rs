@@ -1437,6 +1437,10 @@ fn recommended_action(
             "done",
             "Spec modification proposed; review changes and approve or skip.",
         ),
+        Some(HitlReason::StagnationDetected) => (
+            "replan",
+            "Stagnation detected; replan with a lateral approach to break the loop.",
+        ),
         None => (
             "skip",
             "No HITL reason recorded; review manually and decide.",
@@ -4383,6 +4387,7 @@ sources:
             worktree_preserved: false,
             previous_worktree_path: None,
             replan_count: 0,
+            lateral_plan: None,
         }
     }
 
