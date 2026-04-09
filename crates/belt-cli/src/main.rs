@@ -1641,22 +1641,20 @@ fn cmd_hitl_timeout(command: HitlTimeoutCommands) -> anyhow::Result<()> {
                 );
             }
 
-            // Validate terminal action if provided.
-            let valid_actions = ["skip", "failed", "replan"];
-            if let Some(ref a) = action
-                && !valid_actions.contains(&a.as_str())
-            {
-                anyhow::bail!(
-                    "invalid terminal action '{}': expected one of skip, failed, replan",
-                    a
-                );
-            }
+            // Validate terminal action if provided by parsing via EscalationAction.
+            let parsed_action = action
+                .as_deref()
+                .map(|a| {
+                    a.parse::<belt_core::escalation::EscalationAction>()
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                })
+                .transpose()?;
 
             // Compute absolute timeout timestamp.
             let timeout_at =
                 (chrono::Utc::now() + chrono::Duration::seconds(duration as i64)).to_rfc3339();
 
-            db.set_hitl_timeout(&item_id, &timeout_at, action.as_deref())?;
+            db.set_hitl_timeout(&item_id, &timeout_at, parsed_action.as_ref())?;
 
             println!("Timeout set for item '{item_id}':");
             println!("  expires at: {timeout_at}");
@@ -1678,7 +1676,14 @@ fn cmd_hitl_timeout(command: HitlTimeoutCommands) -> anyhow::Result<()> {
                 );
                 for item in &items {
                     let timeout_at = item.hitl_timeout_at.as_deref().unwrap_or("-");
-                    let action = item.hitl_terminal_action.as_deref().unwrap_or("skip");
+                    let action_str;
+                    let action = match &item.hitl_terminal_action {
+                        Some(a) => {
+                            action_str = a.to_string();
+                            action_str.as_str()
+                        }
+                        None => "skip",
+                    };
                     println!(
                         "{:<40} {:<28} {:<10} {:<20}",
                         truncate(&item.work_id, 40),
@@ -2507,6 +2512,7 @@ async fn main() -> anyhow::Result<()> {
                         pr: None,
                         history,
                         worktree: None,
+                        source_data: serde_json::Value::Null,
                     }
                 }
             };

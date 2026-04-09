@@ -623,10 +623,9 @@ impl CronHandler for HitlTimeoutJob {
             // Determine resolved terminal action from per-item terminal action
             // first, then fall back to workspace escalation_policy terminal
             // action, and finally default to Failed (safe default).
-            let resolved = match item.hitl_terminal_action.as_deref() {
-                Some("skip") => ResolvedTerminalAction::Phase(QueuePhase::Skipped),
-                Some("replan") => ResolvedTerminalAction::Replan,
-                Some("failed") => ResolvedTerminalAction::Phase(QueuePhase::Failed),
+            let resolved = match item.hitl_terminal_action {
+                Some(EscalationAction::Skip) => ResolvedTerminalAction::Phase(QueuePhase::Skipped),
+                Some(EscalationAction::Replan) => ResolvedTerminalAction::Replan,
                 _ => resolve_workspace_terminal_action(
                     &self.db,
                     &item.workspace_id,
@@ -4037,7 +4036,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         );
         item.phase = QueuePhase::Hitl;
         item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339());
-        item.hitl_terminal_action = Some("skip".to_string());
+        item.hitl_terminal_action = Some(EscalationAction::Skip);
         db.insert_item(&item).unwrap();
 
         // Item with per-item timeout in the future (should NOT expire).
@@ -4049,7 +4048,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         );
         future_item.phase = QueuePhase::Hitl;
         future_item.hitl_timeout_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
-        future_item.hitl_terminal_action = Some("failed".to_string());
+        future_item.hitl_terminal_action = None;
         db.insert_item(&future_item).unwrap();
 
         let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr);
@@ -4066,7 +4065,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
     }
 
     #[test]
-    fn hitl_timeout_terminal_action_failed() {
+    fn hitl_timeout_defaults_to_failed_without_workspace() {
         let db = Arc::new(Database::open_in_memory().unwrap());
         let tmp = tempfile::tempdir().unwrap();
         let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
@@ -4077,7 +4076,9 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             belt_core::queue::QueueItem::new("w1".into(), "s1".into(), "ws".into(), "st".into());
         item.phase = QueuePhase::Hitl;
         item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
-        item.hitl_terminal_action = Some("failed".to_string());
+        // No per-item terminal action; falls back to workspace policy, which
+        // defaults to Failed when no workspace config is found.
+        item.hitl_terminal_action = None;
         db.insert_item(&item).unwrap();
 
         let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr);
@@ -4176,18 +4177,18 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
         );
 
-        // Workspace says terminal: skip.
+        // Workspace says terminal: replan.
         let ws_config_path = tmp.path().join("workspace.yml");
         std::fs::write(
             &ws_config_path,
-            "name: override-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n",
+            "name: override-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: replan\n",
         )
         .unwrap();
 
         db.add_workspace("override-ws", ws_config_path.to_str().unwrap())
             .unwrap();
 
-        // But per-item says "failed" — per-item should win.
+        // But per-item says Skip — per-item should win over workspace replan.
         let mut item = belt_core::queue::QueueItem::new(
             "w-override".into(),
             "github:org/repo#5".into(),
@@ -4196,16 +4197,16 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         );
         item.phase = QueuePhase::Hitl;
         item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
-        item.hitl_terminal_action = Some("failed".to_string());
+        item.hitl_terminal_action = Some(EscalationAction::Skip);
         db.insert_item(&item).unwrap();
 
         let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr);
         let ctx = CronContext { now: Utc::now() };
         job.execute(&ctx).unwrap();
 
-        // Per-item "failed" overrides workspace "skip".
+        // Per-item Skip overrides workspace replan terminal action.
         let updated = db.get_item("w-override").unwrap();
-        assert_eq!(updated.phase, QueuePhase::Failed);
+        assert_eq!(updated.phase, QueuePhase::Skipped);
     }
 
     #[test]
@@ -4679,7 +4680,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         );
         item.phase = QueuePhase::Hitl;
         item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
-        item.hitl_terminal_action = Some("replan".to_string());
+        item.hitl_terminal_action = Some(EscalationAction::Replan);
         item.hitl_notes = Some("original failure reason".to_string());
         db.insert_item(&item).unwrap();
 
@@ -4732,7 +4733,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         );
         item.phase = QueuePhase::Hitl;
         item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
-        item.hitl_terminal_action = Some("replan".to_string());
+        item.hitl_terminal_action = Some(EscalationAction::Replan);
         item.replan_count = MAX_REPLAN_COUNT; // Already at limit
         db.insert_item(&item).unwrap();
 
@@ -4769,7 +4770,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         );
         item.phase = QueuePhase::Hitl;
         item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
-        item.hitl_terminal_action = Some("skip".to_string());
+        item.hitl_terminal_action = Some(EscalationAction::Skip);
         db.insert_item(&item).unwrap();
 
         let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr.clone());

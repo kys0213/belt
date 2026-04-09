@@ -50,6 +50,7 @@ impl MockDataSource {
             pr: None,
             history: Vec::new(),
             worktree: None,
+            source_data: serde_json::Value::Null,
         }
     }
 

@@ -3,6 +3,7 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::escalation::EscalationAction;
 use crate::phase::QueuePhase;
 
 /// HITL 생성 경로 — 어떤 원인으로 HITL에 진입했는지 기록한다.
@@ -141,9 +142,9 @@ pub struct QueueItem {
     /// HITL timeout 만료 시각 (RFC3339). `belt hitl timeout` 으로 설정된다.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hitl_timeout_at: Option<String>,
-    /// HITL timeout 만료 시 적용할 terminal action (skip/failed/replan).
+    /// HITL timeout 만료 시 적용할 terminal action.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub hitl_terminal_action: Option<String>,
+    pub hitl_terminal_action: Option<EscalationAction>,
     /// Worktree가 보존되었는지 여부.
     ///
     /// HITL 또는 Failed 전이 시 `true`로 설정되어 worktree가
@@ -234,7 +235,7 @@ impl QueueItem {
             hitl_notes: self.hitl_notes.clone(),
             hitl_reason: self.hitl_reason.map(|r| r.to_string()),
             hitl_timeout_at: self.hitl_timeout_at.clone(),
-            hitl_terminal_action: self.hitl_terminal_action.clone(),
+            hitl_terminal_action: self.hitl_terminal_action.map(|a| a.to_string()),
             worktree_preserved: self.worktree_preserved,
             previous_worktree_path: self.previous_worktree_path.clone(),
             replan_count: self.replan_count,
@@ -257,6 +258,11 @@ impl QueueItem {
                 other => Err(format!("invalid hitl_reason: {other}")),
             })
             .transpose()?;
+        let hitl_terminal_action = row
+            .hitl_terminal_action
+            .as_deref()
+            .map(|s| s.parse::<EscalationAction>())
+            .transpose()?;
         Ok(Self {
             work_id: row.work_id.clone(),
             source_id: row.source_id.clone(),
@@ -271,7 +277,7 @@ impl QueueItem {
             hitl_notes: row.hitl_notes.clone(),
             hitl_reason,
             hitl_timeout_at: row.hitl_timeout_at.clone(),
-            hitl_terminal_action: row.hitl_terminal_action.clone(),
+            hitl_terminal_action,
             worktree_preserved: row.worktree_preserved,
             previous_worktree_path: row.previous_worktree_path.clone(),
             replan_count: row.replan_count,
