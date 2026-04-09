@@ -454,6 +454,7 @@ impl DataSource for GitHubDataSource {
                                 worktree_preserved: false,
                                 previous_worktree_path: None,
                                 replan_count: 0,
+                                lateral_plan: None,
                             });
                         }
                     }

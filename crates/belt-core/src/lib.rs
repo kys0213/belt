@@ -12,6 +12,7 @@ pub mod queue;
 pub mod runtime;
 pub mod source;
 pub mod spec;
+pub mod stagnation;
 pub mod state_machine;
 pub mod test_runner;
 pub mod workspace;
