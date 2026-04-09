@@ -161,7 +161,7 @@ impl EvaluationStage for MechanicalStage {
 }
 ```
 
-workspace yaml에서 검증 커맨드를 정의:
+workspace yaml에서 검증 커맨드를 정의 (전체 스키마: [workspace-schema.md](./workspace-schema.md)):
 
 ```yaml
 evaluate:

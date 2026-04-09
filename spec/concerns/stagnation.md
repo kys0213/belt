@@ -498,6 +498,8 @@ detail = JSON {
 
 ## Configuration
 
+> 전체 yaml 스키마: [workspace-schema.md](./workspace-schema.md)
+
 ```yaml
 # workspace.yaml
 stagnation:

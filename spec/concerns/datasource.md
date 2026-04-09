@@ -172,6 +172,8 @@ FAILURES=$(echo $CTX | jq '[.history[] | select(.status=="failed" and .state=="i
 
 ### GitHub (라벨 기반)
 
+> 전체 yaml 스키마: [workspace-schema.md](./workspace-schema.md)
+
 ```yaml
 sources:
   github:

@@ -104,6 +104,8 @@ impl RuntimeRegistry {
 
 ## 설정
 
+> 전체 yaml 스키마: [workspace-schema.md](./workspace-schema.md)
+
 ```yaml
 runtime:
   default: claude

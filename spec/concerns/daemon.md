@@ -95,16 +95,10 @@ Daemon
 
 두 레벨로 동시 실행을 제어한다:
 
-```yaml
-# workspace.yaml — workspace 루트 레벨에 정의
-concurrency: 2                    # 이 workspace에서 동시 Running 아이템 수
+- **workspace.concurrency** (기본 1): workspace yaml 루트에 정의. "이 프로젝트에 동시에 몇 개까지 돌릴까". 모든 source의 아이템 합산 기준.
+- **daemon.max_concurrent** (기본 4): "머신 리소스 한계". Executor의 handler 실행과 Evaluator의 LLM 호출 모두 동일한 slot 풀을 소비한다.
 
-# daemon 글로벌 설정 (별도 config) — 전체 workspace 합산 상한
-max_concurrent: 4
-```
-
-- **workspace.concurrency**: workspace yaml 루트에 정의. "이 프로젝트에 동시에 몇 개까지 돌릴까". 모든 source의 아이템 합산 기준.
-- **daemon.max_concurrent**: "머신 리소스 한계" (Evaluator의 LLM 호출도 slot을 소비)
+> yaml 스키마 상세: [workspace-schema.md](./workspace-schema.md)
 
 Advancer는 `Ready → Running` 전이 시 두 제한을 모두 확인한다.
 
