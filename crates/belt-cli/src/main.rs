@@ -2507,6 +2507,7 @@ async fn main() -> anyhow::Result<()> {
                         pr: None,
                         history,
                         worktree: None,
+                        source_data: serde_json::Value::Null,
                     }
                 }
             };
