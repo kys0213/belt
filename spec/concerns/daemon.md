@@ -244,8 +244,21 @@ dependency phase 확인은 **DB 조회 기반**:
 3. 판정:
    - Done → gate open
    - DB에 없음 → gate open (orphan 허용)
-   - 그 외 → gate blocked
+   - Failed / Skipped → gate blocked (영구 차단 — 수동 해제 필요)
+   - HITL → gate blocked (사람 응답 대기)
+   - 그 외 (Pending / Ready / Running / Completed) → gate blocked (진행 대기)
 ```
+
+#### 에지 케이스
+
+| 케이스 | 정책 | 이유 |
+|--------|------|------|
+| **순환 의존** | 등록 시점에 탐지 → 거부 | 런타임에 교착 발생하면 복구 불가 |
+| **orphan** (DB에 없음) | gate open | 삭제된 아이템에 의존하면 영원히 차단됨 |
+| **dependency가 Failed/Skipped** | gate blocked | 전제 조건 미충족 — 운영자가 dependency를 해결하거나 의존 관계를 제거해야 함 |
+| **자기 자신에 의존** | 등록 시점에 거부 | 순환의 특수 케이스 |
+
+순환 탐지는 `queue_dependencies` 테이블에 INSERT 시 DFS로 사이클을 확인한다. 사이클이 발견되면 등록을 거부하고 에러를 반환한다.
 
 ### Conflict Gate
 
@@ -328,7 +341,9 @@ SIGINT → on_shutdown:
 
 - [ ] queue dependency의 phase 확인은 DB 조회 기준이다
 - [ ] 재시작 후에도 dependency gate가 정확히 동작한다
-- [ ] dependency가 Failed/Hitl이면 blocked, DB에 없으면 open
+- [ ] dependency가 Failed/Skipped이면 blocked, DB에 없으면 open
+- [ ] 순환 의존은 등록 시점에 탐지하여 거부한다
+- [ ] 자기 자신에 대한 의존은 거부한다
 
 ### Concurrency
 

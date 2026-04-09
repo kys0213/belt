@@ -192,9 +192,9 @@ v4 (15개) → v5 (3개):
 첫 번째로 존재하는 디렉토리 안의 **모든 `.md` 파일**이 로드된다.
 
 ```
-Priority 1: claw_config.rules_path        (workspace YAML 명시)
-Priority 2: $BELT_HOME/workspaces/<name>/claw/system/   (per-workspace)
-Priority 3: $BELT_HOME/claw-workspace/.claude/rules/    (global, belt claw init)
+Priority 1: agent_config.rules_path                      (workspace YAML 명시)
+Priority 2: $BELT_HOME/workspaces/<name>/agent/system/   (per-workspace)
+Priority 3: $BELT_HOME/agent-workspace/.claude/rules/    (global, belt agent init)
 ```
 
 `$BELT_HOME`은 환경변수 `BELT_HOME`이 설정되지 않으면 `~/.belt`로 기본값.
@@ -208,7 +208,7 @@ Priority 3: $BELT_HOME/claw-workspace/.claude/rules/    (global, belt claw init)
 #### 구현 위치
 
 - `crates/belt-cli/src/agent.rs` — `resolve_rules_dir`, `load_rules_from_dir`
-- `crates/belt-cli/src/claw/mod.rs` — `ClawWorkspace::init`, `default_classify_policy()`
+- `crates/belt-cli/src/agent/workspace.rs` — `AgentWorkspace::init`, `default_classify_policy()`
 
 ### LLM이 사용 가능한 도구
 
