@@ -3,6 +3,7 @@ use std::fmt;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::error::BeltError;
 use crate::escalation::EscalationAction;
 use crate::phase::QueuePhase;
 
@@ -194,6 +195,25 @@ impl QueueItem {
     /// format: "{source_id}:{state}"
     pub fn make_work_id(source_id: &str, state: &str) -> String {
         format!("{source_id}:{state}")
+    }
+
+    /// Read-only accessor for the current phase.
+    pub fn phase(&self) -> QueuePhase {
+        self.phase
+    }
+
+    /// Validate and perform a phase transition.
+    ///
+    /// Uses `QueuePhase::can_transition_to` to enforce state-machine invariants.
+    /// On success, updates `updated_at` and returns the previous phase.
+    pub fn transit(&mut self, to: QueuePhase) -> Result<QueuePhase, BeltError> {
+        let from = self.phase;
+        if !from.can_transition_to(&to) {
+            return Err(BeltError::InvalidTransition { from, to });
+        }
+        self.phase = to;
+        self.updated_at = chrono::Utc::now().to_rfc3339();
+        Ok(from)
     }
 }
 

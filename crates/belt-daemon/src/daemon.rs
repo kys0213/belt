@@ -28,17 +28,10 @@ use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
 
 /// Safely transition a [`QueueItem`] to a new phase.
 ///
-/// All phase mutations **must** go through this function so that
-/// [`QueuePhase::can_transition_to`] is always checked.
+/// Delegates to [`QueueItem::transit`] which enforces state-machine invariants.
 /// Returns the previous phase on success for transition event recording.
 fn transit(item: &mut QueueItem, to: QueuePhase) -> Result<QueuePhase, BeltError> {
-    let from = item.phase;
-    if !from.can_transition_to(&to) {
-        return Err(BeltError::InvalidTransition { from, to });
-    }
-    item.phase = to;
-    item.updated_at = Utc::now().to_rfc3339();
-    Ok(from)
+    item.transit(to)
 }
 
 /// Daemon -- state machine + yaml prompt/script executor.
@@ -415,7 +408,7 @@ impl Daemon {
         let state_config = match state_config {
             Some(cfg) => cfg,
             None => {
-                item.phase = QueuePhase::Skipped;
+                let _ = item.transit(QueuePhase::Skipped);
                 return ExecutionResult {
                     item,
                     outcome: ExecutionOutcome::Skipped,
@@ -454,7 +447,7 @@ impl Daemon {
                 match worktree_mgr.create_or_reuse(&ws_name) {
                     Ok(path) => path,
                     Err(e) => {
-                        item.phase = QueuePhase::Failed;
+                        let _ = item.transit(QueuePhase::Failed);
                         return ExecutionResult {
                             item,
                             outcome: ExecutionOutcome::WorktreeError {
@@ -477,7 +470,7 @@ impl Daemon {
                     path
                 }
                 Err(e) => {
-                    item.phase = QueuePhase::Failed;
+                    let _ = item.transit(QueuePhase::Failed);
                     return ExecutionResult {
                         item,
                         outcome: ExecutionOutcome::WorktreeError {
@@ -498,7 +491,7 @@ impl Daemon {
         let on_enter: Vec<Action> = state_config.on_enter.iter().map(Action::from).collect();
         let on_enter_ok = match executor.execute_all(&on_enter, &env).await {
             Ok(Some(r)) if !r.success() => {
-                item.phase = QueuePhase::Failed;
+                let _ = item.transit(QueuePhase::Failed);
                 return ExecutionResult {
                     item,
                     outcome: ExecutionOutcome::Failed {
@@ -513,7 +506,7 @@ impl Daemon {
             }
             Err(e) => {
                 tracing::warn!("on_enter failed for {}: {e}", item.work_id);
-                item.phase = QueuePhase::Failed;
+                let _ = item.transit(QueuePhase::Failed);
                 return ExecutionResult {
                     item,
                     outcome: ExecutionOutcome::Failed {
@@ -546,7 +539,7 @@ impl Daemon {
                 on_enter_result: on_enter_ok,
             },
             Ok(r) => {
-                item.phase = QueuePhase::Completed;
+                let _ = item.transit(QueuePhase::Completed);
                 ExecutionResult {
                     item,
                     outcome: ExecutionOutcome::Completed { result: r },
@@ -557,7 +550,7 @@ impl Daemon {
                 }
             }
             Err(e) => {
-                item.phase = QueuePhase::Failed;
+                let _ = item.transit(QueuePhase::Failed);
                 ExecutionResult {
                     item,
                     outcome: ExecutionOutcome::Failed {
