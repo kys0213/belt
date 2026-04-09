@@ -527,6 +527,7 @@ impl DataSource for GitHubDataSource {
             pr: pr_data,
             history: vec![],
             worktree: None,
+            source_data: serde_json::Value::Null,
         })
     }
 }

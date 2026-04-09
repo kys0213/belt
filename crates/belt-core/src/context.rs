@@ -76,6 +76,14 @@ pub struct ItemContext {
     pub history: Vec<HistoryEntry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
+    /// Raw metadata from the DataSource, enabling OCP extension for custom
+    /// data source types without modifying the ItemContext schema.
+    #[serde(default, skip_serializing_if = "source_data_is_null")]
+    pub source_data: serde_json::Value,
+}
+
+fn source_data_is_null(v: &serde_json::Value) -> bool {
+    v.is_null()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,6 +304,7 @@ mod tests {
             pr: None,
             history,
             worktree: Some("/tmp/belt/test-ws-42".to_string()),
+            source_data: serde_json::Value::Null,
         }
     }
 
@@ -680,6 +689,37 @@ mod tests {
     fn normalize_path_no_brackets() {
         assert_eq!(normalize_path("queue.state"), "queue.state");
         assert_eq!(normalize_path("issue.number"), "issue.number");
+    }
+
+    #[test]
+    fn source_data_roundtrip() {
+        let mut ctx = make_context(vec![]);
+        ctx.source_data = serde_json::json!({"custom_field": "value", "priority": 1});
+        let json = serde_json::to_string_pretty(&ctx).unwrap();
+        assert!(json.contains("source_data"));
+        let parsed: ItemContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.source_data["custom_field"], "value");
+        assert_eq!(parsed.source_data["priority"], 1);
+    }
+
+    #[test]
+    fn source_data_defaults_to_null() {
+        // Backwards compatibility: JSON without source_data should deserialize fine.
+        let ctx = make_context(vec![]);
+        let mut json_value = serde_json::to_value(&ctx).unwrap();
+        // Remove source_data to simulate old JSON format.
+        json_value.as_object_mut().unwrap().remove("source_data");
+        let json = serde_json::to_string(&json_value).unwrap();
+        let parsed: ItemContext = serde_json::from_str(&json).unwrap();
+        assert!(parsed.source_data.is_null());
+    }
+
+    #[test]
+    fn source_data_null_not_serialized() {
+        // When source_data is Null, it should be omitted from JSON output.
+        let ctx = make_context(vec![]);
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(!json.contains("source_data"));
     }
 
     #[test]
