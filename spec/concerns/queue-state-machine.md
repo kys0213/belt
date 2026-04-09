@@ -1,7 +1,7 @@
 # QueuePhase 상태 머신
 
 > 큐 아이템의 전체 생명주기를 정의한다.
-> 상위 설계는 [DESIGN-v6](../DESIGN-v6.md) 참조.
+> 상위 설계는 [DESIGN](../DESIGN.md) 참조.
 
 ---
 
@@ -226,7 +226,7 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 | 실패 유형 | 동작 | 상태 |
 |-----------|------|------|
 | evaluate LLM 오류/timeout | Completed 유지, 다음 Daemon tick에서 재시도 | Completed |
-| evaluate 반복 실패 (N회) | HITL로 에스컬레이션 | → HITL |
+| evaluate 반복 실패 (3회) | HITL로 에스컬레이션 | → HITL |
 | CLI 호출 실패 (`belt queue done/hitl`) | Completed 유지 + 에러 로그, 다음 tick 재시도 | Completed |
 | on_done script 실패 | Failed 상태 (on_fail은 실행하지 않음 — handler 실패가 아니므로) | → Failed |
 
@@ -263,7 +263,7 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 - [ ] 각 판정에 해당 아이템의 context가 포함된다
 - [ ] 개별 판정 실패 시 해당 아이템만 Completed에 머물고, 다른 아이템에 영향 없다
 - [ ] evaluate LLM 오류 시 아이템은 Completed에 머무르고, 다음 cron tick에서 재시도된다
-- [ ] evaluate 반복 실패(N회)로 HITL 에스컬레이션 시 HitlReason::EvaluateFailure가 기록된다
+- [ ] evaluate 반복 실패(3회)로 HITL 에스컬레이션 시 HitlReason::EvaluateFailure가 기록된다
 - [ ] on_done script 실패 시 Failed 전이되고, on_fail은 실행하지 않는다
 
 ### Worktree 생명주기
@@ -277,7 +277,7 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 ### 관련 문서
 
-- [DESIGN-v6](../DESIGN-v6.md) — 설계 철학
+- [DESIGN](../DESIGN.md) — 설계 철학
 - [Daemon](./daemon.md) — 내부 모듈 구조 + 실행 루프
 - [Stagnation Detection](./stagnation.md) — 반복 패턴 감지 + lateral thinking
 - [LifecycleHook](./lifecycle-hook.md) — 상태 전이 반응 trait

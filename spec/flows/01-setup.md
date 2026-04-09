@@ -138,6 +138,19 @@ belt workspace remove <name>    # cascade 삭제 (외부 시스템 데이터는 
 
 ---
 
+## 검증 시나리오
+
+| 시나리오 | 입력 | 기대 상태 | 기대 side effect |
+|---------|------|----------|-----------------|
+| 정상 등록 | 유효한 workspace.yaml | DB에 workspace 등록됨 | DataSource 인스턴스 생성, cron seed 생성 |
+| yaml 파싱 실패 | 잘못된 yaml | 등록 거부 | DB 변경 없음, 구체적 에러 메시지 |
+| repo 접근 불가 | 잘못된 URL/인증 | 등록 거부 | DB 변경 없음, 인증 힌트 표시 |
+| 이름 중복 | 기존 workspace와 동일 name | 등록 거부 | DB 변경 없음 |
+| 미지원 DataSource | `sources.jira` (v6) | 등록 거부 | DB 변경 없음 |
+| workspace 삭제 | `belt workspace remove` | DB에서 cascade 삭제 | 외부 시스템(GitHub 이슈 등) 데이터는 유지 |
+
+---
+
 ### 관련 문서
 
 - [DataSource](../concerns/datasource.md) — 상태 기반 워크플로우 정의

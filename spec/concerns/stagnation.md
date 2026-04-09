@@ -84,8 +84,8 @@ pub trait PatternDetector: Send + Sync {
 
 | Detector | DB 조회 | 구현 시점 |
 |----------|---------|----------|
-| `SpinningDetector` | `history.summary`, `history.error` (최근 N개) | v6 |
-| `OscillationDetector` | `history.summary` (최근 2N개) | v6 |
+| `SpinningDetector` | `history.summary`, `history.error` (최근 `spinning_threshold`개, 기본 3) | v6 |
+| `OscillationDetector` | `history.summary` (최근 `oscillation_cycles * 2`개, 기본 4) | v6 |
 | `DriftDetector` | `history.summary` + `source_data` (목표 vs 결과) | Phase 2 |
 | `DiminishingDetector` | drift score 이력 | Phase 2 |
 
@@ -314,7 +314,7 @@ DriftDetector.detect(source_id, state, db):
   goal = extract_goal(source_data)  // 이슈 본문 등
   drift = compute_goal_drift(goal, summaries.last())
   store_drift_score(db, source_id, state, drift)
-  // NO_DRIFT: 최근 N개 drift 변화량 < epsilon
+  // NO_DRIFT: 최근 no_drift_iterations개(기본 3) drift 변화량 < epsilon
   // DIMINISHING: 개선폭이 감소 추세
 ```
 
@@ -438,8 +438,8 @@ handler/on_enter 실행 실패
     │
     ▼
 ① ExecutionHistory 구성
-   outputs = DB에서 최근 N개 history.summary
-   errors  = DB에서 최근 N개 history.error (별도)
+   outputs = DB에서 최근 spinning_threshold개(기본 3) history.summary
+   errors  = DB에서 최근 spinning_threshold개(기본 3) history.error (별도)
    drifts  = (Phase 2) drift scores
     │
     ▼
@@ -497,6 +497,8 @@ detail = JSON {
 ---
 
 ## Configuration
+
+> 전체 yaml 스키마: [workspace-schema.md](./workspace-schema.md)
 
 ```yaml
 # workspace.yaml
@@ -591,9 +593,9 @@ crates/belt-core/src/stagnation/
 
 ### Detection (4 Patterns)
 
-- [ ] outputs에서 최근 N개가 유사(composite score ≥ threshold)하면 SPINNING이 감지된다
-- [ ] errors에서 최근 N개가 유사하면 SPINNING이 감지된다 (별도 검사)
-- [ ] 최근 2N개 outputs이 짝수/홀수 교대 패턴이면 OSCILLATION이 감지된다
+- [ ] outputs에서 최근 `spinning_threshold`개(기본 3)가 유사(composite score ≥ `similarity_threshold`, 기본 0.8)하면 SPINNING이 감지된다
+- [ ] errors에서 최근 `spinning_threshold`개(기본 3)가 유사하면 SPINNING이 감지된다 (별도 검사)
+- [ ] 최근 `oscillation_cycles * 2`개(기본 4) outputs이 짝수/홀수 교대 패턴이면 OSCILLATION이 감지된다
 - [ ] drift score 변화량이 epsilon 미만이면 NO_DRIFT가 감지된다
 - [ ] 개선폭이 threshold 미만이면 DIMINISHING_RETURNS가 감지된다
 - [ ] stagnation.enabled=false이면 탐지를 수행하지 않는다
@@ -618,7 +620,7 @@ crates/belt-core/src/stagnation/
 
 ### 관련 문서
 
-- [DESIGN-v6](../DESIGN-v6.md) — 설계 철학 #11
+- [DESIGN](../DESIGN.md) — 설계 철학 #11
 - [Daemon](./daemon.md) — 실행 루프 통합 지점
 - [QueuePhase 상태 머신](./queue-state-machine.md) — escalation 정책
 - [Data Model](./data-model.md) — StagnationPattern enum, HitlReason 확장
