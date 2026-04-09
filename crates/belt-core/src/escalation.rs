@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::fmt;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +21,35 @@ pub enum EscalationAction {
     Skip,
     /// on_fail 실행 + HITL(replan) 이벤트 생성
     Replan,
+}
+
+impl fmt::Display for EscalationAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EscalationAction::Retry => f.write_str("retry"),
+            EscalationAction::RetryWithComment => f.write_str("retry_with_comment"),
+            EscalationAction::Hitl => f.write_str("hitl"),
+            EscalationAction::Skip => f.write_str("skip"),
+            EscalationAction::Replan => f.write_str("replan"),
+        }
+    }
+}
+
+impl FromStr for EscalationAction {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "retry" => Ok(EscalationAction::Retry),
+            "retry_with_comment" => Ok(EscalationAction::RetryWithComment),
+            "hitl" => Ok(EscalationAction::Hitl),
+            "skip" => Ok(EscalationAction::Skip),
+            "replan" => Ok(EscalationAction::Replan),
+            _ => Err(format!(
+                "invalid escalation action: {s} (expected: retry, retry_with_comment, hitl, skip, replan)"
+            )),
+        }
+    }
 }
 
 impl EscalationAction {
@@ -216,6 +247,57 @@ mod tests {
         assert_eq!(policy.resolve(2), EscalationAction::RetryWithComment);
         assert_eq!(policy.resolve(3), EscalationAction::Hitl);
         assert_eq!(policy.terminal_action(), Some(&EscalationAction::Skip),);
+    }
+
+    #[test]
+    fn escalation_action_display() {
+        assert_eq!(EscalationAction::Retry.to_string(), "retry");
+        assert_eq!(
+            EscalationAction::RetryWithComment.to_string(),
+            "retry_with_comment"
+        );
+        assert_eq!(EscalationAction::Hitl.to_string(), "hitl");
+        assert_eq!(EscalationAction::Skip.to_string(), "skip");
+        assert_eq!(EscalationAction::Replan.to_string(), "replan");
+    }
+
+    #[test]
+    fn escalation_action_fromstr_roundtrip() {
+        let variants = [
+            EscalationAction::Retry,
+            EscalationAction::RetryWithComment,
+            EscalationAction::Hitl,
+            EscalationAction::Skip,
+            EscalationAction::Replan,
+        ];
+        for action in variants {
+            let s = action.to_string();
+            let parsed: EscalationAction = s.parse().unwrap();
+            assert_eq!(parsed, action);
+        }
+    }
+
+    #[test]
+    fn escalation_action_fromstr_invalid() {
+        assert!("invalid".parse::<EscalationAction>().is_err());
+        assert!("".parse::<EscalationAction>().is_err());
+        assert!("RETRY".parse::<EscalationAction>().is_err());
+    }
+
+    #[test]
+    fn escalation_action_serde_json_roundtrip() {
+        let variants = [
+            EscalationAction::Retry,
+            EscalationAction::RetryWithComment,
+            EscalationAction::Hitl,
+            EscalationAction::Skip,
+            EscalationAction::Replan,
+        ];
+        for action in variants {
+            let json = serde_json::to_string(&action).unwrap();
+            let parsed: EscalationAction = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, action);
+        }
     }
 
     #[test]
