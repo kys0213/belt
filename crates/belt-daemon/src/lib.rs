@@ -5,5 +5,6 @@ pub mod advancer;
 pub mod concurrency;
 pub mod cron;
 pub mod daemon;
+pub mod evaluation_stages;
 pub mod evaluator;
 pub mod executor;

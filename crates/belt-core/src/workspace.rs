@@ -14,9 +14,34 @@ pub struct WorkspaceConfig {
     pub sources: HashMap<String, SourceConfig>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
+    /// Progressive evaluation pipeline configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluate: Option<EvaluateConfig>,
     /// Per-workspace Claw configuration overrides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claw_config: Option<ClawConfig>,
+}
+
+/// Evaluation pipeline configuration.
+///
+/// Defines the mechanical (deterministic) checks that run before the
+/// semantic (LLM) evaluation stage. If `mechanical` is empty or absent,
+/// the pipeline skips directly to semantic evaluation.
+///
+/// ```yaml
+/// evaluate:
+///   mechanical:
+///     - "cargo test"
+///     - "cargo clippy -- -D warnings"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct EvaluateConfig {
+    /// Shell commands to run in the worktree for deterministic verification.
+    ///
+    /// Each command is executed sequentially. If any command fails (non-zero
+    /// exit code), the item is marked for retry without invoking the LLM.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mechanical: Vec<String>,
 }
 
 /// Per-workspace Claw configuration.
@@ -384,5 +409,45 @@ claw_config:
         let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
         let claw = config.claw_config.unwrap();
         assert!(claw.max_conversation_turns.is_none());
+    }
+
+    #[test]
+    fn evaluate_defaults_to_none() {
+        let yaml = "name: minimal\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.evaluate.is_none());
+    }
+
+    #[test]
+    fn evaluate_parses_mechanical_commands() {
+        let yaml = r#"
+name: with-eval
+sources:
+  github:
+    url: https://github.com/org/repo
+evaluate:
+  mechanical:
+    - "cargo test"
+    - "cargo clippy -- -D warnings"
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let eval = config.evaluate.unwrap();
+        assert_eq!(eval.mechanical.len(), 2);
+        assert_eq!(eval.mechanical[0], "cargo test");
+        assert_eq!(eval.mechanical[1], "cargo clippy -- -D warnings");
+    }
+
+    #[test]
+    fn evaluate_empty_mechanical_defaults_to_empty_vec() {
+        let yaml = r#"
+name: empty-eval
+sources:
+  github:
+    url: https://github.com/org/repo
+evaluate: {}
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        let eval = config.evaluate.unwrap();
+        assert!(eval.mechanical.is_empty());
     }
 }

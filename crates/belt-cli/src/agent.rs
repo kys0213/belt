@@ -368,6 +368,7 @@ fn default_agent_config() -> WorkspaceConfig {
         concurrency: 1,
         sources: HashMap::new(),
         runtime: RuntimeConfig::default(),
+        evaluate: None,
         claw_config: None,
     }
 }
@@ -640,6 +641,7 @@ mod tests {
             concurrency: 1,
             sources: HashMap::new(),
             runtime: RuntimeConfig::default(),
+            evaluate: None,
             claw_config: None,
         }
     }
@@ -698,6 +700,7 @@ mod tests {
             concurrency: 2,
             sources,
             runtime: RuntimeConfig::default(),
+            evaluate: None,
             claw_config: None,
         }
     }
