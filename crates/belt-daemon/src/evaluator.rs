@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::Result;
 
 use belt_core::action::Action;
+use belt_core::evaluation::{EvalContext, EvalDecision as PipelineDecision, EvaluationPipeline};
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::runtime::TokenUsage;
@@ -45,6 +46,11 @@ pub struct Evaluator {
     workspace_config_path: Option<PathBuf>,
     /// Timeout for the evaluate subprocess.
     evaluate_timeout: Duration,
+    /// Progressive evaluation pipeline (MechanicalStage + SemanticStage).
+    ///
+    /// When set, `evaluate_item` uses the pipeline instead of the legacy
+    /// subprocess call. When `None`, falls back to the original behavior.
+    pipeline: Option<EvaluationPipeline>,
 }
 
 impl Evaluator {
@@ -55,6 +61,7 @@ impl Evaluator {
             max_eval_failures: DEFAULT_MAX_EVAL_FAILURES,
             workspace_config_path: None,
             evaluate_timeout: Duration::from_secs(DEFAULT_EVALUATE_TIMEOUT_SECS),
+            pipeline: None,
         }
     }
 
@@ -74,6 +81,73 @@ impl Evaluator {
     pub fn with_evaluate_timeout(mut self, timeout: Duration) -> Self {
         self.evaluate_timeout = timeout;
         self
+    }
+
+    /// Set the progressive evaluation pipeline.
+    ///
+    /// When a pipeline is configured, [`evaluate_item`] runs items through
+    /// the staged pipeline instead of the legacy subprocess call.
+    pub fn with_pipeline(mut self, pipeline: EvaluationPipeline) -> Self {
+        self.pipeline = Some(pipeline);
+        self
+    }
+
+    /// Returns `true` if this evaluator has a pipeline configured.
+    pub fn has_pipeline(&self) -> bool {
+        self.pipeline.is_some()
+    }
+
+    /// Evaluate a single item through the progressive pipeline.
+    ///
+    /// Converts the pipeline's [`PipelineDecision`] into the evaluator's
+    /// [`EvalDecision`], maintaining failure tracking and HITL escalation.
+    ///
+    /// Returns `None` if no pipeline is configured (caller should fall back
+    /// to the legacy subprocess approach).
+    pub async fn evaluate_item(
+        &mut self,
+        item: &QueueItem,
+        worktree_path: Option<PathBuf>,
+    ) -> Option<Result<EvalDecision>> {
+        let pipeline = self.pipeline.as_ref()?;
+
+        let ctx = EvalContext {
+            work_id: item.work_id.clone(),
+            source_id: item.source_id.clone(),
+            workspace_name: self.workspace_name.clone(),
+            worktree_path,
+        };
+
+        let result = pipeline.evaluate(&ctx).await;
+
+        Some(match result {
+            Ok(decision) => {
+                let eval_decision = match decision {
+                    PipelineDecision::Done => {
+                        self.clear_eval_failures(&item.work_id);
+                        EvalDecision::Done
+                    }
+                    PipelineDecision::Hitl { reason } => EvalDecision::Hitl { reason },
+                    PipelineDecision::Retry => {
+                        // Use failure tracking to escalate after repeated retries.
+                        self.record_eval_failure(&item.work_id, "pipeline retry")
+                    }
+                    PipelineDecision::Inconclusive => {
+                        // Should not happen — pipeline escalates to HITL.
+                        // But handle defensively.
+                        EvalDecision::Hitl {
+                            reason: "pipeline returned Inconclusive (unexpected)".into(),
+                        }
+                    }
+                };
+                Ok(eval_decision)
+            }
+            Err(e) => {
+                let decision =
+                    self.record_eval_failure(&item.work_id, &format!("pipeline error: {e}"));
+                Ok(decision)
+            }
+        })
     }
 
     pub fn filter_completed(items: &[QueueItem]) -> Vec<&QueueItem> {

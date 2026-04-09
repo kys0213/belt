@@ -12,6 +12,7 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 anyhow = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 serde_yaml = { workspace = true }
