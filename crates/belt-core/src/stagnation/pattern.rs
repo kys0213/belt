@@ -249,7 +249,7 @@ mod tests {
     fn spinning_detector_exact_repeats() {
         let detector = SpinningDetector::new(Box::new(ExactHash), 0.9, 2);
         let outputs = ["same", "same", "same"];
-        let result = detector.detect(&outputs.to_vec());
+        let result = detector.detect(outputs.as_ref());
         assert!(result.is_some());
         let det = result.unwrap();
         assert_eq!(det.pattern, StagnationPattern::Spinning);
