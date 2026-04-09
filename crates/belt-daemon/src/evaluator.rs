@@ -9,16 +9,37 @@ use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::runtime::TokenUsage;
 
+use belt_infra::db::HistoryEvent;
+
 use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
 
 /// Default maximum number of evaluate failures before HITL escalation.
 pub const DEFAULT_MAX_EVAL_FAILURES: u32 = 3;
+
+/// Default number of consecutive successes required for history-based pre-judgment.
+pub const DEFAULT_HISTORY_SUCCESS_THRESHOLD: usize = 3;
 
 /// Maximum number of items to evaluate per batch cycle.
 pub const DEFAULT_EVAL_BATCH_SIZE: usize = 10;
 
 /// Default timeout for the evaluate subprocess (5 minutes).
 pub const DEFAULT_EVALUATE_TIMEOUT_SECS: u64 = 300;
+
+/// Result of history-aware pre-judgment for Ready items (R-EV-005).
+///
+/// When a Ready item has sufficient successful prior execution records,
+/// the evaluator can skip LLM calls entirely — reducing API costs and latency.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoryPreJudgment {
+    /// Prior executions show consistent success — skip handler execution.
+    /// The item can transition directly from Ready to Done.
+    Skip {
+        /// Number of consecutive successes that informed this decision.
+        consecutive_successes: usize,
+    },
+    /// Insufficient history or mixed results — proceed to normal execution.
+    Proceed,
+}
 
 /// Completed 아이템의 평가 결과.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +66,8 @@ pub struct Evaluator {
     workspace_config_path: Option<PathBuf>,
     /// Timeout for the evaluate subprocess.
     evaluate_timeout: Duration,
+    /// Number of consecutive successes required for history-based pre-judgment.
+    history_success_threshold: usize,
 }
 
 impl Evaluator {
@@ -55,6 +78,7 @@ impl Evaluator {
             max_eval_failures: DEFAULT_MAX_EVAL_FAILURES,
             workspace_config_path: None,
             evaluate_timeout: Duration::from_secs(DEFAULT_EVALUATE_TIMEOUT_SECS),
+            history_success_threshold: DEFAULT_HISTORY_SUCCESS_THRESHOLD,
         }
     }
 
@@ -76,11 +100,85 @@ impl Evaluator {
         self
     }
 
+    /// Set the number of consecutive successes required for history-based
+    /// pre-judgment of Ready items.
+    pub fn with_history_success_threshold(mut self, threshold: usize) -> Self {
+        self.history_success_threshold = threshold;
+        self
+    }
+
     pub fn filter_completed(items: &[QueueItem]) -> Vec<&QueueItem> {
         items
             .iter()
             .filter(|item| item.phase == QueuePhase::Completed)
             .collect()
+    }
+
+    /// Filter items in the Ready phase for history-aware pre-judgment.
+    pub fn filter_ready(items: &[QueueItem]) -> Vec<&QueueItem> {
+        items
+            .iter()
+            .filter(|item| item.phase == QueuePhase::Ready)
+            .collect()
+    }
+
+    /// Determine whether a Ready item can be judged from historical execution
+    /// records without invoking a handler or LLM (R-EV-005).
+    ///
+    /// Examines the most recent history events for the given `source_id` and
+    /// `state`. If the last N consecutive executions (where N is
+    /// `history_success_threshold`) all succeeded ("done" status), the item
+    /// is deemed safe to skip.
+    ///
+    /// The caller is responsible for querying the DB and passing the history
+    /// events. This keeps the Evaluator free of direct DB dependency.
+    pub fn can_judge_from_history(
+        &self,
+        item: &QueueItem,
+        history: &[HistoryEvent],
+    ) -> HistoryPreJudgment {
+        // Filter history to events matching this item's state.
+        let mut matching: Vec<&HistoryEvent> =
+            history.iter().filter(|e| e.state == item.state).collect();
+
+        // Sort by created_at descending to get most recent first.
+        matching.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        if matching.len() < self.history_success_threshold {
+            tracing::debug!(
+                source_id = %item.source_id,
+                state = %item.state,
+                history_count = matching.len(),
+                threshold = self.history_success_threshold,
+                "insufficient history for pre-judgment"
+            );
+            return HistoryPreJudgment::Proceed;
+        }
+
+        // Check if the last N events are all successful.
+        let recent = &matching[..self.history_success_threshold];
+        let all_success = recent.iter().all(|e| e.status == "done");
+
+        if all_success {
+            tracing::info!(
+                source_id = %item.source_id,
+                state = %item.state,
+                consecutive_successes = self.history_success_threshold,
+                "history-aware pre-judgment: skipping handler execution"
+            );
+            HistoryPreJudgment::Skip {
+                consecutive_successes: self.history_success_threshold,
+            }
+        } else {
+            let failure_count = recent.iter().filter(|e| e.status != "done").count();
+            tracing::debug!(
+                source_id = %item.source_id,
+                state = %item.state,
+                recent_failures = failure_count,
+                "history shows mixed results, proceeding to normal execution"
+            );
+            HistoryPreJudgment::Proceed
+        }
     }
 
     pub fn target_phase(decision: &EvalDecision) -> QueuePhase {
@@ -1225,6 +1323,10 @@ exit {exit_code}
             evaluator.evaluate_timeout,
             Duration::from_secs(DEFAULT_EVALUATE_TIMEOUT_SECS)
         );
+        assert_eq!(
+            evaluator.history_success_threshold,
+            DEFAULT_HISTORY_SUCCESS_THRESHOLD
+        );
     }
 
     #[test]
@@ -1974,5 +2076,192 @@ exit {exit_code}
         assert_eq!(ipc_usage.runtime_name, "codex");
         assert!(ipc_usage.model.is_none());
         assert!(ipc_usage.duration_ms.is_none());
+    }
+
+    // --- History-aware pre-judgment tests (R-EV-005) ---
+
+    fn make_history_event(source_id: &str, state: &str, status: &str, ts: &str) -> HistoryEvent {
+        HistoryEvent {
+            work_id: format!("{source_id}:{state}"),
+            source_id: source_id.to_string(),
+            state: state.to_string(),
+            status: status.to_string(),
+            attempt: 1,
+            summary: None,
+            error: None,
+            created_at: ts.to_string(),
+        }
+    }
+
+    #[test]
+    fn filter_ready_items() {
+        let mut items = vec![
+            test_item("s1", "analyze"),
+            test_item("s2", "implement"),
+            test_item("s3", "review"),
+        ];
+        items[0].phase = QueuePhase::Ready;
+        items[2].phase = QueuePhase::Ready;
+        let ready = Evaluator::filter_ready(&items);
+        assert_eq!(ready.len(), 2);
+        assert_eq!(ready[0].source_id, "s1");
+        assert_eq!(ready[1].source_id, "s3");
+    }
+
+    #[test]
+    fn can_judge_from_history_skip_on_consecutive_successes() {
+        let evaluator = Evaluator::new("test-ws").with_history_success_threshold(3);
+        let mut item = test_item("s1", "implement");
+        item.phase = QueuePhase::Ready;
+
+        let history = vec![
+            make_history_event("s1", "implement", "done", "2026-04-01T00:00:00Z"),
+            make_history_event("s1", "implement", "done", "2026-04-02T00:00:00Z"),
+            make_history_event("s1", "implement", "done", "2026-04-03T00:00:00Z"),
+        ];
+
+        let judgment = evaluator.can_judge_from_history(&item, &history);
+        assert_eq!(
+            judgment,
+            HistoryPreJudgment::Skip {
+                consecutive_successes: 3
+            }
+        );
+    }
+
+    #[test]
+    fn can_judge_from_history_proceed_on_insufficient_history() {
+        let evaluator = Evaluator::new("test-ws").with_history_success_threshold(3);
+        let mut item = test_item("s1", "implement");
+        item.phase = QueuePhase::Ready;
+
+        let history = vec![
+            make_history_event("s1", "implement", "done", "2026-04-01T00:00:00Z"),
+            make_history_event("s1", "implement", "done", "2026-04-02T00:00:00Z"),
+        ];
+
+        let judgment = evaluator.can_judge_from_history(&item, &history);
+        assert_eq!(judgment, HistoryPreJudgment::Proceed);
+    }
+
+    #[test]
+    fn can_judge_from_history_proceed_on_mixed_results() {
+        let evaluator = Evaluator::new("test-ws").with_history_success_threshold(3);
+        let mut item = test_item("s1", "implement");
+        item.phase = QueuePhase::Ready;
+
+        let history = vec![
+            make_history_event("s1", "implement", "done", "2026-04-01T00:00:00Z"),
+            make_history_event("s1", "implement", "failed", "2026-04-02T00:00:00Z"),
+            make_history_event("s1", "implement", "done", "2026-04-03T00:00:00Z"),
+        ];
+
+        let judgment = evaluator.can_judge_from_history(&item, &history);
+        assert_eq!(judgment, HistoryPreJudgment::Proceed);
+    }
+
+    #[test]
+    fn can_judge_from_history_ignores_different_states() {
+        let evaluator = Evaluator::new("test-ws").with_history_success_threshold(3);
+        let mut item = test_item("s1", "implement");
+        item.phase = QueuePhase::Ready;
+
+        // 3 successes but for "analyze" state, not "implement"
+        let history = vec![
+            make_history_event("s1", "analyze", "done", "2026-04-01T00:00:00Z"),
+            make_history_event("s1", "analyze", "done", "2026-04-02T00:00:00Z"),
+            make_history_event("s1", "analyze", "done", "2026-04-03T00:00:00Z"),
+            make_history_event("s1", "implement", "done", "2026-04-04T00:00:00Z"),
+        ];
+
+        let judgment = evaluator.can_judge_from_history(&item, &history);
+        assert_eq!(judgment, HistoryPreJudgment::Proceed);
+    }
+
+    #[test]
+    fn can_judge_from_history_empty_history() {
+        let evaluator = Evaluator::new("test-ws").with_history_success_threshold(3);
+        let mut item = test_item("s1", "implement");
+        item.phase = QueuePhase::Ready;
+
+        let judgment = evaluator.can_judge_from_history(&item, &[]);
+        assert_eq!(judgment, HistoryPreJudgment::Proceed);
+    }
+
+    #[test]
+    fn can_judge_from_history_checks_most_recent_first() {
+        let evaluator = Evaluator::new("test-ws").with_history_success_threshold(2);
+        let mut item = test_item("s1", "implement");
+        item.phase = QueuePhase::Ready;
+
+        // Old failure, then 2 recent successes — should skip
+        let history = vec![
+            make_history_event("s1", "implement", "failed", "2026-04-01T00:00:00Z"),
+            make_history_event("s1", "implement", "done", "2026-04-02T00:00:00Z"),
+            make_history_event("s1", "implement", "done", "2026-04-03T00:00:00Z"),
+        ];
+
+        let judgment = evaluator.can_judge_from_history(&item, &history);
+        assert_eq!(
+            judgment,
+            HistoryPreJudgment::Skip {
+                consecutive_successes: 2
+            }
+        );
+    }
+
+    #[test]
+    fn can_judge_from_history_recent_failure_blocks_skip() {
+        let evaluator = Evaluator::new("test-ws").with_history_success_threshold(2);
+        let mut item = test_item("s1", "implement");
+        item.phase = QueuePhase::Ready;
+
+        // 2 old successes, then a recent failure — should proceed
+        let history = vec![
+            make_history_event("s1", "implement", "done", "2026-04-01T00:00:00Z"),
+            make_history_event("s1", "implement", "done", "2026-04-02T00:00:00Z"),
+            make_history_event("s1", "implement", "failed", "2026-04-03T00:00:00Z"),
+        ];
+
+        let judgment = evaluator.can_judge_from_history(&item, &history);
+        assert_eq!(judgment, HistoryPreJudgment::Proceed);
+    }
+
+    #[test]
+    fn can_judge_from_history_custom_threshold() {
+        let evaluator = Evaluator::new("test-ws").with_history_success_threshold(1);
+        let mut item = test_item("s1", "implement");
+        item.phase = QueuePhase::Ready;
+
+        let history = vec![make_history_event(
+            "s1",
+            "implement",
+            "done",
+            "2026-04-01T00:00:00Z",
+        )];
+
+        let judgment = evaluator.can_judge_from_history(&item, &history);
+        assert_eq!(
+            judgment,
+            HistoryPreJudgment::Skip {
+                consecutive_successes: 1
+            }
+        );
+    }
+
+    #[test]
+    fn default_history_success_threshold() {
+        let evaluator = Evaluator::new("test-ws");
+        assert_eq!(
+            evaluator.history_success_threshold,
+            DEFAULT_HISTORY_SUCCESS_THRESHOLD
+        );
+        assert_eq!(evaluator.history_success_threshold, 3);
+    }
+
+    #[test]
+    fn with_history_success_threshold_builder() {
+        let evaluator = Evaluator::new("test-ws").with_history_success_threshold(5);
+        assert_eq!(evaluator.history_success_threshold, 5);
     }
 }
