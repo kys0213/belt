@@ -187,6 +187,7 @@ mod tests {
                 pr: None,
                 history: vec![],
                 worktree: Some("/tmp/belt/test-ws-42".to_string()),
+                source_data: serde_json::Value::Null,
             },
             failure_count: 0,
         }
