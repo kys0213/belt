@@ -123,7 +123,7 @@ handler 로직 실패(stagnation)와 인프라 오류는 다른 문제이다.
   │
   └── Circuit Breaker:
         closed (정상)
-          → N회 연속 인프라 오류 → open
+          → 3회 연속 인프라 오류 → open
         open (중단)
           → 해당 source/작업 일시 중단
           → dashboard에 "🔴 circuit open" 표시
