@@ -1,6 +1,6 @@
 # Data Model
 
-> 관련 문서: [DESIGN-v6](../DESIGN-v6.md), [QueuePhase 상태 머신](./queue-state-machine.md), [DataSource](./datasource.md), [LifecycleHook](./lifecycle-hook.md), [Evaluator](./evaluator.md), [Cron 엔진](./cron-engine.md), [Stagnation](./stagnation.md)
+> 관련 문서: [DESIGN](../DESIGN.md), [QueuePhase 상태 머신](./queue-state-machine.md), [DataSource](./datasource.md), [LifecycleHook](./lifecycle-hook.md), [Evaluator](./evaluator.md), [Cron 엔진](./cron-engine.md), [Stagnation](./stagnation.md)
 
 Belt의 모든 상태는 SQLite 단일 파일(`~/.belt/belt.db`)에 저장된다. 이 문서는 테이블 스키마, 도메인 모델, 직렬화 규칙을 한 곳에 정의한다.
 

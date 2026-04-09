@@ -1,7 +1,7 @@
 # QueuePhase 상태 머신
 
 > 큐 아이템의 전체 생명주기를 정의한다.
-> 상위 설계는 [DESIGN-v6](../DESIGN-v6.md) 참조.
+> 상위 설계는 [DESIGN](../DESIGN.md) 참조.
 
 ---
 
@@ -277,7 +277,7 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 ### 관련 문서
 
-- [DESIGN-v6](../DESIGN-v6.md) — 설계 철학
+- [DESIGN](../DESIGN.md) — 설계 철학
 - [Daemon](./daemon.md) — 내부 모듈 구조 + 실행 루프
 - [Stagnation Detection](./stagnation.md) — 반복 패턴 감지 + lateral thinking
 - [LifecycleHook](./lifecycle-hook.md) — 상태 전이 반응 trait

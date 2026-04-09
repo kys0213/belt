@@ -154,7 +154,7 @@ on_spec_completing:
 | 분석 미달 | 점수 < threshold | Draft | 사용자에게 피드백 제공 |
 | 분석 실패 | LLM 오류 | Draft | 에러 표시 |
 | 모든 이슈 완료 + gap 없음 | linked issues 전부 Done | Completing | HITL 최종 확인 요청 |
-| HITL 승인 | 사용자 approve | Completed (terminal) | — |
+| HITL 승인 | 사용자 approve | Completed (terminal) | 스펙 Completed 전이, 관련 worktree 정리 |
 | gap 발견 | gap-detection이 gap 감지 | Active (유지) | 새 이슈 생성 → 파이프라인 재진입 |
 | 순환 의존 | A→B→A 스펙 의존 등록 | 등록 거부 | InvalidDependency 에러 |
 | 스펙 충돌 | 동일 모듈 영향 스펙 2개 | Active (유지) | HITL 이벤트 생성 (사용자 판단) |

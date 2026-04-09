@@ -234,7 +234,7 @@ HITL 이벤트가 생성되면 사용자에게 다음 경로로 알린다:
 
 ### 관련 문서
 
-- [DESIGN-v6](../DESIGN-v6.md) — QueuePhase 상태 머신
+- [DESIGN](../DESIGN.md) — QueuePhase 상태 머신
 - [Stagnation Detection](../concerns/stagnation.md) — 반복 패턴 감지 시각화
 - [스펙 생명주기](./02-spec-lifecycle.md) — 스펙 진행률
 - [실패 복구와 HITL](./04-failure-and-hitl.md) — HITL 오버레이

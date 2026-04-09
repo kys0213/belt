@@ -278,7 +278,7 @@ Evaluator는 cron job이 아닌 **Daemon tick 루프의 정규 단계**이다. �
 
 ### 관련 문서
 
-- [DESIGN-v6](../DESIGN-v6.md) — Daemon tick 순서
+- [DESIGN](../DESIGN.md) — Daemon tick 순서
 - [Daemon](./daemon.md) — 실행 루프
 - [Agent Workspace](./agent-workspace.md) — classify-policy.md (SemanticStage 기준)
 - [Stagnation Detection](./stagnation.md) — PatternDetector (유사도 판단 재사용)
