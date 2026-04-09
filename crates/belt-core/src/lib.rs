@@ -1,4 +1,5 @@
 pub mod action;
+pub mod cipher;
 pub mod context;
 pub mod dependency;
 pub mod error;
