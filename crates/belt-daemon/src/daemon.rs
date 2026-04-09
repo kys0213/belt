@@ -8,14 +8,13 @@ use chrono::Utc;
 
 use belt_core::action::Action;
 use belt_core::context::HistoryEntry;
-use belt_core::dependency::{DependencyGuard, SpecDependencyGuard};
+use belt_core::dependency::SpecDependencyGuard;
 use belt_core::error::BeltError;
 use belt_core::escalation::EscalationAction;
 use belt_core::phase::QueuePhase;
 use belt_core::queue::{HistoryEvent, HitlReason, HitlRespondAction, QueueItem};
 use belt_core::runtime::RuntimeRegistry;
 use belt_core::source::DataSource;
-use belt_core::state_machine;
 use belt_core::workspace::{StateConfig, WorkspaceConfig};
 use belt_infra::db::{Database, TransitionEvent};
 use belt_infra::worktree::WorktreeManager;
@@ -283,124 +282,41 @@ impl Daemon {
     // ---------------------------------------------------------------
 
     /// Auto-transition Pending -> Ready -> Running (respecting concurrency).
+    ///
+    /// Delegates to [`crate::advancer::Advancer`] which encapsulates all
+    /// advance-phase logic (dependency gates, conflict detection, transition
+    /// event recording, concurrency enforcement).
     pub fn advance(&mut self) -> usize {
-        let mut advanced = 0;
+        use crate::advancer::Advancer;
 
-        // Pending -> Ready (uses safe transit + dependency gate + conflict detection)
-        // Collect indices first to avoid borrow issues with self.
-        let pending_indices: Vec<usize> = self
-            .queue
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| item.phase == QueuePhase::Pending)
-            .map(|(i, _)| i)
-            .collect();
-
-        for idx in pending_indices {
-            if state_machine::transit(QueuePhase::Pending, QueuePhase::Ready).is_err() {
-                continue;
-            }
-
-            // Dependency gate: check if the spec's depends_on specs are all completed.
-            if !self.check_dependency_gate(&self.queue[idx].source_id.clone()) {
-                tracing::debug!(
-                    "dependency gate blocked: {} (source={})",
-                    self.queue[idx].work_id,
-                    self.queue[idx].source_id
-                );
-                continue;
-            }
-
-            if transit(&mut self.queue[idx], QueuePhase::Ready).is_ok() {
-                advanced += 1;
-                Self::record_transition(
-                    &self.db,
-                    &self.queue[idx].work_id,
-                    &self.queue[idx].source_id,
-                    QueuePhase::Pending,
-                    QueuePhase::Ready,
-                    "phase_enter",
-                    None,
-                );
-
-                // Conflict detection: after transitioning to Ready, check if spec
-                // entry_points overlap with other active specs. If so, escalate to HITL.
-                let conflict = self.check_conflict_gate(&self.queue[idx].source_id.clone());
-                if let Some(notes) = conflict {
-                    tracing::warn!(
-                        work_id = %self.queue[idx].work_id,
-                        "spec conflict detected, escalating to HITL: {notes}"
-                    );
-                    let now = Utc::now().to_rfc3339();
-                    let _ = transit(&mut self.queue[idx], QueuePhase::Hitl);
-                    Self::record_transition(
-                        &self.db,
-                        &self.queue[idx].work_id,
-                        &self.queue[idx].source_id,
-                        QueuePhase::Ready,
-                        QueuePhase::Hitl,
-                        "phase_enter",
-                        Some(notes.clone()),
-                    );
-                    self.queue[idx].hitl_created_at = Some(now);
-                    self.queue[idx].hitl_reason = Some(HitlReason::SpecConflict);
-                    self.queue[idx].hitl_notes = Some(notes);
-                }
-            }
-        }
-
-        // Ready -> Running (respecting concurrency + queue_dependencies)
-        let ws_id = &self.config.name;
+        let ws_name = self.config.name.clone();
         let ws_concurrency = self.config.concurrency;
-
-        let ready_indices: Vec<usize> = self
-            .queue
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| item.phase == QueuePhase::Ready)
-            .map(|(i, _)| i)
-            .collect();
-
-        for idx in ready_indices {
-            if !self.tracker.can_spawn_in_workspace(ws_id, ws_concurrency) {
-                break;
-            }
-
-            // Queue dependency gate: check if all dependency work_ids are Done.
-            // Gate-open on error to avoid blocking items when DB is unavailable.
-            if !self.check_queue_dependency_gate(&self.queue[idx].work_id.clone()) {
-                tracing::debug!(
-                    "queue dependency gate blocked: {} (waiting for dependencies)",
-                    self.queue[idx].work_id,
-                );
-                continue;
-            }
-
-            if transit(&mut self.queue[idx], QueuePhase::Running).is_ok() {
-                Self::record_transition(
-                    &self.db,
-                    &self.queue[idx].work_id,
-                    &self.queue[idx].source_id,
-                    QueuePhase::Ready,
-                    QueuePhase::Running,
-                    "phase_enter",
-                    None,
-                );
-                self.tracker.track(ws_id);
-                advanced += 1;
-            }
-        }
-
-        advanced
+        let mut advancer = Advancer::new(
+            &mut self.queue,
+            &mut self.tracker,
+            &self.db,
+            &ws_name,
+            ws_concurrency,
+            &self.dependency_guard,
+        );
+        advancer.run()
     }
 
     /// Advance Pending items to Ready.
     pub fn advance_pending_to_ready(&mut self) {
-        for item in self.queue.iter_mut() {
-            if item.phase == QueuePhase::Pending {
-                let _ = transit(item, QueuePhase::Ready);
-            }
-        }
+        use crate::advancer::Advancer;
+
+        let ws_name = self.config.name.clone();
+        let ws_concurrency = self.config.concurrency;
+        let mut advancer = Advancer::new(
+            &mut self.queue,
+            &mut self.tracker,
+            &self.db,
+            &ws_name,
+            ws_concurrency,
+            &self.dependency_guard,
+        );
+        advancer.advance_pending_to_ready();
     }
 
     /// Advance Ready items to Running, respecting both per-workspace and global concurrency.
@@ -412,147 +328,19 @@ impl Daemon {
         ws_concurrency_limits: &HashMap<String, u32>,
         default_concurrency: u32,
     ) {
-        let ready_indices: Vec<usize> = self
-            .queue
-            .iter()
-            .enumerate()
-            .filter(|(_, it)| it.phase == QueuePhase::Ready)
-            .map(|(i, _)| i)
-            .collect();
+        use crate::advancer::Advancer;
 
-        for idx in ready_indices {
-            if !self.tracker.can_spawn() {
-                break;
-            }
-
-            let ws = self.queue[idx].workspace_id.clone();
-            let ws_limit = ws_concurrency_limits
-                .get(&ws)
-                .copied()
-                .unwrap_or(default_concurrency);
-
-            if !self.tracker.can_spawn_in_workspace(&ws, ws_limit) {
-                continue;
-            }
-
-            if transit(&mut self.queue[idx], QueuePhase::Running).is_ok() {
-                self.tracker.track(&ws);
-            }
-        }
-    }
-
-    /// Check whether a queue item's associated spec has all dependencies completed.
-    ///
-    /// Uses the database to resolve specs. If no database is configured or no
-    /// matching spec is found, the gate is open (returns `true`) to avoid
-    /// blocking items that are not spec-based.
-    fn check_dependency_gate(&self, source_id: &str) -> bool {
-        let db = match &self.db {
-            Some(db) => db,
-            None => return true,
-        };
-
-        // Try to find a spec whose ID matches the source_id.
-        let spec = match db.get_spec(source_id) {
-            Ok(spec) => spec,
-            Err(_) => return true, // No matching spec — gate open.
-        };
-
-        let result = self
-            .dependency_guard
-            .check_dependencies(&spec, |dep_id| db.get_spec(dep_id).ok());
-
-        if !result.is_ready() {
-            tracing::trace!("spec {} blocked by dependencies: {:?}", spec.id, result);
-        }
-
-        result.is_ready()
-    }
-
-    /// Check whether a queue item's queue_dependencies are all Done.
-    ///
-    /// Uses the database to look up dependencies by `work_id`. If no database
-    /// is configured or the lookup fails, the gate is open (returns `true`)
-    /// to avoid blocking items unnecessarily.
-    fn check_queue_dependency_gate(&self, work_id: &str) -> bool {
-        let db = match &self.db {
-            Some(db) => db,
-            None => return true,
-        };
-
-        let dep_work_ids = match db.list_queue_dependencies(work_id) {
-            Ok(deps) => deps,
-            Err(_) => return true, // Gate open on error.
-        };
-
-        if dep_work_ids.is_empty() {
-            return true;
-        }
-
-        // Check each dependency's phase in the in-memory queue.
-        for dep_id in &dep_work_ids {
-            let dep_phase = self
-                .queue
-                .iter()
-                .find(|item| item.work_id == *dep_id)
-                .map(|item| item.phase);
-
-            match dep_phase {
-                Some(QueuePhase::Done) => {} // Dependency satisfied.
-                Some(phase) => {
-                    tracing::trace!(
-                        work_id = %work_id,
-                        dependency = %dep_id,
-                        dependency_phase = %phase.as_str(),
-                        "queue dependency not done"
-                    );
-                    return false;
-                }
-                None => {
-                    // Dependency not found in queue — gate open (may have been
-                    // removed or completed in a previous run).
-                }
-            }
-        }
-
-        true
-    }
-
-    /// Check whether a queue item's associated spec has entry_point conflicts
-    /// with other active specs.
-    ///
-    /// Returns `Some(notes)` with conflict details when a conflict is detected,
-    /// or `None` when no conflict exists. If no database is configured or no
-    /// matching spec is found, returns `None` (gate open).
-    fn check_conflict_gate(&self, source_id: &str) -> Option<String> {
-        let db = match &self.db {
-            Some(db) => db,
-            None => return None,
-        };
-
-        let spec = match db.get_spec(source_id) {
-            Ok(spec) => spec,
-            Err(_) => return None,
-        };
-
-        let db_ref = Arc::clone(db);
-        let result = self.dependency_guard.check_conflicts(&spec, || {
-            db_ref
-                .list_specs(None, Some(belt_core::spec::SpecStatus::Active))
-                .unwrap_or_default()
-        });
-
-        match result {
-            belt_core::dependency::ConflictCheckResult::Clear => None,
-            belt_core::dependency::ConflictCheckResult::Conflict {
-                conflicting_specs,
-                overlapping_paths,
-            } => Some(format!(
-                "spec-conflict: entry_point overlap with [{}] on paths [{}]",
-                conflicting_specs.join(", "),
-                overlapping_paths.join(", ")
-            )),
-        }
+        let ws_name = self.config.name.clone();
+        let ws_concurrency = self.config.concurrency;
+        let mut advancer = Advancer::new(
+            &mut self.queue,
+            &mut self.tracker,
+            &self.db,
+            &ws_name,
+            ws_concurrency,
+            &self.dependency_guard,
+        );
+        advancer.advance_ready_to_running(ws_concurrency_limits, default_concurrency);
     }
 
     // ---------------------------------------------------------------
