@@ -286,7 +286,7 @@ mod tests {
 
     #[test]
     fn default_trait() {
-        let cipher = XorStreamCipher::default();
+        let cipher = XorStreamCipher::new();
         let ct = cipher.encrypt(b"test", b"key").unwrap();
         let pt = cipher.decrypt(&ct, b"key").unwrap();
         assert_eq!(pt, b"test");
