@@ -11,6 +11,7 @@ use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 
 use belt_core::error::BeltError;
+use belt_core::escalation::EscalationAction;
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::runtime::TokenUsage;
@@ -379,7 +380,7 @@ impl Database {
                 item.hitl_notes,
                 item.hitl_reason.map(|r| r.to_string()),
                 item.hitl_timeout_at,
-                item.hitl_terminal_action,
+                item.hitl_terminal_action.map(|a| a.to_string()),
                 item.replan_count,
                 item.worktree_preserved,
                 item.previous_worktree_path,
@@ -572,9 +573,10 @@ impl Database {
         &self,
         work_id: &str,
         timeout_at: &str,
-        terminal_action: Option<&str>,
+        terminal_action: Option<&EscalationAction>,
     ) -> Result<(), BeltError> {
         let now = Utc::now().to_rfc3339();
+        let action_str = terminal_action.map(|a| a.to_string());
         let conn = self
             .conn
             .lock()
@@ -582,7 +584,7 @@ impl Database {
         let rows = conn
             .execute(
                 "UPDATE queue_items SET hitl_timeout_at = ?1, hitl_terminal_action = ?2, updated_at = ?3 WHERE work_id = ?4",
-                params![timeout_at, terminal_action, now, work_id],
+                params![timeout_at, action_str, now, work_id],
             )
             .map_err(|e| BeltError::Database(e.to_string()))?;
         if rows == 0 {
@@ -2173,7 +2175,10 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
         hitl_notes: col(row, 10)?,
         hitl_reason,
         hitl_timeout_at: col(row, 12)?,
-        hitl_terminal_action: col(row, 13)?,
+        hitl_terminal_action: col::<Option<String>>(row, 13)?
+            .as_deref()
+            .map(|s| s.parse::<EscalationAction>().map_err(BeltError::Database))
+            .transpose()?,
         replan_count: row.get::<_, u32>(14).unwrap_or(0),
         worktree_preserved: col(row, 15)?,
         previous_worktree_path: col(row, 16)?,
@@ -3288,7 +3293,7 @@ mod tests {
         db.insert_item(&item).unwrap();
 
         let timeout_at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
-        db.set_hitl_timeout(&item.work_id, &timeout_at, Some("skip"))
+        db.set_hitl_timeout(&item.work_id, &timeout_at, Some(&EscalationAction::Skip))
             .unwrap();
 
         let fetched = db.get_item(&item.work_id).unwrap();
@@ -3296,7 +3301,7 @@ mod tests {
             fetched.hitl_timeout_at.as_deref(),
             Some(timeout_at.as_str())
         );
-        assert_eq!(fetched.hitl_terminal_action.as_deref(), Some("skip"));
+        assert_eq!(fetched.hitl_terminal_action, Some(EscalationAction::Skip));
     }
 
     #[test]
@@ -3315,7 +3320,7 @@ mod tests {
         item1.work_id = "w-timeout".to_string();
         item1.phase = QueuePhase::Hitl;
         item1.hitl_timeout_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
-        item1.hitl_terminal_action = Some("skip".to_string());
+        item1.hitl_terminal_action = Some(EscalationAction::Skip);
         db.insert_item(&item1).unwrap();
 
         // Item without timeout.
