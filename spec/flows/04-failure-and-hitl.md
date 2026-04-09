@@ -225,6 +225,24 @@ SIGINT → on_shutdown:
 
 ---
 
+## 검증 시나리오
+
+| 시나리오 | 입력 | 기대 최종 phase | 기대 side effect |
+|---------|------|----------------|-----------------|
+| 1회 실패 | handler 실패 (failure_count=1) | 새 아이템 Pending | retry, on_fail 미실행, lateral plan 주입 |
+| 2회 실패 | handler 실패 (failure_count=2) | 새 아이템 Pending | retry_with_comment, on_fail 실행, lateral plan 주입 |
+| 3회 실패 | handler 실패 (failure_count=3) | HITL | hitl, on_fail 실행, lateral report 첨부 |
+| SPINNING 감지 | 3회 연속 유사 출력 (score ≥ 0.8) | escalation에 따름 | StagnationDetector SPINNING, lateral plan에 대안 접근법 |
+| HITL done 응답 | 사용자 done 선택 | Done | hook.on_done() 트리거, worktree 정리 |
+| HITL retry 응답 | 사용자 retry + 지시 | 새 아이템 Pending | 사용자 지시를 lateral_plan으로 주입, worktree 보존 |
+| HITL skip 응답 | 사용자 skip 선택 | Skipped (terminal) | worktree 정리 |
+| HITL replan 응답 | 사용자 replan 선택 | replan_count 증가 | 스펙 수정 제안, max(3) 초과 시 Skipped |
+| HITL timeout | 24시간 무응답 | terminal 액션 적용 | skip→Skipped, replan→replan 처리 |
+| graceful shutdown | SIGINT + Running 아이템 | 완료 시 정상 처리, 30초 초과 시 Pending | worktree 보존, cron engine 정지 |
+| on_enter 실패 | hook.on_enter() 에러 | escalation 경로 진입 | handler 건너뜀, failure_count 포함 |
+
+---
+
 ### 관련 문서
 
 - [Stagnation Detection](../concerns/stagnation.md) — 패턴 탐지 + Lateral Thinking

@@ -219,6 +219,19 @@ HITL 이벤트가 생성되면 사용자에게 다음 경로로 알린다:
 
 ---
 
+## 검증 시나리오
+
+| 시나리오 | 입력 | 기대 동작 |
+|---------|------|----------|
+| TUI 실시간 갱신 | 아이템 상태 전이 발생 | phase별 카운터 즉시 갱신 |
+| HITL 알림 표시 | HITL 이벤트 생성 | TUI/CLI/Agent 모두에서 경고 표시 |
+| stagnation 카운터 | SPINNING 감지 | TUI에 stagnation 카운터 증가 |
+| token 집계 | LLM 호출 완료 | belt status에 런타임별 토큰 사용량 표시 |
+| --format json | `belt status --format json` | 구조화된 JSON 출력 (Agent 파싱 가능) |
+| 전이 타임라인 | TUI에서 아이템 Enter | phase 전이 이력 + 시간 + 실행 정보 표시 |
+
+---
+
 ### 관련 문서
 
 - [DESIGN-v6](../DESIGN-v6.md) — QueuePhase 상태 머신

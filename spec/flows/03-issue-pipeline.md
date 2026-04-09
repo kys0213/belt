@@ -138,6 +138,20 @@ circuit breaker는 source 단위로 동작한다. 한 source의 인프라 오류
 
 ---
 
+## 검증 시나리오
+
+| 시나리오 | 입력 | 기대 최종 phase | 기대 side effect |
+|---------|------|----------------|-----------------|
+| 정상 완주 | 이슈 + belt:analyze | Done | analyze→implement→review 순서 처리, PR 생성 |
+| handler 전부 성공 + evaluate Done | handler 성공 | Done | hook.on_done() 트리거, worktree 정리 |
+| handler 성공 + evaluate HITL | handler 성공, LLM 불확실 | HITL | HITL 이벤트 생성, worktree 보존 |
+| hook.on_done() 실패 | on_done script exit 1 | Failed | on_fail은 실행하지 않음 (handler 실패가 아니므로) |
+| changes-requested | PR 리뷰 코멘트 | 새 아이템 Pending | DataSource.collect()가 감지, 수정 반영 |
+| circuit breaker open | 3회 연속 인프라 오류 | 해당 source 일시 중단 | dashboard에 circuit open 표시 |
+| circuit breaker 복구 | half-open에서 1건 성공 | closed (정상 복귀) | 해당 source 재개 |
+
+---
+
 ### 관련 문서
 
 - [DataSource](../concerns/datasource.md) — 상태 기반 워크플로우 + context 스키마
