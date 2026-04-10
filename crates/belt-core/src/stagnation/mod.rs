@@ -29,5 +29,5 @@ pub use pattern::{
     StagnationDetector, StagnationPattern,
 };
 pub use similarity::{
-    CompositeSimilarity, ExactHash, SimilarityJudge, SimilarityScore, TokenFingerprint,
+    CompositeSimilarity, ExactHash, NcdJudge, SimilarityJudge, SimilarityScore, TokenFingerprint,
 };
