@@ -1,5 +1,6 @@
 pub mod cipher;
 pub mod db;
+pub mod hooks;
 pub mod ipc;
 pub mod onboarding;
 pub mod platform;
