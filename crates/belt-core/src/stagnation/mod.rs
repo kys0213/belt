@@ -23,7 +23,7 @@ pub mod lateral;
 pub mod pattern;
 pub mod similarity;
 
-pub use lateral::{LateralAnalyzer, LateralPlan, Persona};
+pub use lateral::{AnalyzeParams, LateralAnalyzer, LateralPlan, Persona};
 pub use pattern::{
     OscillationDetector, PatternDetector, SpinningDetector, StagnationDetection,
     StagnationDetector, StagnationPattern,
