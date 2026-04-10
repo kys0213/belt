@@ -1058,6 +1058,7 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
             item.state
         );
         db.update_phase(work_id, QueuePhase::Done)?;
+        record_script_retry_event(&db, work_id, &item.source_id, QueuePhase::Done, None);
         println!("Item '{work_id}' transitioned from failed to done.");
         return Ok(());
     }
@@ -1097,6 +1098,13 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
         match tokio::time::timeout(duration, executor.execute_all(&on_done, &env)).await {
             Ok(r) => r?,
             Err(_) => {
+                record_script_retry_event(
+                    &db,
+                    work_id,
+                    &item.source_id,
+                    QueuePhase::Failed,
+                    Some(format!("timeout after {secs}s")),
+                );
                 println!("Script execution timed out after {secs}s. Item remains failed.");
                 return Ok(());
             }
@@ -1108,11 +1116,19 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
     match result {
         Some(r) if r.success() => {
             db.update_phase(work_id, QueuePhase::Done)?;
+            record_script_retry_event(&db, work_id, &item.source_id, QueuePhase::Done, None);
             println!(
                 "on_done scripts succeeded. Item '{work_id}' transitioned from failed to done."
             );
         }
         Some(r) => {
+            record_script_retry_event(
+                &db,
+                work_id,
+                &item.source_id,
+                QueuePhase::Failed,
+                Some(format!("exit code {}", r.exit_code)),
+            );
             println!(
                 "on_done scripts failed (exit code {}). Item '{work_id}' remains in failed phase.",
                 r.exit_code
@@ -1121,11 +1137,40 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
         None => {
             // No scripts produced a result (shouldn't happen since we checked on_done is non-empty).
             db.update_phase(work_id, QueuePhase::Done)?;
+            record_script_retry_event(&db, work_id, &item.source_id, QueuePhase::Done, None);
             println!("Item '{work_id}' transitioned from failed to done.");
         }
     }
 
     Ok(())
+}
+
+/// Record a `script_retry` transition event for retry-script operations.
+fn record_script_retry_event(
+    db: &Database,
+    work_id: &str,
+    source_id: &str,
+    to_phase: QueuePhase,
+    detail: Option<String>,
+) {
+    let now = chrono::Utc::now();
+    let event = belt_infra::db::TransitionEvent {
+        id: format!("te-{}-{}", work_id, now.timestamp_millis()),
+        work_id: work_id.to_string(),
+        source_id: source_id.to_string(),
+        event_type: "script_retry".to_string(),
+        phase: Some(to_phase.as_str().to_string()),
+        from_phase: Some(QueuePhase::Failed.as_str().to_string()),
+        detail,
+        created_at: now.to_rfc3339(),
+    };
+    if let Err(e) = db.insert_transition_event(&event) {
+        tracing::warn!(
+            work_id = %work_id,
+            error = %e,
+            "failed to record script_retry transition event"
+        );
+    }
 }
 
 /// `belt queue dependency add` -- add a dependency between queue items.
@@ -4684,6 +4729,19 @@ sources:
 
         let final_item = db.get_item("retry-ok-1").unwrap();
         assert_eq!(final_item.phase, QueuePhase::Done);
+
+        // Verify script_retry transition event was recorded.
+        record_script_retry_event(&db, "retry-ok-1", &item.source_id, QueuePhase::Done, None);
+        let events = db.list_transition_events("retry-ok-1").unwrap();
+        let retry_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "script_retry")
+            .collect();
+        assert!(
+            !retry_events.is_empty(),
+            "expected script_retry transition event"
+        );
+        assert_eq!(retry_events.last().unwrap().phase.as_deref(), Some("done"));
     }
 
     /// retry_script: Failed item with on_done script that fails -> remains Failed.
@@ -4745,6 +4803,38 @@ sources:
 
         let final_item = db.get_item("retry-fail-1").unwrap();
         assert_eq!(final_item.phase, QueuePhase::Failed);
+
+        // Verify script_retry transition event was recorded for the failure case.
+        record_script_retry_event(
+            &db,
+            "retry-fail-1",
+            &item.source_id,
+            QueuePhase::Failed,
+            Some("exit code 1".to_string()),
+        );
+        let events = db.list_transition_events("retry-fail-1").unwrap();
+        let retry_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "script_retry")
+            .collect();
+        assert!(
+            !retry_events.is_empty(),
+            "expected script_retry transition event on failure"
+        );
+        assert_eq!(
+            retry_events.last().unwrap().phase.as_deref(),
+            Some("failed")
+        );
+        assert!(
+            retry_events
+                .last()
+                .unwrap()
+                .detail
+                .as_ref()
+                .unwrap()
+                .contains("exit code"),
+            "expected exit code detail"
+        );
     }
 
     /// retry_script: non-Failed item is rejected.
