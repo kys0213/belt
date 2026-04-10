@@ -1,16 +1,17 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
 use chrono::Utc;
 
 use belt_core::action::Action;
-use belt_core::context::HistoryEntry;
+use belt_core::context::{HistoryEntry, ItemContext, QueueContext, SourceContext};
 use belt_core::dependency::SpecDependencyGuard;
 use belt_core::error::BeltError;
 use belt_core::escalation::EscalationAction;
+use belt_core::lifecycle::{HookContext, LifecycleHook, NoopLifecycleHook};
 use belt_core::phase::QueuePhase;
 use belt_core::queue::{HistoryEvent, HitlReason, HitlRespondAction, QueueItem};
 use belt_core::runtime::RuntimeRegistry;
@@ -81,6 +82,8 @@ pub struct Daemon {
     belt_home: PathBuf,
     /// Dependency guard for spec execution ordering.
     dependency_guard: SpecDependencyGuard,
+    /// Lifecycle hook called at phase transitions (on_enter, on_done, on_fail, on_escalation).
+    hook: Arc<dyn LifecycleHook>,
 }
 
 #[derive(Debug)]
@@ -147,6 +150,7 @@ impl Daemon {
                 std::env::var("BELT_HOME").unwrap_or_else(|_| ".belt".to_string()),
             ),
             dependency_guard: SpecDependencyGuard,
+            hook: Arc::new(NoopLifecycleHook),
         }
     }
 
@@ -212,6 +216,16 @@ impl Daemon {
     /// Set the maximum evaluate failure threshold for HITL escalation.
     pub fn with_max_eval_failures(mut self, max: u32) -> Self {
         self.evaluator = Evaluator::new(&self.config.name).with_max_eval_failures(max);
+        self
+    }
+
+    /// Set the lifecycle hook for phase transition notifications.
+    ///
+    /// The hook is called at key state transitions: on_enter (Running),
+    /// on_done (Done), on_fail (Failed), and on_escalation (HITL/Retry).
+    /// Defaults to [`NoopLifecycleHook`] if not set.
+    pub fn with_hook(mut self, hook: Arc<dyn LifecycleHook>) -> Self {
+        self.hook = hook;
         self
     }
 
@@ -399,9 +413,17 @@ impl Daemon {
             let ws_name = self.config.name.clone();
             let state_config = self.find_state_config(&item.state).cloned();
 
+            let hook = Arc::clone(&self.hook);
             join_set.spawn(async move {
-                Self::execute_item_parallel(item, state_config, executor, worktree_mgr, ws_name)
-                    .await
+                Self::execute_item_parallel(
+                    item,
+                    state_config,
+                    executor,
+                    worktree_mgr,
+                    ws_name,
+                    hook,
+                )
+                .await
             });
         }
 
@@ -430,6 +452,7 @@ impl Daemon {
         executor: Arc<ActionExecutor>,
         worktree_mgr: Arc<dyn WorktreeManager>,
         ws_name: String,
+        hook: Arc<dyn LifecycleHook>,
     ) -> ExecutionResult {
         let state_config = match state_config {
             Some(cfg) => cfg,
@@ -510,6 +533,27 @@ impl Daemon {
                 }
             }
         };
+
+        // Lifecycle hook: on_enter — failure here skips handler, enters escalation.
+        let hook_ctx = Self::build_hook_context_static(&item, &worktree, &ws_name);
+        if let Err(e) = hook.on_enter(&hook_ctx).await {
+            tracing::warn!(
+                work_id = %item.work_id,
+                "lifecycle hook on_enter failed, escalating: {e}"
+            );
+            let _ = item.transit(QueuePhase::Failed);
+            return ExecutionResult {
+                item,
+                outcome: ExecutionOutcome::Failed {
+                    error: format!("lifecycle hook on_enter failed: {e}"),
+                    result: None,
+                },
+                ws_name,
+                on_fail_actions,
+                worktree: Some(worktree),
+                on_enter_result: None,
+            };
+        }
 
         let env = ActionEnv::new(&item.work_id, &worktree);
 
@@ -755,6 +799,15 @@ impl Daemon {
                 self.record_history(&item, "failed", Some(&error));
                 self.record_history_event(&item, "failed", Some(error.clone()));
 
+                // Lifecycle hook: on_fail — log only, do not interrupt flow.
+                let hook_ctx = self.build_hook_context(&item, worktree.as_ref());
+                if let Err(e) = self.hook.on_fail(&hook_ctx).await {
+                    tracing::warn!(
+                        work_id = %item.work_id,
+                        "lifecycle hook on_fail error (ignored): {e}"
+                    );
+                }
+
                 // Q-10: Mark worktree as preserved for Failed items.
                 item.mark_worktree_preserved();
 
@@ -830,6 +883,19 @@ impl Daemon {
             "phase_enter",
             None,
         );
+
+        // Lifecycle hook: on_done — fire and forget, log only on failure.
+        let worktree_path = self.worktree_mgr.path(&item.work_id);
+        let hook_ctx = Self::build_hook_context_static(item, &worktree_path, &self.config.name);
+        let hook = Arc::clone(&self.hook);
+        Self::spawn_hook(async move {
+            if let Err(e) = hook.on_done(&hook_ctx).await {
+                tracing::warn!(
+                    work_id = hook_ctx.work_id,
+                    "lifecycle hook on_done error (ignored): {e}"
+                );
+            }
+        });
 
         if let Err(e) = self.worktree_mgr.cleanup(work_id) {
             tracing::warn!(work_id, error = %e, "worktree cleanup failed on mark_done, continuing");
@@ -2010,6 +2076,19 @@ impl Daemon {
         action: EscalationAction,
         lateral_plan: Option<String>,
     ) {
+        // Lifecycle hook: on_escalation — fire and forget, log only on failure.
+        let hook_ctx = self.build_hook_context(item, None);
+        let hook = Arc::clone(&self.hook);
+        let esc_action = action;
+        Self::spawn_hook(async move {
+            if let Err(e) = hook.on_escalation(&hook_ctx, esc_action).await {
+                tracing::warn!(
+                    work_id = hook_ctx.work_id,
+                    "lifecycle hook on_escalation error (ignored): {e}"
+                );
+            }
+        });
+
         let now = chrono::Utc::now().to_rfc3339();
         match action {
             EscalationAction::Retry | EscalationAction::RetryWithComment => {
@@ -2194,6 +2273,88 @@ impl Daemon {
                     ipc_usage.token_usage.output_tokens
                 );
             }
+        }
+    }
+
+    /// Spawn an async hook task if a Tokio runtime is available.
+    ///
+    /// When called from a synchronous context (e.g. unit tests without a runtime),
+    /// the task is silently dropped. This ensures hook calls never panic when
+    /// invoked from sync methods like `mark_done` or `handle_escalation`.
+    fn spawn_hook<F>(fut: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(fut);
+        }
+    }
+
+    /// Build a [`HookContext`] from a queue item and optional worktree path.
+    ///
+    /// Constructs a minimal `ItemContext` from the item's own fields and
+    /// the workspace config.  This avoids calling `DataSource::get_context()`
+    /// at every transition point (which would require async I/O).
+    fn build_hook_context(&self, item: &QueueItem, worktree: Option<&PathBuf>) -> HookContext {
+        let failure_count = self.count_failures(&item.source_id, &item.state);
+        let worktree_path = worktree
+            .cloned()
+            .unwrap_or_else(|| self.worktree_mgr.path(&item.work_id));
+        HookContext {
+            work_id: item.work_id.clone(),
+            worktree: worktree_path,
+            item: item.clone(),
+            item_context: ItemContext {
+                work_id: item.work_id.clone(),
+                workspace: self.config.name.clone(),
+                queue: QueueContext {
+                    phase: format!("{}", item.phase),
+                    state: item.state.clone(),
+                    source_id: item.source_id.clone(),
+                },
+                source: SourceContext {
+                    source_type: String::new(),
+                    url: String::new(),
+                    default_branch: None,
+                },
+                issue: None,
+                pr: None,
+                history: vec![],
+                worktree: worktree.map(|p| p.to_string_lossy().into_owned()),
+                source_data: serde_json::Value::Null,
+            },
+            failure_count,
+        }
+    }
+
+    /// Build a [`HookContext`] without access to `&self` (for static methods).
+    ///
+    /// Used in `execute_item_parallel` where there is no `&self` reference.
+    fn build_hook_context_static(item: &QueueItem, worktree: &Path, ws_name: &str) -> HookContext {
+        HookContext {
+            work_id: item.work_id.clone(),
+            worktree: worktree.to_path_buf(),
+            item: item.clone(),
+            item_context: ItemContext {
+                work_id: item.work_id.clone(),
+                workspace: ws_name.to_string(),
+                queue: QueueContext {
+                    phase: format!("{}", item.phase),
+                    state: item.state.clone(),
+                    source_id: item.source_id.clone(),
+                },
+                source: SourceContext {
+                    source_type: String::new(),
+                    url: String::new(),
+                    default_branch: None,
+                },
+                issue: None,
+                pr: None,
+                history: vec![],
+                worktree: Some(worktree.to_string_lossy().into_owned()),
+                source_data: serde_json::Value::Null,
+            },
+            failure_count: 0,
         }
     }
 
@@ -5383,5 +5544,247 @@ sources:
         let hitl = daemon.queue.back().expect("should have hitl item");
         assert_eq!(hitl.phase, QueuePhase::Hitl);
         // HITL items retain original lateral_plan (from the cloned item), not the new plan.
+    }
+
+    // ---------------------------------------------------------------
+    // Lifecycle hook wiring tests
+    // ---------------------------------------------------------------
+
+    mod lifecycle_hook_tests {
+        use super::*;
+        use belt_core::lifecycle::LifecycleHook;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        /// Mock lifecycle hook that records which methods were called.
+        struct RecordingHook {
+            on_enter_count: AtomicU32,
+            on_done_count: AtomicU32,
+            on_fail_count: AtomicU32,
+            on_escalation_count: AtomicU32,
+            on_enter_should_fail: bool,
+        }
+
+        impl RecordingHook {
+            fn new() -> Self {
+                Self {
+                    on_enter_count: AtomicU32::new(0),
+                    on_done_count: AtomicU32::new(0),
+                    on_fail_count: AtomicU32::new(0),
+                    on_escalation_count: AtomicU32::new(0),
+                    on_enter_should_fail: false,
+                }
+            }
+
+            fn failing_on_enter() -> Self {
+                Self {
+                    on_enter_count: AtomicU32::new(0),
+                    on_done_count: AtomicU32::new(0),
+                    on_fail_count: AtomicU32::new(0),
+                    on_escalation_count: AtomicU32::new(0),
+                    on_enter_should_fail: true,
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl LifecycleHook for RecordingHook {
+            async fn on_enter(
+                &self,
+                _ctx: &belt_core::lifecycle::HookContext,
+            ) -> anyhow::Result<()> {
+                self.on_enter_count.fetch_add(1, Ordering::SeqCst);
+                if self.on_enter_should_fail {
+                    anyhow::bail!("on_enter hook failure")
+                }
+                Ok(())
+            }
+
+            async fn on_done(
+                &self,
+                _ctx: &belt_core::lifecycle::HookContext,
+            ) -> anyhow::Result<()> {
+                self.on_done_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn on_fail(
+                &self,
+                _ctx: &belt_core::lifecycle::HookContext,
+            ) -> anyhow::Result<()> {
+                self.on_fail_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+
+            async fn on_escalation(
+                &self,
+                _ctx: &belt_core::lifecycle::HookContext,
+                _action: EscalationAction,
+            ) -> anyhow::Result<()> {
+                self.on_escalation_count.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        fn setup_daemon_with_hook(
+            tmp: &TempDir,
+            exit_codes: Vec<i32>,
+            hook: Arc<dyn LifecycleHook>,
+        ) -> Daemon {
+            let config = test_workspace_config();
+            let mut registry = RuntimeRegistry::new("mock".to_string());
+            registry.register(Arc::new(MockRuntime::new("mock", exit_codes)));
+            let worktree_mgr = MockWorktreeManager::new(tmp.path().to_path_buf());
+
+            Daemon::new(
+                config,
+                vec![Box::new(MockDataSource::new("github"))],
+                Arc::new(registry),
+                Box::new(worktree_mgr),
+                4,
+            )
+            .with_hook(hook)
+        }
+
+        #[tokio::test]
+        async fn on_enter_called_during_execution() {
+            let tmp = TempDir::new().unwrap();
+            let hook = Arc::new(RecordingHook::new());
+            let mut daemon = setup_daemon_with_hook(
+                &tmp,
+                vec![0, 0],
+                Arc::clone(&hook) as Arc<dyn LifecycleHook>,
+            );
+
+            let mut item = test_item("s1", "implement");
+            item.phase = QueuePhase::Running;
+            item.updated_at = Utc::now().to_rfc3339();
+            daemon.push_item(item);
+
+            daemon.execute_running().await;
+
+            assert!(
+                hook.on_enter_count.load(Ordering::SeqCst) >= 1,
+                "on_enter should be called at least once"
+            );
+        }
+
+        #[tokio::test]
+        async fn on_enter_failure_causes_escalation() {
+            let tmp = TempDir::new().unwrap();
+            let hook = Arc::new(RecordingHook::failing_on_enter());
+            let mut daemon = setup_daemon_with_hook(
+                &tmp,
+                vec![0, 0],
+                Arc::clone(&hook) as Arc<dyn LifecycleHook>,
+            );
+
+            let mut item = test_item("s1", "implement");
+            item.phase = QueuePhase::Running;
+            item.updated_at = Utc::now().to_rfc3339();
+            daemon.push_item(item);
+
+            let outcomes = daemon.execute_running().await;
+
+            assert_eq!(outcomes.len(), 1, "should have one outcome");
+            assert!(
+                matches!(outcomes[0], ItemOutcome::Failed { .. }),
+                "on_enter hook failure should cause item failure"
+            );
+            assert!(
+                hook.on_enter_count.load(Ordering::SeqCst) >= 1,
+                "on_enter should be called even when failing"
+            );
+        }
+
+        #[tokio::test]
+        async fn on_done_called_on_mark_done() {
+            let tmp = TempDir::new().unwrap();
+            let hook = Arc::new(RecordingHook::new());
+            let mut daemon =
+                setup_daemon_with_hook(&tmp, vec![], Arc::clone(&hook) as Arc<dyn LifecycleHook>);
+
+            let mut item = test_item("s1", "analyze");
+            item.phase = QueuePhase::Running;
+            item.updated_at = Utc::now().to_rfc3339();
+            daemon.push_item(item);
+
+            daemon.complete_item("s1:analyze").unwrap();
+            daemon.mark_done("s1:analyze").unwrap();
+
+            // Allow the spawned task to complete.
+            tokio::task::yield_now().await;
+
+            assert!(
+                hook.on_done_count.load(Ordering::SeqCst) >= 1,
+                "on_done should be called on mark_done"
+            );
+        }
+
+        #[tokio::test]
+        async fn on_fail_called_on_execution_failure() {
+            let tmp = TempDir::new().unwrap();
+            let hook = Arc::new(RecordingHook::new());
+            // exit code 1 = handler prompt failure (on_enter has no actions for implement)
+            let mut daemon =
+                setup_daemon_with_hook(&tmp, vec![1], Arc::clone(&hook) as Arc<dyn LifecycleHook>);
+
+            let mut item = test_item("s1", "implement");
+            item.phase = QueuePhase::Running;
+            item.updated_at = Utc::now().to_rfc3339();
+            daemon.push_item(item);
+
+            let outcomes = daemon.execute_running().await;
+
+            assert_eq!(outcomes.len(), 1);
+            assert!(
+                matches!(outcomes[0], ItemOutcome::Failed { .. }),
+                "handler should fail with exit code 1"
+            );
+            assert!(
+                hook.on_fail_count.load(Ordering::SeqCst) >= 1,
+                "on_fail should be called on execution failure"
+            );
+        }
+
+        #[tokio::test]
+        async fn on_escalation_called_on_handle_escalation() {
+            let tmp = TempDir::new().unwrap();
+            let hook = Arc::new(RecordingHook::new());
+            let mut daemon =
+                setup_daemon_with_hook(&tmp, vec![0], Arc::clone(&hook) as Arc<dyn LifecycleHook>);
+
+            let mut item = test_item("s1", "implement");
+            item.phase = QueuePhase::Failed;
+
+            daemon.handle_escalation(&mut item, EscalationAction::Hitl, None);
+
+            // Allow the spawned task to complete.
+            tokio::task::yield_now().await;
+
+            assert!(
+                hook.on_escalation_count.load(Ordering::SeqCst) >= 1,
+                "on_escalation should be called on escalation"
+            );
+        }
+
+        #[test]
+        fn daemon_default_hook_is_noop() {
+            let tmp = TempDir::new().unwrap();
+            let source = MockDataSource::new("github");
+            let daemon = setup_daemon(&tmp, source, vec![]);
+
+            // The daemon should be constructable with default NoopLifecycleHook.
+            // This test just verifies the field exists and the constructor works.
+            assert_eq!(daemon.queue.len(), 0);
+        }
+
+        #[test]
+        fn with_hook_builder_works() {
+            let tmp = TempDir::new().unwrap();
+            let hook: Arc<dyn LifecycleHook> = Arc::new(RecordingHook::new());
+            let daemon = setup_daemon_with_hook(&tmp, vec![], hook);
+
+            assert_eq!(daemon.queue.len(), 0);
+        }
     }
 }
