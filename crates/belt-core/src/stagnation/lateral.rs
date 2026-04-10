@@ -3,10 +3,27 @@
 //! When a stagnation pattern is detected, [`LateralAnalyzer`] selects
 //! a [`Persona`] that suggests a fundamentally different approach,
 //! producing a [`LateralPlan`] that can guide the next agent attempt.
+//!
+//! The analyzer invokes an LLM subprocess (`belt agent -p`) with the
+//! selected persona's embedded prompt template and the failure context,
+//! then parses the response into a structured [`LateralPlan`].
+
+use std::collections::HashMap;
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
 use super::pattern::{StagnationDetection, StagnationPattern};
+use crate::error::BeltError;
+use crate::platform::ShellExecutor;
+
+// --- Embedded persona prompts (compiled into the binary) ---
+
+const PERSONA_HACKER: &str = include_str!("personas/hacker.md");
+const PERSONA_ARCHITECT: &str = include_str!("personas/architect.md");
+const PERSONA_RESEARCHER: &str = include_str!("personas/researcher.md");
+const PERSONA_SIMPLIFIER: &str = include_str!("personas/simplifier.md");
+const PERSONA_CONTRARIAN: &str = include_str!("personas/contrarian.md");
 
 /// A lateral-thinking persona that frames the problem from a different angle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -59,6 +76,54 @@ impl Persona {
             }
         }
     }
+
+    /// Returns the embedded prompt template for this persona.
+    pub fn prompt_template(&self) -> &'static str {
+        match self {
+            Persona::Hacker => PERSONA_HACKER,
+            Persona::Architect => PERSONA_ARCHITECT,
+            Persona::Researcher => PERSONA_RESEARCHER,
+            Persona::Simplifier => PERSONA_SIMPLIFIER,
+            Persona::Contrarian => PERSONA_CONTRARIAN,
+        }
+    }
+
+    /// Affinity-ordered list of personas for a given stagnation pattern.
+    ///
+    /// The first persona is the best match for the pattern, and subsequent
+    /// personas serve as fallbacks in decreasing affinity order.
+    pub fn affinity_order(pattern: StagnationPattern) -> [Persona; 5] {
+        match pattern {
+            StagnationPattern::Spinning => [
+                Persona::Hacker,
+                Persona::Contrarian,
+                Persona::Simplifier,
+                Persona::Architect,
+                Persona::Researcher,
+            ],
+            StagnationPattern::Oscillation => [
+                Persona::Architect,
+                Persona::Contrarian,
+                Persona::Simplifier,
+                Persona::Hacker,
+                Persona::Researcher,
+            ],
+            StagnationPattern::NoDrift => [
+                Persona::Researcher,
+                Persona::Contrarian,
+                Persona::Architect,
+                Persona::Hacker,
+                Persona::Simplifier,
+            ],
+            StagnationPattern::DiminishingReturns => [
+                Persona::Simplifier,
+                Persona::Contrarian,
+                Persona::Researcher,
+                Persona::Architect,
+                Persona::Hacker,
+            ],
+        }
+    }
 }
 
 impl std::fmt::Display for Persona {
@@ -84,17 +149,42 @@ pub struct LateralPlan {
     pub triggered_by: StagnationPattern,
     /// Confidence of the original detection.
     pub detection_confidence: f64,
+    /// LLM-generated analysis of why previous attempts failed.
+    pub failure_analysis: String,
+    /// LLM-generated alternative approach suggestion.
+    pub alternative_approach: String,
+    /// LLM-generated step-by-step execution plan.
+    pub execution_plan: String,
+    /// LLM-generated warnings and caveats.
+    pub warnings: String,
 }
 
-/// Selects a [`Persona`] based on the detected stagnation pattern.
+/// Parameters for [`LateralAnalyzer::analyze`].
 ///
-/// The mapping is deterministic:
-/// - `Spinning` → `Contrarian` (same output = wrong assumptions)
-/// - `Oscillation` → `Architect` (flip-flopping = structural problem)
-/// - `NoDrift` → `Researcher` (no progress = need external knowledge)
-/// - `DiminishingReturns` → `Simplifier` (incremental gains plateau = over-engineering)
+/// Grouped into a struct to avoid excessive function parameters.
+#[derive(Debug)]
+pub struct AnalyzeParams<'a> {
+    /// The stagnation detection result.
+    pub detection: &'a StagnationDetection,
+    /// Context describing recent failures (error messages, summaries).
+    pub failure_context: &'a str,
+    /// Personas that have already been tried and should be skipped.
+    pub attempted_personas: &'a [Persona],
+    /// Working directory for subprocess execution.
+    pub workspace: &'a Path,
+}
+
+/// Selects a [`Persona`] based on the detected stagnation pattern and
+/// invokes an LLM subprocess to generate a [`LateralPlan`].
 ///
-/// A `Hacker` persona is available as a fallback or can be selected manually.
+/// Persona selection follows affinity ordering per pattern type:
+/// - `Spinning` -> `Hacker` > `Contrarian` > `Simplifier` > `Architect` > `Researcher`
+/// - `Oscillation` -> `Architect` > `Contrarian` > `Simplifier` > `Hacker` > `Researcher`
+/// - `NoDrift` -> `Researcher` > `Contrarian` > `Architect` > `Hacker` > `Simplifier`
+/// - `DiminishingReturns` -> `Simplifier` > `Contrarian` > `Researcher` > `Architect` > `Hacker`
+///
+/// Already-tried personas are filtered out. If all personas are exhausted,
+/// analysis returns an error.
 #[derive(Debug, Default)]
 pub struct LateralAnalyzer;
 
@@ -104,25 +194,133 @@ impl LateralAnalyzer {
         Self
     }
 
-    /// Given a stagnation detection, produce a lateral plan.
-    pub fn analyze(&self, detection: &StagnationDetection) -> LateralPlan {
-        let persona = self.select_persona(detection.pattern);
+    /// Select the best available persona for the given pattern, excluding
+    /// any personas that have already been attempted.
+    ///
+    /// Returns `None` if all personas have been exhausted.
+    pub fn select_persona(
+        &self,
+        pattern: StagnationPattern,
+        attempted: &[Persona],
+    ) -> Option<Persona> {
+        Persona::affinity_order(pattern)
+            .iter()
+            .find(|p| !attempted.contains(p))
+            .copied()
+    }
+
+    /// Build the full prompt by combining the persona template with failure context.
+    pub fn build_prompt(&self, persona: Persona, failure_context: &str) -> String {
+        format!(
+            "{}\n\n---\n\n## Failure Context\n\n{failure_context}",
+            persona.prompt_template(),
+        )
+    }
+
+    /// Given a stagnation detection and failure context, invoke the LLM
+    /// subprocess to produce a lateral plan.
+    ///
+    /// Uses `belt agent -p` via the provided [`ShellExecutor`].
+    pub async fn analyze(
+        &self,
+        executor: &dyn ShellExecutor,
+        params: &AnalyzeParams<'_>,
+    ) -> Result<LateralPlan, BeltError> {
+        let persona = self
+            .select_persona(params.detection.pattern, params.attempted_personas)
+            .ok_or_else(|| {
+                BeltError::Stagnation(format!(
+                    "all personas exhausted for pattern {}",
+                    params.detection.pattern,
+                ))
+            })?;
+
+        let prompt = self.build_prompt(persona, params.failure_context);
+
+        // Escape single quotes in the prompt for safe shell embedding.
+        let escaped_prompt = prompt.replace('\'', "'\\''");
+        let command = format!("belt agent -p '{escaped_prompt}'");
+
+        let output = executor
+            .execute(&command, params.workspace, &HashMap::new())
+            .await
+            .map_err(|e| {
+                BeltError::Stagnation(format!(
+                    "subprocess invocation failed for persona {persona}: {e}"
+                ))
+            })?;
+
+        if !output.success() {
+            return Err(BeltError::Stagnation(format!(
+                "subprocess failed for persona {persona} (exit code {:?}): {}",
+                output.exit_code,
+                output.stderr.trim(),
+            )));
+        }
+
+        let response = output.stdout.trim();
+        if response.is_empty() {
+            return Err(BeltError::Stagnation(format!(
+                "empty response from subprocess for persona {persona}"
+            )));
+        }
+
+        Ok(self.parse_response(persona, params.detection, response))
+    }
+
+    /// Parse the LLM response into a [`LateralPlan`].
+    ///
+    /// Extracts sections delimited by `**Failure Analysis**:`,
+    /// `**Alternative Approach**:`, `**Execution Plan**:`, and
+    /// `**Warnings**:` headers. If a section is not found, falls back to
+    /// the persona directive or the full response text.
+    pub fn parse_response(
+        &self,
+        persona: Persona,
+        detection: &StagnationDetection,
+        response: &str,
+    ) -> LateralPlan {
+        let failure_analysis =
+            extract_section(response, "Failure Analysis").unwrap_or_else(|| response.to_string());
+        let alternative_approach = extract_section(response, "Alternative Approach")
+            .unwrap_or_else(|| persona.directive().to_string());
+        let execution_plan = extract_section(response, "Execution Plan").unwrap_or_default();
+        let warnings = extract_section(response, "Warnings").unwrap_or_default();
+
         LateralPlan {
             persona,
             directive: persona.directive().to_string(),
             triggered_by: detection.pattern,
             detection_confidence: detection.confidence,
+            failure_analysis,
+            alternative_approach,
+            execution_plan,
+            warnings,
         }
     }
+}
 
-    /// Select a persona for the given pattern.
-    pub fn select_persona(&self, pattern: StagnationPattern) -> Persona {
-        match pattern {
-            StagnationPattern::Spinning => Persona::Contrarian,
-            StagnationPattern::Oscillation => Persona::Architect,
-            StagnationPattern::NoDrift => Persona::Researcher,
-            StagnationPattern::DiminishingReturns => Persona::Simplifier,
-        }
+/// Extract a named section from a markdown-style response.
+///
+/// Looks for patterns like `**Section Name**:` or `- **Section Name**:` and
+/// captures text until the next section header or end of input.
+fn extract_section(text: &str, section_name: &str) -> Option<String> {
+    let pattern = format!("**{section_name}**:");
+    let start = text.find(&pattern)?;
+    let content_start = start + pattern.len();
+    let rest = &text[content_start..];
+
+    // Find the next section header or end of text.
+    let end = rest
+        .find("\n- **")
+        .or_else(|| rest.find("\n**"))
+        .unwrap_or(rest.len());
+
+    let section = rest[..end].trim();
+    if section.is_empty() {
+        None
+    } else {
+        Some(section.to_string())
     }
 }
 
@@ -161,54 +359,147 @@ mod tests {
     }
 
     #[test]
-    fn lateral_analyzer_spinning_selects_contrarian() {
-        let analyzer = LateralAnalyzer::new();
-        assert_eq!(
-            analyzer.select_persona(StagnationPattern::Spinning),
-            Persona::Contrarian
-        );
+    fn persona_prompt_template_non_empty() {
+        for persona in Persona::ALL {
+            let template = persona.prompt_template();
+            assert!(!template.is_empty(), "{persona} has empty template");
+            assert!(
+                template.contains("## Your Approach"),
+                "{persona} template missing expected section"
+            );
+        }
     }
 
     #[test]
-    fn lateral_analyzer_oscillation_selects_architect() {
-        let analyzer = LateralAnalyzer::new();
-        assert_eq!(
-            analyzer.select_persona(StagnationPattern::Oscillation),
-            Persona::Architect
-        );
+    fn affinity_spinning_starts_with_hacker() {
+        let order = Persona::affinity_order(StagnationPattern::Spinning);
+        assert_eq!(order[0], Persona::Hacker);
     }
 
     #[test]
-    fn lateral_analyzer_no_drift_selects_researcher() {
-        let analyzer = LateralAnalyzer::new();
-        assert_eq!(
-            analyzer.select_persona(StagnationPattern::NoDrift),
-            Persona::Researcher
-        );
+    fn affinity_oscillation_starts_with_architect() {
+        let order = Persona::affinity_order(StagnationPattern::Oscillation);
+        assert_eq!(order[0], Persona::Architect);
     }
 
     #[test]
-    fn lateral_analyzer_diminishing_returns_selects_simplifier() {
-        let analyzer = LateralAnalyzer::new();
-        assert_eq!(
-            analyzer.select_persona(StagnationPattern::DiminishingReturns),
-            Persona::Simplifier
-        );
+    fn affinity_no_drift_starts_with_researcher() {
+        let order = Persona::affinity_order(StagnationPattern::NoDrift);
+        assert_eq!(order[0], Persona::Researcher);
     }
 
     #[test]
-    fn lateral_plan_from_detection() {
+    fn affinity_diminishing_starts_with_simplifier() {
+        let order = Persona::affinity_order(StagnationPattern::DiminishingReturns);
+        assert_eq!(order[0], Persona::Simplifier);
+    }
+
+    #[test]
+    fn affinity_orders_contain_all_personas() {
+        for pattern in [
+            StagnationPattern::Spinning,
+            StagnationPattern::Oscillation,
+            StagnationPattern::NoDrift,
+            StagnationPattern::DiminishingReturns,
+        ] {
+            let order = Persona::affinity_order(pattern);
+            for persona in Persona::ALL {
+                assert!(
+                    order.contains(&persona),
+                    "pattern {pattern} missing persona {persona}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn select_persona_filters_attempted() {
         let analyzer = LateralAnalyzer::new();
+        // Spinning affinity: Hacker > Contrarian > Simplifier > Architect > Researcher
+        let attempted = &[Persona::Hacker, Persona::Contrarian];
+        let selected = analyzer.select_persona(StagnationPattern::Spinning, attempted);
+        assert_eq!(selected, Some(Persona::Simplifier));
+    }
+
+    #[test]
+    fn select_persona_returns_none_when_exhausted() {
+        let analyzer = LateralAnalyzer::new();
+        let all = Persona::ALL.to_vec();
+        let selected = analyzer.select_persona(StagnationPattern::Spinning, &all);
+        assert!(selected.is_none());
+    }
+
+    #[test]
+    fn select_persona_no_filter_returns_first_affinity() {
+        let analyzer = LateralAnalyzer::new();
+        let selected = analyzer.select_persona(StagnationPattern::Oscillation, &[]);
+        assert_eq!(selected, Some(Persona::Architect));
+    }
+
+    #[test]
+    fn build_prompt_contains_persona_template_and_context() {
+        let analyzer = LateralAnalyzer::new();
+        let prompt = analyzer.build_prompt(Persona::Hacker, "compile error: Session not found");
+        assert!(prompt.contains("# Hacker Persona"));
+        assert!(prompt.contains("compile error: Session not found"));
+        assert!(prompt.contains("## Failure Context"));
+    }
+
+    #[test]
+    fn parse_response_extracts_sections() {
+        let analyzer = LateralAnalyzer::new();
+        let response = "\
+- **Failure Analysis**: The code is looping on the same compile error.
+- **Alternative Approach**: Use tower-sessions crate instead.
+- **Execution Plan**: 1. Add dependency. 2. Replace type.
+- **Warnings**: This introduces a new dependency.";
+
         let detection = StagnationDetection {
             pattern: StagnationPattern::Spinning,
-            confidence: 0.95,
-            reason: "3 consecutive identical outputs".to_string(),
+            confidence: 0.9,
+            reason: "test".to_string(),
         };
-        let plan = analyzer.analyze(&detection);
-        assert_eq!(plan.persona, Persona::Contrarian);
+
+        let plan = analyzer.parse_response(Persona::Hacker, &detection, response);
+        assert_eq!(plan.persona, Persona::Hacker);
         assert_eq!(plan.triggered_by, StagnationPattern::Spinning);
-        assert!((plan.detection_confidence - 0.95).abs() < f64::EPSILON);
-        assert!(!plan.directive.is_empty());
+        assert!(plan.failure_analysis.contains("looping"));
+        assert!(plan.alternative_approach.contains("tower-sessions"));
+        assert!(plan.execution_plan.contains("Add dependency"));
+        assert!(plan.warnings.contains("new dependency"));
+    }
+
+    #[test]
+    fn parse_response_falls_back_on_missing_sections() {
+        let analyzer = LateralAnalyzer::new();
+        let response = "Just a plain text response with no sections.";
+        let detection = StagnationDetection {
+            pattern: StagnationPattern::NoDrift,
+            confidence: 0.7,
+            reason: "test".to_string(),
+        };
+
+        let plan = analyzer.parse_response(Persona::Researcher, &detection, response);
+        // failure_analysis falls back to full response
+        assert_eq!(plan.failure_analysis, response);
+        // alternative_approach falls back to directive
+        assert_eq!(plan.alternative_approach, Persona::Researcher.directive());
+        // execution_plan and warnings fall back to empty
+        assert!(plan.execution_plan.is_empty());
+        assert!(plan.warnings.is_empty());
+    }
+
+    #[test]
+    fn extract_section_with_bold_markers() {
+        let text = "**Failure Analysis**: Something failed.\n**Alternative Approach**: Try X.";
+        let result = extract_section(text, "Failure Analysis");
+        assert_eq!(result, Some("Something failed.".to_string()));
+    }
+
+    #[test]
+    fn extract_section_returns_none_for_missing() {
+        let text = "No sections here.";
+        assert!(extract_section(text, "Failure Analysis").is_none());
     }
 
     #[test]
@@ -218,10 +509,16 @@ mod tests {
             directive: "redesign".to_string(),
             triggered_by: StagnationPattern::Oscillation,
             detection_confidence: 0.8,
+            failure_analysis: "structural issue".to_string(),
+            alternative_approach: "new abstraction".to_string(),
+            execution_plan: "1. refactor 2. test".to_string(),
+            warnings: "may break API".to_string(),
         };
         let json = serde_json::to_string(&plan).unwrap();
         let parsed: LateralPlan = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.persona, plan.persona);
         assert_eq!(parsed.triggered_by, plan.triggered_by);
+        assert_eq!(parsed.failure_analysis, plan.failure_analysis);
+        assert_eq!(parsed.alternative_approach, plan.alternative_approach);
     }
 }

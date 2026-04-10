@@ -37,4 +37,7 @@ pub enum BeltError {
         count: u32,
         max: u32,
     },
+
+    #[error("stagnation error: {0}")]
+    Stagnation(String),
 }
