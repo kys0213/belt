@@ -302,6 +302,67 @@ impl Daemon {
         }
     }
 
+    /// Build hitl_notes markdown from lateral plan and stagnation events.
+    ///
+    /// When an item escalates to HITL, this attaches the full lateral thinking
+    /// history so that human reviewers can see what automated approaches were
+    /// already attempted.
+    fn build_lateral_hitl_notes(
+        db: &Option<Arc<Database>>,
+        work_id: &str,
+        lateral_plan: &Option<String>,
+    ) -> Option<String> {
+        // Only produce notes when there is a lateral plan or stagnation events.
+        let stagnation_events: Vec<TransitionEvent> = db
+            .as_ref()
+            .and_then(|db| db.list_transition_events(work_id).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| e.event_type == "stagnation")
+            .collect();
+
+        if lateral_plan.is_none() && stagnation_events.is_empty() {
+            return None;
+        }
+
+        let mut notes = String::from("## Lateral Thinking History\n");
+
+        if let Some(plan) = lateral_plan {
+            notes.push_str(&format!("- Current lateral plan: {plan}\n"));
+        }
+
+        notes.push_str(&format!(
+            "- Stagnation events: {}건\n",
+            stagnation_events.len()
+        ));
+
+        // Extract pattern/confidence/persona from each stagnation event detail (JSON).
+        for ev in &stagnation_events {
+            if let Some(detail) = &ev.detail
+                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(detail)
+            {
+                let pattern = parsed
+                    .get("pattern_type")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let confidence = parsed
+                    .get("confidence")
+                    .and_then(|v| v.as_f64())
+                    .map(|c| format!("{c:.2}"))
+                    .unwrap_or_else(|| "N/A".to_string());
+                let persona = parsed
+                    .get("recommended_persona")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                notes.push_str(&format!(
+                    "- Pattern: {pattern} (confidence: {confidence})\n- Persona: {persona}\n",
+                ));
+            }
+        }
+
+        Some(notes)
+    }
+
     // ---------------------------------------------------------------
     // Phase 1: Collect items from DataSources
     // ---------------------------------------------------------------
@@ -2168,6 +2229,8 @@ impl Daemon {
                 item.set_phase_unchecked(QueuePhase::Hitl);
                 item.hitl_created_at = Some(now);
                 item.hitl_reason = Some(HitlReason::RetryMaxExceeded);
+                item.hitl_notes =
+                    Self::build_lateral_hitl_notes(&self.db, &item.work_id, &lateral_plan);
                 self.queue.push_back(item.clone());
             }
         }
@@ -5714,6 +5777,88 @@ sources:
         let hitl = daemon.queue.back().expect("should have hitl item");
         assert_eq!(hitl.phase(), QueuePhase::Hitl);
         // HITL items retain original lateral_plan (from the cloned item), not the new plan.
+    }
+
+    #[test]
+    fn handle_escalation_hitl_attaches_lateral_notes_from_plan() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![0]);
+
+        let mut item = test_item("src:1", "implement");
+        item.set_phase_unchecked(QueuePhase::Failed);
+        let plan = Some("try a different algorithm".to_string());
+
+        daemon.handle_escalation(&mut item, EscalationAction::Hitl, plan);
+
+        let hitl = daemon.queue.back().expect("should have hitl item");
+        assert_eq!(hitl.phase(), QueuePhase::Hitl);
+        let notes = hitl.hitl_notes.as_ref().expect("hitl_notes should be set");
+        assert!(notes.contains("## Lateral Thinking History"));
+        assert!(notes.contains("try a different algorithm"));
+        assert!(notes.contains("Stagnation events: 0"));
+    }
+
+    #[test]
+    fn handle_escalation_hitl_no_notes_without_plan_or_events() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![0]);
+
+        let mut item = test_item("src:1", "implement");
+        item.set_phase_unchecked(QueuePhase::Failed);
+
+        daemon.handle_escalation(&mut item, EscalationAction::Hitl, None);
+
+        let hitl = daemon.queue.back().expect("should have hitl item");
+        assert_eq!(hitl.phase(), QueuePhase::Hitl);
+        assert!(hitl.hitl_notes.is_none());
+    }
+
+    #[test]
+    fn handle_escalation_hitl_includes_stagnation_events_from_db() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![0]);
+
+        let db = Database::open_in_memory().unwrap();
+        // Insert a stagnation event for the work_id.
+        let ev = TransitionEvent {
+            id: "ev-stag-1".to_string(),
+            work_id: "src:1:implement".to_string(),
+            source_id: "src:1".to_string(),
+            event_type: "stagnation".to_string(),
+            phase: None,
+            from_phase: None,
+            detail: Some(
+                serde_json::json!({
+                    "pattern_type": "spinning",
+                    "confidence": 0.95,
+                    "reason": "repeated identical errors",
+                    "recommended_persona": "contrarian",
+                    "failure_count": 3
+                })
+                .to_string(),
+            ),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        db.insert_transition_event(&ev).unwrap();
+
+        let mut daemon = daemon.with_db(db);
+
+        let mut item = test_item("src:1", "implement");
+        item.set_phase_unchecked(QueuePhase::Failed);
+        let plan = Some("use contrarian approach".to_string());
+
+        daemon.handle_escalation(&mut item, EscalationAction::Hitl, plan);
+
+        let hitl = daemon.queue.back().expect("should have hitl item");
+        let notes = hitl.hitl_notes.as_ref().expect("hitl_notes should be set");
+        assert!(notes.contains("## Lateral Thinking History"));
+        assert!(notes.contains("use contrarian approach"));
+        assert!(notes.contains("Stagnation events: 1"));
+        assert!(notes.contains("Pattern: spinning (confidence: 0.95)"));
+        assert!(notes.contains("Persona: contrarian"));
     }
 
     // ---------------------------------------------------------------
