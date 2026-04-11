@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use belt_core::context::{
     IssueContext, ItemContext, PrContext, QueueContext, ReviewContext, SourceContext,
 };
-use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::source::DataSource;
 use belt_core::workspace::WorkspaceConfig;
@@ -436,26 +435,14 @@ impl DataSource for GitHubDataSource {
                             let source_id = format!("github:{repo_name}#{number}");
                             let work_id = QueueItem::make_work_id(&source_id, state_name);
 
-                            items.push(QueueItem {
+                            let mut item = QueueItem::new(
                                 work_id,
                                 source_id,
-                                workspace_id: workspace.name.clone(),
-                                state: state_name.clone(),
-                                phase: QueuePhase::Pending,
-                                title: Some(title),
-                                created_at: chrono::Utc::now().to_rfc3339(),
-                                updated_at: chrono::Utc::now().to_rfc3339(),
-                                hitl_created_at: None,
-                                hitl_respondent: None,
-                                hitl_notes: None,
-                                hitl_reason: None,
-                                hitl_timeout_at: None,
-                                hitl_terminal_action: None,
-                                worktree_preserved: false,
-                                previous_worktree_path: None,
-                                replan_count: 0,
-                                lateral_plan: None,
-                            });
+                                workspace.name.clone(),
+                                state_name.clone(),
+                            );
+                            item.title = Some(title);
+                            items.push(item);
                         }
                     }
                 }
@@ -508,7 +495,7 @@ impl DataSource for GitHubDataSource {
             work_id: item.work_id.clone(),
             workspace: item.workspace_id.clone(),
             queue: QueueContext {
-                phase: item.phase.as_str().to_string(),
+                phase: item.phase().as_str().to_string(),
                 state: item.state.clone(),
                 source_id: item.source_id.clone(),
             },
@@ -800,7 +787,7 @@ sources:
         let ctx = ds.get_context(&item).await.unwrap();
         assert_eq!(ctx.queue.state, item.state);
         assert_eq!(ctx.queue.source_id, item.source_id);
-        assert_eq!(ctx.queue.phase, item.phase.as_str());
+        assert_eq!(ctx.queue.phase, item.phase().as_str());
     }
 
     #[tokio::test]
@@ -935,7 +922,7 @@ sources:
         assert_eq!(item.work_id, "github:org/repo!10:fix_review");
         assert_eq!(item.source_id, "github:org/repo!10");
         assert_eq!(item.state, "fix_review");
-        assert_eq!(item.phase, QueuePhase::Pending);
+        assert_eq!(item.phase(), QueuePhase::Pending);
         assert!(item.title.as_ref().unwrap().starts_with("[review]"));
     }
 }

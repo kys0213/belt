@@ -183,7 +183,7 @@ async fn hitl_respond_done() {
 
     // Manually set up an item in Completed -> Hitl.
     let mut item = test_item("github:org/repo#1", "analyze");
-    item.phase = QueuePhase::Running;
+    item.set_phase_unchecked(QueuePhase::Running);
     item.updated_at = chrono::Utc::now().to_rfc3339();
     daemon.push_item(item);
 
@@ -208,7 +208,7 @@ async fn hitl_respond_done() {
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:analyze").unwrap();
-    assert_eq!(item.phase, QueuePhase::Done);
+    assert_eq!(item.phase(), QueuePhase::Done);
     assert_eq!(item.hitl_respondent.as_deref(), Some("human"));
 }
 
@@ -220,7 +220,7 @@ async fn hitl_respond_retry() {
     let mut daemon = setup_daemon(&tmp, source, vec![]);
 
     let mut item = test_item("github:org/repo#1", "analyze");
-    item.phase = QueuePhase::Running;
+    item.set_phase_unchecked(QueuePhase::Running);
     item.updated_at = chrono::Utc::now().to_rfc3339();
     daemon.push_item(item);
 
@@ -244,7 +244,7 @@ async fn hitl_respond_retry() {
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:analyze").unwrap();
-    assert_eq!(item.phase, QueuePhase::Pending);
+    assert_eq!(item.phase(), QueuePhase::Pending);
 }
 
 /// HITL item can be resolved with Skip action.
@@ -255,7 +255,7 @@ async fn hitl_respond_skip() {
     let mut daemon = setup_daemon(&tmp, source, vec![]);
 
     let mut item = test_item("github:org/repo#1", "analyze");
-    item.phase = QueuePhase::Running;
+    item.set_phase_unchecked(QueuePhase::Running);
     item.updated_at = chrono::Utc::now().to_rfc3339();
     daemon.push_item(item);
 
@@ -279,7 +279,7 @@ async fn hitl_respond_skip() {
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:analyze").unwrap();
-    assert_eq!(item.phase, QueuePhase::Skipped);
+    assert_eq!(item.phase(), QueuePhase::Skipped);
 }
 
 /// Failed items have worktree_preserved flag set.
@@ -290,7 +290,7 @@ async fn failed_items_preserve_worktree() {
     let mut daemon = setup_daemon(&tmp, source, vec![]);
 
     let mut item = test_item("github:org/repo#1", "analyze");
-    item.phase = QueuePhase::Running;
+    item.set_phase_unchecked(QueuePhase::Running);
     item.updated_at = chrono::Utc::now().to_rfc3339();
     daemon.push_item(item);
 
@@ -299,7 +299,7 @@ async fn failed_items_preserve_worktree() {
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:analyze").unwrap();
-    assert_eq!(item.phase, QueuePhase::Failed);
+    assert_eq!(item.phase(), QueuePhase::Failed);
     assert!(
         item.worktree_preserved,
         "failed items should have worktree_preserved=true"
@@ -407,7 +407,7 @@ async fn spec_conflict_detection_creates_hitl() {
     let mut daemon = setup_daemon(&tmp, source, vec![]);
 
     let mut item = test_item("github:org/repo#1", "implement");
-    item.phase = QueuePhase::Running;
+    item.set_phase_unchecked(QueuePhase::Running);
     item.updated_at = chrono::Utc::now().to_rfc3339();
     daemon.push_item(item);
 
@@ -423,7 +423,7 @@ async fn spec_conflict_detection_creates_hitl() {
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:implement").unwrap();
-    assert_eq!(item.phase, QueuePhase::Hitl);
+    assert_eq!(item.phase(), QueuePhase::Hitl);
     assert_eq!(item.hitl_reason, Some(HitlReason::SpecConflict));
     assert!(
         item.hitl_notes
@@ -444,7 +444,7 @@ async fn spec_conflict_hitl_approve_proceeds_parallel() {
     let mut daemon = setup_daemon(&tmp, source, vec![]);
 
     let mut item = test_item("github:org/repo#1", "implement");
-    item.phase = QueuePhase::Running;
+    item.set_phase_unchecked(QueuePhase::Running);
     item.updated_at = chrono::Utc::now().to_rfc3339();
     daemon.push_item(item);
 
@@ -468,7 +468,7 @@ async fn spec_conflict_hitl_approve_proceeds_parallel() {
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:implement").unwrap();
-    assert_eq!(item.phase, QueuePhase::Done);
+    assert_eq!(item.phase(), QueuePhase::Done);
     assert_eq!(item.hitl_respondent.as_deref(), Some("reviewer"));
 }
 
@@ -483,7 +483,7 @@ async fn spec_conflict_hitl_reject_skips_later_spec() {
     let mut daemon = setup_daemon(&tmp, source, vec![]);
 
     let mut item = test_item("github:org/repo#1", "implement");
-    item.phase = QueuePhase::Running;
+    item.set_phase_unchecked(QueuePhase::Running);
     item.updated_at = chrono::Utc::now().to_rfc3339();
     daemon.push_item(item);
 
@@ -507,7 +507,7 @@ async fn spec_conflict_hitl_reject_skips_later_spec() {
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:implement").unwrap();
-    assert_eq!(item.phase, QueuePhase::Skipped);
+    assert_eq!(item.phase(), QueuePhase::Skipped);
 }
 
 /// Spec conflict HITL with Retry: re-check conflict after modification.
@@ -521,7 +521,7 @@ async fn spec_conflict_hitl_retry_re_evaluates() {
     let mut daemon = setup_daemon(&tmp, source, vec![]);
 
     let mut item = test_item("github:org/repo#1", "implement");
-    item.phase = QueuePhase::Running;
+    item.set_phase_unchecked(QueuePhase::Running);
     item.updated_at = chrono::Utc::now().to_rfc3339();
     daemon.push_item(item);
 
@@ -545,7 +545,7 @@ async fn spec_conflict_hitl_retry_re_evaluates() {
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:implement").unwrap();
-    assert_eq!(item.phase, QueuePhase::Pending);
+    assert_eq!(item.phase(), QueuePhase::Pending);
 }
 
 /// Spec conflict HITL with Replan: delegate to Claw for spec modification.
@@ -559,7 +559,7 @@ async fn spec_conflict_hitl_replan_creates_modification_item() {
     let mut daemon = setup_daemon(&tmp, source, vec![]);
 
     let mut item = test_item("github:org/repo#1", "implement");
-    item.phase = QueuePhase::Running;
+    item.set_phase_unchecked(QueuePhase::Running);
     item.updated_at = chrono::Utc::now().to_rfc3339();
     daemon.push_item(item);
 
@@ -583,7 +583,7 @@ async fn spec_conflict_hitl_replan_creates_modification_item() {
         .unwrap();
 
     let item = daemon.get_item("github:org/repo#1:implement").unwrap();
-    assert_eq!(item.phase, QueuePhase::Pending);
+    assert_eq!(item.phase(), QueuePhase::Pending);
     assert_eq!(item.replan_count, 1);
 
     let hitl_items = daemon.items_in_phase(QueuePhase::Hitl);
@@ -647,7 +647,7 @@ async fn spec_completion_hitl_approve_transitions_to_completed() {
         "test-ws".to_string(),
         "spec_completion".to_string(),
     );
-    item.phase = QueuePhase::Hitl;
+    item.set_phase_unchecked(QueuePhase::Hitl);
     item.hitl_reason = Some(HitlReason::SpecCompletionReview);
     daemon.push_item(item);
 
@@ -665,7 +665,7 @@ async fn spec_completion_hitl_approve_transitions_to_completed() {
         daemon
             .get_item("spec-completion:spec-100:hitl")
             .unwrap()
-            .phase,
+            .phase(),
         QueuePhase::Done
     );
 
@@ -702,7 +702,7 @@ async fn spec_completion_hitl_reject_reverts_to_active() {
         "test-ws".to_string(),
         "spec_completion".to_string(),
     );
-    item.phase = QueuePhase::Hitl;
+    item.set_phase_unchecked(QueuePhase::Hitl);
     item.hitl_reason = Some(HitlReason::SpecCompletionReview);
     daemon.push_item(item);
 
@@ -720,7 +720,7 @@ async fn spec_completion_hitl_reject_reverts_to_active() {
         daemon
             .get_item("spec-completion:spec-101:hitl")
             .unwrap()
-            .phase,
+            .phase(),
         QueuePhase::Skipped
     );
 
@@ -757,7 +757,7 @@ async fn spec_completion_hitl_retry_reverts_to_active() {
         "test-ws".to_string(),
         "spec_completion".to_string(),
     );
-    item.phase = QueuePhase::Hitl;
+    item.set_phase_unchecked(QueuePhase::Hitl);
     item.hitl_reason = Some(HitlReason::SpecCompletionReview);
     daemon.push_item(item);
 
@@ -775,7 +775,7 @@ async fn spec_completion_hitl_retry_reverts_to_active() {
         daemon
             .get_item("spec-completion:spec-102:hitl")
             .unwrap()
-            .phase,
+            .phase(),
         QueuePhase::Pending
     );
 

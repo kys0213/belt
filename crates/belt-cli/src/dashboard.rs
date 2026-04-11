@@ -377,7 +377,7 @@ fn run_loop(
         let all_items = db.list_items(None, None).unwrap_or_default();
         let running_items: Vec<_> = all_items
             .iter()
-            .filter(|i| i.phase == QueuePhase::Running)
+            .filter(|i| i.phase() == QueuePhase::Running)
             .cloned()
             .collect();
         let recent_items = collect_recent_items(db);
@@ -404,7 +404,9 @@ fn run_loop(
                 } else if let Some(ws) = workspaces.get(state.selected_workspace) {
                     all_items
                         .iter()
-                        .filter(|i| i.workspace_id == ws.0 && state.status_filter.matches(&i.phase))
+                        .filter(|i| {
+                            i.workspace_id == ws.0 && state.status_filter.matches(&i.phase())
+                        })
                         .count()
                 } else {
                     0
@@ -440,7 +442,7 @@ fn run_loop(
         // Build per-column items for Board view.
         let board_columns: Vec<Vec<&QueueItem>> = BOARD_COLUMNS
             .iter()
-            .map(|phase| all_items.iter().filter(|i| i.phase == *phase).collect())
+            .map(|phase| all_items.iter().filter(|i| i.phase() == *phase).collect())
             .collect();
 
         // Clamp board selection.
@@ -458,22 +460,23 @@ fn run_loop(
 
         // Build per-workspace kanban columns (Pending / In-Progress / Completed).
         let per_ws_kanban_columns: Vec<Vec<&QueueItem>> = {
-            let ws_items: Vec<&QueueItem> =
-                if let Some(ws) = workspaces.get(state.selected_workspace) {
-                    all_items
-                        .iter()
-                        .filter(|i| i.workspace_id == ws.0 && state.status_filter.matches(&i.phase))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+            let ws_items: Vec<&QueueItem> = if let Some(ws) =
+                workspaces.get(state.selected_workspace)
+            {
+                all_items
+                    .iter()
+                    .filter(|i| i.workspace_id == ws.0 && state.status_filter.matches(&i.phase()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             vec![
                 // Pending: Pending + Ready + Hitl
                 ws_items
                     .iter()
                     .filter(|i| {
                         matches!(
-                            i.phase,
+                            i.phase(),
                             QueuePhase::Pending | QueuePhase::Ready | QueuePhase::Hitl
                         )
                     })
@@ -482,7 +485,7 @@ fn run_loop(
                 // In-Progress: Running
                 ws_items
                     .iter()
-                    .filter(|i| i.phase == QueuePhase::Running)
+                    .filter(|i| i.phase() == QueuePhase::Running)
                     .copied()
                     .collect(),
                 // Completed: Completed + Done + Failed
@@ -490,7 +493,7 @@ fn run_loop(
                     .iter()
                     .filter(|i| {
                         matches!(
-                            i.phase,
+                            i.phase(),
                             QueuePhase::Completed | QueuePhase::Done | QueuePhase::Failed
                         )
                     })
@@ -612,7 +615,7 @@ fn run_loop(
                 OverlayMode::Hitl { selected } => {
                     let hitl_items: Vec<_> = all_items
                         .iter()
-                        .filter(|i| i.phase == QueuePhase::Hitl)
+                        .filter(|i| i.phase() == QueuePhase::Hitl)
                         .collect();
                     let count = hitl_items.len();
                     match key.code {
@@ -898,7 +901,7 @@ fn handle_enter(
                     .list_items(None, Some(&ws.0))
                     .unwrap_or_default()
                     .into_iter()
-                    .filter(|i| state.status_filter.matches(&i.phase))
+                    .filter(|i| state.status_filter.matches(&i.phase()))
                     .collect();
                 let idx = state.current_tab_state().selected_index;
                 if let Some(item) = ws_items.get(idx) {
@@ -1106,7 +1109,7 @@ fn collect_datasource_status(
                 .filter(|item| {
                     item.workspace_id == *ws_name
                         && !matches!(
-                            item.phase,
+                            item.phase(),
                             QueuePhase::Done | QueuePhase::Failed | QueuePhase::Completed
                         )
                 })
@@ -1464,7 +1467,7 @@ fn render_recent_items_stateful(
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            let phase_str = item.phase.as_str().to_string();
+            let phase_str = item.phase().as_str().to_string();
             let color = phase_color(&phase_str);
             let row = Row::new(vec![
                 Cell::from(item.work_id.clone()),
@@ -1691,14 +1694,14 @@ fn render_per_workspace_table(
 
     let filtered_items: Vec<&QueueItem> = ws_items
         .iter()
-        .filter(|i| state.status_filter.matches(&i.phase))
+        .filter(|i| state.status_filter.matches(&i.phase()))
         .collect();
 
     let rows: Vec<Row<'static>> = filtered_items
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            let phase_str = item.phase.as_str().to_string();
+            let phase_str = item.phase().as_str().to_string();
             let color = phase_color(&phase_str);
             let row = Row::new(vec![
                 Cell::from(item.work_id.clone()),
@@ -1788,7 +1791,7 @@ fn render_per_workspace_kanban(
             let is_selected = is_selected_col && row_idx == state.per_ws_kanban_row;
             let col_width = col_areas[col_idx].width as usize;
             let work_id_display = truncate_str(&item.work_id, col_width.saturating_sub(4));
-            let phase_str = item.phase.as_str();
+            let phase_str = item.phase().as_str();
             let phase_clr = phase_color(phase_str);
 
             if is_selected {
@@ -1844,7 +1847,7 @@ fn render_workspace_phase_summary(frame: &mut ratatui::Frame, area: Rect, ws_ite
     let mut phase_counts: HashMap<String, usize> = HashMap::new();
     for item in ws_items {
         *phase_counts
-            .entry(item.phase.as_str().to_string())
+            .entry(item.phase().as_str().to_string())
             .or_insert(0) += 1;
     }
 
@@ -2499,7 +2502,7 @@ fn build_detail_lines_with_history<'a>(
 
     match item {
         Some(item) => {
-            let phase_str = item.phase.as_str().to_string();
+            let phase_str = item.phase().as_str().to_string();
             let color = phase_color(&phase_str);
 
             lines.push(Line::from(vec![
@@ -3695,7 +3698,7 @@ mod tests {
             "ws".to_string(),
             "s".to_string(),
         );
-        item.phase = phase;
+        item.set_phase_unchecked(phase);
         item.updated_at = updated_at.to_string();
         item
     }
@@ -4956,7 +4959,7 @@ mod tests {
             "ws1".to_string(),
             "analyze".to_string(),
         );
-        item1.phase = QueuePhase::Hitl;
+        item1.set_phase_unchecked(QueuePhase::Hitl);
         item1.title = Some("Fix auth bug".to_string());
         item1.hitl_reason = Some(belt_core::queue::HitlReason::RetryMaxExceeded);
         item1.hitl_created_at = Some("2026-03-25T10:00:00Z".to_string());
@@ -4967,7 +4970,7 @@ mod tests {
             "ws1".to_string(),
             "implement".to_string(),
         );
-        item2.phase = QueuePhase::Hitl;
+        item2.set_phase_unchecked(QueuePhase::Hitl);
 
         let lines = build_hitl_overlay_lines(&[item1, item2], 0);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
@@ -4988,7 +4991,7 @@ mod tests {
             "ws1".to_string(),
             "analyze".to_string(),
         );
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
 
         let lines = build_hitl_overlay_lines(&[item], 0);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
@@ -5133,7 +5136,7 @@ mod tests {
             "ws1".to_string(),
             "analyze".to_string(),
         );
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_reason = Some(belt_core::queue::HitlReason::RetryMaxExceeded);
         db.insert_item(&item).unwrap();
 
@@ -5986,7 +5989,7 @@ mod tests {
             "ws".to_string(),
             "implement".to_string(),
         );
-        item2.phase = QueuePhase::Running;
+        item2.set_phase_unchecked(QueuePhase::Running);
 
         let kanban_columns: Vec<Vec<&QueueItem>> = vec![vec![&item1], vec![&item2], vec![]];
 

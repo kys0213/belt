@@ -184,7 +184,7 @@ impl Evaluator {
     pub fn filter_completed(items: &[QueueItem]) -> Vec<&QueueItem> {
         items
             .iter()
-            .filter(|item| item.phase == QueuePhase::Completed)
+            .filter(|item| item.phase() == QueuePhase::Completed)
             .collect()
     }
 
@@ -192,7 +192,7 @@ impl Evaluator {
     pub fn filter_ready(items: &[QueueItem]) -> Vec<&QueueItem> {
         items
             .iter()
-            .filter(|item| item.phase == QueuePhase::Ready)
+            .filter(|item| item.phase() == QueuePhase::Ready)
             .collect()
     }
 
@@ -563,7 +563,7 @@ mod tests {
             test_item("s2", "implement"),
             test_item("s3", "review"),
         ];
-        items[1].phase = QueuePhase::Completed;
+        items[1].set_phase_unchecked(QueuePhase::Completed);
         let completed = Evaluator::filter_completed(&items);
         assert_eq!(completed.len(), 1);
         assert_eq!(completed[0].work_id, "s2:implement");
@@ -2184,8 +2184,8 @@ exit {exit_code}
             test_item("s2", "implement"),
             test_item("s3", "review"),
         ];
-        items[0].phase = QueuePhase::Ready;
-        items[2].phase = QueuePhase::Ready;
+        items[0].set_phase_unchecked(QueuePhase::Ready);
+        items[2].set_phase_unchecked(QueuePhase::Ready);
         let ready = Evaluator::filter_ready(&items);
         assert_eq!(ready.len(), 2);
         assert_eq!(ready[0].source_id, "s1");
@@ -2196,7 +2196,7 @@ exit {exit_code}
     fn can_judge_from_history_skip_on_consecutive_successes() {
         let evaluator = Evaluator::new("test-ws").with_history_success_threshold(3);
         let mut item = test_item("s1", "implement");
-        item.phase = QueuePhase::Ready;
+        item.set_phase_unchecked(QueuePhase::Ready);
 
         let history = vec![
             make_history_event("s1", "implement", "done", "2026-04-01T00:00:00Z"),
@@ -2217,7 +2217,7 @@ exit {exit_code}
     fn can_judge_from_history_proceed_on_insufficient_history() {
         let evaluator = Evaluator::new("test-ws").with_history_success_threshold(3);
         let mut item = test_item("s1", "implement");
-        item.phase = QueuePhase::Ready;
+        item.set_phase_unchecked(QueuePhase::Ready);
 
         let history = vec![
             make_history_event("s1", "implement", "done", "2026-04-01T00:00:00Z"),
@@ -2232,7 +2232,7 @@ exit {exit_code}
     fn can_judge_from_history_proceed_on_mixed_results() {
         let evaluator = Evaluator::new("test-ws").with_history_success_threshold(3);
         let mut item = test_item("s1", "implement");
-        item.phase = QueuePhase::Ready;
+        item.set_phase_unchecked(QueuePhase::Ready);
 
         let history = vec![
             make_history_event("s1", "implement", "done", "2026-04-01T00:00:00Z"),
@@ -2248,7 +2248,7 @@ exit {exit_code}
     fn can_judge_from_history_ignores_different_states() {
         let evaluator = Evaluator::new("test-ws").with_history_success_threshold(3);
         let mut item = test_item("s1", "implement");
-        item.phase = QueuePhase::Ready;
+        item.set_phase_unchecked(QueuePhase::Ready);
 
         // 3 successes but for "analyze" state, not "implement"
         let history = vec![
@@ -2266,7 +2266,7 @@ exit {exit_code}
     fn can_judge_from_history_empty_history() {
         let evaluator = Evaluator::new("test-ws").with_history_success_threshold(3);
         let mut item = test_item("s1", "implement");
-        item.phase = QueuePhase::Ready;
+        item.set_phase_unchecked(QueuePhase::Ready);
 
         let judgment = evaluator.can_judge_from_history(&item, &[]);
         assert_eq!(judgment, HistoryPreJudgment::Proceed);
@@ -2276,7 +2276,7 @@ exit {exit_code}
     fn can_judge_from_history_checks_most_recent_first() {
         let evaluator = Evaluator::new("test-ws").with_history_success_threshold(2);
         let mut item = test_item("s1", "implement");
-        item.phase = QueuePhase::Ready;
+        item.set_phase_unchecked(QueuePhase::Ready);
 
         // Old failure, then 2 recent successes — should skip
         let history = vec![
@@ -2298,7 +2298,7 @@ exit {exit_code}
     fn can_judge_from_history_recent_failure_blocks_skip() {
         let evaluator = Evaluator::new("test-ws").with_history_success_threshold(2);
         let mut item = test_item("s1", "implement");
-        item.phase = QueuePhase::Ready;
+        item.set_phase_unchecked(QueuePhase::Ready);
 
         // 2 old successes, then a recent failure — should proceed
         let history = vec![
@@ -2315,7 +2315,7 @@ exit {exit_code}
     fn can_judge_from_history_custom_threshold() {
         let evaluator = Evaluator::new("test-ws").with_history_success_threshold(1);
         let mut item = test_item("s1", "implement");
-        item.phase = QueuePhase::Ready;
+        item.set_phase_unchecked(QueuePhase::Ready);
 
         let history = vec![make_history_event(
             "s1",

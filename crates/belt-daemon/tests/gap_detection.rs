@@ -348,7 +348,7 @@ fn terminal_items_do_not_block_gap_detection() {
         "ws".into(),
         "implement".into(),
     );
-    item.phase = QueuePhase::Done;
+    item.set_phase_unchecked(QueuePhase::Done);
     db.insert_item(&item).unwrap();
 
     // Verify Done items are not considered "open".

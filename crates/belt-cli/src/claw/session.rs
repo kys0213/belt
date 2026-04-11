@@ -233,7 +233,7 @@ fn collect_workspace_stats_from_db(
     let mut running_items_count: u32 = 0;
     let mut hitl_item_ids: HashSet<String> = HashSet::new();
     for item in &items {
-        match item.phase {
+        match item.phase() {
             belt_core::phase::QueuePhase::Pending => pending_items_count += 1,
             belt_core::phase::QueuePhase::Running => running_items_count += 1,
             belt_core::phase::QueuePhase::Hitl => {

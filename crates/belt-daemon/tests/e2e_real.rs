@@ -53,7 +53,7 @@ async fn e2e_setup_and_collect() {
         .find(|it| it.work_id.contains(&format!("#{number}")))
         .expect("our test issue should be in the queue");
 
-    assert_eq!(our_item.phase, QueuePhase::Pending);
+    assert_eq!(our_item.phase(), QueuePhase::Pending);
     assert_eq!(our_item.state, "analyze");
 }
 
@@ -159,7 +159,7 @@ async fn e2e_handler_failure_escalation() {
         daemon
             .queue_items()
             .iter()
-            .map(|i| format!("{}:{}", i.work_id, i.phase))
+            .map(|i| format!("{}:{}", i.work_id, i.phase()))
             .collect::<Vec<_>>()
     );
 
@@ -175,7 +175,7 @@ async fn e2e_handler_failure_escalation() {
         daemon
             .queue_items()
             .iter()
-            .map(|i| format!("{}:{}", i.work_id, i.phase))
+            .map(|i| format!("{}:{}", i.work_id, i.phase()))
             .collect::<Vec<_>>()
     );
 }
@@ -217,12 +217,12 @@ async fn e2e_hitl_respond() {
         None,
     );
     assert!(hitl_result.is_ok(), "mark_hitl should succeed");
-    assert_eq!(daemon.get_item(&work_id).unwrap().phase, QueuePhase::Hitl);
+    assert_eq!(daemon.get_item(&work_id).unwrap().phase(), QueuePhase::Hitl);
 
     // Respond with Done.
     let done_result = daemon.mark_done(&work_id);
     assert!(done_result.is_ok(), "mark_done should succeed");
-    assert_eq!(daemon.get_item(&work_id).unwrap().phase, QueuePhase::Done);
+    assert_eq!(daemon.get_item(&work_id).unwrap().phase(), QueuePhase::Done);
 }
 
 // ─── Test 5: Token Usage Tracking ────────────────────────────────

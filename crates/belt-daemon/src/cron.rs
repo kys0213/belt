@@ -735,7 +735,7 @@ fn execute_replan(
         item.workspace_id.clone(),
         item.state.clone(),
     );
-    replan_item.phase = QueuePhase::Hitl;
+    replan_item.set_phase_unchecked(QueuePhase::Hitl);
     replan_item.hitl_created_at = Some(Utc::now().to_rfc3339());
     replan_item.hitl_reason = Some(HitlReason::SpecModificationProposed);
     replan_item.hitl_notes = Some(format!(
@@ -1691,7 +1691,7 @@ fn create_spec_completion_hitl(db: &Database, spec: &belt_core::spec::Spec, deta
         spec.workspace_id.clone(),
         "spec_completion".to_string(),
     );
-    item.phase = QueuePhase::Hitl;
+    item.set_phase_unchecked(QueuePhase::Hitl);
     item.title = Some(format!("Spec '{}' ready for final review", spec.name));
     item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
     item.hitl_reason = Some(belt_core::queue::HitlReason::SpecCompletionReview);
@@ -1734,7 +1734,7 @@ fn create_spec_test_failure_hitl(db: &Database, spec: &belt_core::spec::Spec, de
         spec.workspace_id.clone(),
         "spec_test_failure".to_string(),
     );
-    item.phase = QueuePhase::Hitl;
+    item.set_phase_unchecked(QueuePhase::Hitl);
     item.title = Some(format!("Spec '{}' test commands failed", spec.name));
     item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
     item.hitl_notes = Some(format!(
@@ -3658,7 +3658,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "ws".into(),
             "implement".into(),
         );
-        item.phase = QueuePhase::Done;
+        item.set_phase_unchecked(QueuePhase::Done);
         db.insert_item(&item).unwrap();
 
         // Terminal item should not count as open.
@@ -3691,7 +3691,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "implement".into(),
         );
         item.title = Some("implement authentication handler".to_string());
-        item.phase = QueuePhase::Done;
+        item.set_phase_unchecked(QueuePhase::Done);
         db.insert_item(&item).unwrap();
 
         let job = KnowledgeExtractionJob::new(Arc::clone(&db));
@@ -3717,7 +3717,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "implement".into(),
         );
         item.title = Some("implement feature".to_string());
-        item.phase = QueuePhase::Done;
+        item.set_phase_unchecked(QueuePhase::Done);
         db.insert_item(&item).unwrap();
 
         let job = KnowledgeExtractionJob::new(Arc::clone(&db));
@@ -3743,7 +3743,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "implement".into(),
         );
         item.title = Some("decided to use JWT for authentication".to_string());
-        item.phase = QueuePhase::Done;
+        item.set_phase_unchecked(QueuePhase::Done);
         db.insert_item(&item).unwrap();
 
         let job = KnowledgeExtractionJob::new(Arc::clone(&db));
@@ -3766,7 +3766,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "refactor".into(),
         );
         item.title = Some("refactor auth module to use new pattern".to_string());
-        item.phase = QueuePhase::Done;
+        item.set_phase_unchecked(QueuePhase::Done);
         db.insert_item(&item).unwrap();
 
         let job = KnowledgeExtractionJob::new(Arc::clone(&db));
@@ -3853,7 +3853,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         let old_time = (Utc::now() - chrono::Duration::hours(25)).to_rfc3339();
         let mut item =
             belt_core::queue::QueueItem::new("w1".into(), "s1".into(), "ws".into(), "st".into());
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.created_at = old_time.clone();
         item.updated_at = old_time;
         db.insert_item(&item).unwrap();
@@ -3861,7 +3861,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         // Insert a recent HITL item that should NOT be expired.
         let mut recent =
             belt_core::queue::QueueItem::new("w2".into(), "s2".into(), "ws".into(), "st".into());
-        recent.phase = QueuePhase::Hitl;
+        recent.set_phase_unchecked(QueuePhase::Hitl);
         db.insert_item(&recent).unwrap();
 
         // We need to set phase via DB since insert_item sets it from the struct.
@@ -3873,11 +3873,11 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
 
         // Old item should be Failed now.
         let updated = db.get_item("w1").unwrap();
-        assert_eq!(updated.phase, QueuePhase::Failed);
+        assert_eq!(updated.phase(), QueuePhase::Failed);
 
         // Recent item should still be Hitl.
         let still_hitl = db.get_item("w2").unwrap();
-        assert_eq!(still_hitl.phase, QueuePhase::Hitl);
+        assert_eq!(still_hitl.phase(), QueuePhase::Hitl);
     }
 
     #[test]
@@ -3895,7 +3895,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "ws".into(),
             "st".into(),
         );
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339());
         item.hitl_terminal_action = Some(EscalationAction::Skip);
         db.insert_item(&item).unwrap();
@@ -3907,7 +3907,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "ws".into(),
             "st".into(),
         );
-        future_item.phase = QueuePhase::Hitl;
+        future_item.set_phase_unchecked(QueuePhase::Hitl);
         future_item.hitl_timeout_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
         future_item.hitl_terminal_action = None;
         db.insert_item(&future_item).unwrap();
@@ -3918,11 +3918,11 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
 
         // Expired item should be Skipped (per its terminal action).
         let expired = db.get_item("w-expired").unwrap();
-        assert_eq!(expired.phase, QueuePhase::Skipped);
+        assert_eq!(expired.phase(), QueuePhase::Skipped);
 
         // Future item should still be Hitl.
         let still_hitl = db.get_item("w-future").unwrap();
-        assert_eq!(still_hitl.phase, QueuePhase::Hitl);
+        assert_eq!(still_hitl.phase(), QueuePhase::Hitl);
     }
 
     #[test]
@@ -3935,7 +3935,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
 
         let mut item =
             belt_core::queue::QueueItem::new("w1".into(), "s1".into(), "ws".into(), "st".into());
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
         // No per-item terminal action; falls back to workspace policy, which
         // defaults to Failed when no workspace config is found.
@@ -3947,7 +3947,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         job.execute(&ctx).unwrap();
 
         let updated = db.get_item("w1").unwrap();
-        assert_eq!(updated.phase, QueuePhase::Failed);
+        assert_eq!(updated.phase(), QueuePhase::Failed);
     }
 
     #[test]
@@ -3978,7 +3978,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "test-ws".into(),
             "implement".into(),
         );
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339());
         // hitl_terminal_action is None — should fall back to workspace policy.
         db.insert_item(&item).unwrap();
@@ -3989,7 +3989,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
 
         // Item should be Skipped (from workspace escalation terminal: skip).
         let updated = db.get_item("w-ws-fallback").unwrap();
-        assert_eq!(updated.phase, QueuePhase::Skipped);
+        assert_eq!(updated.phase(), QueuePhase::Skipped);
     }
 
     #[test]
@@ -4017,7 +4017,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "no-terminal-ws".into(),
             "implement".into(),
         );
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
         db.insert_item(&item).unwrap();
 
@@ -4027,7 +4027,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
 
         // Should default to Failed (safe default).
         let updated = db.get_item("w-no-term").unwrap();
-        assert_eq!(updated.phase, QueuePhase::Failed);
+        assert_eq!(updated.phase(), QueuePhase::Failed);
     }
 
     #[test]
@@ -4056,7 +4056,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "override-ws".into(),
             "implement".into(),
         );
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
         item.hitl_terminal_action = Some(EscalationAction::Skip);
         db.insert_item(&item).unwrap();
@@ -4067,7 +4067,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
 
         // Per-item Skip overrides workspace replan terminal action.
         let updated = db.get_item("w-override").unwrap();
-        assert_eq!(updated.phase, QueuePhase::Skipped);
+        assert_eq!(updated.phase(), QueuePhase::Skipped);
     }
 
     #[test]
@@ -4077,12 +4077,12 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         // Insert items in various phases.
         let mut done_item =
             belt_core::queue::QueueItem::new("w1".into(), "s1".into(), "ws".into(), "st".into());
-        done_item.phase = QueuePhase::Done;
+        done_item.set_phase_unchecked(QueuePhase::Done);
         db.insert_item(&done_item).unwrap();
 
         let mut failed_item =
             belt_core::queue::QueueItem::new("w2".into(), "s2".into(), "ws".into(), "st".into());
-        failed_item.phase = QueuePhase::Failed;
+        failed_item.set_phase_unchecked(QueuePhase::Failed);
         db.insert_item(&failed_item).unwrap();
 
         let job = DailyReportJob::new(Arc::clone(&db), None);
@@ -4098,23 +4098,23 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         // Insert items in multiple phases.
         let mut done1 =
             belt_core::queue::QueueItem::new("d1".into(), "s1".into(), "ws".into(), "st".into());
-        done1.phase = QueuePhase::Done;
+        done1.set_phase_unchecked(QueuePhase::Done);
         db.insert_item(&done1).unwrap();
 
         let mut done2 =
             belt_core::queue::QueueItem::new("d2".into(), "s2".into(), "ws".into(), "st".into());
-        done2.phase = QueuePhase::Done;
+        done2.set_phase_unchecked(QueuePhase::Done);
         db.insert_item(&done2).unwrap();
 
         let mut failed1 =
             belt_core::queue::QueueItem::new("f1".into(), "s3".into(), "ws".into(), "st".into());
-        failed1.phase = QueuePhase::Failed;
+        failed1.set_phase_unchecked(QueuePhase::Failed);
         failed1.title = Some("failed task".into());
         db.insert_item(&failed1).unwrap();
 
         let mut hitl1 =
             belt_core::queue::QueueItem::new("h1".into(), "s4".into(), "ws".into(), "st".into());
-        hitl1.phase = QueuePhase::Hitl;
+        hitl1.set_phase_unchecked(QueuePhase::Hitl);
         hitl1.hitl_notes = Some("needs review".into());
         db.insert_item(&hitl1).unwrap();
 
@@ -4140,7 +4140,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
 
         let mut item =
             belt_core::queue::QueueItem::new("w1".into(), "s1".into(), "ws".into(), "st".into());
-        item.phase = QueuePhase::Done;
+        item.set_phase_unchecked(QueuePhase::Done);
         db.insert_item(&item).unwrap();
 
         let job = DailyReportJob::new(Arc::clone(&db), Some(report_dir.clone()));
@@ -4185,7 +4185,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         let old_time = (Utc::now() - chrono::Duration::days(8)).to_rfc3339();
         let mut item =
             belt_core::queue::QueueItem::new("w1".into(), "s1".into(), "ws".into(), "st".into());
-        item.phase = QueuePhase::Done;
+        item.set_phase_unchecked(QueuePhase::Done);
         item.updated_at = old_time;
         db.insert_item(&item).unwrap();
 
@@ -4215,7 +4215,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         // Insert a Done item with a recent timestamp.
         let mut item =
             belt_core::queue::QueueItem::new("w1".into(), "s1".into(), "ws".into(), "st".into());
-        item.phase = QueuePhase::Done;
+        item.set_phase_unchecked(QueuePhase::Done);
         db.insert_item(&item).unwrap();
 
         // Create a worktree for it.
@@ -4247,7 +4247,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         let db = Arc::new(Database::open_in_memory().unwrap());
         // Insert a completed item.
         let mut item = belt_core::queue::testing::test_item("test-source", "evaluate");
-        item.phase = QueuePhase::Completed;
+        item.set_phase_unchecked(QueuePhase::Completed);
         item.workspace_id = "test-ws".to_string();
         db.insert_item(&item).unwrap();
 
@@ -4547,7 +4547,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "ws".into(),
             "st".into(),
         );
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
         item.hitl_terminal_action = Some(EscalationAction::Replan);
         item.hitl_notes = Some("original failure reason".to_string());
@@ -4559,12 +4559,12 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
 
         // "replan" transitions the original item to Pending (not Failed).
         let updated = db.get_item("w-replan").unwrap();
-        assert_eq!(updated.phase, QueuePhase::Pending);
+        assert_eq!(updated.phase(), QueuePhase::Pending);
         assert_eq!(updated.replan_count, 1);
 
         // A companion HITL item should be created for spec modification review.
         let replan_item = db.get_item("w-replan:replan-1").unwrap();
-        assert_eq!(replan_item.phase, QueuePhase::Hitl);
+        assert_eq!(replan_item.phase(), QueuePhase::Hitl);
         assert_eq!(
             replan_item.hitl_reason,
             Some(belt_core::queue::HitlReason::SpecModificationProposed)
@@ -4600,7 +4600,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "ws".into(),
             "st".into(),
         );
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
         item.hitl_terminal_action = Some(EscalationAction::Replan);
         item.replan_count = MAX_REPLAN_COUNT; // Already at limit
@@ -4612,7 +4612,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
 
         // When replan limit is exceeded, item transitions to Failed.
         let updated = db.get_item("w-replan-limit").unwrap();
-        assert_eq!(updated.phase, QueuePhase::Failed);
+        assert_eq!(updated.phase(), QueuePhase::Failed);
         assert_eq!(updated.replan_count, MAX_REPLAN_COUNT + 1);
 
         // No companion HITL item should be created.
@@ -4637,7 +4637,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "ws".into(),
             "st".into(),
         );
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
         item.hitl_terminal_action = Some(EscalationAction::Skip);
         db.insert_item(&item).unwrap();
@@ -4648,7 +4648,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
 
         // Skip should transition to Skipped and cleanup worktree.
         let updated = db.get_item("w-skip-wt").unwrap();
-        assert_eq!(updated.phase, QueuePhase::Skipped);
+        assert_eq!(updated.phase(), QueuePhase::Skipped);
         assert!(!worktree_mgr.exists("w-skip-wt"));
     }
 
@@ -4667,7 +4667,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "ws".into(),
             "st".into(),
         );
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         db.insert_item(&item).unwrap();
 
         let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr);
@@ -4676,7 +4676,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
 
         // Item should remain in Hitl phase.
         let updated = db.get_item("w-recent").unwrap();
-        assert_eq!(updated.phase, QueuePhase::Hitl);
+        assert_eq!(updated.phase(), QueuePhase::Hitl);
     }
 
     // -- GapDetectionJob::execute() dedupe guard tests --
@@ -4807,7 +4807,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "ws".into(),
             "implement".into(),
         );
-        item.phase = QueuePhase::Done;
+        item.set_phase_unchecked(QueuePhase::Done);
         db.insert_item(&item).unwrap();
 
         // Terminal items should not count as "open".
@@ -5517,7 +5517,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "workspace-alpha".into(),
             "implement".into(),
         );
-        item_a1.phase = QueuePhase::Completed;
+        item_a1.set_phase_unchecked(QueuePhase::Completed);
         db.insert_item(&item_a1).unwrap();
 
         let mut item_a2 = belt_core::queue::QueueItem::new(
@@ -5526,7 +5526,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "workspace-alpha".into(),
             "implement".into(),
         );
-        item_a2.phase = QueuePhase::Completed;
+        item_a2.set_phase_unchecked(QueuePhase::Completed);
         db.insert_item(&item_a2).unwrap();
 
         let mut item_b1 = belt_core::queue::QueueItem::new(
@@ -5535,7 +5535,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "workspace-beta".into(),
             "implement".into(),
         );
-        item_b1.phase = QueuePhase::Completed;
+        item_b1.set_phase_unchecked(QueuePhase::Completed);
         db.insert_item(&item_b1).unwrap();
 
         let job = EvaluateJob::new(Arc::clone(&db));
@@ -5562,7 +5562,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "ws".into(),
             "implement".into(),
         );
-        item.phase = QueuePhase::Completed;
+        item.set_phase_unchecked(QueuePhase::Completed);
         db.insert_item(&item).unwrap();
 
         let count1 = db.increment_replan_count("eval-replan").unwrap();
@@ -5585,7 +5585,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "ws".into(),
             "implement".into(),
         );
-        item.phase = QueuePhase::Completed;
+        item.set_phase_unchecked(QueuePhase::Completed);
         db.insert_item(&item).unwrap();
 
         for _ in 0..crate::evaluator::DEFAULT_MAX_EVAL_FAILURES {
@@ -5596,7 +5596,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         assert!(result.is_ok());
 
         let updated = db.get_item("eval-hitl").unwrap();
-        assert_eq!(updated.phase, QueuePhase::Hitl);
+        assert_eq!(updated.phase(), QueuePhase::Hitl);
         assert_eq!(
             updated.hitl_reason,
             Some(belt_core::queue::HitlReason::EvaluateFailure)
@@ -5669,7 +5669,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
             "ws".into(),
             "st".into(),
         );
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.created_at = old_time.clone();
         item.updated_at = old_time;
         db.insert_item(&item).unwrap();
@@ -5678,7 +5678,7 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         job.execute(&ctx).unwrap();
 
         let updated = db.get_item("w-short-timeout").unwrap();
-        assert_eq!(updated.phase, QueuePhase::Failed);
+        assert_eq!(updated.phase(), QueuePhase::Failed);
     }
 
     // ---- GapDetectionJob::with_coverage_threshold boundary tests -----------
