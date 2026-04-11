@@ -1704,6 +1704,27 @@ impl Database {
         Ok(deps)
     }
 
+    /// List all dependency pairs across all queue items.
+    ///
+    /// Returns `(work_id, depends_on)` tuples ordered by creation time.
+    pub fn list_all_queue_dependencies(&self) -> Result<Vec<(String, String)>, BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let mut stmt = conn
+            .prepare("SELECT work_id, depends_on FROM queue_dependencies ORDER BY created_at ASC")
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        let deps = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| BeltError::Database(e.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(deps)
+    }
+
     // ---- Token Usage -------------------------------------------------------
 
     /// Record token usage for a completed runtime invocation.
