@@ -302,67 +302,6 @@ impl Daemon {
         }
     }
 
-    /// Build hitl_notes markdown from lateral plan and stagnation events.
-    ///
-    /// When an item escalates to HITL, this attaches the full lateral thinking
-    /// history so that human reviewers can see what automated approaches were
-    /// already attempted.
-    fn build_lateral_hitl_notes(
-        db: &Option<Arc<Database>>,
-        work_id: &str,
-        lateral_plan: &Option<String>,
-    ) -> Option<String> {
-        // Only produce notes when there is a lateral plan or stagnation events.
-        let stagnation_events: Vec<TransitionEvent> = db
-            .as_ref()
-            .and_then(|db| db.list_transition_events(work_id).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|e| e.event_type == "stagnation")
-            .collect();
-
-        if lateral_plan.is_none() && stagnation_events.is_empty() {
-            return None;
-        }
-
-        let mut notes = String::from("## Lateral Thinking History\n");
-
-        if let Some(plan) = lateral_plan {
-            notes.push_str(&format!("- Current lateral plan: {plan}\n"));
-        }
-
-        notes.push_str(&format!(
-            "- Stagnation events: {}건\n",
-            stagnation_events.len()
-        ));
-
-        // Extract pattern/confidence/persona from each stagnation event detail (JSON).
-        for ev in &stagnation_events {
-            if let Some(detail) = &ev.detail
-                && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(detail)
-            {
-                let pattern = parsed
-                    .get("pattern_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let confidence = parsed
-                    .get("confidence")
-                    .and_then(|v| v.as_f64())
-                    .map(|c| format!("{c:.2}"))
-                    .unwrap_or_else(|| "N/A".to_string());
-                let persona = parsed
-                    .get("recommended_persona")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                notes.push_str(&format!(
-                    "- Pattern: {pattern} (confidence: {confidence})\n- Persona: {persona}\n",
-                ));
-            }
-        }
-
-        Some(notes)
-    }
-
     // ---------------------------------------------------------------
     // Phase 1: Collect items from DataSources
     // ---------------------------------------------------------------
@@ -2180,60 +2119,24 @@ impl Daemon {
         policy.resolve(failure_count)
     }
 
+    /// Handle an escalation action for a queue item.
+    ///
+    /// Delegates to [`crate::hitl_service::HitlService`] which encapsulates
+    /// all HITL escalation routing logic.
     fn handle_escalation(
         &mut self,
         item: &mut QueueItem,
         action: EscalationAction,
         lateral_plan: Option<String>,
     ) {
-        // Lifecycle hook: on_escalation — fire and forget, log only on failure.
         let hook_ctx = self.build_hook_context(item, None);
-        let hook = Arc::clone(&self.hook);
-        let esc_action = action;
-        Self::spawn_hook(async move {
-            if let Err(e) = hook.on_escalation(&hook_ctx, esc_action).await {
-                tracing::warn!(
-                    work_id = hook_ctx.work_id,
-                    "lifecycle hook on_escalation error (ignored): {e}"
-                );
-            }
-        });
-
-        let now = chrono::Utc::now().to_rfc3339();
-        match action {
-            EscalationAction::Retry | EscalationAction::RetryWithComment => {
-                let mut retry_item = item.clone();
-                retry_item.set_phase_unchecked(QueuePhase::Pending);
-                retry_item.updated_at = now;
-                // Carry over the preserved worktree path so the retry item
-                // can reuse the existing working tree via create_or_reuse_with_previous.
-                if item.worktree_preserved {
-                    let prev_path = self.worktree_mgr.path(&item.work_id);
-                    retry_item.previous_worktree_path =
-                        Some(prev_path.to_string_lossy().into_owned());
-                    tracing::info!(
-                        work_id = %item.work_id,
-                        ?prev_path,
-                        "storing preserved worktree path for retry item"
-                    );
-                }
-                retry_item.worktree_preserved = false;
-                // Inject lateral plan into retry item when stagnation was detected.
-                retry_item.lateral_plan = lateral_plan;
-                self.queue.push_back(retry_item);
-            }
-            EscalationAction::Skip => {
-                item.set_phase_unchecked(QueuePhase::Skipped);
-            }
-            EscalationAction::Hitl | EscalationAction::Replan => {
-                item.set_phase_unchecked(QueuePhase::Hitl);
-                item.hitl_created_at = Some(now);
-                item.hitl_reason = Some(HitlReason::RetryMaxExceeded);
-                item.hitl_notes =
-                    Self::build_lateral_hitl_notes(&self.db, &item.work_id, &lateral_plan);
-                self.queue.push_back(item.clone());
-            }
-        }
+        let mut svc = crate::hitl_service::HitlService::new(
+            &mut self.queue,
+            &self.db,
+            &self.hook,
+            &self.worktree_mgr,
+        );
+        svc.handle_escalation(item, action, lateral_plan, hook_ctx);
     }
 
     /// Detect stagnation from failure history and generate a lateral plan directive.
