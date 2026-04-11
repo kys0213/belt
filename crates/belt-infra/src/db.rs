@@ -1640,9 +1640,7 @@ impl Database {
             }
             // Find all nodes that `node` depends on (outgoing edges).
             let mut stmt = conn
-                .prepare(
-                    "SELECT depends_on FROM queue_dependencies WHERE work_id = ?1",
-                )
+                .prepare("SELECT depends_on FROM queue_dependencies WHERE work_id = ?1")
                 .map_err(|e| BeltError::Database(e.to_string()))?;
             let deps: Vec<String> = stmt
                 .query_map(params![node], |row| row.get(0))
