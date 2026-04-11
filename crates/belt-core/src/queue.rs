@@ -123,7 +123,7 @@ pub struct QueueItem {
     /// DataSource 정의 워크플로우 상태 (e.g. "analyze", "implement", "review")
     pub state: String,
     /// 큐 phase (Pending → Ready → Running → ...)
-    pub phase: QueuePhase,
+    pub(crate) phase: QueuePhase,
     /// 아이템 제목
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -313,6 +313,15 @@ impl QueueItem {
             replan_count: row.replan_count,
             lateral_plan: row.lateral_plan.clone(),
         })
+    }
+
+    /// Force-set the phase without transition validation.
+    ///
+    /// Intended for test fixtures and DB hydration in external crates where
+    /// going through `transit()` would be impractical.  Production code
+    /// should always use [`transit`](Self::transit).
+    pub fn set_phase_unchecked(&mut self, phase: QueuePhase) {
+        self.phase = phase;
     }
 
     /// Mark that the worktree is preserved (not cleaned up).

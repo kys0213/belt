@@ -423,7 +423,7 @@ impl Daemon {
             .queue
             .iter()
             .enumerate()
-            .filter(|(_, item)| item.phase == QueuePhase::Running)
+            .filter(|(_, item)| item.phase() == QueuePhase::Running)
             .map(|(i, _)| i)
             .collect();
 
@@ -1035,9 +1035,9 @@ impl Daemon {
 
         {
             let item = &self.queue[idx];
-            if item.phase != QueuePhase::Hitl {
+            if item.phase() != QueuePhase::Hitl {
                 return Err(BeltError::InvalidTransition {
-                    from: item.phase,
+                    from: item.phase(),
                     to: QueuePhase::Done, // placeholder
                 });
             }
@@ -1966,7 +1966,7 @@ impl Daemon {
         let running_work_ids: Vec<String> = self
             .queue
             .iter()
-            .filter(|item| item.phase == QueuePhase::Running)
+            .filter(|item| item.phase() == QueuePhase::Running)
             .map(|item| item.work_id.clone())
             .collect();
 
@@ -1993,7 +1993,7 @@ impl Daemon {
     pub fn rollback_running_to_pending(&mut self) {
         let ws_name = self.config.name.clone();
         for item in self.queue.iter_mut() {
-            if item.phase == QueuePhase::Running {
+            if item.phase() == QueuePhase::Running {
                 // Register preserved worktree before rollback so it can be reused.
                 let wt_path = self.worktree_mgr.path(&ws_name);
                 let wt_path_str = if wt_path.exists() {
@@ -2130,7 +2130,7 @@ impl Daemon {
         match action {
             EscalationAction::Retry | EscalationAction::RetryWithComment => {
                 let mut retry_item = item.clone();
-                retry_item.phase = QueuePhase::Pending;
+                retry_item.set_phase_unchecked(QueuePhase::Pending);
                 retry_item.updated_at = now;
                 // Carry over the preserved worktree path so the retry item
                 // can reuse the existing working tree via create_or_reuse_with_previous.
@@ -2150,10 +2150,10 @@ impl Daemon {
                 self.queue.push_back(retry_item);
             }
             EscalationAction::Skip => {
-                item.phase = QueuePhase::Skipped;
+                item.set_phase_unchecked(QueuePhase::Skipped);
             }
             EscalationAction::Hitl | EscalationAction::Replan => {
-                item.phase = QueuePhase::Hitl;
+                item.set_phase_unchecked(QueuePhase::Hitl);
                 item.hitl_created_at = Some(now);
                 item.hitl_reason = Some(HitlReason::RetryMaxExceeded);
                 self.queue.push_back(item.clone());
@@ -2356,7 +2356,7 @@ impl Daemon {
                 work_id: item.work_id.clone(),
                 workspace: self.config.name.clone(),
                 queue: QueueContext {
-                    phase: format!("{}", item.phase),
+                    phase: format!("{}", item.phase()),
                     state: item.state.clone(),
                     source_id: item.source_id.clone(),
                 },
@@ -2387,7 +2387,7 @@ impl Daemon {
                 work_id: item.work_id.clone(),
                 workspace: ws_name.to_string(),
                 queue: QueueContext {
-                    phase: format!("{}", item.phase),
+                    phase: format!("{}", item.phase()),
                     state: item.state.clone(),
                     source_id: item.source_id.clone(),
                 },
@@ -2457,7 +2457,7 @@ impl Daemon {
 
     /// Get items in a specific phase.
     pub fn items_in_phase(&self, phase: QueuePhase) -> Vec<&QueueItem> {
-        self.queue.iter().filter(|i| i.phase == phase).collect()
+        self.queue.iter().filter(|i| i.phase() == phase).collect()
     }
 
     /// Get HistoryEntry records.
@@ -2489,7 +2489,7 @@ impl Daemon {
     pub fn running_count(&self) -> usize {
         self.queue
             .iter()
-            .filter(|it| it.phase == QueuePhase::Running)
+            .filter(|it| it.phase() == QueuePhase::Running)
             .count()
     }
 
@@ -2562,7 +2562,7 @@ sources:
     fn transit_success() {
         let mut item = test_item("s1", "analyze");
         assert!(transit(&mut item, QueuePhase::Ready).is_ok());
-        assert_eq!(item.phase, QueuePhase::Ready);
+        assert_eq!(item.phase(), QueuePhase::Ready);
     }
 
     #[test]
@@ -2571,7 +2571,7 @@ sources:
         // Pending -> Completed is not allowed.
         let err = transit(&mut item, QueuePhase::Completed);
         assert!(err.is_err());
-        assert_eq!(item.phase, QueuePhase::Pending);
+        assert_eq!(item.phase(), QueuePhase::Pending);
     }
 
     #[test]
@@ -2581,19 +2581,19 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         item.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(item);
 
         assert!(daemon.complete_item("s1:analyze").is_ok());
         assert_eq!(
-            daemon.get_item("s1:analyze").unwrap().phase,
+            daemon.get_item("s1:analyze").unwrap().phase(),
             QueuePhase::Completed
         );
 
         assert!(daemon.mark_done("s1:analyze").is_ok());
         assert_eq!(
-            daemon.get_item("s1:analyze").unwrap().phase,
+            daemon.get_item("s1:analyze").unwrap().phase(),
             QueuePhase::Done
         );
     }
@@ -2605,7 +2605,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         item.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(item);
 
@@ -2630,7 +2630,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         item.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(item);
 
@@ -2646,13 +2646,13 @@ sources:
                 .is_ok()
         );
         assert_eq!(
-            daemon.get_item("s1:analyze").unwrap().phase,
+            daemon.get_item("s1:analyze").unwrap().phase(),
             QueuePhase::Hitl
         );
 
         assert!(daemon.retry_from_hitl("s1:analyze").is_ok());
         assert_eq!(
-            daemon.get_item("s1:analyze").unwrap().phase,
+            daemon.get_item("s1:analyze").unwrap().phase(),
             QueuePhase::Pending
         );
     }
@@ -2664,13 +2664,13 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         item.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(item);
 
         assert!(daemon.mark_failed("s1:analyze", "timeout".into()).is_ok());
         assert_eq!(
-            daemon.get_item("s1:analyze").unwrap().phase,
+            daemon.get_item("s1:analyze").unwrap().phase(),
             QueuePhase::Failed
         );
         assert_eq!(daemon.history_events().len(), 1);
@@ -2688,7 +2688,7 @@ sources:
         let result = daemon.mark_done("s1:analyze");
         assert!(result.is_err());
         assert_eq!(
-            daemon.get_item("s1:analyze").unwrap().phase,
+            daemon.get_item("s1:analyze").unwrap().phase(),
             QueuePhase::Pending
         );
     }
@@ -2796,11 +2796,11 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("github:org/repo#1", "analyze");
-        item.phase = QueuePhase::Completed;
+        item.set_phase_unchecked(QueuePhase::Completed);
 
         let success = daemon.execute_on_done(&mut item).await.unwrap();
         assert!(success);
-        assert_eq!(item.phase, QueuePhase::Done);
+        assert_eq!(item.phase(), QueuePhase::Done);
     }
 
     #[tokio::test]
@@ -2859,12 +2859,12 @@ sources:
 
         // Put multiple items directly into Running phase.
         let mut item1 = test_item("github:org/repo#1", "analyze");
-        item1.phase = QueuePhase::Running;
+        item1.set_phase_unchecked(QueuePhase::Running);
         item1.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(item1);
 
         let mut item2 = test_item("github:org/repo#2", "analyze");
-        item2.phase = QueuePhase::Running;
+        item2.set_phase_unchecked(QueuePhase::Running);
         item2.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(item2);
 
@@ -2898,7 +2898,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("github:org/repo#1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         item.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(item);
 
@@ -3021,7 +3021,7 @@ sources:
 
         let retrieved = daemon.get_item("src1:analyze").unwrap();
         assert_eq!(retrieved.work_id, "src1:analyze");
-        assert_eq!(retrieved.phase, QueuePhase::Pending);
+        assert_eq!(retrieved.phase(), QueuePhase::Pending);
     }
 
     #[test]
@@ -3033,7 +3033,7 @@ sources:
         daemon.push_item(test_item("s1", "analyze"));
 
         let mut item2 = test_item("s2", "implement");
-        item2.phase = QueuePhase::Running;
+        item2.set_phase_unchecked(QueuePhase::Running);
         daemon.push_item(item2);
 
         let pending = daemon.items_in_phase(QueuePhase::Pending);
@@ -3057,13 +3057,13 @@ sources:
         assert_eq!(daemon.running_count(), 0);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         daemon.push_item(item);
 
         assert_eq!(daemon.running_count(), 1);
 
         let mut item2 = test_item("s2", "implement");
-        item2.phase = QueuePhase::Running;
+        item2.set_phase_unchecked(QueuePhase::Running);
         daemon.push_item(item2);
 
         assert_eq!(daemon.running_count(), 2);
@@ -3123,7 +3123,7 @@ sources:
         daemon.push_item(test_item("s1", "analyze"));
 
         let mut item2 = test_item("s2", "implement");
-        item2.phase = QueuePhase::Running;
+        item2.set_phase_unchecked(QueuePhase::Running);
         daemon.push_item(item2);
 
         daemon.advance_pending_to_ready();
@@ -3153,7 +3153,7 @@ sources:
     fn ready_item_for_ws(source_id: &str, workspace_id: &str) -> QueueItem {
         let mut item = test_item(source_id, "analyze");
         item.workspace_id = workspace_id.to_string();
-        item.phase = QueuePhase::Ready;
+        item.set_phase_unchecked(QueuePhase::Ready);
         item
     }
 
@@ -3298,7 +3298,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("src1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         daemon.push_item(item);
 
         daemon
@@ -3315,7 +3315,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item1 = test_item("src1", "analyze");
-        item1.phase = QueuePhase::Running;
+        item1.set_phase_unchecked(QueuePhase::Running);
         daemon.push_item(item1);
 
         daemon
@@ -3341,7 +3341,7 @@ sources:
         for i in 0..3u32 {
             let mut item = test_item("src1", "analyze");
             item.work_id = format!("src1:analyze-attempt-{i}");
-            item.phase = QueuePhase::Running;
+            item.set_phase_unchecked(QueuePhase::Running);
             daemon.push_item(item);
             daemon
                 .mark_failed(
@@ -3382,7 +3382,7 @@ sources:
         for i in 0..3u32 {
             let mut item = test_item("src1", "analyze");
             item.work_id = format!("src1:analyze-attempt-{i}");
-            item.phase = QueuePhase::Running;
+            item.set_phase_unchecked(QueuePhase::Running);
             daemon.push_item(item);
             daemon
                 .mark_failed(&format!("src1:analyze-attempt-{i}"), "failure".into())
@@ -3391,7 +3391,7 @@ sources:
 
         // Push a Completed item so mark_hitl (called by apply_escalation) can succeed.
         let mut item = test_item("src1", "analyze");
-        item.phase = QueuePhase::Completed;
+        item.set_phase_unchecked(QueuePhase::Completed);
         daemon.push_item(item);
 
         // With 3 recorded failures, apply_escalation sees failure_count >= 3 → HITL.
@@ -3411,12 +3411,12 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         daemon.push_item(item);
 
         assert!(daemon.mark_skipped("s1:analyze").is_ok());
         assert_eq!(
-            daemon.get_item("s1:analyze").unwrap().phase,
+            daemon.get_item("s1:analyze").unwrap().phase(),
             QueuePhase::Skipped
         );
     }
@@ -3452,7 +3452,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         daemon.push_item(item);
 
         daemon
@@ -3476,7 +3476,7 @@ sources:
         for i in 0..3u32 {
             let mut item = test_item("s1", "analyze");
             item.work_id = format!("s1:analyze-{i}");
-            item.phase = QueuePhase::Running;
+            item.set_phase_unchecked(QueuePhase::Running);
             daemon.push_item(item);
             daemon
                 .mark_failed(&format!("s1:analyze-{i}"), format!("failure {i}"))
@@ -3552,7 +3552,7 @@ sources:
 
         // updated_at must be unchanged on failed transition.
         assert_eq!(item.updated_at, original_updated_at);
-        assert_eq!(item.phase, QueuePhase::Pending);
+        assert_eq!(item.phase(), QueuePhase::Pending);
     }
 
     // ---------------------------------------------------------------
@@ -3628,7 +3628,7 @@ sources:
         let result = daemon.complete_item("s1:analyze");
         assert!(result.is_err());
         assert_eq!(
-            daemon.get_item("s1:analyze").unwrap().phase,
+            daemon.get_item("s1:analyze").unwrap().phase(),
             QueuePhase::Pending
         );
     }
@@ -3688,7 +3688,7 @@ sources:
         );
         assert!(result.is_err());
         assert_eq!(
-            daemon.get_item("s1:analyze").unwrap().phase,
+            daemon.get_item("s1:analyze").unwrap().phase(),
             QueuePhase::Pending
         );
     }
@@ -3718,28 +3718,28 @@ sources:
         daemon.push_item(test_item("s1", "analyze")); // Pending
 
         let mut item2 = test_item("s2", "implement");
-        item2.phase = QueuePhase::Completed;
+        item2.set_phase_unchecked(QueuePhase::Completed);
         daemon.push_item(item2);
 
         let mut item3 = test_item("s3", "implement");
-        item3.phase = QueuePhase::Running;
+        item3.set_phase_unchecked(QueuePhase::Running);
         daemon.push_item(item3);
 
         daemon.rollback_running_to_pending();
 
         // Pending item untouched
         assert_eq!(
-            daemon.get_item("s1:analyze").unwrap().phase,
+            daemon.get_item("s1:analyze").unwrap().phase(),
             QueuePhase::Pending
         );
         // Completed item untouched
         assert_eq!(
-            daemon.get_item("s2:implement").unwrap().phase,
+            daemon.get_item("s2:implement").unwrap().phase(),
             QueuePhase::Completed
         );
         // Running item rolled back to Pending
         assert_eq!(
-            daemon.get_item("s3:implement").unwrap().phase,
+            daemon.get_item("s3:implement").unwrap().phase(),
             QueuePhase::Pending
         );
     }
@@ -3752,7 +3752,7 @@ sources:
 
         for i in 0..3u32 {
             let mut item = test_item(&format!("s{i}"), "analyze");
-            item.phase = QueuePhase::Running;
+            item.set_phase_unchecked(QueuePhase::Running);
             daemon.push_item(item);
         }
 
@@ -3777,7 +3777,7 @@ sources:
         std::fs::create_dir_all(&ws_path).unwrap();
 
         let mut item = test_item("github:org/repo#1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         daemon.push_item(item);
 
         daemon.rollback_running_to_pending();
@@ -3795,14 +3795,14 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("github:org/repo#1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         daemon.push_item(item);
 
         daemon.rollback_running_to_pending();
 
         let item = daemon.get_item("github:org/repo#1:analyze").unwrap();
         assert!(item.worktree_preserved);
-        assert_eq!(item.phase, QueuePhase::Pending);
+        assert_eq!(item.phase(), QueuePhase::Pending);
     }
 
     #[tokio::test]
@@ -3816,7 +3816,7 @@ sources:
         std::fs::create_dir_all(&ws_path).unwrap();
 
         let mut item = test_item("github:org/repo#1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         item.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(item);
 
@@ -3842,7 +3842,7 @@ sources:
             .register_preserved("github:org/repo#1", wt_path);
 
         let mut item = test_item("github:org/repo#1", "analyze");
-        item.phase = QueuePhase::Completed;
+        item.set_phase_unchecked(QueuePhase::Completed);
 
         let success = daemon.execute_on_done(&mut item).await.unwrap();
         assert!(success);
@@ -3867,7 +3867,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_notes = Some("original failure reason".into());
         daemon.push_item(item);
 
@@ -3883,12 +3883,12 @@ sources:
 
         // Original item should be rolled back to Pending with replan_count = 1.
         let original = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(original.phase, QueuePhase::Pending);
+        assert_eq!(original.phase(), QueuePhase::Pending);
         assert_eq!(original.replan_count, 1);
 
         // A new HITL item should have been created for spec modification.
         let replan_item = daemon.get_item("s1:analyze:replan-1").unwrap();
-        assert_eq!(replan_item.phase, QueuePhase::Hitl);
+        assert_eq!(replan_item.phase(), QueuePhase::Hitl);
         assert_eq!(
             replan_item.hitl_reason,
             Some(HitlReason::SpecModificationProposed)
@@ -3916,7 +3916,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.replan_count = 1; // Already replanned once.
         daemon.push_item(item);
 
@@ -3931,11 +3931,11 @@ sources:
         assert!(result.is_ok());
 
         let original = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(original.phase, QueuePhase::Pending);
+        assert_eq!(original.phase(), QueuePhase::Pending);
         assert_eq!(original.replan_count, 2);
 
         let replan_item = daemon.get_item("s1:analyze:replan-2").unwrap();
-        assert_eq!(replan_item.phase, QueuePhase::Hitl);
+        assert_eq!(replan_item.phase(), QueuePhase::Hitl);
     }
 
     #[tokio::test]
@@ -3945,7 +3945,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.replan_count = 3; // Already at max.
         daemon.push_item(item);
 
@@ -3956,7 +3956,7 @@ sources:
 
         // Should transition to Failed, not Pending.
         let original = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(original.phase, QueuePhase::Failed);
+        assert_eq!(original.phase(), QueuePhase::Failed);
         assert_eq!(original.replan_count, 4);
 
         // No replan HITL item should be created.
@@ -3985,7 +3985,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         daemon.push_item(item);
 
         let result = daemon
@@ -3998,7 +3998,7 @@ sources:
             .await;
         assert!(result.is_ok());
         assert_eq!(
-            daemon.get_item("s1:analyze").unwrap().phase,
+            daemon.get_item("s1:analyze").unwrap().phase(),
             QueuePhase::Done
         );
     }
@@ -4157,11 +4157,11 @@ sources:
 
         // Use a state that has no matching state config.
         let mut item = test_item("github:org/repo#1", "unknown_state");
-        item.phase = QueuePhase::Completed;
+        item.set_phase_unchecked(QueuePhase::Completed);
 
         let success = daemon.execute_on_done(&mut item).await.unwrap();
         assert!(success);
-        assert_eq!(item.phase, QueuePhase::Done);
+        assert_eq!(item.phase(), QueuePhase::Done);
     }
 
     #[tokio::test]
@@ -4196,11 +4196,11 @@ sources:
         );
 
         let mut item = test_item("github:org/repo#1", "no_done");
-        item.phase = QueuePhase::Completed;
+        item.set_phase_unchecked(QueuePhase::Completed);
 
         let success = daemon.execute_on_done(&mut item).await.unwrap();
         assert!(success);
-        assert_eq!(item.phase, QueuePhase::Done);
+        assert_eq!(item.phase(), QueuePhase::Done);
     }
 
     #[tokio::test]
@@ -4210,7 +4210,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("github:org/repo#1", "analyze");
-        item.phase = QueuePhase::Completed;
+        item.set_phase_unchecked(QueuePhase::Completed);
 
         assert_eq!(daemon.history().len(), 0);
 
@@ -4298,7 +4298,7 @@ sources:
 
         // Put an item directly in Running to simulate pre-existing work.
         let mut item = test_item("github:org/repo#1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         item.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(item);
 
@@ -4354,7 +4354,7 @@ sources:
             "test-ws".to_string(),
             "spec_completion".to_string(),
         );
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_reason = Some(HitlReason::SpecCompletionReview);
         daemon.push_item(item);
 
@@ -4374,7 +4374,7 @@ sources:
             daemon
                 .get_item("spec-completion:spec-42:hitl")
                 .unwrap()
-                .phase,
+                .phase(),
             QueuePhase::Done
         );
 
@@ -4407,7 +4407,7 @@ sources:
             "test-ws".to_string(),
             "spec_completion".to_string(),
         );
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_reason = Some(HitlReason::SpecCompletionReview);
         daemon.push_item(item);
 
@@ -4427,7 +4427,7 @@ sources:
             daemon
                 .get_item("spec-completion:spec-43:hitl")
                 .unwrap()
-                .phase,
+                .phase(),
             QueuePhase::Skipped
         );
 
@@ -4460,7 +4460,7 @@ sources:
             "test-ws".to_string(),
             "spec_completion".to_string(),
         );
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_reason = Some(HitlReason::SpecCompletionReview);
         daemon.push_item(item);
 
@@ -4480,7 +4480,7 @@ sources:
             daemon
                 .get_item("spec-completion:spec-44:hitl")
                 .unwrap()
-                .phase,
+                .phase(),
             QueuePhase::Pending
         );
 
@@ -4765,7 +4765,7 @@ sources:
         // Place one item already in Running to occupy a slot.
         let mut running = test_item("existing", "analyze");
         running.workspace_id = "ws-a".to_string();
-        running.phase = QueuePhase::Running;
+        running.set_phase_unchecked(QueuePhase::Running);
         running.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(running);
         // Track the existing running item in the concurrency tracker.
@@ -4867,12 +4867,12 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![0, 0]);
 
         let mut item1 = test_item("github:org/repo#1", "analyze");
-        item1.phase = QueuePhase::Running;
+        item1.set_phase_unchecked(QueuePhase::Running);
         item1.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(item1);
 
         let mut item2 = test_item("github:org/repo#2", "analyze");
-        item2.phase = QueuePhase::Running;
+        item2.set_phase_unchecked(QueuePhase::Running);
         item2.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(item2);
 
@@ -4898,7 +4898,7 @@ sources:
 
         for i in 0..3u32 {
             let mut item = test_item(&format!("github:org/repo#{i}"), "analyze");
-            item.phase = QueuePhase::Running;
+            item.set_phase_unchecked(QueuePhase::Running);
             item.updated_at = Utc::now().to_rfc3339();
             daemon.push_item(item);
         }
@@ -4923,7 +4923,7 @@ sources:
 
         for i in 0..3u32 {
             let mut item = test_item(&format!("github:org/repo#{i}"), "analyze");
-            item.phase = QueuePhase::Running;
+            item.set_phase_unchecked(QueuePhase::Running);
             item.updated_at = Utc::now().to_rfc3339();
             daemon.push_item(item);
         }
@@ -4971,7 +4971,7 @@ sources:
         std::fs::create_dir_all(&ws_path).unwrap();
 
         let mut item = test_item("github:org/repo#99", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         daemon.push_item(item);
 
         // Item is NOT in the DB yet (only in-memory queue).
@@ -4993,7 +4993,7 @@ sources:
             .unwrap()
             .get_item("github:org/repo#99:analyze")
             .expect("item should be inserted into DB during rollback");
-        assert_eq!(db_item.phase, QueuePhase::Pending);
+        assert_eq!(db_item.phase(), QueuePhase::Pending);
         assert!(db_item.worktree_preserved);
         assert_eq!(
             db_item.previous_worktree_path.as_deref(),
@@ -5021,7 +5021,7 @@ sources:
         std::fs::create_dir_all(&ws_path).unwrap();
 
         let mut item = test_item("github:org/repo#100", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         daemon.push_item(item);
 
         daemon.rollback_running_to_pending();
@@ -5033,7 +5033,7 @@ sources:
             .unwrap()
             .get_item("github:org/repo#100:analyze")
             .unwrap();
-        assert_eq!(db_item.phase, QueuePhase::Pending);
+        assert_eq!(db_item.phase(), QueuePhase::Pending);
         assert!(db_item.worktree_preserved);
         assert!(db_item.previous_worktree_path.is_some());
     }
@@ -5086,7 +5086,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         item.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(item);
 
@@ -5100,7 +5100,7 @@ sources:
             .unwrap();
 
         let item = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(item.phase, QueuePhase::Hitl);
+        assert_eq!(item.phase(), QueuePhase::Hitl);
         assert_eq!(item.hitl_reason, Some(HitlReason::EvaluateFailure));
         assert_eq!(item.hitl_notes.as_deref(), Some("partial result"));
         assert!(
@@ -5116,7 +5116,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         item.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(item);
 
@@ -5126,7 +5126,7 @@ sources:
             .unwrap();
 
         let item = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(item.phase, QueuePhase::Hitl);
+        assert_eq!(item.phase(), QueuePhase::Hitl);
         assert_eq!(item.hitl_reason, Some(HitlReason::Timeout));
         assert!(item.hitl_notes.is_none());
     }
@@ -5142,7 +5142,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_reason = Some(HitlReason::RetryMaxExceeded);
         item.hitl_notes = Some("needs review".into());
         item.hitl_created_at = Some(Utc::now().to_rfc3339());
@@ -5151,7 +5151,7 @@ sources:
         daemon.retry_from_hitl("s1:analyze").unwrap();
 
         let item = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(item.phase, QueuePhase::Pending);
+        assert_eq!(item.phase(), QueuePhase::Pending);
     }
 
     // ---------------------------------------------------------------
@@ -5165,7 +5165,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         daemon.push_item(item);
 
         let result = daemon
@@ -5179,7 +5179,7 @@ sources:
         assert!(result.is_ok());
 
         let item = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(item.phase, QueuePhase::Pending);
+        assert_eq!(item.phase(), QueuePhase::Pending);
         assert_eq!(item.hitl_respondent.as_deref(), Some("reviewer"));
         assert_eq!(item.hitl_notes.as_deref(), Some("retrying after fix"));
     }
@@ -5191,7 +5191,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         daemon.push_item(item);
 
         let result = daemon
@@ -5205,7 +5205,7 @@ sources:
         assert!(result.is_ok());
 
         let item = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(item.phase, QueuePhase::Skipped);
+        assert_eq!(item.phase(), QueuePhase::Skipped);
         assert_eq!(item.hitl_respondent.as_deref(), Some("admin"));
     }
 
@@ -5228,7 +5228,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_notes = Some("original notes".into());
         daemon.push_item(item);
 
@@ -5253,7 +5253,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_notes = Some("original notes".into());
         daemon.push_item(item);
 
@@ -5326,7 +5326,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         item.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(item);
 
@@ -5352,7 +5352,7 @@ sources:
 
         // First failure.
         let mut item = test_item("s1", "analyze");
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
         item.updated_at = Utc::now().to_rfc3339();
         daemon.push_item(item);
         daemon
@@ -5365,7 +5365,7 @@ sources:
             .iter_mut()
             .find(|it| it.work_id == "s1:analyze")
             .unwrap();
-        item.phase = QueuePhase::Running;
+        item.set_phase_unchecked(QueuePhase::Running);
 
         daemon
             .mark_failed("s1:analyze", "second error".into())
@@ -5613,13 +5613,13 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![0]);
 
         let mut item = test_item("src:1", "implement");
-        item.phase = QueuePhase::Failed;
+        item.set_phase_unchecked(QueuePhase::Failed);
         let plan = Some("\n\n## Lateral Plan\ntest plan".to_string());
 
         daemon.handle_escalation(&mut item, EscalationAction::Retry, plan.clone());
 
         let retry = daemon.queue.back().expect("should have retry item");
-        assert_eq!(retry.phase, QueuePhase::Pending);
+        assert_eq!(retry.phase(), QueuePhase::Pending);
         assert_eq!(retry.lateral_plan, plan);
     }
 
@@ -5630,7 +5630,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![0]);
 
         let mut item = test_item("src:1", "implement");
-        item.phase = QueuePhase::Failed;
+        item.set_phase_unchecked(QueuePhase::Failed);
         item.lateral_plan = Some("old plan".to_string());
 
         daemon.handle_escalation(&mut item, EscalationAction::Retry, None);
@@ -5646,13 +5646,13 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![0]);
 
         let mut item = test_item("src:1", "implement");
-        item.phase = QueuePhase::Failed;
+        item.set_phase_unchecked(QueuePhase::Failed);
         let plan = Some("some plan".to_string());
 
         daemon.handle_escalation(&mut item, EscalationAction::Hitl, plan);
 
         let hitl = daemon.queue.back().expect("should have hitl item");
-        assert_eq!(hitl.phase, QueuePhase::Hitl);
+        assert_eq!(hitl.phase(), QueuePhase::Hitl);
         // HITL items retain original lateral_plan (from the cloned item), not the new plan.
     }
 
@@ -5766,7 +5766,7 @@ sources:
             );
 
             let mut item = test_item("s1", "implement");
-            item.phase = QueuePhase::Running;
+            item.set_phase_unchecked(QueuePhase::Running);
             item.updated_at = Utc::now().to_rfc3339();
             daemon.push_item(item);
 
@@ -5789,7 +5789,7 @@ sources:
             );
 
             let mut item = test_item("s1", "implement");
-            item.phase = QueuePhase::Running;
+            item.set_phase_unchecked(QueuePhase::Running);
             item.updated_at = Utc::now().to_rfc3339();
             daemon.push_item(item);
 
@@ -5814,7 +5814,7 @@ sources:
                 setup_daemon_with_hook(&tmp, vec![], Arc::clone(&hook) as Arc<dyn LifecycleHook>);
 
             let mut item = test_item("s1", "analyze");
-            item.phase = QueuePhase::Running;
+            item.set_phase_unchecked(QueuePhase::Running);
             item.updated_at = Utc::now().to_rfc3339();
             daemon.push_item(item);
 
@@ -5839,7 +5839,7 @@ sources:
                 setup_daemon_with_hook(&tmp, vec![1], Arc::clone(&hook) as Arc<dyn LifecycleHook>);
 
             let mut item = test_item("s1", "implement");
-            item.phase = QueuePhase::Running;
+            item.set_phase_unchecked(QueuePhase::Running);
             item.updated_at = Utc::now().to_rfc3339();
             daemon.push_item(item);
 
@@ -5864,7 +5864,7 @@ sources:
                 setup_daemon_with_hook(&tmp, vec![0], Arc::clone(&hook) as Arc<dyn LifecycleHook>);
 
             let mut item = test_item("s1", "implement");
-            item.phase = QueuePhase::Failed;
+            item.set_phase_unchecked(QueuePhase::Failed);
 
             daemon.handle_escalation(&mut item, EscalationAction::Hitl, None);
 

@@ -371,7 +371,7 @@ impl Database {
                 item.source_id,
                 item.workspace_id,
                 item.state,
-                phase_to_str(item.phase),
+                phase_to_str(item.phase()),
                 item.title,
                 item.created_at,
                 item.updated_at,
@@ -2219,29 +2219,25 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
         })
         .transpose()?;
 
-    Ok(QueueItem {
-        work_id: col(row, 0)?,
-        source_id: col(row, 1)?,
-        workspace_id: col(row, 2)?,
-        state: col(row, 3)?,
-        phase: str_to_phase(&phase_str)?,
-        title: col(row, 5)?,
-        created_at: col(row, 6)?,
-        updated_at: col(row, 7)?,
-        hitl_created_at: col(row, 8)?,
-        hitl_respondent: col(row, 9)?,
-        hitl_notes: col(row, 10)?,
-        hitl_reason,
-        hitl_timeout_at: col(row, 12)?,
-        hitl_terminal_action: col::<Option<String>>(row, 13)?
-            .as_deref()
-            .map(|s| s.parse::<EscalationAction>().map_err(BeltError::Database))
-            .transpose()?,
-        replan_count: row.get::<_, u32>(14).unwrap_or(0),
-        worktree_preserved: col(row, 15)?,
-        previous_worktree_path: col(row, 16)?,
-        lateral_plan: col(row, 17).unwrap_or(None),
-    })
+    let mut item = QueueItem::new(col(row, 0)?, col(row, 1)?, col(row, 2)?, col(row, 3)?);
+    item.set_phase_unchecked(str_to_phase(&phase_str)?);
+    item.title = col(row, 5)?;
+    item.created_at = col(row, 6)?;
+    item.updated_at = col(row, 7)?;
+    item.hitl_created_at = col(row, 8)?;
+    item.hitl_respondent = col(row, 9)?;
+    item.hitl_notes = col(row, 10)?;
+    item.hitl_reason = hitl_reason;
+    item.hitl_timeout_at = col(row, 12)?;
+    item.hitl_terminal_action = col::<Option<String>>(row, 13)?
+        .as_deref()
+        .map(|s| s.parse::<EscalationAction>().map_err(BeltError::Database))
+        .transpose()?;
+    item.replan_count = row.get::<_, u32>(14).unwrap_or(0);
+    item.worktree_preserved = col(row, 15)?;
+    item.previous_worktree_path = col(row, 16)?;
+    item.lateral_plan = col(row, 17).unwrap_or(None);
+    Ok(item)
 }
 
 #[cfg(test)]
@@ -2253,26 +2249,12 @@ mod tests {
     }
 
     fn sample_item() -> QueueItem {
-        QueueItem {
-            work_id: "gh:org/repo#1:implement".to_string(),
-            source_id: "gh:org/repo#1".to_string(),
-            workspace_id: "my-ws".to_string(),
-            state: "implement".to_string(),
-            phase: QueuePhase::Pending,
-            title: None,
-            created_at: Utc::now().to_rfc3339(),
-            updated_at: Utc::now().to_rfc3339(),
-            hitl_created_at: None,
-            hitl_respondent: None,
-            hitl_notes: None,
-            hitl_reason: None,
-            hitl_timeout_at: None,
-            hitl_terminal_action: None,
-            worktree_preserved: false,
-            previous_worktree_path: None,
-            replan_count: 0,
-            lateral_plan: None,
-        }
+        QueueItem::new(
+            "gh:org/repo#1:implement".to_string(),
+            "gh:org/repo#1".to_string(),
+            "my-ws".to_string(),
+            "implement".to_string(),
+        )
     }
 
     // ---- Queue CRUD --------------------------------------------------------
@@ -2286,7 +2268,7 @@ mod tests {
         let fetched = db.get_item(&item.work_id).unwrap();
         assert_eq!(fetched.work_id, item.work_id);
         assert_eq!(fetched.source_id, item.source_id);
-        assert_eq!(fetched.phase, QueuePhase::Pending);
+        assert_eq!(fetched.phase(), QueuePhase::Pending);
     }
 
     #[test]
@@ -2304,7 +2286,7 @@ mod tests {
         db.update_phase(&item.work_id, QueuePhase::Ready).unwrap();
 
         let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.phase, QueuePhase::Ready);
+        assert_eq!(fetched.phase(), QueuePhase::Ready);
     }
 
     #[test]
@@ -2326,7 +2308,7 @@ mod tests {
             .unwrap();
 
         let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.phase, QueuePhase::Hitl);
+        assert_eq!(fetched.phase(), QueuePhase::Hitl);
         assert!(fetched.hitl_created_at.is_some());
         assert_eq!(fetched.hitl_notes.as_deref(), Some("failed 3 times"));
     }
@@ -3280,14 +3262,14 @@ mod tests {
     fn insert_and_get_item_with_hitl_metadata() {
         let db = test_db();
         let mut item = sample_item();
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_created_at = Some(Utc::now().to_rfc3339());
         item.hitl_reason = Some(belt_core::queue::HitlReason::RetryMaxExceeded);
         item.hitl_notes = Some("max retries".to_string());
         db.insert_item(&item).unwrap();
 
         let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.phase, QueuePhase::Hitl);
+        assert_eq!(fetched.phase(), QueuePhase::Hitl);
         assert!(fetched.hitl_created_at.is_some());
         assert_eq!(
             fetched.hitl_reason,
@@ -3300,7 +3282,7 @@ mod tests {
     fn respond_hitl_updates_metadata() {
         let db = test_db();
         let mut item = sample_item();
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_created_at = Some(Utc::now().to_rfc3339());
         db.insert_item(&item).unwrap();
 
@@ -3313,7 +3295,7 @@ mod tests {
         .unwrap();
 
         let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.phase, QueuePhase::Done);
+        assert_eq!(fetched.phase(), QueuePhase::Done);
         assert_eq!(fetched.hitl_respondent.as_deref(), Some("irene"));
         assert_eq!(fetched.hitl_notes.as_deref(), Some("looks good"));
     }
@@ -3323,18 +3305,16 @@ mod tests {
         let db = test_db();
         // Item with hitl_created_at 25 hours ago
         let mut old_item = sample_item();
-        old_item.phase = QueuePhase::Hitl;
+        old_item.set_phase_unchecked(QueuePhase::Hitl);
         old_item.hitl_created_at = Some((Utc::now() - chrono::Duration::hours(25)).to_rfc3339());
         db.insert_item(&old_item).unwrap();
         db.update_phase(&old_item.work_id, QueuePhase::Hitl)
             .unwrap();
 
         // Item with hitl_created_at 1 hour ago (not expired)
-        let mut new_item = QueueItem {
-            work_id: "gh:org/repo#2:implement".to_string(),
-            ..sample_item()
-        };
-        new_item.phase = QueuePhase::Hitl;
+        let mut new_item = sample_item();
+        new_item.work_id = "gh:org/repo#2:implement".to_string();
+        new_item.set_phase_unchecked(QueuePhase::Hitl);
         new_item.hitl_created_at = Some((Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
         db.insert_item(&new_item).unwrap();
         db.update_phase(&new_item.work_id, QueuePhase::Hitl)
@@ -3349,7 +3329,7 @@ mod tests {
     fn set_hitl_timeout_updates_item() {
         let db = test_db();
         let mut item = sample_item();
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         db.insert_item(&item).unwrap();
 
         let timeout_at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
@@ -3378,7 +3358,7 @@ mod tests {
         // Item with timeout set.
         let mut item1 = sample_item();
         item1.work_id = "w-timeout".to_string();
-        item1.phase = QueuePhase::Hitl;
+        item1.set_phase_unchecked(QueuePhase::Hitl);
         item1.hitl_timeout_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
         item1.hitl_terminal_action = Some(EscalationAction::Skip);
         db.insert_item(&item1).unwrap();
@@ -3386,7 +3366,7 @@ mod tests {
         // Item without timeout.
         let mut item2 = sample_item();
         item2.work_id = "w-no-timeout".to_string();
-        item2.phase = QueuePhase::Hitl;
+        item2.set_phase_unchecked(QueuePhase::Hitl);
         db.insert_item(&item2).unwrap();
 
         let items = db.list_hitl_items_with_timeout().unwrap();
@@ -3452,17 +3432,17 @@ mod tests {
         let db = test_db();
         let mut item1 = sample_item();
         item1.work_id = "w1".to_string();
-        item1.phase = QueuePhase::Pending;
+        item1.set_phase_unchecked(QueuePhase::Pending);
         db.insert_item(&item1).unwrap();
 
         let mut item2 = sample_item();
         item2.work_id = "w2".to_string();
-        item2.phase = QueuePhase::Running;
+        item2.set_phase_unchecked(QueuePhase::Running);
         db.insert_item(&item2).unwrap();
 
         let mut item3 = sample_item();
         item3.work_id = "w3".to_string();
-        item3.phase = QueuePhase::Pending;
+        item3.set_phase_unchecked(QueuePhase::Pending);
         db.insert_item(&item3).unwrap();
 
         let counts = db.count_items_by_phase().unwrap();
@@ -3682,7 +3662,7 @@ mod tests {
 
         let fetched = db.get_item(&item.work_id).unwrap();
         assert!(fetched.worktree_preserved);
-        assert_eq!(fetched.phase, QueuePhase::Running);
+        assert_eq!(fetched.phase(), QueuePhase::Running);
     }
 
     #[test]
@@ -3764,7 +3744,7 @@ mod tests {
         .unwrap();
 
         let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.phase, QueuePhase::Pending);
+        assert_eq!(fetched.phase(), QueuePhase::Pending);
         assert!(fetched.worktree_preserved);
         assert_eq!(
             fetched.previous_worktree_path.as_deref(),
@@ -3899,7 +3879,7 @@ mod tests {
     fn respond_hitl_with_none_respondent_and_notes() {
         let db = test_db();
         let mut item = sample_item();
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_created_at = Some(Utc::now().to_rfc3339());
         item.hitl_notes = Some("original notes".to_string());
         db.insert_item(&item).unwrap();
@@ -3908,7 +3888,7 @@ mod tests {
             .unwrap();
 
         let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.phase, QueuePhase::Pending);
+        assert_eq!(fetched.phase(), QueuePhase::Pending);
         assert!(fetched.hitl_respondent.is_none());
         // When notes is NULL, COALESCE preserves original notes
         assert_eq!(fetched.hitl_notes.as_deref(), Some("original notes"));
@@ -3918,7 +3898,7 @@ mod tests {
     fn respond_hitl_overwrites_notes_when_provided() {
         let db = test_db();
         let mut item = sample_item();
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         item.hitl_created_at = Some(Utc::now().to_rfc3339());
         item.hitl_notes = Some("old notes".to_string());
         db.insert_item(&item).unwrap();
@@ -3988,7 +3968,7 @@ mod tests {
     fn has_open_items_for_source_returns_false_for_done() {
         let db = test_db();
         let mut item = sample_item();
-        item.phase = QueuePhase::Done;
+        item.set_phase_unchecked(QueuePhase::Done);
         db.insert_item(&item).unwrap();
 
         let result = db.has_open_items_for_source(&item.source_id).unwrap();
@@ -3999,7 +3979,7 @@ mod tests {
     fn has_open_items_for_source_returns_false_for_skipped() {
         let db = test_db();
         let mut item = sample_item();
-        item.phase = QueuePhase::Skipped;
+        item.set_phase_unchecked(QueuePhase::Skipped);
         db.insert_item(&item).unwrap();
 
         let result = db.has_open_items_for_source(&item.source_id).unwrap();
@@ -4049,7 +4029,7 @@ mod tests {
     fn set_hitl_timeout_with_no_terminal_action() {
         let db = test_db();
         let mut item = sample_item();
-        item.phase = QueuePhase::Hitl;
+        item.set_phase_unchecked(QueuePhase::Hitl);
         db.insert_item(&item).unwrap();
 
         let timeout_at = (Utc::now() + chrono::Duration::hours(2)).to_rfc3339();

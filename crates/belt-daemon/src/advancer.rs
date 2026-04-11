@@ -22,20 +22,14 @@ use crate::concurrency::ConcurrencyTracker;
 
 /// Safely transition a [`QueueItem`] to a new phase.
 ///
-/// All phase mutations **must** go through this function so that
-/// [`QueuePhase::can_transition_to`] is always checked.
+/// Delegates to [`QueueItem::transit`] which validates via
+/// [`QueuePhase::can_transition_to`].
 /// Returns the previous phase on success for transition event recording.
 fn transit(
     item: &mut QueueItem,
     to: QueuePhase,
 ) -> Result<QueuePhase, belt_core::error::BeltError> {
-    let from = item.phase;
-    if !from.can_transition_to(&to) {
-        return Err(belt_core::error::BeltError::InvalidTransition { from, to });
-    }
-    item.phase = to;
-    item.updated_at = Utc::now().to_rfc3339();
-    Ok(from)
+    item.transit(to)
 }
 
 /// Record a phase transition event to the database.
@@ -122,7 +116,7 @@ impl<'a> Advancer<'a> {
             .queue
             .iter()
             .enumerate()
-            .filter(|(_, item)| item.phase == QueuePhase::Pending)
+            .filter(|(_, item)| item.phase() == QueuePhase::Pending)
             .map(|(i, _)| i)
             .collect();
 
@@ -184,7 +178,7 @@ impl<'a> Advancer<'a> {
             .queue
             .iter()
             .enumerate()
-            .filter(|(_, item)| item.phase == QueuePhase::Ready)
+            .filter(|(_, item)| item.phase() == QueuePhase::Ready)
             .map(|(i, _)| i)
             .collect();
 
@@ -226,7 +220,7 @@ impl<'a> Advancer<'a> {
     /// Advance Pending items to Ready.
     pub fn advance_pending_to_ready(&mut self) {
         for item in self.queue.iter_mut() {
-            if item.phase == QueuePhase::Pending {
+            if item.phase() == QueuePhase::Pending {
                 let _ = transit(item, QueuePhase::Ready);
             }
         }
@@ -245,7 +239,7 @@ impl<'a> Advancer<'a> {
             .queue
             .iter()
             .enumerate()
-            .filter(|(_, it)| it.phase == QueuePhase::Ready)
+            .filter(|(_, it)| it.phase() == QueuePhase::Ready)
             .map(|(i, _)| i)
             .collect();
 
@@ -314,7 +308,7 @@ impl<'a> Advancer<'a> {
                 .queue
                 .iter()
                 .find(|item| item.work_id == *dep_id)
-                .map(|item| item.phase);
+                .map(|item| item.phase());
 
             match dep_phase {
                 Some(QueuePhase::Done) => {}
@@ -389,7 +383,7 @@ mod tests {
 
         let advanced = advancer.run();
         assert_eq!(advanced, 2); // Pending->Ready + Ready->Running
-        assert_eq!(queue[0].phase, QueuePhase::Running);
+        assert_eq!(queue[0].phase(), QueuePhase::Running);
     }
 
     #[test]
@@ -411,7 +405,7 @@ mod tests {
 
         let running_count = queue
             .iter()
-            .filter(|i| i.phase == QueuePhase::Running)
+            .filter(|i| i.phase() == QueuePhase::Running)
             .count();
         assert_eq!(running_count, 1);
     }
@@ -430,7 +424,7 @@ mod tests {
 
         advancer.advance_pending_to_ready();
 
-        assert!(queue.iter().all(|i| i.phase == QueuePhase::Ready));
+        assert!(queue.iter().all(|i| i.phase() == QueuePhase::Ready));
     }
 
     #[test]
@@ -456,7 +450,7 @@ mod tests {
 
         advancer.advance_ready_to_running(&limits, 1);
 
-        assert!(queue.iter().all(|i| i.phase == QueuePhase::Running));
+        assert!(queue.iter().all(|i| i.phase() == QueuePhase::Running));
     }
 
     #[test]

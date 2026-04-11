@@ -861,7 +861,7 @@ fn cmd_queue_list(
                     println!(
                         "{:<40} {:<12} {:<10} {:<20}",
                         truncate(&item.work_id, 40),
-                        item.phase.as_str(),
+                        item.phase().as_str(),
                         &item.state,
                         &item.updated_at,
                     );
@@ -888,7 +888,7 @@ fn cmd_queue_show(work_id: &str, format: &str) -> anyhow::Result<()> {
             println!("Source ID:    {}", item.source_id);
             println!("Workspace:    {}", item.workspace_id);
             println!("State:        {}", item.state);
-            println!("Phase:        {}", item.phase);
+            println!("Phase:        {}", item.phase());
             if let Some(title) = &item.title {
                 println!("Title:        {title}");
             }
@@ -1026,11 +1026,11 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
     let db = open_db()?;
     let item = db.get_item(work_id)?;
 
-    if item.phase != QueuePhase::Failed {
+    if item.phase() != QueuePhase::Failed {
         anyhow::bail!(
             "item '{}' is in phase '{}', not 'failed'",
             work_id,
-            item.phase
+            item.phase()
         );
     }
 
@@ -1498,11 +1498,11 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
     let db = open_db()?;
     let item = db.get_item(item_id)?;
 
-    if item.phase != QueuePhase::Hitl {
+    if item.phase() != QueuePhase::Hitl {
         anyhow::bail!(
             "item '{}' is in phase '{}', not 'hitl'",
             item_id,
-            item.phase
+            item.phase()
         );
     }
 
@@ -1531,7 +1531,7 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
             println!("Source ID:    {}", item.source_id);
             println!("Workspace:    {}", item.workspace_id);
             println!("State:        {}", item.state);
-            println!("Phase:        {}", item.phase);
+            println!("Phase:        {}", item.phase());
             if let Some(title) = &item.title {
                 println!("Title:        {title}");
             }
@@ -1611,7 +1611,7 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
                         item.workspace_id.clone(),
                         item.state.clone(),
                     );
-                    replan_item.phase = QueuePhase::Hitl;
+                    replan_item.set_phase_unchecked(QueuePhase::Hitl);
                     replan_item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
                     replan_item.hitl_reason =
                         Some(belt_core::queue::HitlReason::SpecModificationProposed);
@@ -1682,11 +1682,11 @@ fn cmd_hitl_timeout(command: HitlTimeoutCommands) -> anyhow::Result<()> {
         } => {
             // Validate that the item exists and is in HITL phase.
             let item = db.get_item(&item_id)?;
-            if item.phase != QueuePhase::Hitl {
+            if item.phase() != QueuePhase::Hitl {
                 anyhow::bail!(
                     "item '{}' is in phase '{}', expected 'hitl'",
                     item_id,
-                    item.phase
+                    item.phase()
                 );
             }
 
@@ -2358,7 +2358,7 @@ async fn main() -> anyhow::Result<()> {
                     let items = db.list_items(None, Some(&name))?;
                     let active_count = items
                         .iter()
-                        .filter(|i| !matches!(i.phase, QueuePhase::Done | QueuePhase::Skipped))
+                        .filter(|i| !matches!(i.phase(), QueuePhase::Done | QueuePhase::Skipped))
                         .count();
 
                     if active_count > 0 && !force {
@@ -2548,7 +2548,7 @@ async fn main() -> anyhow::Result<()> {
                         work_id: item.work_id.clone(),
                         workspace: item.workspace_id.clone(),
                         queue: belt_core::context::QueueContext {
-                            phase: item.phase.as_str().to_string(),
+                            phase: item.phase().as_str().to_string(),
                             state: item.state.clone(),
                             source_id: item.source_id.clone(),
                         },
@@ -2728,7 +2728,7 @@ async fn main() -> anyhow::Result<()> {
                             workspace.clone(),
                             "review".to_string(),
                         );
-                        hitl_item.phase = QueuePhase::Hitl;
+                        hitl_item.set_phase_unchecked(QueuePhase::Hitl);
                         hitl_item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
                         hitl_item.hitl_reason = Some(belt_core::queue::HitlReason::SpecConflict);
                         hitl_item.hitl_notes =
@@ -3306,11 +3306,11 @@ async fn main() -> anyhow::Result<()> {
                 let db = open_db()?;
                 // Verify the item exists and is in HITL phase.
                 let item = db.get_item(&item_id)?;
-                if item.phase != QueuePhase::Hitl {
+                if item.phase() != QueuePhase::Hitl {
                     anyhow::bail!(
                         "item '{}' is in phase '{}', not 'hitl'",
                         item_id,
-                        item.phase
+                        item.phase()
                     );
                 }
                 match action {
@@ -3336,7 +3336,7 @@ async fn main() -> anyhow::Result<()> {
                                 item.workspace_id.clone(),
                                 item.state.clone(),
                             );
-                            replan_item.phase = QueuePhase::Hitl;
+                            replan_item.set_phase_unchecked(QueuePhase::Hitl);
                             replan_item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
                             replan_item.hitl_reason =
                                 Some(belt_core::queue::HitlReason::SpecModificationProposed);
@@ -4414,26 +4414,15 @@ sources:
         state: &str,
         phase: QueuePhase,
     ) -> belt_core::queue::QueueItem {
-        belt_core::queue::QueueItem {
-            work_id: work_id.to_string(),
-            source_id: format!("gh:test/repo#{}", work_id),
-            workspace_id: ws_id.to_string(),
-            state: state.to_string(),
-            phase,
-            title: Some("test item".to_string()),
-            created_at: chrono::Utc::now().to_rfc3339(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-            hitl_created_at: None,
-            hitl_respondent: None,
-            hitl_notes: None,
-            hitl_reason: None,
-            hitl_timeout_at: None,
-            hitl_terminal_action: None,
-            worktree_preserved: false,
-            previous_worktree_path: None,
-            replan_count: 0,
-            lateral_plan: None,
-        }
+        let mut item = belt_core::queue::QueueItem::new(
+            work_id.to_string(),
+            format!("gh:test/repo#{}", work_id),
+            ws_id.to_string(),
+            state.to_string(),
+        );
+        item.set_phase_unchecked(phase);
+        item.title = Some("test item".to_string());
+        item
     }
 
     /// Helper: build an `ActionExecutor` with default shell and a minimal
@@ -4507,7 +4496,7 @@ sources:
         }
 
         let final_item = db.get_item("done-ok-1").unwrap();
-        assert_eq!(final_item.phase, QueuePhase::Done);
+        assert_eq!(final_item.phase(), QueuePhase::Done);
     }
 
     /// on_done script fails -> item transitions to Failed.
@@ -4567,7 +4556,7 @@ sources:
         }
 
         let final_item = db.get_item("done-fail-1").unwrap();
-        assert_eq!(final_item.phase, QueuePhase::Failed);
+        assert_eq!(final_item.phase(), QueuePhase::Failed);
     }
 
     /// No on_done configured -> direct Done transition.
@@ -4612,7 +4601,7 @@ sources:
         db.update_phase("done-direct-1", QueuePhase::Done).unwrap();
 
         let final_item = db.get_item("done-direct-1").unwrap();
-        assert_eq!(final_item.phase, QueuePhase::Done);
+        assert_eq!(final_item.phase(), QueuePhase::Done);
     }
 
     /// Worktree cleanup is invoked on Done transition.
@@ -4668,7 +4657,7 @@ sources:
         db.update_phase("skip-1", QueuePhase::Skipped).unwrap();
 
         let final_item = db.get_item("skip-1").unwrap();
-        assert_eq!(final_item.phase, QueuePhase::Skipped);
+        assert_eq!(final_item.phase(), QueuePhase::Skipped);
     }
 
     // ---- cmd_queue_retry_script tests ----
@@ -4695,7 +4684,7 @@ sources:
 
         // Replicate cmd_queue_retry_script logic.
         let stored = db.get_item("retry-ok-1").unwrap();
-        assert_eq!(stored.phase, QueuePhase::Failed);
+        assert_eq!(stored.phase(), QueuePhase::Failed);
 
         let (_, config_path, _) = db.get_workspace(&stored.workspace_id).unwrap();
         let config =
@@ -4728,7 +4717,7 @@ sources:
         }
 
         let final_item = db.get_item("retry-ok-1").unwrap();
-        assert_eq!(final_item.phase, QueuePhase::Done);
+        assert_eq!(final_item.phase(), QueuePhase::Done);
 
         // Verify script_retry transition event was recorded.
         record_script_retry_event(&db, "retry-ok-1", &item.source_id, QueuePhase::Done, None);
@@ -4765,7 +4754,7 @@ sources:
         db.insert_item(&item).unwrap();
 
         let stored = db.get_item("retry-fail-1").unwrap();
-        assert_eq!(stored.phase, QueuePhase::Failed);
+        assert_eq!(stored.phase(), QueuePhase::Failed);
 
         let (_, config_path, _) = db.get_workspace(&stored.workspace_id).unwrap();
         let config =
@@ -4802,7 +4791,7 @@ sources:
         }
 
         let final_item = db.get_item("retry-fail-1").unwrap();
-        assert_eq!(final_item.phase, QueuePhase::Failed);
+        assert_eq!(final_item.phase(), QueuePhase::Failed);
 
         // Verify script_retry transition event was recorded for the failure case.
         record_script_retry_event(
@@ -4851,8 +4840,8 @@ sources:
         db.insert_item(&item).unwrap();
 
         let stored = db.get_item("retry-reject-1").unwrap();
-        // cmd_queue_retry_script checks: if item.phase != QueuePhase::Failed { bail! }
-        assert_ne!(stored.phase, QueuePhase::Failed);
+        // cmd_queue_retry_script checks: if item.phase() != QueuePhase::Failed { bail! }
+        assert_ne!(stored.phase(), QueuePhase::Failed);
     }
 
     /// retry_script: timeout causes early return, item remains Failed.
@@ -4906,7 +4895,7 @@ sources:
 
         // Item remains Failed since timeout prevents phase change.
         let final_item = db.get_item("retry-timeout-1").unwrap();
-        assert_eq!(final_item.phase, QueuePhase::Failed);
+        assert_eq!(final_item.phase(), QueuePhase::Failed);
     }
 
     // --- Spec decompose: build_decomposed_issues_from_llm tests ---

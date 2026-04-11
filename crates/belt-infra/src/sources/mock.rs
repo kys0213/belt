@@ -37,7 +37,7 @@ impl MockDataSource {
             work_id: item.work_id.clone(),
             workspace: item.workspace_id.clone(),
             queue: QueueContext {
-                phase: item.phase.as_str().to_string(),
+                phase: item.phase().as_str().to_string(),
                 state: item.state.clone(),
                 source_id: item.source_id.clone(),
             },

@@ -356,7 +356,10 @@ async fn complete_then_mark_done() {
     let result = daemon.mark_done("github:org/repo#1:analyze");
     assert!(result.is_ok());
     assert_eq!(
-        daemon.get_item("github:org/repo#1:analyze").unwrap().phase,
+        daemon
+            .get_item("github:org/repo#1:analyze")
+            .unwrap()
+            .phase(),
         QueuePhase::Done
     );
 }

@@ -215,12 +215,15 @@ pub fn gather_status(db: &Database) -> anyhow::Result<SystemStatus> {
     let running = db.list_items(Some(QueuePhase::Running), None)?;
     let running_items = running
         .into_iter()
-        .map(|item| ItemSummary {
-            work_id: item.work_id,
-            workspace: item.workspace_id,
-            state: item.state,
-            phase: item.phase.as_str().to_string(),
-            updated_at: item.updated_at,
+        .map(|item| {
+            let phase = item.phase().as_str().to_string();
+            ItemSummary {
+                work_id: item.work_id,
+                workspace: item.workspace_id,
+                state: item.state,
+                phase,
+                updated_at: item.updated_at,
+            }
         })
         .collect();
 
@@ -249,7 +252,7 @@ pub fn gather_status(db: &Database) -> anyhow::Result<SystemStatus> {
         let ws_total = ws_items.len() as u32;
         let mut counts = std::collections::HashMap::<String, u32>::new();
         for item in &ws_items {
-            *counts.entry(item.phase.as_str().to_string()).or_insert(0) += 1;
+            *counts.entry(item.phase().as_str().to_string()).or_insert(0) += 1;
         }
         let mut ws_phases: Vec<PhaseCount> = counts
             .into_iter()
@@ -267,12 +270,15 @@ pub fn gather_status(db: &Database) -> anyhow::Result<SystemStatus> {
     let failed = db.list_items(Some(QueuePhase::Failed), None)?;
     let error_items = failed
         .into_iter()
-        .map(|item| ItemSummary {
-            work_id: item.work_id,
-            workspace: item.workspace_id,
-            state: item.state,
-            phase: item.phase.as_str().to_string(),
-            updated_at: item.updated_at,
+        .map(|item| {
+            let phase = item.phase().as_str().to_string();
+            ItemSummary {
+                work_id: item.work_id,
+                workspace: item.workspace_id,
+                state: item.state,
+                phase,
+                updated_at: item.updated_at,
+            }
         })
         .collect();
 
@@ -280,12 +286,15 @@ pub fn gather_status(db: &Database) -> anyhow::Result<SystemStatus> {
     let hitl = db.list_items(Some(QueuePhase::Hitl), None)?;
     let hitl_items = hitl
         .into_iter()
-        .map(|item| ItemSummary {
-            work_id: item.work_id,
-            workspace: item.workspace_id,
-            state: item.state,
-            phase: item.phase.as_str().to_string(),
-            updated_at: item.updated_at,
+        .map(|item| {
+            let phase = item.phase().as_str().to_string();
+            ItemSummary {
+                work_id: item.work_id,
+                workspace: item.workspace_id,
+                state: item.state,
+                phase,
+                updated_at: item.updated_at,
+            }
         })
         .collect();
 
@@ -469,7 +478,7 @@ pub fn gather_spec_status(db: &Database, workspace: &str) -> anyhow::Result<Spec
 
     let mut counts = std::collections::HashMap::<String, u32>::new();
     for item in &all_items {
-        *counts.entry(item.phase.as_str().to_string()).or_insert(0) += 1;
+        *counts.entry(item.phase().as_str().to_string()).or_insert(0) += 1;
     }
 
     let mut phase_counts: Vec<PhaseCount> = counts
@@ -514,7 +523,7 @@ fn gather_spec_details(
         // Keep the latest item per source_id (items are ordered by creation).
         item_lookup.insert(
             item.source_id.as_str(),
-            (item.phase.as_str(), item.title.as_deref()),
+            (item.phase().as_str(), item.title.as_deref()),
         );
     }
 
@@ -1607,7 +1616,7 @@ mod tests {
             workspace_id.to_string(),
             "implement".to_string(),
         );
-        item.phase = phase;
+        item.set_phase_unchecked(phase);
         item
     }
 
@@ -2056,7 +2065,7 @@ mod tests {
             "ws-li".to_string(),
             "implement".to_string(),
         );
-        item.phase = QueuePhase::Done;
+        item.set_phase_unchecked(QueuePhase::Done);
         item.title = Some("JWT middleware".to_string());
         db.insert_item(&item).unwrap();
 
