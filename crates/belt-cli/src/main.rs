@@ -384,6 +384,14 @@ enum DependencyCommands {
         #[arg(long)]
         after: String,
     },
+    /// List dependencies for a queue item, or all dependencies.
+    List {
+        /// Queue item work_id (omit to list all dependencies).
+        queue_id: Option<String>,
+        /// Output format.
+        #[arg(long, default_value = "text")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1186,6 +1194,47 @@ fn cmd_queue_dependency_remove(queue_id: &str, after: &str) -> anyhow::Result<()
     let db = open_db()?;
     db.remove_queue_dependency(queue_id, after)?;
     println!("Removed dependency: {queue_id} no longer depends on {after}.");
+    Ok(())
+}
+
+/// `belt queue dependency list` -- list dependencies for a queue item or all items.
+fn cmd_queue_dependency_list(queue_id: Option<&str>, format: &str) -> anyhow::Result<()> {
+    let db = open_db()?;
+    if let Some(id) = queue_id {
+        let deps = db.list_queue_dependencies(id)?;
+        match format {
+            "json" => {
+                let obj = serde_json::json!({ "work_id": id, "depends_on": deps });
+                println!("{}", serde_json::to_string_pretty(&obj)?);
+            }
+            _ => {
+                if deps.is_empty() {
+                    println!("No dependencies for {id}.");
+                } else {
+                    println!("Dependencies for {id}:");
+                    for dep in &deps {
+                        println!("  - {dep}");
+                    }
+                }
+            }
+        }
+    } else {
+        let all = db.list_all_queue_dependencies()?;
+        match format {
+            "json" => {
+                println!("{}", serde_json::to_string_pretty(&all)?);
+            }
+            _ => {
+                if all.is_empty() {
+                    println!("No dependencies found.");
+                } else {
+                    for (work_id, depends_on) in &all {
+                        println!("{work_id} -> {depends_on}");
+                    }
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2462,6 +2511,9 @@ async fn main() -> anyhow::Result<()> {
                 }
                 DependencyCommands::Remove { queue_id, after } => {
                     cmd_queue_dependency_remove(&queue_id, &after)?;
+                }
+                DependencyCommands::List { queue_id, format } => {
+                    cmd_queue_dependency_list(queue_id.as_deref(), &format)?;
                 }
             },
         },
