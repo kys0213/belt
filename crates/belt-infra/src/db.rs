@@ -1577,25 +1577,84 @@ impl Database {
     /// Add a dependency between two queue items.
     ///
     /// Declares that `work_id` depends on (must run after) `depends_on_id`.
+    /// Before inserting, performs a DFS cycle check to prevent circular
+    /// dependencies that could cause runtime deadlocks.
     ///
     /// # Errors
-    /// Returns `BeltError::Database` on constraint violation or I/O error.
+    /// - Returns `BeltError::CircularDependency` if adding this edge would
+    ///   create a cycle.
+    /// - Returns `BeltError::Database` on constraint violation or I/O error.
     pub fn add_queue_dependency(
         &self,
         work_id: &str,
         depends_on_id: &str,
     ) -> Result<(), BeltError> {
-        let now = Utc::now().to_rfc3339();
+        // Self-dependency is a trivial cycle.
+        if work_id == depends_on_id {
+            return Err(BeltError::CircularDependency(format!(
+                "{work_id} -> {work_id}"
+            )));
+        }
+
         let conn = self
             .conn
             .lock()
             .map_err(|e| BeltError::Database(e.to_string()))?;
+
+        // Check for circular dependency using DFS before inserting.
+        // We want to verify that `depends_on_id` does not transitively
+        // depend on `work_id`. Starting from `depends_on_id`, follow
+        // the depends_on edges; if we reach `work_id`, a cycle exists.
+        Self::detect_cycle(&conn, work_id, depends_on_id)?;
+
+        let now = Utc::now().to_rfc3339();
         conn.execute(
             "INSERT OR IGNORE INTO queue_dependencies (work_id, depends_on, created_at)
                  VALUES (?1, ?2, ?3)",
             params![work_id, depends_on_id, now],
         )
         .map_err(|e| BeltError::Database(e.to_string()))?;
+        Ok(())
+    }
+
+    /// DFS cycle detection: starting from `start`, follow depends_on edges
+    /// in the existing graph. If we reach `target`, a cycle would be formed.
+    fn detect_cycle(
+        conn: &rusqlite::Connection,
+        target: &str,
+        start: &str,
+    ) -> Result<(), BeltError> {
+        use std::collections::HashSet;
+
+        let mut visited = HashSet::new();
+        let mut stack = vec![start.to_string()];
+
+        while let Some(node) = stack.pop() {
+            if node == target {
+                return Err(BeltError::CircularDependency(format!(
+                    "{target} -> ... -> {node}"
+                )));
+            }
+            if !visited.insert(node.clone()) {
+                continue;
+            }
+            // Find all nodes that `node` depends on (outgoing edges).
+            let mut stmt = conn
+                .prepare(
+                    "SELECT depends_on FROM queue_dependencies WHERE work_id = ?1",
+                )
+                .map_err(|e| BeltError::Database(e.to_string()))?;
+            let deps: Vec<String> = stmt
+                .query_map(params![node], |row| row.get(0))
+                .map_err(|e| BeltError::Database(e.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| BeltError::Database(e.to_string()))?;
+            for dep in deps {
+                if !visited.contains(&dep) {
+                    stack.push(dep);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -3464,6 +3523,61 @@ mod tests {
         let db = test_db();
         let deps = db.list_queue_dependencies("item-a").unwrap();
         assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn circular_dependency_self_loop() {
+        let db = test_db();
+        let result = db.add_queue_dependency("item-a", "item-a");
+        assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), BeltError::CircularDependency(_)),
+            "self-loop should be detected as circular dependency"
+        );
+    }
+
+    #[test]
+    fn circular_dependency_direct_cycle() {
+        let db = test_db();
+        // A depends on B
+        db.add_queue_dependency("item-a", "item-b").unwrap();
+        // B depends on A => cycle: B -> A -> B
+        let result = db.add_queue_dependency("item-b", "item-a");
+        assert!(
+            matches!(result, Err(BeltError::CircularDependency(_))),
+            "direct cycle should be detected"
+        );
+    }
+
+    #[test]
+    fn circular_dependency_indirect_cycle() {
+        let db = test_db();
+        // A -> B -> C (A depends on B, B depends on C)
+        db.add_queue_dependency("item-a", "item-b").unwrap();
+        db.add_queue_dependency("item-b", "item-c").unwrap();
+        // C -> A => cycle: C -> A -> B -> C
+        let result = db.add_queue_dependency("item-c", "item-a");
+        assert!(
+            matches!(result, Err(BeltError::CircularDependency(_))),
+            "indirect cycle (3 nodes) should be detected"
+        );
+    }
+
+    #[test]
+    fn circular_dependency_long_chain() {
+        let db = test_db();
+        // A -> B -> C -> D
+        db.add_queue_dependency("item-a", "item-b").unwrap();
+        db.add_queue_dependency("item-b", "item-c").unwrap();
+        db.add_queue_dependency("item-c", "item-d").unwrap();
+        // D -> A => cycle through 4 nodes
+        let result = db.add_queue_dependency("item-d", "item-a");
+        assert!(
+            matches!(result, Err(BeltError::CircularDependency(_))),
+            "long indirect cycle (4 nodes) should be detected"
+        );
+        // Non-cyclic addition should still work
+        db.add_queue_dependency("item-d", "item-e").unwrap();
     }
 
     // ---- Script Execution Stats ---------------------------------------------
