@@ -2013,10 +2013,22 @@ impl Daemon {
                 // Persist the worktree path so it survives daemon restart.
                 item.previous_worktree_path = wt_path_str;
 
+                let from_phase = item.phase();
                 if let Err(e) = transit(item, QueuePhase::Pending) {
                     tracing::error!("failed to rollback {}: {e}", item.work_id);
                     continue;
                 }
+
+                // Record the shutdown rollback in transition_events for auditability.
+                Self::record_transition(
+                    &self.db,
+                    &item.work_id,
+                    &item.source_id,
+                    from_phase,
+                    QueuePhase::Pending,
+                    "shutdown_rollback",
+                    Some("graceful shutdown timeout: rolled back to Pending".to_string()),
+                );
 
                 // Persist worktree state to DB so it survives restart.
                 // Items collected from DataSource live in-memory only and may
@@ -4946,6 +4958,54 @@ sources:
                     .error
                     .as_ref()
                     .is_some_and(|err| err.contains("forced shutdown via second SIGINT"))
+            );
+        }
+    }
+
+    #[test]
+    fn rollback_running_to_pending_records_shutdown_rollback_transition_event() {
+        // When rollback_running_to_pending is called (e.g. drain timeout),
+        // each rolled-back item should have a transition_event with
+        // event_type='shutdown_rollback' recorded in the DB.
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![]);
+
+        let db = Database::open_in_memory().unwrap();
+        let mut daemon = daemon.with_db(db);
+
+        for i in 0..2u32 {
+            let mut item = test_item(&format!("github:org/repo#{i}"), "analyze");
+            item.set_phase_unchecked(QueuePhase::Running);
+            item.updated_at = Utc::now().to_rfc3339();
+            daemon.push_item(item);
+        }
+
+        daemon.rollback_running_to_pending();
+
+        assert_eq!(daemon.items_in_phase(QueuePhase::Pending).len(), 2);
+
+        // Verify transition_events were recorded for each item.
+        let db = daemon.db.as_ref().unwrap();
+        for i in 0..2u32 {
+            let work_id = format!("github:org/repo#{i}:analyze");
+            let events = db.list_transition_events(&work_id).unwrap();
+            let rollback_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.event_type == "shutdown_rollback")
+                .collect();
+            assert_eq!(
+                rollback_events.len(),
+                1,
+                "expected one shutdown_rollback event for {work_id}"
+            );
+            let ev = rollback_events[0];
+            assert_eq!(ev.from_phase.as_deref(), Some("running"));
+            assert_eq!(ev.phase.as_deref(), Some("pending"));
+            assert!(
+                ev.detail
+                    .as_ref()
+                    .is_some_and(|d| d.contains("shutdown timeout"))
             );
         }
     }
