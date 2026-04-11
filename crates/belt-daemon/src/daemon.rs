@@ -269,6 +269,39 @@ impl Daemon {
         }
     }
 
+    /// Record a stagnation detection event in the `transition_events` table.
+    ///
+    /// Uses `event_type = "stagnation"` with no phase fields, since stagnation
+    /// is an analytical event rather than a state-machine transition.
+    fn record_stagnation_event(
+        db: &Option<Arc<Database>>,
+        work_id: &str,
+        source_id: &str,
+        detail: &str,
+    ) {
+        let Some(db) = db.as_ref() else {
+            return;
+        };
+        let now = Utc::now();
+        let event = TransitionEvent {
+            id: format!("te-{}-{}", work_id, now.timestamp_millis()),
+            work_id: work_id.to_string(),
+            source_id: source_id.to_string(),
+            event_type: "stagnation".to_string(),
+            phase: None,
+            from_phase: None,
+            detail: Some(detail.to_string()),
+            created_at: now.to_rfc3339(),
+        };
+        if let Err(e) = db.insert_transition_event(&event) {
+            tracing::warn!(
+                work_id = %work_id,
+                error = %e,
+                "failed to record stagnation event"
+            );
+        }
+    }
+
     // ---------------------------------------------------------------
     // Phase 1: Collect items from DataSources
     // ---------------------------------------------------------------
@@ -824,8 +857,12 @@ impl Daemon {
                 );
 
                 // Detect stagnation and generate a lateral plan for retry injection.
-                let lateral_plan =
-                    self.detect_stagnation_and_generate_plan(&item.source_id, &item.state, &error);
+                let lateral_plan = self.detect_stagnation_and_generate_plan(
+                    &item.work_id,
+                    &item.source_id,
+                    &item.state,
+                    &error,
+                );
 
                 self.handle_escalation(&mut item, escalation, lateral_plan);
                 self.tracker.release(&ws_name);
@@ -2132,6 +2169,7 @@ impl Daemon {
     /// builds a directive-based lateral plan string.
     fn detect_stagnation_and_generate_plan(
         &self,
+        work_id: &str,
         source_id: &str,
         state: &str,
         current_error: &str,
@@ -2200,6 +2238,16 @@ impl Daemon {
             persona = persona,
             directive = persona.directive(),
         );
+
+        // Record stagnation detection event in transition_events.
+        let detail = serde_json::json!({
+            "pattern_type": detection.pattern.to_string(),
+            "confidence": detection.confidence,
+            "reason": detection.reason,
+            "recommended_persona": persona.to_string(),
+            "failure_count": failure_count,
+        });
+        Self::record_stagnation_event(&self.db, work_id, source_id, &detail.to_string());
 
         tracing::info!(
             source_id = %source_id,
@@ -5434,7 +5482,8 @@ sources:
         let source = MockDataSource::new("github");
         let daemon = setup_daemon(&tmp, source, vec![0]);
 
-        let result = daemon.detect_stagnation_and_generate_plan("src:1", "implement", "error");
+        let result =
+            daemon.detect_stagnation_and_generate_plan("w:1", "src:1", "implement", "error");
         assert!(result.is_none());
     }
 
@@ -5449,8 +5498,12 @@ sources:
         daemon.record_history_event(&item, "failed", Some("compile error".to_string()));
 
         // Only 2 outputs (1 prior + 1 current), need min_consecutive=2 spinning pairs.
-        let result =
-            daemon.detect_stagnation_and_generate_plan("src:1", "implement", "compile error");
+        let result = daemon.detect_stagnation_and_generate_plan(
+            "w:1",
+            "src:1",
+            "implement",
+            "compile error",
+        );
         assert!(result.is_none());
     }
 
@@ -5466,8 +5519,12 @@ sources:
             daemon.record_history_event(&item, "failed", Some("compile error X".to_string()));
         }
 
-        let result =
-            daemon.detect_stagnation_and_generate_plan("src:1", "implement", "compile error X");
+        let result = daemon.detect_stagnation_and_generate_plan(
+            "w:1",
+            "src:1",
+            "implement",
+            "compile error X",
+        );
         assert!(
             result.is_some(),
             "expected lateral plan for spinning pattern"
@@ -5490,8 +5547,61 @@ sources:
         daemon.record_history_event(&item, "failed", Some("error B".to_string()));
         daemon.record_history_event(&item, "failed", Some("error C".to_string()));
 
-        let result = daemon.detect_stagnation_and_generate_plan("src:1", "implement", "error D");
+        let result =
+            daemon.detect_stagnation_and_generate_plan("w:1", "src:1", "implement", "error D");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn detect_stagnation_records_transition_event() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![0]);
+
+        let db = Database::open_in_memory().unwrap();
+        let mut daemon = daemon.with_db(db);
+
+        let item = test_item("src:1", "implement");
+        for _ in 0..3 {
+            daemon.record_history_event(&item, "failed", Some("compile error X".to_string()));
+        }
+
+        let result = daemon.detect_stagnation_and_generate_plan(
+            &item.work_id,
+            "src:1",
+            "implement",
+            "compile error X",
+        );
+        assert!(result.is_some(), "expected stagnation detection");
+
+        // Verify the stagnation event was recorded in transition_events.
+        let events = daemon
+            .db
+            .as_ref()
+            .unwrap()
+            .list_transition_events(&item.work_id)
+            .unwrap();
+        let stagnation_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "stagnation")
+            .collect();
+        assert_eq!(
+            stagnation_events.len(),
+            1,
+            "expected exactly one stagnation event"
+        );
+        let ev = stagnation_events[0];
+        assert_eq!(ev.work_id, item.work_id);
+        assert_eq!(ev.source_id, "src:1");
+        assert!(ev.phase.is_none());
+        assert!(ev.from_phase.is_none());
+
+        let detail: serde_json::Value =
+            serde_json::from_str(ev.detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["pattern_type"], "spinning");
+        assert!(detail["confidence"].as_f64().unwrap() > 0.0);
+        assert!(detail["recommended_persona"].as_str().is_some());
+        assert!(detail["failure_count"].as_u64().unwrap() >= 1);
     }
 
     // --- handle_escalation with lateral_plan tests ---
