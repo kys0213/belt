@@ -40,4 +40,7 @@ pub enum BeltError {
 
     #[error("stagnation error: {0}")]
     Stagnation(String),
+
+    #[error("circular dependency detected: {0}")]
+    CircularDependency(String),
 }
