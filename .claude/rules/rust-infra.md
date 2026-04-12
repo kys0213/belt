@@ -1,6 +1,6 @@
 ---
 paths:
-  - "crates/belt-infra/**/*.rs"
+  - "**/belt-infra/**/*.rs"
 ---
 
 # Infrastructure 레이어 컨벤션 (외부 시스템 어댑터)

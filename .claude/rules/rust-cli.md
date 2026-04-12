@@ -1,6 +1,6 @@
 ---
 paths:
-  - "crates/belt-cli/**/*.rs"
+  - "**/belt-cli/**/*.rs"
 ---
 
 # CLI 레이어 컨벤션 (사용자 인터페이스)
