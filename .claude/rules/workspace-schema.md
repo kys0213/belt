@@ -1,7 +1,8 @@
 ---
 paths:
-  - "**/*.yaml"
-  - "**/*.yml"
+  - "**/workspace*.yaml"
+  - "**/workspace*.yml"
+  - "tests/**/*.yaml"
 ---
 
 # workspace.yaml 스키마 컨벤션
@@ -10,7 +11,7 @@ paths:
 
 ## 원칙
 
-1. **필수 필드**: `name`, `sources`, `concurrency`는 반드시 포함한다.
+1. **필수 필드**: `name`은 반드시 포함한다. `sources`(기본 빈 맵)와 `concurrency`(기본 1)는 생략 가능하나 명시를 권장한다.
 2. **prompt/script 분리**: handler 하나는 `prompt` 또는 `script` 중 하나만 가진다. 혼용하지 않는다.
 3. **환경변수 주입은 2개만**: 핸들러 실행 시 주입되는 환경변수는 `WORK_ID`와 `WORKTREE`뿐이다. 추가 변수를 기대하는 스크립트를 작성하지 않는다.
 4. **on_done/on_fail은 side-effect 전용**: hook은 외부 시스템 반영(GitHub 댓글, 라벨 변경)을 담당한다. 도메인 로직을 넣지 않는다.
@@ -81,7 +82,7 @@ escalation:
 
 ## 체크리스트
 
-- [ ] `name`, `sources`, `concurrency` 필드가 있는가
+- [ ] `name` 필드가 있는가 (`sources`, `concurrency`는 명시 권장)
 - [ ] 각 handler에 `prompt` 또는 `script` 중 하나만 있는가
 - [ ] 스크립트가 `WORK_ID`, `WORKTREE` 외 환경변수에 의존하지 않는가
 - [ ] `on_done`/`on_fail`이 외부 시스템 반영(GitHub 댓글 등)만 담당하는가
