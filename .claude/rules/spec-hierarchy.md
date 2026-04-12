@@ -1,6 +1,8 @@
 ---
 paths:
-  - "spec/**/*.md"
+  - "spec/DESIGN.md"
+  - "spec/concerns/*.md"
+  - "spec/flows/*.md"
 ---
 
 # Spec 문서 계층 구조

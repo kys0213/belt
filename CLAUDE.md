@@ -73,3 +73,23 @@ gh workflow run release-please.yml   # Release PR 생성/업데이트 (수동)
 - Release PR 머지 시 자동으로 태그 생성 → release.yml 트리거 → 5개 플랫폼 바이너리 빌드 + GitHub Release
 
 PR 제목도 conventional commit 형식을 따른다 (squash merge 시 커밋 메시지로 사용됨).
+
+## 프로젝트 맥락
+
+- **종류**: 제품 (CLI 도구 + 데몬 서비스)
+- **팀**: 1인 개발
+- **주요 독자**: Rust 개발자
+
+## 엔지니어링 가치
+
+- 가독성 > 성능 (프로파일링으로 확인된 병목만 최적화)
+- 명시성 > 간결성 (trait 경계·에러 타입·match 브랜치 명시)
+- 안정성 > 속도 (의심스러우면 HITL)
+- 추상화는 Rule of 3 (3번 반복 전까지 명시적 중복 허용)
+
+## 문서화
+
+- **톤**: 기술적 한다체 (`~한다`, `~된다`)
+- **언어**: README=영어, spec/rules=한국어 기반, 기술용어=영어 원어 유지
+- **독자**: Rust 개발자 (코드 예시·trait 이름 자유롭게 사용)
+- **구조**: 비교/분류는 테이블 우선, 핵심 제약은 blockquote 강조

@@ -1,6 +1,6 @@
 ---
 paths:
-  - "crates/belt-core/**/*.rs"
+  - "**/belt-core/**/*.rs"
 ---
 
 # Core 레이어 컨벤션 (도메인 모델 / trait / enum)

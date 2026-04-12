@@ -1,3 +1,9 @@
+---
+paths:
+  - "CHANGELOG.md"
+  - ".github/**"
+---
+
 # Commit Convention (Release Please 연동)
 
 Conventional Commits 형식을 **반드시** 준수한다. Release Please가 커밋 메시지를 파싱하여 자동으로 버전을 결정한다.

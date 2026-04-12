@@ -1,6 +1,6 @@
 ---
 paths:
-  - "crates/belt-daemon/**/*.rs"
+  - "**/belt-daemon/**/*.rs"
 ---
 
 # Daemon 레이어 컨벤션 (실행 루프 + Cron)
