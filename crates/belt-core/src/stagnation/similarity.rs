@@ -4,7 +4,7 @@
 //! - [`ExactHash`]: byte-exact equality via hash comparison.
 //! - [`TokenFingerprint`]: normalized token-level similarity using Jaccard index.
 //! - [`NcdJudge`]: Normalized Compression Distance via flate2 GzEncoder.
-//! - [`CompositeSimilarity`]: combines multiple judges, returning the maximum score.
+//! - [`CompositeSimilarity`]: combines multiple judges using weighted average.
 
 use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
@@ -169,26 +169,30 @@ impl SimilarityJudge for NcdJudge {
     }
 }
 
-/// Combines multiple [`SimilarityJudge`]s, returning the maximum score.
+/// Combines multiple [`SimilarityJudge`]s using weighted average.
+///
+/// Each judge is paired with a weight. The composite score is computed as:
+/// `sum(score_i * weight_i) / sum(weight_i)`, clamped to `[0.0, 1.0]`.
+/// Returns 0.0 when there are no judges (total weight is zero).
 pub struct CompositeSimilarity {
-    judges: Vec<Box<dyn SimilarityJudge>>,
+    judges: Vec<(Box<dyn SimilarityJudge>, f64)>,
 }
 
 impl CompositeSimilarity {
-    /// Create a new composite from the given judges.
-    pub fn new(judges: Vec<Box<dyn SimilarityJudge>>) -> Self {
+    /// Create a new composite from the given `(judge, weight)` pairs.
+    pub fn new(judges: Vec<(Box<dyn SimilarityJudge>, f64)>) -> Self {
         Self { judges }
     }
 }
 
 impl Default for CompositeSimilarity {
-    /// Default preset with ExactHash, TokenFingerprint, and NcdJudge.
+    /// Default preset per spec R-016: ExactHash(0.5), TokenFingerprint(0.3), NcdJudge(0.2).
     fn default() -> Self {
         Self {
             judges: vec![
-                Box::new(ExactHash),
-                Box::new(TokenFingerprint),
-                Box::new(NcdJudge::default()),
+                (Box::new(ExactHash), 0.5),
+                (Box::new(TokenFingerprint), 0.3),
+                (Box::new(NcdJudge::default()), 0.2),
             ],
         }
     }
@@ -196,10 +200,17 @@ impl Default for CompositeSimilarity {
 
 impl SimilarityJudge for CompositeSimilarity {
     fn score(&self, a: &str, b: &str) -> SimilarityScore {
-        self.judges
+        let (weighted_sum, total_weight) = self
+            .judges
             .iter()
-            .map(|j| j.score(a, b))
-            .fold(0.0_f64, f64::max)
+            .map(|(j, w)| (j.score(a, b) * w, w))
+            .fold((0.0_f64, 0.0_f64), |(s, tw), (v, w)| (s + v, tw + w));
+
+        if total_weight == 0.0 {
+            return 0.0;
+        }
+
+        (weighted_sum / total_weight).clamp(0.0, 1.0)
     }
 
     fn name(&self) -> &str {
@@ -337,27 +348,84 @@ mod tests {
     #[test]
     fn composite_default_includes_ncd() {
         let composite = CompositeSimilarity::default();
-        // Default preset should have 3 judges
+        // Default preset: ExactHash(0.5) + TokenFingerprint(0.3) + NcdJudge(0.2)
+        // For identical text, ExactHash=1.0, TokenFingerprint=1.0, NCD~=1.0 (short strings
+        // have slight gz header overhead), so the weighted average is near 1.0.
         let score = composite.score("hello world", "hello world");
+        assert!(
+            score > 0.95,
+            "identical text should score near 1.0, got {score}"
+        );
+    }
+
+    #[test]
+    fn composite_weighted_average() {
+        // ExactHash returns 0.0 for different strings, TokenFingerprint returns >0.0
+        let composite = CompositeSimilarity::new(vec![
+            (Box::new(ExactHash), 0.5),
+            (Box::new(TokenFingerprint), 0.5),
+        ]);
+        // "hello world" vs "hello earth": ExactHash=0.0, TokenFingerprint=1/3
+        // weighted avg = (0.0*0.5 + (1.0/3.0)*0.5) / (0.5+0.5) = 1/6
+        let score = composite.score("hello world", "hello earth");
+        let token_score = TokenFingerprint.score("hello world", "hello earth");
+        let expected = (0.0 * 0.5 + token_score * 0.5) / 1.0;
+        assert!(
+            (score - expected).abs() < 0.001,
+            "expected {expected}, got {score}"
+        );
+    }
+
+    #[test]
+    fn composite_weighted_average_exact_match() {
+        let composite = CompositeSimilarity::new(vec![
+            (Box::new(ExactHash), 0.5),
+            (Box::new(TokenFingerprint), 0.5),
+        ]);
+        // Exact match -- both return 1.0, weighted avg = 1.0
+        let score = composite.score("hello", "hello");
         assert!((score - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
-    fn composite_returns_max() {
-        let composite =
-            CompositeSimilarity::new(vec![Box::new(ExactHash), Box::new(TokenFingerprint)]);
-        // Different strings but overlapping tokens — ExactHash=0.0, TokenFingerprint>0.0
+    fn composite_respects_weights() {
+        // Give all weight to ExactHash (returns 0.0 for different strings)
+        let composite = CompositeSimilarity::new(vec![
+            (Box::new(ExactHash), 1.0),
+            (Box::new(TokenFingerprint), 0.0),
+        ]);
         let score = composite.score("hello world", "hello earth");
-        assert!(score > 0.0);
-        // Exact match — both return 1.0
-        let score = composite.score("hello", "hello");
-        assert!((score - 1.0).abs() < f64::EPSILON);
+        // ExactHash=0.0 * 1.0 + TokenFingerprint * 0.0 = 0.0, total_weight=1.0
+        assert!((score).abs() < f64::EPSILON);
+
+        // Give all weight to TokenFingerprint
+        let composite = CompositeSimilarity::new(vec![
+            (Box::new(ExactHash), 0.0),
+            (Box::new(TokenFingerprint), 1.0),
+        ]);
+        let score = composite.score("hello world", "hello earth");
+        let expected = TokenFingerprint.score("hello world", "hello earth");
+        assert!(
+            (score - expected).abs() < f64::EPSILON,
+            "expected {expected}, got {score}"
+        );
     }
 
     #[test]
     fn composite_empty_judges() {
         let composite = CompositeSimilarity::new(vec![]);
         assert!((composite.score("a", "b")).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn composite_result_clamped() {
+        // Even with unusual inputs, result stays in [0.0, 1.0]
+        let composite = CompositeSimilarity::default();
+        let score = composite.score("abc", "xyz");
+        assert!(
+            (0.0..=1.0).contains(&score),
+            "score must be in [0,1], got {score}"
+        );
     }
 
     #[test]
