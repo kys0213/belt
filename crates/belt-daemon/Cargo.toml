@@ -16,6 +16,7 @@ async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+lru = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
