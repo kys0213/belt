@@ -521,4 +521,252 @@ mod tests {
         assert_eq!(parsed.failure_analysis, plan.failure_analysis);
         assert_eq!(parsed.alternative_approach, plan.alternative_approach);
     }
+
+    // --- Subprocess mock tests for analyze() ---
+
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+
+    use crate::platform::ShellOutput;
+
+    /// A configurable mock shell executor for testing `analyze()`.
+    struct MockShell {
+        /// The result to return from `execute`.
+        result: Mutex<Result<ShellOutput, BeltError>>,
+    }
+
+    impl MockShell {
+        /// Create a mock that returns a successful response with the given stdout.
+        fn success(stdout: &str) -> Self {
+            Self {
+                result: Mutex::new(Ok(ShellOutput {
+                    exit_code: Some(0),
+                    stdout: stdout.to_string(),
+                    stderr: String::new(),
+                })),
+            }
+        }
+
+        /// Create a mock that returns a non-zero exit code with the given stderr.
+        fn failure(exit_code: i32, stderr: &str) -> Self {
+            Self {
+                result: Mutex::new(Ok(ShellOutput {
+                    exit_code: Some(exit_code),
+                    stdout: String::new(),
+                    stderr: stderr.to_string(),
+                })),
+            }
+        }
+
+        /// Create a mock that returns an execution error (simulating e.g. timeout).
+        fn exec_error(message: &str) -> Self {
+            Self {
+                result: Mutex::new(Err(BeltError::Runtime(message.to_string()))),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ShellExecutor for MockShell {
+        async fn execute(
+            &self,
+            _command: &str,
+            _working_dir: &Path,
+            _env_vars: &HashMap<String, String>,
+        ) -> Result<ShellOutput, BeltError> {
+            let mut guard = self.result.lock().unwrap();
+            std::mem::replace(
+                &mut *guard,
+                Err(BeltError::Runtime("mock already consumed".to_string())),
+            )
+        }
+    }
+
+    fn test_detection() -> StagnationDetection {
+        StagnationDetection {
+            pattern: StagnationPattern::Spinning,
+            confidence: 0.9,
+            reason: "repeated identical errors".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn analyze_success_returns_lateral_plan() {
+        let response = "\
+- **Failure Analysis**: The session type is not imported correctly.
+- **Alternative Approach**: Use a type alias to simplify the import chain.
+- **Execution Plan**: 1. Add type alias. 2. Update imports.
+- **Warnings**: Alias may confuse new contributors.";
+
+        let shell = MockShell::success(response);
+        let analyzer = LateralAnalyzer::new();
+        let detection = test_detection();
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let params = AnalyzeParams {
+            detection: &detection,
+            failure_context: "compile error: Session not found",
+            attempted_personas: &[],
+            workspace: &workspace,
+        };
+
+        let plan = analyzer.analyze(&shell, &params).await.unwrap();
+
+        assert_eq!(plan.persona, Persona::Hacker); // first affinity for Spinning
+        assert_eq!(plan.triggered_by, StagnationPattern::Spinning);
+        assert!((plan.detection_confidence - 0.9).abs() < f64::EPSILON);
+        assert!(plan.failure_analysis.contains("session type"));
+        assert!(plan.alternative_approach.contains("type alias"));
+        assert!(plan.execution_plan.contains("Add type alias"));
+        assert!(plan.warnings.contains("confuse"));
+    }
+
+    #[tokio::test]
+    async fn analyze_success_skips_attempted_personas() {
+        let response = "**Failure Analysis**: root cause found.";
+        let shell = MockShell::success(response);
+        let analyzer = LateralAnalyzer::new();
+        let detection = test_detection();
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let attempted = [Persona::Hacker, Persona::Contrarian];
+        let params = AnalyzeParams {
+            detection: &detection,
+            failure_context: "compile error: Session not found",
+            attempted_personas: &attempted,
+            workspace: &workspace,
+        };
+
+        let plan = analyzer.analyze(&shell, &params).await.unwrap();
+
+        // Third in Spinning affinity order is Simplifier.
+        assert_eq!(plan.persona, Persona::Simplifier);
+    }
+
+    #[tokio::test]
+    async fn analyze_subprocess_nonzero_exit_returns_stagnation_error() {
+        let shell = MockShell::failure(1, "agent crashed");
+        let analyzer = LateralAnalyzer::new();
+        let detection = test_detection();
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let params = AnalyzeParams {
+            detection: &detection,
+            failure_context: "compile error",
+            attempted_personas: &[],
+            workspace: &workspace,
+        };
+
+        let err = analyzer.analyze(&shell, &params).await.unwrap_err();
+
+        match &err {
+            BeltError::Stagnation(msg) => {
+                assert!(msg.contains("subprocess failed"), "got: {msg}");
+                assert!(msg.contains("agent crashed"), "got: {msg}");
+                assert!(msg.contains("hacker"), "got: {msg}");
+            }
+            other => panic!("expected BeltError::Stagnation, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn analyze_subprocess_exec_error_returns_stagnation_error() {
+        let shell = MockShell::exec_error("connection timed out");
+        let analyzer = LateralAnalyzer::new();
+        let detection = test_detection();
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let params = AnalyzeParams {
+            detection: &detection,
+            failure_context: "compile error",
+            attempted_personas: &[],
+            workspace: &workspace,
+        };
+
+        let err = analyzer.analyze(&shell, &params).await.unwrap_err();
+
+        match &err {
+            BeltError::Stagnation(msg) => {
+                assert!(msg.contains("subprocess invocation failed"), "got: {msg}");
+                assert!(msg.contains("connection timed out"), "got: {msg}");
+            }
+            other => panic!("expected BeltError::Stagnation, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn analyze_empty_response_returns_stagnation_error() {
+        let shell = MockShell::success("   \n  "); // whitespace-only
+        let analyzer = LateralAnalyzer::new();
+        let detection = test_detection();
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let params = AnalyzeParams {
+            detection: &detection,
+            failure_context: "compile error",
+            attempted_personas: &[],
+            workspace: &workspace,
+        };
+
+        let err = analyzer.analyze(&shell, &params).await.unwrap_err();
+
+        match &err {
+            BeltError::Stagnation(msg) => {
+                assert!(msg.contains("empty response"), "got: {msg}");
+                assert!(msg.contains("hacker"), "got: {msg}");
+            }
+            other => panic!("expected BeltError::Stagnation, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn analyze_all_personas_exhausted_returns_stagnation_error() {
+        let shell = MockShell::exec_error("should not be called");
+        let analyzer = LateralAnalyzer::new();
+        let detection = test_detection();
+        let all_personas = Persona::ALL.to_vec();
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let params = AnalyzeParams {
+            detection: &detection,
+            failure_context: "compile error",
+            attempted_personas: &all_personas,
+            workspace: &workspace,
+        };
+
+        let err = analyzer.analyze(&shell, &params).await.unwrap_err();
+
+        match &err {
+            BeltError::Stagnation(msg) => {
+                assert!(msg.contains("all personas exhausted"), "got: {msg}");
+            }
+            other => panic!("expected BeltError::Stagnation, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn analyze_nonzero_exit_with_signal_terminated() {
+        let shell = MockShell {
+            result: Mutex::new(Ok(ShellOutput {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: "killed by signal".to_string(),
+            })),
+        };
+        let analyzer = LateralAnalyzer::new();
+        let detection = test_detection();
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let params = AnalyzeParams {
+            detection: &detection,
+            failure_context: "compile error",
+            attempted_personas: &[],
+            workspace: &workspace,
+        };
+
+        let err = analyzer.analyze(&shell, &params).await.unwrap_err();
+
+        match &err {
+            BeltError::Stagnation(msg) => {
+                assert!(msg.contains("subprocess failed"), "got: {msg}");
+                assert!(msg.contains("killed by signal"), "got: {msg}");
+            }
+            other => panic!("expected BeltError::Stagnation, got: {other:?}"),
+        }
+    }
 }
