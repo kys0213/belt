@@ -2163,12 +2163,28 @@ impl Daemon {
         }
 
         // Collect recent failure error messages for this source_id + state.
+        // Prefer DB query (R-018); fall back to in-memory history_events when DB
+        // is unavailable or the query fails.
         let errors: Vec<String> = self
-            .history_events
-            .iter()
-            .filter(|h| h.source_id == source_id && h.state == state && h.status == "failed")
-            .filter_map(|h| h.error.clone())
-            .collect();
+            .db
+            .as_ref()
+            .and_then(|db| db.get_history(source_id).ok())
+            .map(|db_events| {
+                db_events
+                    .into_iter()
+                    .filter(|h| h.state == state && h.status == "failed")
+                    .filter_map(|h| h.error)
+                    .collect()
+            })
+            .unwrap_or_else(|| {
+                self.history_events
+                    .iter()
+                    .filter(|h| {
+                        h.source_id == source_id && h.state == state && h.status == "failed"
+                    })
+                    .filter_map(|h| h.error.clone())
+                    .collect()
+            });
 
         // Need at least one prior failure to detect stagnation.
         if errors.is_empty() {
@@ -2422,7 +2438,7 @@ impl Daemon {
             .filter(|h| h.source_id == item.source_id && h.state == item.state)
             .count() as u32
             + 1;
-        self.history_events.push(HistoryEvent {
+        let event = HistoryEvent {
             work_id: item.work_id.clone(),
             source_id: item.source_id.clone(),
             state: item.state.clone(),
@@ -2431,7 +2447,26 @@ impl Daemon {
             summary: None,
             error,
             created_at: Utc::now(),
-        });
+        };
+
+        // Persist to DB when available (R-018: DB is the source of truth).
+        if let Some(ref db) = self.db {
+            let db_event = belt_infra::db::HistoryEvent {
+                work_id: event.work_id.clone(),
+                source_id: event.source_id.clone(),
+                state: event.state.clone(),
+                status: event.status.clone(),
+                attempt: event.attempt as i32,
+                summary: event.summary.clone(),
+                error: event.error.clone(),
+                created_at: event.created_at.to_rfc3339(),
+            };
+            if let Err(e) = db.append_history(&db_event) {
+                tracing::warn!(error = %e, "failed to persist history event to DB");
+            }
+        }
+
+        self.history_events.push(event);
     }
 
     // ---------------------------------------------------------------
@@ -5717,6 +5752,67 @@ sources:
         assert!(
             daemon.config.stagnation.lateral.enabled,
             "lateral should be enabled by default"
+        );
+    }
+
+    #[test]
+    fn detect_stagnation_queries_db_history() {
+        use belt_infra::db::Database;
+
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![0]);
+
+        let db = Database::open_in_memory().unwrap();
+        let mut daemon = daemon.with_db(db);
+
+        let item = test_item("src:1", "implement");
+        // record_history_event now persists to DB as well.
+        for _ in 0..3 {
+            daemon.record_history_event(&item, "failed", Some("compile error X".to_string()));
+        }
+
+        // Clear in-memory history to prove detection uses DB.
+        daemon.history_events.clear();
+
+        let result = daemon.detect_stagnation_and_generate_plan(
+            &item.work_id,
+            "src:1",
+            "implement",
+            "compile error X",
+        );
+        assert!(
+            result.is_some(),
+            "stagnation should be detected from DB history even when in-memory is empty"
+        );
+        let plan = result.unwrap();
+        assert!(plan.contains("## Lateral Plan"));
+        assert!(plan.contains("Pattern: spinning"));
+    }
+
+    #[test]
+    fn detect_stagnation_falls_back_to_in_memory_without_db() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![0]);
+
+        // No DB configured — should fall back to in-memory history_events.
+        assert!(daemon.db.is_none());
+
+        let item = test_item("src:1", "implement");
+        for _ in 0..3 {
+            daemon.record_history_event(&item, "failed", Some("compile error Y".to_string()));
+        }
+
+        let result = daemon.detect_stagnation_and_generate_plan(
+            &item.work_id,
+            "src:1",
+            "implement",
+            "compile error Y",
+        );
+        assert!(
+            result.is_some(),
+            "stagnation should be detected from in-memory fallback"
         );
     }
 
