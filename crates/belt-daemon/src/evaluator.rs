@@ -140,14 +140,33 @@ impl Evaluator {
         item: &QueueItem,
         worktree_path: Option<PathBuf>,
     ) -> Option<Result<EvalDecision>> {
-        let pipeline = self.pipeline.as_ref()?;
-
         let ctx = EvalContext {
             work_id: item.work_id.clone(),
             source_id: item.source_id.clone(),
             workspace_name: self.workspace_name.clone(),
             worktree_path,
+            issue_body: None,
+            handler_stdout: None,
+            handler_stderr: None,
+            execution_history: None,
+            classify_policy: None,
         };
+        self.evaluate_item_with_context(item, ctx).await
+    }
+
+    /// Evaluate a single item through the progressive pipeline with full context.
+    ///
+    /// Provides the semantic stage with all 4 context fields required by R-015:
+    /// issue body, handler output (stdout/stderr), execution history, and
+    /// classify-policy.md contents.
+    ///
+    /// Returns `None` if no pipeline is configured.
+    pub async fn evaluate_item_with_context(
+        &mut self,
+        item: &QueueItem,
+        ctx: EvalContext,
+    ) -> Option<Result<EvalDecision>> {
+        let pipeline = self.pipeline.as_ref()?;
 
         let result = pipeline.evaluate(&ctx).await;
 

@@ -145,12 +145,39 @@ impl SemanticStage {
         }
     }
 
-    /// Build the evaluate prompt for the LLM.
-    fn build_prompt(&self) -> String {
-        format!(
+    /// Build a structured evaluate prompt for the LLM.
+    ///
+    /// Includes all available context: issue body, handler output,
+    /// execution history, and classify-policy.md guidelines (R-015).
+    fn build_prompt(&self, ctx: &EvalContext) -> String {
+        let mut sections = Vec::new();
+
+        sections.push(format!(
             "Completed 아이템의 완료 여부를 판단하고, belt queue done 또는 belt queue hitl 을 실행해줘 (workspace: {ws})",
             ws = self.workspace_name
-        )
+        ));
+
+        if let Some(ref policy) = ctx.classify_policy {
+            sections.push(format!("## classify-policy.md\n{policy}"));
+        }
+
+        if let Some(ref body) = ctx.issue_body {
+            sections.push(format!("## Issue Body\n{body}"));
+        }
+
+        if let Some(ref stdout) = ctx.handler_stdout {
+            sections.push(format!("## Handler stdout\n{stdout}"));
+        }
+
+        if let Some(ref stderr) = ctx.handler_stderr {
+            sections.push(format!("## Handler stderr\n{stderr}"));
+        }
+
+        if let Some(ref history) = ctx.execution_history {
+            sections.push(format!("## Execution History\n{history}"));
+        }
+
+        sections.join("\n\n")
     }
 }
 
@@ -161,7 +188,7 @@ impl EvaluationStage for SemanticStage {
     }
 
     async fn evaluate(&self, ctx: &EvalContext) -> Result<EvalDecision> {
-        let action = belt_core::action::Action::prompt(&self.build_prompt());
+        let action = belt_core::action::Action::prompt(&self.build_prompt(ctx));
         let working_dir = ctx.worktree_path.as_deref().unwrap_or(Path::new("/tmp"));
         let env = ActionEnv::new(&ctx.work_id, working_dir);
 
@@ -288,6 +315,11 @@ mod tests {
             source_id: "test".into(),
             workspace_name: "test-ws".into(),
             worktree_path: Some(std::path::PathBuf::from("/tmp/worktree")),
+            issue_body: None,
+            handler_stdout: None,
+            handler_stderr: None,
+            execution_history: None,
+            classify_policy: None,
         }
     }
 
@@ -297,6 +329,11 @@ mod tests {
             source_id: "test".into(),
             workspace_name: "test-ws".into(),
             worktree_path: None,
+            issue_body: None,
+            handler_stdout: None,
+            handler_stderr: None,
+            execution_history: None,
+            classify_policy: None,
         }
     }
 
@@ -373,5 +410,152 @@ mod tests {
         let pipeline = build_pipeline("test-ws", vec!["cargo test".into()], executor, shell);
         assert_eq!(pipeline.stage_count(), 2);
         assert_eq!(pipeline.stage_names(), vec!["mechanical", "semantic"]);
+    }
+
+    // --- SemanticStage prompt tests (R-015) ---
+
+    #[test]
+    fn semantic_build_prompt_includes_all_context_fields() {
+        use belt_core::runtime::RuntimeRegistry;
+
+        let registry = Arc::new(RuntimeRegistry::new("mock".into()));
+        let executor = Arc::new(ActionExecutor::new(registry));
+        let stage = SemanticStage::new("test-ws".into(), executor);
+
+        let ctx = EvalContext {
+            work_id: "test:implement".into(),
+            source_id: "test".into(),
+            workspace_name: "test-ws".into(),
+            worktree_path: None,
+            issue_body: Some("Fix the login bug".into()),
+            handler_stdout: Some("All tests passed".into()),
+            handler_stderr: Some("warning: unused import".into()),
+            execution_history: Some("attempt 1: failed, attempt 2: success".into()),
+            classify_policy: Some("Tests must pass and PR description is required".into()),
+        };
+
+        let prompt = stage.build_prompt(&ctx);
+
+        assert!(
+            prompt.contains("## Issue Body"),
+            "prompt should include issue body section"
+        );
+        assert!(
+            prompt.contains("Fix the login bug"),
+            "prompt should include issue body content"
+        );
+        assert!(
+            prompt.contains("## Handler stdout"),
+            "prompt should include handler stdout section"
+        );
+        assert!(
+            prompt.contains("All tests passed"),
+            "prompt should include handler stdout content"
+        );
+        assert!(
+            prompt.contains("## Handler stderr"),
+            "prompt should include handler stderr section"
+        );
+        assert!(
+            prompt.contains("warning: unused import"),
+            "prompt should include handler stderr content"
+        );
+        assert!(
+            prompt.contains("## Execution History"),
+            "prompt should include execution history section"
+        );
+        assert!(
+            prompt.contains("attempt 1: failed"),
+            "prompt should include execution history content"
+        );
+        assert!(
+            prompt.contains("## classify-policy.md"),
+            "prompt should include classify-policy section"
+        );
+        assert!(
+            prompt.contains("Tests must pass"),
+            "prompt should include classify-policy content"
+        );
+    }
+
+    #[test]
+    fn semantic_build_prompt_omits_absent_fields() {
+        use belt_core::runtime::RuntimeRegistry;
+
+        let registry = Arc::new(RuntimeRegistry::new("mock".into()));
+        let executor = Arc::new(ActionExecutor::new(registry));
+        let stage = SemanticStage::new("test-ws".into(), executor);
+
+        let ctx = EvalContext {
+            work_id: "test:implement".into(),
+            source_id: "test".into(),
+            workspace_name: "test-ws".into(),
+            worktree_path: None,
+            issue_body: None,
+            handler_stdout: None,
+            handler_stderr: None,
+            execution_history: None,
+            classify_policy: None,
+        };
+
+        let prompt = stage.build_prompt(&ctx);
+
+        assert!(
+            !prompt.contains("## Issue Body"),
+            "prompt should omit absent issue body"
+        );
+        assert!(
+            !prompt.contains("## Handler stdout"),
+            "prompt should omit absent handler stdout"
+        );
+        assert!(
+            !prompt.contains("## Handler stderr"),
+            "prompt should omit absent handler stderr"
+        );
+        assert!(
+            !prompt.contains("## Execution History"),
+            "prompt should omit absent execution history"
+        );
+        assert!(
+            !prompt.contains("## classify-policy.md"),
+            "prompt should omit absent classify-policy"
+        );
+        // Should still contain the base instruction.
+        assert!(
+            prompt.contains("test-ws"),
+            "prompt should contain workspace name"
+        );
+    }
+
+    #[test]
+    fn semantic_build_prompt_partial_context() {
+        use belt_core::runtime::RuntimeRegistry;
+
+        let registry = Arc::new(RuntimeRegistry::new("mock".into()));
+        let executor = Arc::new(ActionExecutor::new(registry));
+        let stage = SemanticStage::new("test-ws".into(), executor);
+
+        let ctx = EvalContext {
+            work_id: "test:implement".into(),
+            source_id: "test".into(),
+            workspace_name: "test-ws".into(),
+            worktree_path: None,
+            issue_body: Some("Implement feature X".into()),
+            handler_stdout: None,
+            handler_stderr: Some("error: compilation failed".into()),
+            execution_history: None,
+            classify_policy: Some("All tests must pass".into()),
+        };
+
+        let prompt = stage.build_prompt(&ctx);
+
+        assert!(prompt.contains("## Issue Body"));
+        assert!(prompt.contains("Implement feature X"));
+        assert!(!prompt.contains("## Handler stdout"));
+        assert!(prompt.contains("## Handler stderr"));
+        assert!(prompt.contains("error: compilation failed"));
+        assert!(!prompt.contains("## Execution History"));
+        assert!(prompt.contains("## classify-policy.md"));
+        assert!(prompt.contains("All tests must pass"));
     }
 }
