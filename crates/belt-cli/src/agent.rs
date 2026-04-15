@@ -370,6 +370,7 @@ fn default_agent_config() -> WorkspaceConfig {
         runtime: RuntimeConfig::default(),
         evaluate: None,
         claw_config: None,
+        stagnation: Default::default(),
     }
 }
 
@@ -643,6 +644,7 @@ mod tests {
             runtime: RuntimeConfig::default(),
             evaluate: None,
             claw_config: None,
+            stagnation: Default::default(),
         }
     }
 
@@ -702,6 +704,7 @@ mod tests {
             runtime: RuntimeConfig::default(),
             evaluate: None,
             claw_config: None,
+            stagnation: Default::default(),
         }
     }
 

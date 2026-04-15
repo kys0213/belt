@@ -31,3 +31,26 @@ pub use pattern::{
 pub use similarity::{
     CompositeSimilarity, ExactHash, NcdJudge, SimilarityJudge, SimilarityScore, TokenFingerprint,
 };
+
+use serde::{Deserialize, Serialize};
+
+/// Stagnation detection configuration.
+///
+/// Controls whether stagnation analysis runs and its parameters.
+/// When `enabled` is `false`, the daemon skips stagnation detection entirely.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StagnationConfig {
+    /// Whether stagnation detection is enabled. Defaults to `true`.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+impl Default for StagnationConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
