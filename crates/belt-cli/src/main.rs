@@ -238,6 +238,9 @@ enum HitlCommands {
         /// Additional notes.
         #[arg(long)]
         notes: Option<String>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// List HITL items.
     List {
@@ -278,9 +281,16 @@ enum HitlTimeoutCommands {
         /// Terminal action when timeout fires: skip, failed, replan.
         #[arg(long)]
         action: Option<String>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// List HITL items with active timeouts.
-    Ls,
+    Ls {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -290,11 +300,23 @@ enum WorkspaceCommands {
         /// Path to workspace.yaml config.
         #[arg(long)]
         config: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// List registered workspaces.
-    List,
+    List {
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Show workspace details.
-    Show { name: String },
+    Show {
+        name: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Update workspace configuration.
     Update {
         /// Workspace name.
@@ -302,6 +324,9 @@ enum WorkspaceCommands {
         /// New config file path.
         #[arg(long)]
         config: Option<String>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Remove a workspace.
     Remove {
@@ -310,6 +335,9 @@ enum WorkspaceCommands {
         /// Skip confirmation warning for active items.
         #[arg(long)]
         force: bool,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Show workspace configuration details.
     Config {
@@ -343,16 +371,29 @@ enum QueueCommands {
         format: String,
     },
     /// Mark item as done (called by evaluate).
-    Done { work_id: String },
+    Done {
+        work_id: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Mark item as HITL (called by evaluate).
     Hitl {
         work_id: String,
         /// Reason for HITL.
         #[arg(long)]
         reason: Option<String>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Skip an item.
-    Skip { work_id: String },
+    Skip {
+        work_id: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Re-run on_done script for a Failed item.
     RetryScript {
         /// Queue item work_id.
@@ -360,6 +401,9 @@ enum QueueCommands {
         /// Script execution timeout in seconds.
         #[arg(long)]
         timeout: Option<u64>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Manage queue item dependencies.
     #[command(subcommand)]
@@ -375,6 +419,9 @@ enum DependencyCommands {
         /// The work_id that this item depends on (must complete first).
         #[arg(long)]
         after: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Remove a dependency.
     Remove {
@@ -383,6 +430,9 @@ enum DependencyCommands {
         /// The work_id to remove from dependencies.
         #[arg(long)]
         after: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// List dependencies for a queue item, or all dependencies.
     List {
@@ -479,26 +529,41 @@ enum SpecCommands {
         /// New entry_point (comma-separated file/module paths).
         #[arg(long)]
         entry_point: Option<String>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Pause an active spec.
     Pause {
         /// Spec ID.
         id: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Resume a paused spec.
     Resume {
         /// Spec ID.
         id: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Complete an active spec.
     Complete {
         /// Spec ID.
         id: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Remove a spec.
     Remove {
         /// Spec ID.
         id: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Link a spec to an external resource (URL or issue reference).
     Link {
@@ -506,6 +571,9 @@ enum SpecCommands {
         id: String,
         /// Target URL or issue reference (e.g. `https://...` or `owner/repo#123`).
         target: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Unlink a spec from an external resource.
     Unlink {
@@ -513,6 +581,9 @@ enum SpecCommands {
         id: String,
         /// Target URL or issue reference to remove.
         target: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Verify all links for a spec (check reachability).
     Verify {
@@ -617,6 +688,9 @@ enum CronCommands {
         /// Optional workspace scope.
         #[arg(long)]
         workspace: Option<String>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Update an existing cron job.
     Update {
@@ -628,31 +702,49 @@ enum CronCommands {
         /// New script path.
         #[arg(long)]
         script: Option<String>,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Pause (disable) a cron job.
     Pause {
         /// Name of the cron job to pause.
         name: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Resume (enable) a paused cron job.
     Resume {
         /// Name of the cron job to resume.
         name: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Remove a cron job.
     Remove {
         /// Name of the cron job to remove.
         name: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Trigger a cron job immediately by resetting its last_run_at.
     Trigger {
         /// Name of the cron job to trigger.
         name: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Run a user-defined cron job script immediately (bypasses scheduling).
     Run {
         /// Name of the cron job to run.
         name: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -909,7 +1001,7 @@ fn cmd_queue_show(work_id: &str, format: &str) -> anyhow::Result<()> {
 }
 
 /// `belt queue done` -- mark a queue item as Done, running on_done scripts if configured.
-async fn cmd_queue_done(work_id: &str) -> anyhow::Result<()> {
+async fn cmd_queue_done(work_id: &str, json: bool) -> anyhow::Result<()> {
     let db = open_db()?;
     let item = db.get_item(work_id)?;
 
@@ -945,7 +1037,19 @@ async fn cmd_queue_done(work_id: &str) -> anyhow::Result<()> {
         if let Err(e) = worktree_mgr.cleanup(work_id) {
             tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue done, continuing");
         }
-        println!("Marked {work_id} as done.");
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "success": true,
+                    "work_id": work_id,
+                    "phase": "done",
+                    "scripts_run": false
+                }))?
+            );
+        } else {
+            println!("Marked {work_id} as done.");
+        }
         return Ok(());
     }
 
@@ -966,7 +1070,9 @@ async fn cmd_queue_done(work_id: &str) -> anyhow::Result<()> {
     ));
     let executor = belt_daemon::executor::ActionExecutor::new(std::sync::Arc::new(registry));
 
-    println!("Running on_done scripts for '{work_id}'...");
+    if !json {
+        println!("Running on_done scripts for '{work_id}'...");
+    }
 
     let result = executor.execute_all(&on_done_actions, &env).await?;
 
@@ -977,14 +1083,39 @@ async fn cmd_queue_done(work_id: &str) -> anyhow::Result<()> {
             if let Err(e) = worktree_mgr.cleanup(work_id) {
                 tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue done, continuing");
             }
-            println!("on_done scripts succeeded. Marked '{work_id}' as done.");
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "success": true,
+                        "work_id": work_id,
+                        "phase": "done",
+                        "scripts_run": true
+                    }))?
+                );
+            } else {
+                println!("on_done scripts succeeded. Marked '{work_id}' as done.");
+            }
         }
         Some(r) => {
             db.update_phase(work_id, QueuePhase::Failed)?;
-            println!(
-                "on_done scripts failed (exit code {}). Item '{work_id}' transitioned to failed.",
-                r.exit_code
-            );
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "success": false,
+                        "work_id": work_id,
+                        "phase": "failed",
+                        "scripts_run": true,
+                        "exit_code": r.exit_code
+                    }))?
+                );
+            } else {
+                println!(
+                    "on_done scripts failed (exit code {}). Item '{work_id}' transitioned to failed.",
+                    r.exit_code
+                );
+            }
         }
         None => {
             db.update_phase(work_id, QueuePhase::Done)?;
@@ -992,7 +1123,19 @@ async fn cmd_queue_done(work_id: &str) -> anyhow::Result<()> {
             if let Err(e) = worktree_mgr.cleanup(work_id) {
                 tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue done, continuing");
             }
-            println!("Marked '{work_id}' as done.");
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "success": true,
+                        "work_id": work_id,
+                        "phase": "done",
+                        "scripts_run": false
+                    }))?
+                );
+            } else {
+                println!("Marked '{work_id}' as done.");
+            }
         }
     }
 
@@ -1000,10 +1143,20 @@ async fn cmd_queue_done(work_id: &str) -> anyhow::Result<()> {
 }
 
 /// `belt queue hitl` -- mark a queue item as HITL.
-fn cmd_queue_hitl(work_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
+fn cmd_queue_hitl(work_id: &str, reason: Option<&str>, json: bool) -> anyhow::Result<()> {
     let db = open_db()?;
     db.update_phase(work_id, QueuePhase::Hitl)?;
-    if let Some(r) = reason {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "work_id": work_id,
+                "phase": "hitl",
+                "reason": reason
+            }))?
+        );
+    } else if let Some(r) = reason {
         println!("Marked {work_id} as HITL (reason: {r}).");
     } else {
         println!("Marked {work_id} as HITL.");
@@ -1012,7 +1165,7 @@ fn cmd_queue_hitl(work_id: &str, reason: Option<&str>) -> anyhow::Result<()> {
 }
 
 /// `belt queue skip` -- mark a queue item as Skipped.
-fn cmd_queue_skip(work_id: &str) -> anyhow::Result<()> {
+fn cmd_queue_skip(work_id: &str, json: bool) -> anyhow::Result<()> {
     let db = open_db()?;
     db.update_phase(work_id, QueuePhase::Skipped)?;
 
@@ -1025,12 +1178,27 @@ fn cmd_queue_skip(work_id: &str) -> anyhow::Result<()> {
         tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue skip, continuing");
     }
 
-    println!("Skipped {work_id}.");
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "work_id": work_id,
+                "phase": "skipped"
+            }))?
+        );
+    } else {
+        println!("Skipped {work_id}.");
+    }
     Ok(())
 }
 
 /// `belt queue retry-script` -- re-run on_done script for a Failed item.
-async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::Result<()> {
+async fn cmd_queue_retry_script(
+    work_id: &str,
+    timeout: Option<u64>,
+    json: bool,
+) -> anyhow::Result<()> {
     let db = open_db()?;
     let item = db.get_item(work_id)?;
 
@@ -1061,13 +1229,25 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
         })?;
 
     if state_config.on_done.is_empty() {
-        println!(
-            "No on_done scripts configured for state '{}'. Transitioning to done.",
-            item.state
-        );
         db.update_phase(work_id, QueuePhase::Done)?;
         record_script_retry_event(&db, work_id, &item.source_id, QueuePhase::Done, None);
-        println!("Item '{work_id}' transitioned from failed to done.");
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "success": true,
+                    "work_id": work_id,
+                    "phase": "done",
+                    "scripts_run": false
+                }))?
+            );
+        } else {
+            println!(
+                "No on_done scripts configured for state '{}'. Transitioning to done.",
+                item.state
+            );
+            println!("Item '{work_id}' transitioned from failed to done.");
+        }
         return Ok(());
     }
 
@@ -1099,7 +1279,9 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
     ));
     let executor = belt_daemon::executor::ActionExecutor::new(std::sync::Arc::new(registry));
 
-    println!("Re-running on_done scripts for '{work_id}'...");
+    if !json {
+        println!("Re-running on_done scripts for '{work_id}'...");
+    }
 
     let result = if let Some(secs) = timeout {
         let duration = std::time::Duration::from_secs(secs);
@@ -1113,7 +1295,19 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
                     QueuePhase::Failed,
                     Some(format!("timeout after {secs}s")),
                 );
-                println!("Script execution timed out after {secs}s. Item remains failed.");
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "success": false,
+                            "work_id": work_id,
+                            "phase": "failed",
+                            "error": format!("timeout after {secs}s")
+                        }))?
+                    );
+                } else {
+                    println!("Script execution timed out after {secs}s. Item remains failed.");
+                }
                 return Ok(());
             }
         }
@@ -1125,9 +1319,21 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
         Some(r) if r.success() => {
             db.update_phase(work_id, QueuePhase::Done)?;
             record_script_retry_event(&db, work_id, &item.source_id, QueuePhase::Done, None);
-            println!(
-                "on_done scripts succeeded. Item '{work_id}' transitioned from failed to done."
-            );
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "success": true,
+                        "work_id": work_id,
+                        "phase": "done",
+                        "scripts_run": true
+                    }))?
+                );
+            } else {
+                println!(
+                    "on_done scripts succeeded. Item '{work_id}' transitioned from failed to done."
+                );
+            }
         }
         Some(r) => {
             record_script_retry_event(
@@ -1137,16 +1343,41 @@ async fn cmd_queue_retry_script(work_id: &str, timeout: Option<u64>) -> anyhow::
                 QueuePhase::Failed,
                 Some(format!("exit code {}", r.exit_code)),
             );
-            println!(
-                "on_done scripts failed (exit code {}). Item '{work_id}' remains in failed phase.",
-                r.exit_code
-            );
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "success": false,
+                        "work_id": work_id,
+                        "phase": "failed",
+                        "scripts_run": true,
+                        "exit_code": r.exit_code
+                    }))?
+                );
+            } else {
+                println!(
+                    "on_done scripts failed (exit code {}). Item '{work_id}' remains in failed phase.",
+                    r.exit_code
+                );
+            }
         }
         None => {
             // No scripts produced a result (shouldn't happen since we checked on_done is non-empty).
             db.update_phase(work_id, QueuePhase::Done)?;
             record_script_retry_event(&db, work_id, &item.source_id, QueuePhase::Done, None);
-            println!("Item '{work_id}' transitioned from failed to done.");
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "success": true,
+                        "work_id": work_id,
+                        "phase": "done",
+                        "scripts_run": false
+                    }))?
+                );
+            } else {
+                println!("Item '{work_id}' transitioned from failed to done.");
+            }
         }
     }
 
@@ -1182,18 +1413,40 @@ fn record_script_retry_event(
 }
 
 /// `belt queue dependency add` -- add a dependency between queue items.
-fn cmd_queue_dependency_add(queue_id: &str, after: &str) -> anyhow::Result<()> {
+fn cmd_queue_dependency_add(queue_id: &str, after: &str, json: bool) -> anyhow::Result<()> {
     let db = open_db()?;
     db.add_queue_dependency(queue_id, after)?;
-    println!("Added dependency: {queue_id} depends on {after}.");
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "work_id": queue_id,
+                "depends_on": after
+            }))?
+        );
+    } else {
+        println!("Added dependency: {queue_id} depends on {after}.");
+    }
     Ok(())
 }
 
 /// `belt queue dependency remove` -- remove a dependency between queue items.
-fn cmd_queue_dependency_remove(queue_id: &str, after: &str) -> anyhow::Result<()> {
+fn cmd_queue_dependency_remove(queue_id: &str, after: &str, json: bool) -> anyhow::Result<()> {
     let db = open_db()?;
     db.remove_queue_dependency(queue_id, after)?;
-    println!("Removed dependency: {queue_id} no longer depends on {after}.");
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "work_id": queue_id,
+                "removed_dependency": after
+            }))?
+        );
+    } else {
+        println!("Removed dependency: {queue_id} no longer depends on {after}.");
+    }
     Ok(())
 }
 
@@ -1279,6 +1532,7 @@ fn cmd_cron_add(
     schedule: &str,
     script: &str,
     workspace: Option<&str>,
+    json: bool,
 ) -> anyhow::Result<()> {
     validate_cron_expression(schedule)?;
     let script_path = std::path::Path::new(script);
@@ -1288,13 +1542,31 @@ fn cmd_cron_add(
 
     let db = open_db()?;
     db.add_cron_job(name, schedule, script, workspace)?;
-    println!("Cron job '{name}' added.");
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "name": name,
+                "schedule": schedule,
+                "script": script,
+                "workspace": workspace
+            }))?
+        );
+    } else {
+        println!("Cron job '{name}' added.");
+    }
     notify_daemon_cron_sync();
     Ok(())
 }
 
 /// `belt cron update` -- update schedule and/or script of an existing cron job.
-fn cmd_cron_update(name: &str, schedule: Option<&str>, script: Option<&str>) -> anyhow::Result<()> {
+fn cmd_cron_update(
+    name: &str,
+    schedule: Option<&str>,
+    script: Option<&str>,
+    json: bool,
+) -> anyhow::Result<()> {
     if schedule.is_none() && script.is_none() {
         anyhow::bail!("at least one of --schedule or --script must be provided");
     }
@@ -1316,34 +1588,79 @@ fn cmd_cron_update(name: &str, schedule: Option<&str>, script: Option<&str>) -> 
         db.update_cron_script(name, s)?;
     }
 
-    println!("Cron job '{name}' updated.");
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "name": name,
+                "schedule": schedule,
+                "script": script
+            }))?
+        );
+    } else {
+        println!("Cron job '{name}' updated.");
+    }
     notify_daemon_cron_sync();
     Ok(())
 }
 
 /// `belt cron pause` -- disable a cron job.
-fn cmd_cron_pause(name: &str) -> anyhow::Result<()> {
+fn cmd_cron_pause(name: &str, json: bool) -> anyhow::Result<()> {
     let db = open_db()?;
     db.toggle_cron_job(name, false)?;
-    println!("Cron job '{name}' paused.");
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "name": name,
+                "enabled": false
+            }))?
+        );
+    } else {
+        println!("Cron job '{name}' paused.");
+    }
     notify_daemon_cron_sync();
     Ok(())
 }
 
 /// `belt cron resume` -- enable a paused cron job.
-fn cmd_cron_resume(name: &str) -> anyhow::Result<()> {
+fn cmd_cron_resume(name: &str, json: bool) -> anyhow::Result<()> {
     let db = open_db()?;
     db.toggle_cron_job(name, true)?;
-    println!("Cron job '{name}' resumed.");
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "name": name,
+                "enabled": true
+            }))?
+        );
+    } else {
+        println!("Cron job '{name}' resumed.");
+    }
     notify_daemon_cron_sync();
     Ok(())
 }
 
 /// `belt cron remove` -- delete a cron job.
-fn cmd_cron_remove(name: &str) -> anyhow::Result<()> {
+fn cmd_cron_remove(name: &str, json: bool) -> anyhow::Result<()> {
     let db = open_db()?;
     db.remove_cron_job(name)?;
-    println!("Cron job '{name}' removed.");
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "name": name,
+                "removed": true
+            }))?
+        );
+    } else {
+        println!("Cron job '{name}' removed.");
+    }
     notify_daemon_cron_sync();
     Ok(())
 }
@@ -1377,7 +1694,7 @@ fn validate_cron_expression(expr: &str) -> anyhow::Result<()> {
 }
 
 /// `belt cron run` -- execute a user-defined cron job script immediately.
-fn cmd_cron_run(name: &str) -> anyhow::Result<()> {
+fn cmd_cron_run(name: &str, json: bool) -> anyhow::Result<()> {
     let db = open_db()?;
     let job = db.get_cron_job(name)?;
 
@@ -1386,7 +1703,9 @@ fn cmd_cron_run(name: &str) -> anyhow::Result<()> {
         anyhow::bail!("script not found: {}", job.script);
     }
 
-    println!("Running cron job '{name}' (script: {})...", job.script);
+    if !json {
+        println!("Running cron job '{name}' (script: {})...", job.script);
+    }
 
     let belt_home = belt_home()?;
     let output = std::process::Command::new("sh")
@@ -1396,21 +1715,43 @@ fn cmd_cron_run(name: &str) -> anyhow::Result<()> {
         .env("BELT_CRON_JOB", name)
         .output()?;
 
-    if !output.stdout.is_empty() {
-        print!("{}", String::from_utf8_lossy(&output.stdout));
-    }
-    if !output.stderr.is_empty() {
-        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    if !json {
+        if !output.stdout.is_empty() {
+            print!("{}", String::from_utf8_lossy(&output.stdout));
+        }
+        if !output.stderr.is_empty() {
+            eprint!("{}", String::from_utf8_lossy(&output.stderr));
+        }
     }
 
     if output.status.success() {
         db.update_cron_last_run(name)?;
-        println!("Cron job '{name}' completed successfully.");
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "success": true,
+                    "name": name,
+                    "exit_code": 0
+                }))?
+            );
+        } else {
+            println!("Cron job '{name}' completed successfully.");
+        }
     } else {
-        anyhow::bail!(
-            "cron job '{name}' failed with exit code {}",
-            output.status.code().unwrap_or(-1)
-        );
+        let exit_code = output.status.code().unwrap_or(-1);
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "success": false,
+                    "name": name,
+                    "exit_code": exit_code
+                }))?
+            );
+        } else {
+            anyhow::bail!("cron job '{name}' failed with exit code {exit_code}");
+        }
     }
 
     Ok(())
@@ -1421,23 +1762,31 @@ fn cmd_cron_run(name: &str) -> anyhow::Result<()> {
 /// Resets the job's `last_run_at` to `NULL` in the database so the cron
 /// engine treats it as never-run, then sends `SIGUSR1` to the daemon
 /// (if running) to sync triggers and execute an immediate tick.
-fn cmd_cron_trigger(name: &str) -> anyhow::Result<()> {
+fn cmd_cron_trigger(name: &str, json: bool) -> anyhow::Result<()> {
     let db = open_db()?;
 
     // Verify the job exists and reset its last_run_at to NULL.
     db.reset_cron_last_run(name)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    println!("Trigger persisted for cron job '{name}' (last_run_at reset).");
-
     // Signal the daemon to sync triggers from DB and run an immediate tick.
-    match signal_daemon() {
-        Ok(()) => {
+    let daemon_notified = signal_daemon().is_ok();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "success": true,
+                "name": name,
+                "daemon_notified": daemon_notified
+            }))?
+        );
+    } else {
+        println!("Trigger persisted for cron job '{name}' (last_run_at reset).");
+        if daemon_notified {
             println!("Daemon notified (SIGUSR1). The job will execute shortly.");
-        }
-        Err(e) => {
-            println!("Could not signal daemon: {e}");
-            println!("The job will execute on the next daemon tick.");
+        } else {
+            println!("Could not signal daemon. The job will execute on the next daemon tick.");
         }
     }
 
@@ -1728,6 +2077,7 @@ fn cmd_hitl_timeout(command: HitlTimeoutCommands) -> anyhow::Result<()> {
             item_id,
             duration,
             action,
+            json,
         } => {
             // Validate that the item exists and is in HITL phase.
             let item = db.get_item(&item_id)?;
@@ -1754,18 +2104,44 @@ fn cmd_hitl_timeout(command: HitlTimeoutCommands) -> anyhow::Result<()> {
 
             db.set_hitl_timeout(&item_id, &timeout_at, parsed_action.as_ref())?;
 
-            println!("Timeout set for item '{item_id}':");
-            println!("  expires at: {timeout_at}");
-            println!("  duration:   {} seconds", duration);
-            if let Some(a) = &action {
-                println!("  action:     {a}");
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "success": true,
+                        "work_id": item_id,
+                        "timeout_at": timeout_at,
+                        "duration_secs": duration,
+                        "action": action.as_deref().unwrap_or("skip")
+                    }))?
+                );
             } else {
-                println!("  action:     skip (default)");
+                println!("Timeout set for item '{item_id}':");
+                println!("  expires at: {timeout_at}");
+                println!("  duration:   {} seconds", duration);
+                if let Some(a) = &action {
+                    println!("  action:     {a}");
+                } else {
+                    println!("  action:     skip (default)");
+                }
             }
         }
-        HitlTimeoutCommands::Ls => {
+        HitlTimeoutCommands::Ls { json } => {
             let items = db.list_hitl_items_with_timeout()?;
-            if items.is_empty() {
+            if json {
+                let entries: Vec<serde_json::Value> = items
+                    .iter()
+                    .map(|item| {
+                        serde_json::json!({
+                            "work_id": item.work_id,
+                            "timeout_at": item.hitl_timeout_at,
+                            "action": item.hitl_terminal_action.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "skip".to_string()),
+                            "workspace": item.workspace_id,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else if items.is_empty() {
                 println!("No HITL items with active timeouts.");
             } else {
                 println!(
@@ -2316,7 +2692,7 @@ async fn main() -> anyhow::Result<()> {
             )?;
 
             match command {
-                WorkspaceCommands::Add { config } => {
+                WorkspaceCommands::Add { config, json } => {
                     let config_path = std::path::Path::new(&config);
                     let result =
                         belt_infra::onboarding::onboard_workspace(&db, config_path, &belt_home)?;
@@ -2329,7 +2705,7 @@ async fn main() -> anyhow::Result<()> {
                         }
                         Err(e) => {
                             tracing::warn!(error = %e, "failed to initialize claw workspace");
-                            if !claw_ws_path.is_dir() {
+                            if !json && !claw_ws_path.is_dir() {
                                 eprintln!(
                                     "Warning: Claw workspace not found at {}",
                                     claw_ws_path.display()
@@ -2339,25 +2715,51 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    if result.created {
+                    if json {
                         println!(
-                            "Workspace '{}' registered successfully.",
-                            result.workspace_name
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "success": true,
+                                "workspace": result.workspace_name,
+                                "created": result.created,
+                                "config": result.config_path,
+                                "sources": result.source_count,
+                                "cron_jobs_seeded": result.cron_jobs_seeded
+                            }))?
                         );
                     } else {
-                        println!(
-                            "Workspace '{}' updated successfully.",
-                            result.workspace_name
-                        );
+                        if result.created {
+                            println!(
+                                "Workspace '{}' registered successfully.",
+                                result.workspace_name
+                            );
+                        } else {
+                            println!(
+                                "Workspace '{}' updated successfully.",
+                                result.workspace_name
+                            );
+                        }
+                        println!("  Config: {}", result.config_path);
+                        println!("  Sources: {}", result.source_count);
+                        println!("  Cron jobs seeded: {}", result.cron_jobs_seeded);
+                        println!("  Claw dir: {}", result.claw_dir.display());
                     }
-                    println!("  Config: {}", result.config_path);
-                    println!("  Sources: {}", result.source_count);
-                    println!("  Cron jobs seeded: {}", result.cron_jobs_seeded);
-                    println!("  Claw dir: {}", result.claw_dir.display());
                 }
-                WorkspaceCommands::List => {
+                WorkspaceCommands::List { json } => {
                     let workspaces = db.list_workspaces()?;
-                    if workspaces.is_empty() {
+                    if json {
+                        let entries: Vec<serde_json::Value> = workspaces
+                            .iter()
+                            .map(|(name, config_path, created_at)| {
+                                serde_json::json!({
+                                    "name": name,
+                                    "config": config_path,
+                                    "created_at": created_at,
+                                })
+                            })
+                            .collect();
+                        println!("{}", serde_json::to_string_pretty(&entries)?);
+                    } else if workspaces.is_empty() {
                         println!("No workspaces registered.");
                     } else {
                         println!("{:<20} {:<50} CREATED", "NAME", "CONFIG");
@@ -2366,11 +2768,8 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
-                WorkspaceCommands::Show { name } => {
+                WorkspaceCommands::Show { name, json } => {
                     let (ws_name, config_path, created_at) = db.get_workspace(&name)?;
-                    println!("Name:       {ws_name}");
-                    println!("Config:     {config_path}");
-                    println!("Created at: {created_at}");
 
                     // Show associated cron jobs
                     let jobs = db.list_cron_jobs()?;
@@ -2378,15 +2777,41 @@ async fn main() -> anyhow::Result<()> {
                         .iter()
                         .filter(|j| j.workspace.as_deref() == Some(&name))
                         .collect();
-                    if !ws_jobs.is_empty() {
-                        println!("\nCron jobs:");
-                        for job in &ws_jobs {
-                            let status = if job.enabled { "enabled" } else { "disabled" };
-                            println!("  {} [{}] ({})", job.name, job.schedule, status);
+
+                    if json {
+                        let cron_entries: Vec<serde_json::Value> = ws_jobs
+                            .iter()
+                            .map(|j| {
+                                serde_json::json!({
+                                    "name": j.name,
+                                    "schedule": j.schedule,
+                                    "enabled": j.enabled,
+                                })
+                            })
+                            .collect();
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "name": ws_name,
+                                "config": config_path,
+                                "created_at": created_at,
+                                "cron_jobs": cron_entries,
+                            }))?
+                        );
+                    } else {
+                        println!("Name:       {ws_name}");
+                        println!("Config:     {config_path}");
+                        println!("Created at: {created_at}");
+                        if !ws_jobs.is_empty() {
+                            println!("\nCron jobs:");
+                            for job in &ws_jobs {
+                                let status = if job.enabled { "enabled" } else { "disabled" };
+                                println!("  {} [{}] ({})", job.name, job.schedule, status);
+                            }
                         }
                     }
                 }
-                WorkspaceCommands::Update { name, config } => {
+                WorkspaceCommands::Update { name, config, json } => {
                     if let Some(config_path) = config {
                         let path = std::path::Path::new(&config_path);
                         let abs_path = std::fs::canonicalize(path)
@@ -2394,15 +2819,34 @@ async fn main() -> anyhow::Result<()> {
                             .to_string_lossy()
                             .to_string();
                         db.update_workspace(&name, &abs_path)?;
-                        println!("Workspace '{}' updated.", name);
-                        println!("  Config: {}", abs_path);
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "success": true,
+                                    "workspace": name,
+                                    "config": abs_path
+                                }))?
+                            );
+                        } else {
+                            println!("Workspace '{}' updated.", name);
+                            println!("  Config: {}", abs_path);
+                        }
+                    } else if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "success": false,
+                                "error": "no update options provided"
+                            }))?
+                        );
                     } else {
                         println!(
                             "No update options provided. Use --config to update the config path."
                         );
                     }
                 }
-                WorkspaceCommands::Remove { name, force } => {
+                WorkspaceCommands::Remove { name, force, json } => {
                     // Check for active queue items in this workspace
                     let items = db.list_items(None, Some(&name))?;
                     let active_count = items
@@ -2411,21 +2855,42 @@ async fn main() -> anyhow::Result<()> {
                         .count();
 
                     if active_count > 0 && !force {
-                        eprintln!(
-                            "Warning: workspace '{}' has {} active item(s).",
-                            name, active_count
-                        );
-                        eprintln!("Use --force to remove anyway.");
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "success": false,
+                                    "error": format!("workspace '{}' has {} active item(s), use --force to remove", name, active_count)
+                                }))?
+                            );
+                        } else {
+                            eprintln!(
+                                "Warning: workspace '{}' has {} active item(s).",
+                                name, active_count
+                            );
+                            eprintln!("Use --force to remove anyway.");
+                        }
                         std::process::exit(1);
                     }
 
                     db.remove_workspace(&name)?;
-                    println!("Workspace '{}' removed.", name);
-                    if active_count > 0 {
+                    if json {
                         println!(
-                            "  Note: {} active item(s) remain in the queue.",
-                            active_count
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "success": true,
+                                "workspace": name,
+                                "active_items_remaining": active_count
+                            }))?
                         );
+                    } else {
+                        println!("Workspace '{}' removed.", name);
+                        if active_count > 0 {
+                            println!(
+                                "  Note: {} active item(s) remain in the queue.",
+                                active_count
+                            );
+                        }
                     }
                 }
                 WorkspaceCommands::Config { name, json } => {
@@ -2493,24 +2958,40 @@ async fn main() -> anyhow::Result<()> {
             QueueCommands::Show { work_id, format } => {
                 cmd_queue_show(&work_id, &format)?;
             }
-            QueueCommands::Done { work_id } => {
-                cmd_queue_done(&work_id).await?;
+            QueueCommands::Done { work_id, json } => {
+                cmd_queue_done(&work_id, json).await?;
             }
-            QueueCommands::Hitl { work_id, reason } => {
-                cmd_queue_hitl(&work_id, reason.as_deref())?;
+            QueueCommands::Hitl {
+                work_id,
+                reason,
+                json,
+            } => {
+                cmd_queue_hitl(&work_id, reason.as_deref(), json)?;
             }
-            QueueCommands::Skip { work_id } => {
-                cmd_queue_skip(&work_id)?;
+            QueueCommands::Skip { work_id, json } => {
+                cmd_queue_skip(&work_id, json)?;
             }
-            QueueCommands::RetryScript { work_id, timeout } => {
-                cmd_queue_retry_script(&work_id, timeout).await?;
+            QueueCommands::RetryScript {
+                work_id,
+                timeout,
+                json,
+            } => {
+                cmd_queue_retry_script(&work_id, timeout, json).await?;
             }
             QueueCommands::Dependency(dep_cmd) => match dep_cmd {
-                DependencyCommands::Add { queue_id, after } => {
-                    cmd_queue_dependency_add(&queue_id, &after)?;
+                DependencyCommands::Add {
+                    queue_id,
+                    after,
+                    json,
+                } => {
+                    cmd_queue_dependency_add(&queue_id, &after, json)?;
                 }
-                DependencyCommands::Remove { queue_id, after } => {
-                    cmd_queue_dependency_remove(&queue_id, &after)?;
+                DependencyCommands::Remove {
+                    queue_id,
+                    after,
+                    json,
+                } => {
+                    cmd_queue_dependency_remove(&queue_id, &after, json)?;
                 }
                 DependencyCommands::List { queue_id, format } => {
                     cmd_queue_dependency_list(queue_id.as_deref(), &format)?;
@@ -2526,30 +3007,32 @@ async fn main() -> anyhow::Result<()> {
                 schedule,
                 script,
                 workspace,
+                json,
             } => {
-                cmd_cron_add(&name, &schedule, &script, workspace.as_deref())?;
+                cmd_cron_add(&name, &schedule, &script, workspace.as_deref(), json)?;
             }
             CronCommands::Update {
                 name,
                 schedule,
                 script,
+                json,
             } => {
-                cmd_cron_update(&name, schedule.as_deref(), script.as_deref())?;
+                cmd_cron_update(&name, schedule.as_deref(), script.as_deref(), json)?;
             }
-            CronCommands::Pause { name } => {
-                cmd_cron_pause(&name)?;
+            CronCommands::Pause { name, json } => {
+                cmd_cron_pause(&name, json)?;
             }
-            CronCommands::Resume { name } => {
-                cmd_cron_resume(&name)?;
+            CronCommands::Resume { name, json } => {
+                cmd_cron_resume(&name, json)?;
             }
-            CronCommands::Remove { name } => {
-                cmd_cron_remove(&name)?;
+            CronCommands::Remove { name, json } => {
+                cmd_cron_remove(&name, json)?;
             }
-            CronCommands::Trigger { name } => {
-                cmd_cron_trigger(&name)?;
+            CronCommands::Trigger { name, json } => {
+                cmd_cron_trigger(&name, json)?;
             }
-            CronCommands::Run { name } => {
-                cmd_cron_run(&name)?;
+            CronCommands::Run { name, json } => {
+                cmd_cron_run(&name, json)?;
             }
         },
         Commands::Context {
@@ -3021,6 +3504,7 @@ async fn main() -> anyhow::Result<()> {
                     labels,
                     depends_on,
                     entry_point,
+                    json,
                 } => {
                     let mut spec = db.get_spec(&id)?;
                     if let Some(n) = name {
@@ -3042,25 +3526,35 @@ async fn main() -> anyhow::Result<()> {
                         spec.entry_point = entry_point;
                     }
                     db.update_spec(&spec)?;
-                    println!("spec updated: {id}");
 
                     // Force gap_detection re-evaluation on next daemon tick
                     // by resetting the cron job's last_run_at to NULL.
                     let gap_job_name = format!("{}:gap_detection", spec.workspace_id);
-                    match db.reset_cron_last_run(&gap_job_name) {
-                        Ok(()) => {
+                    let gap_reset = db.reset_cron_last_run(&gap_job_name).is_ok();
+                    if !gap_reset {
+                        tracing::warn!(
+                            job = %gap_job_name,
+                            "failed to reset gap_detection cron job"
+                        );
+                    }
+
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "success": true,
+                                "id": id,
+                                "action": "updated"
+                            }))?
+                        );
+                    } else {
+                        println!("spec updated: {id}");
+                        if gap_reset {
                             println!("gap_detection scheduled for next tick ({})", gap_job_name);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                job = %gap_job_name,
-                                error = %e,
-                                "failed to reset gap_detection cron job"
-                            );
                         }
                     }
                 }
-                SpecCommands::Pause { id } => {
+                SpecCommands::Pause { id, json } => {
                     let spec = db.get_spec(&id)?;
                     if !spec
                         .status
@@ -3072,9 +3566,20 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                     db.update_spec_status(&id, belt_core::spec::SpecStatus::Paused)?;
-                    println!("spec paused: {id}");
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "success": true,
+                                "id": id,
+                                "status": "paused"
+                            }))?
+                        );
+                    } else {
+                        println!("spec paused: {id}");
+                    }
                 }
-                SpecCommands::Resume { id } => {
+                SpecCommands::Resume { id, json } => {
                     let spec = db.get_spec(&id)?;
                     if !spec
                         .status
@@ -3088,7 +3593,16 @@ async fn main() -> anyhow::Result<()> {
                     let was_draft = spec.status == belt_core::spec::SpecStatus::Draft;
                     let was_archived = spec.status == belt_core::spec::SpecStatus::Archived;
                     db.update_spec_status(&id, belt_core::spec::SpecStatus::Active)?;
-                    if was_archived {
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "success": true,
+                                "id": id,
+                                "status": "active"
+                            }))?
+                        );
+                    } else if was_archived {
                         println!("spec restored from archive: {id}");
                     } else {
                         println!("spec activated: {id}");
@@ -3101,7 +3615,7 @@ async fn main() -> anyhow::Result<()> {
                         );
                     }
                 }
-                SpecCommands::Complete { id } => {
+                SpecCommands::Complete { id, json } => {
                     let spec = db.get_spec(&id)?;
                     // Determine the target status based on current state:
                     // Active -> Completing (enter completion flow)
@@ -3120,17 +3634,28 @@ async fn main() -> anyhow::Result<()> {
                         anyhow::bail!("invalid transition: {} -> {}", spec.status, target);
                     }
                     db.update_spec_status(&id, target)?;
-                    match target {
-                        belt_core::spec::SpecStatus::Completing => {
-                            println!("spec entering completion flow: {id}");
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "success": true,
+                                "id": id,
+                                "status": target.to_string()
+                            }))?
+                        );
+                    } else {
+                        match target {
+                            belt_core::spec::SpecStatus::Completing => {
+                                println!("spec entering completion flow: {id}");
+                            }
+                            belt_core::spec::SpecStatus::Completed => {
+                                println!("spec completed: {id}");
+                            }
+                            _ => unreachable!(),
                         }
-                        belt_core::spec::SpecStatus::Completed => {
-                            println!("spec completed: {id}");
-                        }
-                        _ => unreachable!(),
                     }
                 }
-                SpecCommands::Remove { id } => {
+                SpecCommands::Remove { id, json } => {
                     let spec = db.get_spec(&id)?;
                     if spec.status == belt_core::spec::SpecStatus::Completed {
                         anyhow::bail!(
@@ -3141,20 +3666,54 @@ async fn main() -> anyhow::Result<()> {
                         anyhow::bail!("spec is already archived");
                     }
                     db.update_spec_status(&id, belt_core::spec::SpecStatus::Archived)?;
-                    println!("spec archived: {id}");
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "success": true,
+                                "id": id,
+                                "status": "archived"
+                            }))?
+                        );
+                    } else {
+                        println!("spec archived: {id}");
+                    }
                 }
-                SpecCommands::Link { id, target } => {
+                SpecCommands::Link { id, target, json } => {
                     // Ensure spec exists.
                     let _ = db.get_spec(&id)?;
                     let link_id = format!("link-{}", chrono::Utc::now().timestamp_millis());
                     let link =
                         belt_core::spec::SpecLink::new(link_id.clone(), id.clone(), target.clone());
                     db.insert_spec_link(&link)?;
-                    println!("linked {id} -> {target}");
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "success": true,
+                                "id": id,
+                                "target": target,
+                                "link_id": link_id
+                            }))?
+                        );
+                    } else {
+                        println!("linked {id} -> {target}");
+                    }
                 }
-                SpecCommands::Unlink { id, target } => {
+                SpecCommands::Unlink { id, target, json } => {
                     db.remove_spec_link(&id, &target)?;
-                    println!("unlinked {id} -x- {target}");
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "success": true,
+                                "id": id,
+                                "target": target
+                            }))?
+                        );
+                    } else {
+                        println!("unlinked {id} -x- {target}");
+                    }
                 }
                 SpecCommands::Verify { id, json } => {
                     let spec = db.get_spec(&id)?;
@@ -3345,6 +3904,7 @@ async fn main() -> anyhow::Result<()> {
                 action,
                 respondent,
                 notes,
+                json: json_output,
             } => {
                 let action: belt_core::queue::HitlRespondAction =
                     action.parse().map_err(|e: String| anyhow::anyhow!(e))?;
@@ -3371,10 +3931,23 @@ async fn main() -> anyhow::Result<()> {
                         let new_count = item.replan_count + 1;
                         if new_count > max_replan {
                             db.update_phase(&item_id, QueuePhase::Failed)?;
-                            println!(
-                                "Item '{}' replan limit exceeded ({}/{}), transitioned to failed.",
-                                item_id, new_count, max_replan
-                            );
+                            if json_output {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "success": true,
+                                        "work_id": item_id,
+                                        "action": "replan",
+                                        "phase": "failed",
+                                        "reason": "replan limit exceeded"
+                                    }))?
+                                );
+                            } else {
+                                println!(
+                                    "Item '{}' replan limit exceeded ({}/{}), transitioned to failed.",
+                                    item_id, new_count, max_replan
+                                );
+                            }
                         } else {
                             // Roll back original item to Pending.
                             db.update_phase(&item_id, QueuePhase::Pending)?;
@@ -3399,11 +3972,25 @@ async fn main() -> anyhow::Result<()> {
                                 Some(format!("spec-modification-proposed (replan #{new_count})"));
                             replan_item.replan_count = new_count;
                             db.insert_item(&replan_item)?;
-                            println!(
-                                "Item '{}' rolled back to pending (replan {}/{}). \
-                                 Created HITL item '{}' for spec modification review.",
-                                item_id, new_count, max_replan, replan_work_id
-                            );
+                            if json_output {
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&serde_json::json!({
+                                        "success": true,
+                                        "work_id": item_id,
+                                        "action": "replan",
+                                        "phase": "pending",
+                                        "replan_count": new_count,
+                                        "replan_work_id": replan_work_id
+                                    }))?
+                                );
+                            } else {
+                                println!(
+                                    "Item '{}' rolled back to pending (replan {}/{}). \
+                                     Created HITL item '{}' for spec modification review.",
+                                    item_id, new_count, max_replan, replan_work_id
+                                );
+                            }
                         }
                     }
                     _ => {
@@ -3493,10 +4080,22 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
 
-                        println!(
-                            "Item '{}' transitioned from hitl to {} (action: {}).",
-                            item_id, target_phase, action
-                        );
+                        if json_output {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&serde_json::json!({
+                                    "success": true,
+                                    "work_id": item_id,
+                                    "action": action.to_string(),
+                                    "phase": target_phase.as_str()
+                                }))?
+                            );
+                        } else {
+                            println!(
+                                "Item '{}' transitioned from hitl to {} (action: {}).",
+                                item_id, target_phase, action
+                            );
+                        }
                     }
                 }
             }
@@ -3857,7 +4456,7 @@ mod tests {
         let cli = Cli::try_parse_from(["belt", "cron", "trigger", "daily-report"]).unwrap();
         match cli.command {
             Commands::Cron {
-                command: CronCommands::Trigger { name },
+                command: CronCommands::Trigger { name, .. },
             } => assert_eq!(name, "daily-report"),
             _ => panic!("expected Cron Trigger command"),
         }
@@ -4263,7 +4862,7 @@ mod tests {
         .unwrap();
         match cli.command {
             Commands::Spec {
-                command: SpecCommands::Link { id, target },
+                command: SpecCommands::Link { id, target, .. },
             } => {
                 assert_eq!(id, "spec-10");
                 assert_eq!(target, "https://example.com/issue/1");
@@ -4278,7 +4877,7 @@ mod tests {
             Cli::try_parse_from(["belt", "spec", "link", "spec-5", "owner/repo#123"]).unwrap();
         match cli.command {
             Commands::Spec {
-                command: SpecCommands::Link { id, target },
+                command: SpecCommands::Link { id, target, .. },
             } => {
                 assert_eq!(id, "spec-5");
                 assert_eq!(target, "owner/repo#123");
@@ -4299,7 +4898,7 @@ mod tests {
         .unwrap();
         match cli.command {
             Commands::Spec {
-                command: SpecCommands::Unlink { id, target },
+                command: SpecCommands::Unlink { id, target, .. },
             } => {
                 assert_eq!(id, "spec-10");
                 assert_eq!(target, "https://example.com/issue/1");
@@ -5545,5 +6144,432 @@ sources:
     fn decompose_preview_empty() {
         let preview = belt_core::spec::format_decomposition_preview(&[]);
         assert!(preview.contains("0 child issue(s)"));
+    }
+
+    // --- JSON flag parsing tests ---
+
+    #[test]
+    fn queue_done_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "queue", "done", "item-1", "--json"]).unwrap();
+        match cli.command {
+            Commands::Queue {
+                command: QueueCommands::Done { work_id, json },
+            } => {
+                assert_eq!(work_id, "item-1");
+                assert!(json);
+            }
+            _ => panic!("expected Queue Done command"),
+        }
+    }
+
+    #[test]
+    fn queue_done_without_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "queue", "done", "item-1"]).unwrap();
+        match cli.command {
+            Commands::Queue {
+                command: QueueCommands::Done { json, .. },
+            } => assert!(!json),
+            _ => panic!("expected Queue Done command"),
+        }
+    }
+
+    #[test]
+    fn queue_hitl_json_flag() {
+        let cli = Cli::try_parse_from([
+            "belt", "queue", "hitl", "item-1", "--reason", "test", "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Queue {
+                command: QueueCommands::Hitl { json, reason, .. },
+            } => {
+                assert!(json);
+                assert_eq!(reason.as_deref(), Some("test"));
+            }
+            _ => panic!("expected Queue Hitl command"),
+        }
+    }
+
+    #[test]
+    fn queue_skip_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "queue", "skip", "item-1", "--json"]).unwrap();
+        match cli.command {
+            Commands::Queue {
+                command: QueueCommands::Skip { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Queue Skip command"),
+        }
+    }
+
+    #[test]
+    fn queue_retry_script_json_flag() {
+        let cli =
+            Cli::try_parse_from(["belt", "queue", "retry-script", "item-1", "--json"]).unwrap();
+        match cli.command {
+            Commands::Queue {
+                command: QueueCommands::RetryScript { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Queue RetryScript command"),
+        }
+    }
+
+    #[test]
+    fn queue_dependency_add_json_flag() {
+        let cli = Cli::try_parse_from([
+            "belt",
+            "queue",
+            "dependency",
+            "add",
+            "q1",
+            "--after",
+            "q2",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Queue {
+                command: QueueCommands::Dependency(DependencyCommands::Add { json, .. }),
+            } => assert!(json),
+            _ => panic!("expected Queue Dependency Add command"),
+        }
+    }
+
+    #[test]
+    fn queue_dependency_remove_json_flag() {
+        let cli = Cli::try_parse_from([
+            "belt",
+            "queue",
+            "dependency",
+            "remove",
+            "q1",
+            "--after",
+            "q2",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Queue {
+                command: QueueCommands::Dependency(DependencyCommands::Remove { json, .. }),
+            } => assert!(json),
+            _ => panic!("expected Queue Dependency Remove command"),
+        }
+    }
+
+    #[test]
+    fn hitl_respond_json_flag() {
+        let cli = Cli::try_parse_from([
+            "belt", "hitl", "respond", "item-1", "--action", "done", "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Hitl {
+                command: HitlCommands::Respond { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Hitl Respond command"),
+        }
+    }
+
+    #[test]
+    fn hitl_timeout_set_json_flag() {
+        let cli = Cli::try_parse_from([
+            "belt",
+            "hitl",
+            "timeout",
+            "set",
+            "item-1",
+            "--duration",
+            "60",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Hitl {
+                command:
+                    HitlCommands::Timeout {
+                        command: HitlTimeoutCommands::Set { json, .. },
+                    },
+            } => assert!(json),
+            _ => panic!("expected Hitl Timeout Set command"),
+        }
+    }
+
+    #[test]
+    fn hitl_timeout_ls_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "hitl", "timeout", "ls", "--json"]).unwrap();
+        match cli.command {
+            Commands::Hitl {
+                command:
+                    HitlCommands::Timeout {
+                        command: HitlTimeoutCommands::Ls { json },
+                    },
+            } => assert!(json),
+            _ => panic!("expected Hitl Timeout Ls command"),
+        }
+    }
+
+    #[test]
+    fn workspace_add_json_flag() {
+        let cli =
+            Cli::try_parse_from(["belt", "workspace", "add", "--config", "ws.yaml", "--json"])
+                .unwrap();
+        match cli.command {
+            Commands::Workspace {
+                command: WorkspaceCommands::Add { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Workspace Add command"),
+        }
+    }
+
+    #[test]
+    fn workspace_list_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "workspace", "list", "--json"]).unwrap();
+        match cli.command {
+            Commands::Workspace {
+                command: WorkspaceCommands::List { json },
+            } => assert!(json),
+            _ => panic!("expected Workspace List command"),
+        }
+    }
+
+    #[test]
+    fn workspace_show_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "workspace", "show", "my-ws", "--json"]).unwrap();
+        match cli.command {
+            Commands::Workspace {
+                command: WorkspaceCommands::Show { json, name },
+            } => {
+                assert!(json);
+                assert_eq!(name, "my-ws");
+            }
+            _ => panic!("expected Workspace Show command"),
+        }
+    }
+
+    #[test]
+    fn workspace_update_json_flag() {
+        let cli = Cli::try_parse_from([
+            "belt",
+            "workspace",
+            "update",
+            "my-ws",
+            "--config",
+            "new.yaml",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Workspace {
+                command: WorkspaceCommands::Update { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Workspace Update command"),
+        }
+    }
+
+    #[test]
+    fn workspace_remove_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "workspace", "remove", "my-ws", "--json"]).unwrap();
+        match cli.command {
+            Commands::Workspace {
+                command: WorkspaceCommands::Remove { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Workspace Remove command"),
+        }
+    }
+
+    #[test]
+    fn cron_add_json_flag() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let cli = Cli::try_parse_from([
+            "belt",
+            "cron",
+            "add",
+            "job1",
+            "--schedule",
+            "0 * * * *",
+            "--script",
+            tmp.path().to_str().unwrap(),
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Cron {
+                command: CronCommands::Add { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Cron Add command"),
+        }
+    }
+
+    #[test]
+    fn cron_pause_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "cron", "pause", "job1", "--json"]).unwrap();
+        match cli.command {
+            Commands::Cron {
+                command: CronCommands::Pause { json, name },
+            } => {
+                assert!(json);
+                assert_eq!(name, "job1");
+            }
+            _ => panic!("expected Cron Pause command"),
+        }
+    }
+
+    #[test]
+    fn cron_resume_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "cron", "resume", "job1", "--json"]).unwrap();
+        match cli.command {
+            Commands::Cron {
+                command: CronCommands::Resume { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Cron Resume command"),
+        }
+    }
+
+    #[test]
+    fn cron_remove_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "cron", "remove", "job1", "--json"]).unwrap();
+        match cli.command {
+            Commands::Cron {
+                command: CronCommands::Remove { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Cron Remove command"),
+        }
+    }
+
+    #[test]
+    fn cron_trigger_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "cron", "trigger", "job1", "--json"]).unwrap();
+        match cli.command {
+            Commands::Cron {
+                command: CronCommands::Trigger { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Cron Trigger command"),
+        }
+    }
+
+    #[test]
+    fn cron_run_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "cron", "run", "job1", "--json"]).unwrap();
+        match cli.command {
+            Commands::Cron {
+                command: CronCommands::Run { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Cron Run command"),
+        }
+    }
+
+    #[test]
+    fn spec_update_json_flag() {
+        let cli = Cli::try_parse_from([
+            "belt", "spec", "update", "spec-1", "--name", "new-name", "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Spec {
+                command: SpecCommands::Update { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Spec Update command"),
+        }
+    }
+
+    #[test]
+    fn spec_pause_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "spec", "pause", "spec-1", "--json"]).unwrap();
+        match cli.command {
+            Commands::Spec {
+                command: SpecCommands::Pause { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Spec Pause command"),
+        }
+    }
+
+    #[test]
+    fn spec_resume_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "spec", "resume", "spec-1", "--json"]).unwrap();
+        match cli.command {
+            Commands::Spec {
+                command: SpecCommands::Resume { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Spec Resume command"),
+        }
+    }
+
+    #[test]
+    fn spec_complete_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "spec", "complete", "spec-1", "--json"]).unwrap();
+        match cli.command {
+            Commands::Spec {
+                command: SpecCommands::Complete { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Spec Complete command"),
+        }
+    }
+
+    #[test]
+    fn spec_remove_json_flag() {
+        let cli = Cli::try_parse_from(["belt", "spec", "remove", "spec-1", "--json"]).unwrap();
+        match cli.command {
+            Commands::Spec {
+                command: SpecCommands::Remove { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Spec Remove command"),
+        }
+    }
+
+    #[test]
+    fn spec_link_json_flag() {
+        let cli = Cli::try_parse_from([
+            "belt",
+            "spec",
+            "link",
+            "spec-1",
+            "https://example.com",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Spec {
+                command: SpecCommands::Link { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Spec Link command"),
+        }
+    }
+
+    #[test]
+    fn spec_unlink_json_flag() {
+        let cli = Cli::try_parse_from([
+            "belt",
+            "spec",
+            "unlink",
+            "spec-1",
+            "https://example.com",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Spec {
+                command: SpecCommands::Unlink { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Spec Unlink command"),
+        }
+    }
+
+    #[test]
+    fn cron_update_json_flag() {
+        let cli = Cli::try_parse_from([
+            "belt",
+            "cron",
+            "update",
+            "job1",
+            "--schedule",
+            "5 * * * *",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Cron {
+                command: CronCommands::Update { json, .. },
+            } => assert!(json),
+            _ => panic!("expected Cron Update command"),
+        }
     }
 }
