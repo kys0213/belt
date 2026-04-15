@@ -489,4 +489,45 @@ stagnation:
         let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.stagnation.enabled);
     }
+
+    #[test]
+    fn lateral_defaults_to_enabled() {
+        let yaml = "name: minimal\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.stagnation.lateral.enabled);
+    }
+
+    #[test]
+    fn lateral_parses_disabled() {
+        let yaml = r#"
+name: lat-off
+sources:
+  github:
+    url: https://github.com/org/repo
+stagnation:
+  lateral:
+    enabled: false
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(
+            config.stagnation.enabled,
+            "stagnation should remain enabled"
+        );
+        assert!(!config.stagnation.lateral.enabled);
+    }
+
+    #[test]
+    fn lateral_parses_enabled_explicitly() {
+        let yaml = r#"
+name: lat-on
+sources:
+  github:
+    url: https://github.com/org/repo
+stagnation:
+  lateral:
+    enabled: true
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.stagnation.lateral.enabled);
+    }
 }

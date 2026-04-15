@@ -2157,6 +2157,11 @@ impl Daemon {
             return None;
         }
 
+        // Respect lateral.enabled configuration flag.
+        if !self.config.stagnation.lateral.enabled {
+            return None;
+        }
+
         // Collect recent failure error messages for this source_id + state.
         let errors: Vec<String> = self
             .history_events
@@ -5672,6 +5677,46 @@ sources:
         assert!(
             daemon.config.stagnation.enabled,
             "stagnation should be enabled by default"
+        );
+    }
+
+    #[test]
+    fn detect_stagnation_lateral_disabled_skips_plan_generation() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![0]);
+
+        // Keep stagnation enabled but disable lateral analysis.
+        daemon.config.stagnation.lateral.enabled = false;
+
+        // Record enough failures that would normally trigger stagnation + lateral plan.
+        let item = test_item("src:1", "implement");
+        for _ in 0..3 {
+            daemon.record_history_event(&item, "failed", Some("compile error X".to_string()));
+        }
+
+        let result = daemon.detect_stagnation_and_generate_plan(
+            "w:1",
+            "src:1",
+            "implement",
+            "compile error X",
+        );
+        assert!(
+            result.is_none(),
+            "lateral plan generation should be skipped when lateral.enabled is false"
+        );
+    }
+
+    #[test]
+    fn detect_stagnation_lateral_enabled_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![0]);
+
+        // Default config should have lateral enabled.
+        assert!(
+            daemon.config.stagnation.lateral.enabled,
+            "lateral should be enabled by default"
         );
     }
 

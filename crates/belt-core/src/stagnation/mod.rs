@@ -34,6 +34,24 @@ pub use similarity::{
 
 use serde::{Deserialize, Serialize};
 
+/// Lateral thinking analysis configuration.
+///
+/// Controls whether lateral plan generation runs when stagnation is detected.
+/// When `enabled` is `false`, stagnation detection still runs but lateral plan
+/// generation is skipped.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LateralConfig {
+    /// Whether lateral thinking analysis is enabled. Defaults to `true`.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+impl Default for LateralConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// Stagnation detection configuration.
 ///
 /// Controls whether stagnation analysis runs and its parameters.
@@ -43,6 +61,10 @@ pub struct StagnationConfig {
     /// Whether stagnation detection is enabled. Defaults to `true`.
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+
+    /// Lateral thinking analysis sub-configuration.
+    #[serde(default)]
+    pub lateral: LateralConfig,
 }
 
 fn default_enabled() -> bool {
@@ -51,6 +73,9 @@ fn default_enabled() -> bool {
 
 impl Default for StagnationConfig {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            lateral: LateralConfig::default(),
+        }
     }
 }
