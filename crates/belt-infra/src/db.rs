@@ -884,6 +884,36 @@ impl Database {
         })
     }
 
+    /// Get a single workspace by name, including `updated_at` for cache invalidation.
+    ///
+    /// Returns `(name, config_path, updated_at)`.
+    ///
+    /// # Errors
+    /// Returns `BeltError::WorkspaceNotFound` if no such workspace exists.
+    pub fn get_workspace_with_updated_at(
+        &self,
+        name: &str,
+    ) -> Result<(String, String, String), BeltError> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))?;
+        conn.query_row(
+            "SELECT name, config_path, updated_at FROM workspaces WHERE name = ?1",
+            params![name],
+            |row| {
+                let n: String = row.get(0)?;
+                let cp: String = row.get(1)?;
+                let ua: String = row.get(2)?;
+                Ok((n, cp, ua))
+            },
+        )
+        .map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => BeltError::WorkspaceNotFound(name.to_string()),
+            other => BeltError::Database(other.to_string()),
+        })
+    }
+
     /// Remove a workspace by name.
     ///
     /// # Errors

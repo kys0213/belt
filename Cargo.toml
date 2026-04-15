@@ -50,6 +50,8 @@ regex = "1"
 flate2 = "1"
 # Time
 chrono = { version = "0.4", features = ["serde"] }
+# Cache
+lru = "0.12"
 
 # Internal crates
 belt-core = { path = "crates/belt-core" }

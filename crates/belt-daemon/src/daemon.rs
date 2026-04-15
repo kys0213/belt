@@ -29,6 +29,7 @@ use crate::cron::{
 };
 use crate::evaluator::Evaluator;
 use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
+use crate::hook_cache::DynamicHookLoader;
 
 /// Safely transition a [`QueueItem`] to a new phase.
 ///
@@ -83,7 +84,17 @@ pub struct Daemon {
     /// Dependency guard for spec execution ordering.
     dependency_guard: SpecDependencyGuard,
     /// Lifecycle hook called at phase transitions (on_enter, on_done, on_fail, on_escalation).
+    ///
+    /// When `hook_loader` is `Some`, this serves as the fallback for workspaces
+    /// not found in the DB.  When `hook_loader` is `None`, this is the sole hook
+    /// used for all items (backward-compatible static injection).
     hook: Arc<dyn LifecycleHook>,
+    /// Dynamic hook loader with LRU cache.
+    ///
+    /// When set, hooks are resolved per-workspace at trigger time by querying
+    /// the DB and parsing the workspace yaml.  Results are cached in an LRU
+    /// to avoid repeated yaml parsing.
+    hook_loader: Option<Arc<DynamicHookLoader>>,
 }
 
 #[derive(Debug)]
@@ -151,6 +162,7 @@ impl Daemon {
             ),
             dependency_guard: SpecDependencyGuard,
             hook: Arc::new(NoopLifecycleHook),
+            hook_loader: None,
         }
     }
 
@@ -219,14 +231,60 @@ impl Daemon {
         self
     }
 
-    /// Set the lifecycle hook for phase transition notifications.
+    /// Set a static lifecycle hook for phase transition notifications.
     ///
     /// The hook is called at key state transitions: on_enter (Running),
     /// on_done (Done), on_fail (Failed), and on_escalation (HITL/Retry).
     /// Defaults to [`NoopLifecycleHook`] if not set.
+    ///
+    /// When a [`DynamicHookLoader`] is also configured (via [`with_hook_loader`]),
+    /// this static hook serves as the fallback for workspaces not found in the DB.
     pub fn with_hook(mut self, hook: Arc<dyn LifecycleHook>) -> Self {
         self.hook = hook;
         self
+    }
+
+    /// Set a dynamic hook loader for per-workspace hook resolution.
+    ///
+    /// When set, hook trigger points resolve the hook from the DB + yaml
+    /// configuration with LRU caching, instead of using the static hook
+    /// for all items.  This enables:
+    /// - Dynamic workspace addition without Daemon restart
+    /// - Immediate yaml config change reflection
+    /// - Bounded memory via LRU eviction
+    ///
+    /// The static hook (set via [`with_hook`]) is used as fallback when the
+    /// loader cannot resolve a hook for a given workspace.
+    pub fn with_hook_loader(mut self, loader: Arc<DynamicHookLoader>) -> Self {
+        self.hook_loader = Some(loader);
+        self
+    }
+
+    /// Resolve the lifecycle hook for a workspace.
+    ///
+    /// If a [`DynamicHookLoader`] is configured, delegates to it.
+    /// Otherwise returns the static hook.
+    fn resolve_hook(&self, workspace_name: &str) -> Arc<dyn LifecycleHook> {
+        if let Some(loader) = &self.hook_loader {
+            loader.resolve(workspace_name)
+        } else {
+            Arc::clone(&self.hook)
+        }
+    }
+
+    /// Resolve the lifecycle hook for a workspace (static version for parallel execution).
+    ///
+    /// Same as [`resolve_hook`] but takes explicit parameters instead of `&self`.
+    fn resolve_hook_static(
+        hook: &Arc<dyn LifecycleHook>,
+        hook_loader: &Option<Arc<DynamicHookLoader>>,
+        workspace_name: &str,
+    ) -> Arc<dyn LifecycleHook> {
+        if let Some(loader) = hook_loader {
+            loader.resolve(workspace_name)
+        } else {
+            Arc::clone(hook)
+        }
     }
 
     // ---------------------------------------------------------------
@@ -446,7 +504,7 @@ impl Daemon {
             let ws_name = self.config.name.clone();
             let state_config = self.find_state_config(&item.state).cloned();
 
-            let hook = Arc::clone(&self.hook);
+            let hook = Self::resolve_hook_static(&self.hook, &self.hook_loader, &ws_name);
             join_set.spawn(async move {
                 Self::execute_item_parallel(
                     item,
@@ -834,7 +892,8 @@ impl Daemon {
 
                 // Lifecycle hook: on_fail — log only, do not interrupt flow.
                 let hook_ctx = self.build_hook_context(&item, worktree.as_ref());
-                if let Err(e) = self.hook.on_fail(&hook_ctx).await {
+                let fail_hook = self.resolve_hook(&ws_name);
+                if let Err(e) = fail_hook.on_fail(&hook_ctx).await {
                     tracing::warn!(
                         work_id = %item.work_id,
                         "lifecycle hook on_fail error (ignored): {e}"
@@ -924,7 +983,7 @@ impl Daemon {
         // Lifecycle hook: on_done — fire and forget, log only on failure.
         let worktree_path = self.worktree_mgr.path(&item.work_id);
         let hook_ctx = Self::build_hook_context_static(item, &worktree_path, &self.config.name);
-        let hook = Arc::clone(&self.hook);
+        let hook = self.resolve_hook(&self.config.name);
         Self::spawn_hook(async move {
             if let Err(e) = hook.on_done(&hook_ctx).await {
                 tracing::warn!(
@@ -2130,10 +2189,11 @@ impl Daemon {
         lateral_plan: Option<String>,
     ) {
         let hook_ctx = self.build_hook_context(item, None);
+        let resolved_hook = self.resolve_hook(&self.config.name);
         let mut svc = crate::hitl_service::HitlService::new(
             &mut self.queue,
             &self.db,
-            &self.hook,
+            &resolved_hook,
             &self.worktree_mgr,
         );
         svc.handle_escalation(item, action, lateral_plan, hook_ctx);
