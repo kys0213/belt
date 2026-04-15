@@ -44,6 +44,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Platform
 libc = "0.2"
+# Regex
+regex = "1"
 # Compression
 flate2 = "1"
 # Time

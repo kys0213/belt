@@ -10,9 +10,11 @@ use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
+use std::sync::LazyLock;
 
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use regex::Regex;
 
 /// A similarity score in `[0.0, 1.0]` where 1.0 means identical.
 pub type SimilarityScore = f64;
@@ -56,31 +58,63 @@ impl SimilarityJudge for ExactHash {
     }
 }
 
-/// Normalized token-level similarity using the Jaccard index.
+/// Normalized token-level similarity using the Jaccard index on hashed tokens.
 ///
-/// Tokenizes by splitting on whitespace, lowercasing, and stripping
-/// non-alphanumeric characters. The score is `|intersection| / |union|`.
+/// Normalizes variable parts (hex hashes, UUIDs, file paths, decimal numbers)
+/// to placeholders before tokenizing. Tokens are hashed and compared as sets.
+/// The score is `|intersection| / |union|` of the hash sets (Jaccard index).
+///
+/// Normalization rules per spec R-016:
+/// - Hex hash (6+ hex digits, optionally `0x`-prefixed) → `<HASH>`
+/// - UUID (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) → `<UUID>`
+/// - File path (Unix or Windows style with extension) → `<PATH>`
+/// - Decimal number → `<N>`
 #[derive(Debug, Default)]
 pub struct TokenFingerprint;
 
+/// Regex patterns for token normalization, compiled once.
+static RE_UUID: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+        .expect("valid regex")
+});
+static RE_HEX_HASH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:0x)?[0-9a-fA-F]{6,}").expect("valid regex"));
+static RE_PATH: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?:[a-zA-Z]:\\|/)[^\s]+\.[a-zA-Z0-9]+").expect("valid regex"));
+static RE_NUMBER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\b\d+(?:\.\d+)?\b").expect("valid regex"));
+
 impl TokenFingerprint {
-    fn tokenize(s: &str) -> HashSet<String> {
-        s.split_whitespace()
+    /// Normalize variable parts in the input string to fixed placeholders.
+    fn normalize(s: &str) -> String {
+        // Order matters: UUID before hex hash (UUIDs contain hex sequences).
+        let s = RE_UUID.replace_all(s, "<UUID>");
+        let s = RE_HEX_HASH.replace_all(&s, "<HASH>");
+        let s = RE_PATH.replace_all(&s, "<PATH>");
+        let s = RE_NUMBER.replace_all(&s, "<N>");
+        s.into_owned()
+    }
+
+    /// Normalize, then tokenize by whitespace and lowercase. Each token is
+    /// hashed to a `u64` for efficient set comparison.
+    fn tokenize_to_hashes(s: &str) -> HashSet<u64> {
+        let normalized = Self::normalize(s);
+        normalized
+            .split_whitespace()
             .map(|w| {
-                w.to_lowercase()
-                    .chars()
-                    .filter(|c| c.is_alphanumeric())
-                    .collect::<String>()
+                let lower = w.to_lowercase();
+                let mut hasher = DefaultHasher::new();
+                lower.hash(&mut hasher);
+                hasher.finish()
             })
-            .filter(|t| !t.is_empty())
             .collect()
     }
 }
 
 impl SimilarityJudge for TokenFingerprint {
     fn score(&self, a: &str, b: &str) -> SimilarityScore {
-        let set_a = Self::tokenize(a);
-        let set_b = Self::tokenize(b);
+        let set_a = Self::tokenize_to_hashes(a);
+        let set_b = Self::tokenize_to_hashes(b);
 
         if set_a.is_empty() && set_b.is_empty() {
             return 1.0;
@@ -276,15 +310,110 @@ mod tests {
     }
 
     #[test]
-    fn token_fingerprint_strips_punctuation() {
-        let judge = TokenFingerprint;
-        let score = judge.score("hello, world!", "hello world");
-        assert!((score - 1.0).abs() < f64::EPSILON);
+    fn token_fingerprint_name() {
+        assert_eq!(TokenFingerprint.name(), "token_fingerprint");
     }
 
     #[test]
-    fn token_fingerprint_name() {
-        assert_eq!(TokenFingerprint.name(), "token_fingerprint");
+    fn token_fingerprint_normalizes_numbers() {
+        let judge = TokenFingerprint;
+        // "line 42" vs "line 58" both normalize to "line <N>" -- identical
+        let score = judge.score("error at line 42 in module", "error at line 58 in module");
+        assert!(
+            (score - 1.0).abs() < f64::EPSILON,
+            "numbers should be normalized, got {score}"
+        );
+    }
+
+    #[test]
+    fn token_fingerprint_normalizes_hex_hash() {
+        let judge = TokenFingerprint;
+        let score = judge.score(
+            "commit 0x7f3a2b caused failure",
+            "commit 0xab12cd caused failure",
+        );
+        assert!(
+            (score - 1.0).abs() < f64::EPSILON,
+            "hex hashes should be normalized, got {score}"
+        );
+    }
+
+    #[test]
+    fn token_fingerprint_normalizes_uuid() {
+        let judge = TokenFingerprint;
+        let score = judge.score(
+            "task 550e8400-e29b-41d4-a716-446655440000 failed",
+            "task a1b2c3d4-e5f6-7890-abcd-ef1234567890 failed",
+        );
+        assert!(
+            (score - 1.0).abs() < f64::EPSILON,
+            "UUIDs should be normalized, got {score}"
+        );
+    }
+
+    #[test]
+    fn token_fingerprint_normalizes_file_path() {
+        let judge = TokenFingerprint;
+        let score = judge.score(
+            "error in /tmp/abc123/foo.rs at compile",
+            "error in /var/build/bar.rs at compile",
+        );
+        assert!(
+            (score - 1.0).abs() < f64::EPSILON,
+            "file paths should be normalized, got {score}"
+        );
+    }
+
+    #[test]
+    fn token_fingerprint_spec_example() {
+        let judge = TokenFingerprint;
+        // Spec example: same error on different lines should score 1.0
+        let score = judge.score(
+            "error[E0433]: not found in auth::middleware (line 42)",
+            "error[E0433]: not found in auth::middleware (line 58)",
+        );
+        assert!(
+            (score - 1.0).abs() < f64::EPSILON,
+            "spec example should normalize to identical, got {score}"
+        );
+    }
+
+    #[test]
+    fn token_fingerprint_different_structure() {
+        let judge = TokenFingerprint;
+        // Completely different structure should score low
+        let score = judge.score(
+            "error[E0433]: not found in auth::middleware",
+            "warning: unused variable in tests::unit",
+        );
+        assert!(
+            score < 0.5,
+            "different structure should score low, got {score}"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_structure() {
+        let normalized = TokenFingerprint::normalize(
+            "error[E0433]: not found in /src/auth.rs (line 42) hash 0xdeadbeef",
+        );
+        assert!(normalized.contains("<N>"), "numbers should become <N>");
+        assert!(normalized.contains("<PATH>"), "paths should become <PATH>");
+        assert!(
+            normalized.contains("<HASH>"),
+            "hex hashes should become <HASH>"
+        );
+    }
+
+    #[test]
+    fn normalize_uuid_before_hex() {
+        // UUID should be replaced as <UUID>, not partially matched as hex
+        let normalized =
+            TokenFingerprint::normalize("id 550e8400-e29b-41d4-a716-446655440000 done");
+        assert!(
+            normalized.contains("<UUID>"),
+            "UUID should be normalized: {normalized}"
+        );
     }
 
     #[test]
