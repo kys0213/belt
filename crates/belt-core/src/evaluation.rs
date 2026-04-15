@@ -19,6 +19,9 @@ use async_trait::async_trait;
 /// Evaluation context passed to each stage.
 ///
 /// Contains the information a stage needs to perform its judgment.
+/// The semantic stage requires `issue_body`, `handler_stdout`, `handler_stderr`,
+/// `execution_history`, and `classify_policy` to build a structured LLM prompt
+/// (R-015).
 #[derive(Debug, Clone)]
 pub struct EvalContext {
     /// The work_id of the queue item being evaluated.
@@ -29,6 +32,16 @@ pub struct EvalContext {
     pub workspace_name: String,
     /// Path to the worktree directory for this item.
     pub worktree_path: Option<PathBuf>,
+    /// Original issue body from the data source.
+    pub issue_body: Option<String>,
+    /// Handler stdout captured after execution.
+    pub handler_stdout: Option<String>,
+    /// Handler stderr captured after execution.
+    pub handler_stderr: Option<String>,
+    /// Execution history summary (prior attempts, failures, lateral plans).
+    pub execution_history: Option<String>,
+    /// Contents of classify-policy.md for workspace-specific judgment guidelines.
+    pub classify_policy: Option<String>,
 }
 
 /// Decision produced by an evaluation stage.
@@ -154,6 +167,11 @@ mod tests {
             source_id: "test".into(),
             workspace_name: "test-ws".into(),
             worktree_path: None,
+            issue_body: None,
+            handler_stdout: None,
+            handler_stderr: None,
+            execution_history: None,
+            classify_policy: None,
         }
     }
 
