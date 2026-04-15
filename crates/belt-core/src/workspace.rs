@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::escalation::EscalationPolicy;
+use crate::stagnation::StagnationConfig;
 
 /// 워크스페이스 설정.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +21,9 @@ pub struct WorkspaceConfig {
     /// Per-workspace Claw configuration overrides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claw_config: Option<ClawConfig>,
+    /// Stagnation detection configuration.
+    #[serde(default)]
+    pub stagnation: StagnationConfig,
 }
 
 /// Evaluation pipeline configuration.
@@ -449,5 +453,40 @@ evaluate: {}
         let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
         let eval = config.evaluate.unwrap();
         assert!(eval.mechanical.is_empty());
+    }
+
+    #[test]
+    fn stagnation_defaults_to_enabled() {
+        let yaml = "name: minimal\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.stagnation.enabled);
+    }
+
+    #[test]
+    fn stagnation_parses_disabled() {
+        let yaml = r#"
+name: stag-off
+sources:
+  github:
+    url: https://github.com/org/repo
+stagnation:
+  enabled: false
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(!config.stagnation.enabled);
+    }
+
+    #[test]
+    fn stagnation_parses_enabled_explicitly() {
+        let yaml = r#"
+name: stag-on
+sources:
+  github:
+    url: https://github.com/org/repo
+stagnation:
+  enabled: true
+"#;
+        let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
+        assert!(config.stagnation.enabled);
     }
 }

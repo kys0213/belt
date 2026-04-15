@@ -2152,6 +2152,11 @@ impl Daemon {
         state: &str,
         current_error: &str,
     ) -> Option<String> {
+        // Respect stagnation.enabled configuration flag.
+        if !self.config.stagnation.enabled {
+            return None;
+        }
+
         // Collect recent failure error messages for this source_id + state.
         let errors: Vec<String> = self
             .history_events
@@ -5628,6 +5633,46 @@ sources:
         assert!(detail["confidence"].as_f64().unwrap() > 0.0);
         assert!(detail["recommended_persona"].as_str().is_some());
         assert!(detail["failure_count"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn detect_stagnation_disabled_skips_analysis() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![0]);
+
+        // Disable stagnation detection via config.
+        daemon.config.stagnation.enabled = false;
+
+        // Record enough failures that would normally trigger stagnation.
+        let item = test_item("src:1", "implement");
+        for _ in 0..3 {
+            daemon.record_history_event(&item, "failed", Some("compile error X".to_string()));
+        }
+
+        let result = daemon.detect_stagnation_and_generate_plan(
+            "w:1",
+            "src:1",
+            "implement",
+            "compile error X",
+        );
+        assert!(
+            result.is_none(),
+            "stagnation detection should be skipped when disabled"
+        );
+    }
+
+    #[test]
+    fn detect_stagnation_enabled_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![0]);
+
+        // Default config should have stagnation enabled.
+        assert!(
+            daemon.config.stagnation.enabled,
+            "stagnation should be enabled by default"
+        );
     }
 
     // --- handle_escalation with lateral_plan tests ---
