@@ -322,7 +322,33 @@ impl<'a> Advancer<'a> {
                     return false;
                 }
                 None => {
-                    // Dependency not found in queue -- gate open.
+                    // Dependency not found in in-memory queue — fall back to DB
+                    // to handle system restart scenarios where the dependency
+                    // was completed in a previous session.
+                    match db.get_item(dep_id) {
+                        Ok(item) if item.phase() == QueuePhase::Done => {}
+                        Ok(item) => {
+                            tracing::trace!(
+                                work_id = %work_id,
+                                dependency = %dep_id,
+                                dependency_phase = %item.phase().as_str(),
+                                "queue dependency not done (DB lookup)"
+                            );
+                            return false;
+                        }
+                        Err(belt_core::error::BeltError::ItemNotFound(_)) => {
+                            // Not in DB either — gate open (original behavior).
+                        }
+                        Err(err) => {
+                            // DB error — gate open for stability (safe default).
+                            tracing::warn!(
+                                work_id = %work_id,
+                                dependency = %dep_id,
+                                error = %err,
+                                "DB lookup failed for dependency; keeping gate open"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -464,5 +490,93 @@ mod tests {
 
         let advanced = advancer.run();
         assert_eq!(advanced, 0);
+    }
+
+    #[test]
+    fn dependency_gate_db_fallback_done_passes() {
+        // When a dependency is not in the in-memory queue but exists in DB
+        // as Done, the gate should pass.
+        let db = Database::open_in_memory().expect("in-memory DB");
+        let db = Arc::new(db);
+
+        // Insert dependency item into DB and mark it Done.
+        let mut dep_item = test_item("dep-src", "analyze");
+        dep_item.work_id = "dep-work-id".to_string();
+        db.insert_item(&dep_item).unwrap();
+        db.update_phase("dep-work-id", QueuePhase::Ready).unwrap();
+        db.update_phase("dep-work-id", QueuePhase::Running).unwrap();
+        db.update_phase("dep-work-id", QueuePhase::Done).unwrap();
+
+        // Insert the item that depends on it.
+        let mut item = test_item("my-src", "implement");
+        item.work_id = "my-work-id".to_string();
+        db.insert_item(&item).unwrap();
+        db.add_queue_dependency("my-work-id", "dep-work-id")
+            .unwrap();
+
+        // In-memory queue has only the current item, NOT the dependency.
+        let mut queue = make_queue(vec![item]);
+        let mut tracker = ConcurrencyTracker::new(4);
+        let db_opt: Option<Arc<Database>> = Some(Arc::clone(&db));
+        let dep_guard = SpecDependencyGuard;
+
+        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
+
+        assert!(advancer.check_queue_dependency_gate("my-work-id"));
+    }
+
+    #[test]
+    fn dependency_gate_db_fallback_not_done_blocks() {
+        // When a dependency is not in the in-memory queue and exists in DB
+        // but is NOT Done, the gate should block.
+        let db = Database::open_in_memory().expect("in-memory DB");
+        let db = Arc::new(db);
+
+        // Insert dependency item into DB and leave it at Ready (not Done).
+        let mut dep_item = test_item("dep-src", "analyze");
+        dep_item.work_id = "dep-work-id".to_string();
+        db.insert_item(&dep_item).unwrap();
+        db.update_phase("dep-work-id", QueuePhase::Ready).unwrap();
+
+        // Insert the item that depends on it.
+        let mut item = test_item("my-src", "implement");
+        item.work_id = "my-work-id".to_string();
+        db.insert_item(&item).unwrap();
+        db.add_queue_dependency("my-work-id", "dep-work-id")
+            .unwrap();
+
+        // In-memory queue has only the current item, NOT the dependency.
+        let mut queue = make_queue(vec![item]);
+        let mut tracker = ConcurrencyTracker::new(4);
+        let db_opt: Option<Arc<Database>> = Some(Arc::clone(&db));
+        let dep_guard = SpecDependencyGuard;
+
+        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
+
+        assert!(!advancer.check_queue_dependency_gate("my-work-id"));
+    }
+
+    #[test]
+    fn dependency_gate_db_fallback_not_found_passes() {
+        // When a dependency is neither in the in-memory queue nor in DB,
+        // the gate should pass (original behavior).
+        let db = Database::open_in_memory().expect("in-memory DB");
+        let db = Arc::new(db);
+
+        // Insert the item that depends on a non-existent dependency.
+        let mut item = test_item("my-src", "implement");
+        item.work_id = "my-work-id".to_string();
+        db.insert_item(&item).unwrap();
+        db.add_queue_dependency("my-work-id", "nonexistent-dep")
+            .unwrap();
+
+        let mut queue = make_queue(vec![item]);
+        let mut tracker = ConcurrencyTracker::new(4);
+        let db_opt: Option<Arc<Database>> = Some(Arc::clone(&db));
+        let dep_guard = SpecDependencyGuard;
+
+        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
+
+        assert!(advancer.check_queue_dependency_gate("my-work-id"));
     }
 }
