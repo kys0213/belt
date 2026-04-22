@@ -657,7 +657,7 @@ fn gather_workspace_token_usage(db: &Database, workspace: &str) -> Option<TokenU
             executions: cnt,
         })
         .collect();
-    by_model.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    by_model.sort_by_key(|m| std::cmp::Reverse(m.total_tokens));
 
     Some(TokenUsageSummary {
         total_input,
@@ -688,7 +688,7 @@ fn build_period_usage(label: &str, rows: &[(String, u64, u64, u64)]) -> PeriodTo
         });
     }
     // Already sorted by total desc from DB, but ensure deterministic order.
-    by_model.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+    by_model.sort_by_key(|m| std::cmp::Reverse(m.total_tokens));
 
     PeriodTokenUsage {
         label: label.to_string(),
@@ -1143,7 +1143,7 @@ fn print_rich_runtime(stats: &RuntimeStats) {
         let _ = writeln!(stdout, "  {}", "\u{2500}".repeat(70).dark_grey(),);
 
         let mut models: Vec<_> = stats.by_model.values().collect();
-        models.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+        models.sort_by_key(|m| std::cmp::Reverse(m.total_tokens));
 
         for m in &models {
             let avg = m
