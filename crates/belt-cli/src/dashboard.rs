@@ -622,19 +622,15 @@ fn run_loop(
                         KeyCode::Char('q') | KeyCode::Esc => {
                             state.overlay = OverlayMode::None;
                         }
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if count > 0 {
-                                state.overlay = OverlayMode::Hitl {
-                                    selected: (*selected + 1).min(count.saturating_sub(1)),
-                                };
-                            }
+                        KeyCode::Down | KeyCode::Char('j') if count > 0 => {
+                            state.overlay = OverlayMode::Hitl {
+                                selected: (*selected + 1).min(count.saturating_sub(1)),
+                            };
                         }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            if count > 0 {
-                                state.overlay = OverlayMode::Hitl {
-                                    selected: selected.saturating_sub(1),
-                                };
-                            }
+                        KeyCode::Up | KeyCode::Char('k') if count > 0 => {
+                            state.overlay = OverlayMode::Hitl {
+                                selected: selected.saturating_sub(1),
+                            };
                         }
                         KeyCode::Enter => {
                             // Open the selected HITL item's detail overlay.
@@ -684,24 +680,20 @@ fn run_loop(
                     state.overlay = OverlayMode::Help;
                 }
                 // Toggle PerWorkspace sub-view (table/kanban).
-                KeyCode::Char('v') => {
-                    if state.active_tab == DashboardTab::PerWorkspace {
-                        state.per_ws_view = match state.per_ws_view {
-                            PerWorkspaceView::Table => PerWorkspaceView::Kanban,
-                            PerWorkspaceView::Kanban => PerWorkspaceView::Table,
-                        };
-                        state.per_ws_kanban_col = 0;
-                        state.per_ws_kanban_row = 0;
-                    }
+                KeyCode::Char('v') if state.active_tab == DashboardTab::PerWorkspace => {
+                    state.per_ws_view = match state.per_ws_view {
+                        PerWorkspaceView::Table => PerWorkspaceView::Kanban,
+                        PerWorkspaceView::Kanban => PerWorkspaceView::Table,
+                    };
+                    state.per_ws_kanban_col = 0;
+                    state.per_ws_kanban_row = 0;
                 }
                 // Cycle status filter in PerWorkspace tab.
-                KeyCode::Char('f') => {
-                    if state.active_tab == DashboardTab::PerWorkspace {
-                        state.status_filter = state.status_filter.next();
-                        // Reset selection when filter changes.
-                        state.current_tab_state_mut().selected_index = 0;
-                        state.per_ws_kanban_row = 0;
-                    }
+                KeyCode::Char('f') if state.active_tab == DashboardTab::PerWorkspace => {
+                    state.status_filter = state.status_filter.next();
+                    // Reset selection when filter changes.
+                    state.current_tab_state_mut().selected_index = 0;
+                    state.per_ws_kanban_row = 0;
                 }
                 // Tab/Shift+Tab to cycle through tabs.
                 KeyCode::Tab => {
@@ -1914,11 +1906,7 @@ fn render_workspace_spec_progress(
     };
 
     let bar_width = 15usize;
-    let filled = if total > 0 {
-        (completed * bar_width) / total
-    } else {
-        0
-    };
+    let filled = (completed * bar_width).checked_div(total).unwrap_or(0);
     let empty = bar_width.saturating_sub(filled);
 
     let line = Line::from(vec![
@@ -2017,11 +2005,7 @@ fn render_spec_tab(
 
     // Build a progress bar line.
     let bar_width = 30usize;
-    let filled = if total > 0 {
-        (completed * bar_width) / total
-    } else {
-        0
-    };
+    let filled = (completed * bar_width).checked_div(total).unwrap_or(0);
     let empty = bar_width.saturating_sub(filled);
     let bar_line = Line::from(vec![
         Span::raw("  ["),
@@ -2979,11 +2963,9 @@ fn build_spec_detail_lines(specs: &[Spec], spec_index: usize) -> Vec<Line<'stati
         ]));
 
         let bar_width = 20usize;
-        let filled = if total > 0 {
-            (completed_count * bar_width) / total
-        } else {
-            0
-        };
+        let filled = (completed_count * bar_width)
+            .checked_div(total)
+            .unwrap_or(0);
         let empty = bar_width.saturating_sub(filled);
         lines.push(Line::from(vec![
             Span::raw("  ["),
@@ -3261,7 +3243,7 @@ fn render_runtime_panel_tui(db: &Database) -> Table<'static> {
 
         // Per-model rows sorted by total_tokens descending.
         let mut models: Vec<_> = stats.by_model.values().collect();
-        models.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+        models.sort_by_key(|m| std::cmp::Reverse(m.total_tokens));
 
         for m in models {
             let avg = m
@@ -3331,7 +3313,7 @@ fn render_runtime_panel(stats: &belt_infra::db::RuntimeStats) {
         println!("  {}", "-".repeat(70));
 
         let mut models: Vec<_> = stats.by_model.values().collect();
-        models.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+        models.sort_by_key(|m| std::cmp::Reverse(m.total_tokens));
 
         for m in models {
             let avg = m
@@ -3516,7 +3498,7 @@ mod tests {
 
         // Verify the sort logic used in render_runtime_panel directly.
         let mut models: Vec<_> = by_model.values().collect();
-        models.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens));
+        models.sort_by_key(|m| std::cmp::Reverse(m.total_tokens));
 
         assert_eq!(models[0].model, "large-model");
         assert_eq!(models[1].model, "small-model");
