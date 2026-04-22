@@ -1,17 +1,29 @@
 name: Release
 
 on:
+  # Called by release-please.yml after it creates a tag + GitHub Release.
   workflow_call:
     inputs:
       tag_name:
         required: true
         type: string
+  # Manual recovery: build + upload assets for an existing tag.
   workflow_dispatch:
     inputs:
       tag_name:
         description: 'Tag name (e.g. v0.1.5)'
         required: true
         type: string
+  # Safety net: any `v*` tag push triggers a build, so tags created outside
+  # release-please (manual backfill, recovery) still produce binaries.
+  push:
+    tags:
+      - 'v*'
+
+# Prevent two builds racing for the same tag (e.g. workflow_call + push.tags).
+concurrency:
+  group: release-${{ inputs.tag_name || github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -44,7 +56,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag_name }}
+          ref: ${{ inputs.tag_name || github.ref_name }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -104,5 +116,5 @@ jobs:
       - name: Upload assets to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag_name }}
+          tag_name: ${{ inputs.tag_name || github.ref_name }}
           files: artifacts/*
