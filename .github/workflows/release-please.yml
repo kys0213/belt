@@ -1,14 +1,13 @@
 name: Release Please
 
 on:
-  # Manual: creates/updates Release PR
+  # Manual: creates/updates Release PR on demand
   workflow_dispatch:
-  # Auto: detects merged Release PR and creates tag + release
+  # Auto: every main push (both feature commits and Release PR merges).
+  # Feature commits refresh the open Release PR; Release PR merges produce the tag + GitHub Release.
   push:
     branches:
       - main
-    paths:
-      - '.release-please-manifest.json'
 
 permissions:
   contents: write
@@ -26,7 +25,28 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-          skip-labeling: true
+
+  # Safety net: fail the workflow if the HEAD commit is a merged Release PR
+  # but release-please did not create a tag. This turns silent release-skip
+  # (e.g. the 2026-03 skip-labeling regression that produced v0.1.7-v0.1.10
+  # commits without matching tags) into a loud CI failure.
+  verify-release:
+    needs: release-please
+    if: always() && needs.release-please.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect silently-skipped release
+        env:
+          RELEASE_CREATED: ${{ needs.release-please.outputs.release_created }}
+        run: |
+          msg=$(git log -1 --pretty=%s)
+          if [[ "$msg" =~ ^chore\(main\):\ release ]] && [[ "$RELEASE_CREATED" != "true" ]]; then
+            echo "::error::HEAD commit is a Release PR merge ('$msg') but release-please did not create a tag (release_created=$RELEASE_CREATED)."
+            echo "::error::Recovery: add the 'release-please:force-run' label to the merged PR, then re-run this workflow."
+            exit 1
+          fi
+          echo "Release guard OK (HEAD: $msg, release_created=$RELEASE_CREATED)"
 
   build-and-upload:
     needs: release-please
