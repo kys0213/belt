@@ -1,14 +1,13 @@
 name: Release Please
 
 on:
-  # Manual: creates/updates Release PR
+  # Manual: creates/updates Release PR on demand
   workflow_dispatch:
-  # Auto: detects merged Release PR and creates tag + release
+  # Auto: every main push (both feature commits and Release PR merges).
+  # Feature commits refresh the open Release PR; Release PR merges produce the tag + GitHub Release.
   push:
     branches:
       - main
-    paths:
-      - '.release-please-manifest.json'
 
 permissions:
   contents: write
@@ -26,7 +25,6 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-          skip-labeling: true
 
   build-and-upload:
     needs: release-please
