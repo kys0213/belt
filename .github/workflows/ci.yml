@@ -46,3 +46,40 @@ jobs:
         with:
           key: ${{ matrix.os }}
       - run: cargo test --workspace
+
+  version-consistency:
+    name: Version Consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check manifest / Cargo.toml / latest tag alignment
+        run: |
+          MANIFEST_VER=$(jq -r '.["."]' .release-please-manifest.json)
+          CARGO_VER=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          LATEST_TAG=$(git tag --list 'v*' --sort=-v:refname | head -1 | sed 's/^v//')
+          echo "manifest:   $MANIFEST_VER"
+          echo "Cargo.toml: $CARGO_VER"
+          echo "latest tag: $LATEST_TAG"
+
+          if [ "$MANIFEST_VER" != "$CARGO_VER" ]; then
+            echo "::error::Cargo.toml ($CARGO_VER) and .release-please-manifest.json ($MANIFEST_VER) disagree."
+            exit 1
+          fi
+
+          # manifest == latest tag is the normal resting state.
+          # manifest == latest tag + 1 bump is acceptable only while a Release PR is in flight
+          # (HEAD is then the Release PR merge commit). Any other mismatch indicates a silent
+          # tag-creation failure like the 2026-04 skip-labeling regression.
+          if [ "$MANIFEST_VER" != "$LATEST_TAG" ]; then
+            msg=$(git log -1 --pretty=%s)
+            if [[ ! "$msg" =~ ^chore\(main\):\ release ]]; then
+              echo "::error::manifest ($MANIFEST_VER) ahead of latest tag ($LATEST_TAG), but HEAD is not a release commit: '$msg'"
+              echo "::error::This pattern means an earlier Release PR merged without producing a tag."
+              echo "::error::Recovery: backfill the missing tag(s) via 'gh release create vX.Y.Z --target <sha>' and re-run release.yml."
+              exit 1
+            fi
+            echo "Release commit at HEAD; manifest one bump ahead of latest tag is expected."
+          fi
+          echo "Version consistency OK."
