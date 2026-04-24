@@ -82,6 +82,30 @@ jobs:
           fi
         shell: bash
 
+      # Runs on natively-executable targets only: cross builds (aarch64 Linux on x64
+      # Linux runner) and x86_64-apple-darwin (macos-latest is arm64; Rosetta presence
+      # is not contractual) are skipped. Verifies both that the binary runs and that
+      # it reports the same version as the tag being released.
+      - name: Smoke test binary
+        if: matrix.cross != true && matrix.target != 'x86_64-apple-darwin'
+        shell: bash
+        run: |
+          expected="${{ inputs.tag_name || github.ref_name }}"
+          expected="${expected#v}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            bin="./target/${{ matrix.target }}/release/belt.exe"
+          else
+            bin="./target/${{ matrix.target }}/release/belt"
+          fi
+          out=$("$bin" --version 2>&1)
+          echo "Binary reports: $out"
+          actual=$(printf '%s' "$out" | awk '{print $NF}')
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::Binary version '$actual' does not match tag '$expected'"
+            exit 1
+          fi
+          echo "Smoke test OK: binary version matches tag ($expected)"
+
       - name: Package (tar.gz)
         if: matrix.archive == 'tar.gz'
         run: |
