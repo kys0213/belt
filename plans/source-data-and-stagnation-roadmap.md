@@ -46,6 +46,8 @@ belt context $WORK_ID --json | jq '.source_data.ticket.key'
 
 ### core 구현 완료 · daemon 미배선 인벤토리
 
+> 이 표는 작성 시점(2026-09) 스냅샷이다 — 현재 배선 여부는 코드로 확인한다.
+
 `crates/belt-core/src/stagnation/`에 구현되고 단위 테스트도 갖춰져 있지만, daemon 실행 경로에서는 호출되지 않는 항목들이다. 새로 배선하려면 daemon 코드 변경만 필요하고 core 변경은 필요 없다 (OCP).
 
 | 항목 | 위치 | 현재 상태 |

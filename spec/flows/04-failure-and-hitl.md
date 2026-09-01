@@ -222,7 +222,7 @@ SIGINT → on_shutdown:
 | 1회 실패 | handler 실패 (failure_count=1) | 새 아이템 Pending | retry, on_fail 미실행, lateral plan 주입 |
 | 2회 실패 | handler 실패 (failure_count=2) | 새 아이템 Pending | retry_with_comment, on_fail 실행, lateral plan 주입 |
 | 3회 실패 | handler 실패 (failure_count=3) | HITL | hitl, on_fail 실행, lateral report 첨부 |
-| SPINNING 감지 | 2회 연속 동일 error (유사도 ≥ 0.9) | escalation에 따름 | 페르소나 directive가 담긴 lateral plan 주입 |
+| SPINNING 감지 | 동일 error 3회 연속 (유사도 ≥ 0.9, 인접 쌍 일치 2회) | escalation에 따름 | 페르소나 directive가 담긴 lateral plan 주입 |
 | HITL done 응답 | 사용자 done 선택 | Done | hook.on_done() 트리거, worktree 정리 |
 | HITL retry 응답 | 사용자 retry + 지시 | 새 아이템 Pending | 사용자 지시를 lateral_plan으로 주입, worktree 보존 |
 | HITL skip 응답 | 사용자 skip 선택 | Skipped (terminal) | worktree 정리 |

@@ -15,7 +15,7 @@ handler 실패
     ▼
 Stagnation 분석 (같은 source_id + state에서 실패 이력이 있으면 항상 실행)
     │
-    ├── ① 유사도 판단 (완전 일치 비교, threshold 0.9 / 최소 연속 2회)
+    ├── ① 유사도 판단 (완전 일치 비교, threshold 0.9 / 동일 출력 3회 연속(인접 쌍 일치 2회))
     │     과거 실패 error 메시지 + 이번 error를 순서대로 비교
     │
     ├── ② Lateral Plan 생성 (패턴 감지 시)
@@ -91,7 +91,7 @@ pub trait SimilarityJudge: Send + Sync {
 }
 ```
 
-현재 daemon이 사용하는 구현체는 **ExactHash**(해시 완전 일치 비교, 동일=1.0/다름=0.0) 하나뿐이다. 다른 알고리즘 구성과 가중 합산 방식의 로드맵은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
+현재 daemon이 사용하는 구현체는 완전 일치 비교(동일=1.0/다름=0.0) 하나뿐이다. 다른 알고리즘 구성과 가중 합산 방식의 로드맵은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
 
 ---
 
@@ -112,7 +112,7 @@ impl StagnationDetector {
 
 ### 현재 판정 기준
 
-정체 판정은 완전 일치(해시) 비교 하나만 사용한다: 유사도 threshold 0.9, 최소 연속 2회 — 두 값 모두 현재 고정값이며 yaml로 노출되지 않는다.
+정체 판정은 완전 일치 비교 하나만 사용한다: 유사도 threshold 0.9, 동일 출력 3회 연속(인접 쌍 일치 2회) — 두 값 모두 현재 고정값이며 yaml로 노출되지 않는다.
 
 - 입력(`outputs`)은 같은 `source_id` + `state`의 과거 실패 error 메시지(DB `history` 조회, DB 조회 실패 시 in-memory 이력으로 폴백)에 이번 실패의 error를 이어붙인 배열이다.
 - 과거 실패 이력이 하나도 없으면(첫 실패) stagnation 분석 자체를 생략한다.

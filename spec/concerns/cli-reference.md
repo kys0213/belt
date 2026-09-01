@@ -77,8 +77,6 @@ belt
 
 > `belt claw`는 `belt agent`와 동일한 서브커맨드 집합(`AgentCommands`)을 갖는 deprecated alias다. 신규 사용은 `belt agent`를 쓴다.
 
-> **미해결 불일치**: clap 정의(`crates/belt-cli/src/main.rs`)는 `agent` 뒤에 `session` 등 서브커맨드를 반드시 요구한다. 그런데 evaluate 서브프로세스 호출 코드(`crates/belt-daemon/src/evaluator.rs`의 `build_evaluate_command()`)는 `belt agent --workspace <path> -p <prompt> --json`을 `session` 서브커맨드 없이 구성한다. 두 코드가 서로 다른 형태를 전제하고 있어 어느 쪽이 실제 동작하는 형태인지 이 문서만으로는 확정할 수 없다 — 코드 소유자 확인이 필요하다.
-
 ### Phase 2: /agent 위임 (읽기 전용)
 
 아래 커맨드는 `/agent` 세션에서 자연어로 접근. 별도 CLI 구현은 `/agent`가 안정화된 후 필요 시 추가.
