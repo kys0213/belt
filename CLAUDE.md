@@ -5,7 +5,7 @@ Autonomous development conveyor belt — GitHub 이슈를 수집하여 LLM agent
 ## Language & Toolchain
 
 - Rust edition 2024
-- `cargo fmt` (rustfmt.toml 준수)
+- `cargo fmt` (기본 설정)
 - `cargo clippy -- -D warnings` 통과 필수
 
 ## Workspace Structure
@@ -25,7 +25,7 @@ crates/
 | 용도 | 패키지 |
 |------|--------|
 | 직렬화 | serde, serde_json, serde_yaml |
-| 에러 | thiserror (library), anyhow (application) |
+| 에러 | thiserror (belt-infra 에러 타입), anyhow (belt-core trait 시그니처 포함 전반) |
 | 비동기 | tokio (full), async-trait |
 | DB | rusqlite (bundled) |
 | CLI | clap (derive) |
@@ -38,11 +38,14 @@ crates/
 
 ```
 crates/belt-daemon/tests/
-  daemon_lifecycle.rs    # Daemon 풀 라이프사이클 (collect → advance → execute)
-  escalation.rs          # 실패 에스컬레이션, HITL 진입/응답
-  cron_integration.rs    # CronEngine tick, pause/resume, DB 동기화
-  e2e_real.rs            # Real E2E (GitHub + Claude API, #[ignore])
-  e2e_helpers.rs         # E2E 헬퍼 (gh CLI 래퍼, daemon 팩토리)
+  daemon_lifecycle.rs      # Daemon 풀 라이프사이클 (collect → advance → execute)
+  advancer_integration.rs  # Advancer phase 전이, dependency gate, conflict 감지
+  evaluator_integration.rs # Evaluator subprocess 실행, 토큰 사용량, HITL 에스컬레이션
+  gap_detection.rs         # GapDetectionJob 스펙 커버리지 분석, 중복 방지
+  escalation.rs            # 실패 에스컬레이션, HITL 진입/응답
+  cron_integration.rs      # CronEngine tick, pause/resume, DB 동기화
+  e2e_real.rs              # Real E2E (GitHub + Claude API, #[ignore])
+  e2e_helpers.rs           # E2E 헬퍼 (gh CLI 래퍼, daemon 팩토리)
 ```
 
 ```bash

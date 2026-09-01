@@ -2,7 +2,7 @@
 
 ## Code Conventions
 - Public API에는 doc comment 작성
-- Error handling: `thiserror` for library errors, `anyhow` for CLI/application errors
+- Error handling: `thiserror` for belt-infra error types, `anyhow` elsewhere including belt-core trait signatures
 
 ## Design Principles
 - Daemon은 도메인 로직을 모른다 — yaml에 정의된 prompt/script만 실행

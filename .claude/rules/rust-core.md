@@ -8,8 +8,9 @@ paths:
 > 이 레이어에서 정의한 타입은 프로젝트 전체가 의존한다. 호출부만 보고 제약과 의도를 인지할 수 있어야 한다.
 
 ## 외부 의존성 최소화
-- core에는 serde, thiserror, async-trait, chrono 수준만 허용한다.
-- tokio, rusqlite 등 인프라 의존성을 core에 끌어오지 마라.
+- core는 도메인 표현·에러·직렬화 수준의 의존성만 허용한다 (예: serde 계열, thiserror, anyhow, async-trait, chrono, tracing, 압축·정규식 등 순수 로직 라이브러리).
+- tokio, rusqlite 등 인프라(비동기 런타임·DB) 의존성을 core에 끌어오지 마라.
+- 새 의존성을 core에 추가할 때는 "인프라에 묶이지 않는가"를 기준으로 판단한다.
 
 ## 타입으로 제약을 표현하라
 - 함수가 특정 enum variant만 허용한다면, enum 전체가 아닌 해당 variant 전용 struct를 파라미터로 받아라.
