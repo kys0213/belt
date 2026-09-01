@@ -363,8 +363,8 @@ trait SimilarityJudge
 |------|------|
 | [QueuePhase 상태 머신](./concerns/queue-state-machine.md) | 상태 전이, 전이 캡슐화, worktree 생명주기, on_fail 조건 |
 | [Daemon](./concerns/daemon.md) | 내부 모듈 구조, 실행 루프, dependency gate (DB), concurrency, graceful shutdown |
-| [Evaluator](./concerns/evaluator.md) | Progressive Evaluation Pipeline, Evaluate before Execute, Stage trait |
-| [Stagnation Detection](./concerns/stagnation.md) | Composite Similarity, 4가지 패턴, Lateral Thinking (내장 페르소나) |
+| [Evaluator](./concerns/evaluator.md) | Progressive Evaluation Pipeline, Stage trait — 완료 아이템 판정 |
+| [Stagnation Detection](./concerns/stagnation.md) | SPINNING 감지(ExactHash) 배선, Composite/Oscillation 은 core 구현·daemon 미배선 |
 | [LifecycleHook](./concerns/lifecycle-hook.md) | 상태 전이 반응 trait, DataSource별 impl, workspace 바인딩, lazy 로딩 |
 | [DataSource](./concerns/datasource.md) | trait, context 스키마 (source_data), 워크플로우 yaml, escalation |
 | [AgentRuntime](./concerns/agent-runtime.md) | LLM 실행 추상화, RuntimeRegistry |

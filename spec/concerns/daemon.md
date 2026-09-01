@@ -33,9 +33,9 @@ Daemon은 상태 머신을 순회하며 전이를 결정하고 hook을 트리거
 Daemon (CPU)
   loop {
     collector.collect()
-    evaluator.evaluate()     // 판정 — 실행보다 먼저
     advancer.advance()
     executor.execute()       // handler 실행 + hook 트리거
+    evaluator.evaluate()     // 판정 — Completed 아이템을 Done/HITL로 분류
     cron_engine.tick()
   }
 ```
@@ -111,16 +111,11 @@ loop {
             items = source.collect()
             queue.push(Pending, items)
 
-    // 2. 판정 (Evaluator) — 실행보다 먼저
-    //    Completed 아이템을 비용 순으로 판정: Mechanical → Semantic → (Consensus)
-    //    Ready 아이템 중 이전 기록으로 판정 가능한 것은 handler 실행 없이 판정
-    evaluator.evaluate()
-
-    // 3. 자동 전이 (Advancer)
+    // 2. 자동 전이 (Advancer)
     advancer.advance_pending_to_ready()         // spec dep gate (DB)
     advancer.advance_ready_to_running(limit)    // queue dep gate (DB) + concurrency
 
-    // 4. 실행 (Executor)
+    // 3. 실행 (Executor)
     for item in queue.get_new(Running):
         binding = lookup_workspace_binding(item)
         hook = binding.hook                     // 이 workspace의 LifecycleHook
@@ -143,6 +138,11 @@ loop {
                 break
         else:
             item.transit(Completed)
+
+    // 4. 판정 (Evaluator) — Executor가 끝낸 Completed 아이템을 비용 순으로 판정: Mechanical → Semantic → (Consensus)
+    //    Ready 아이템 중 이전 기록으로 판정 가능한 것은 handler 실행 없이 판정
+    //    판정 결과(Done/HITL)는 다음 tick의 advance에 반영된다
+    evaluator.evaluate()
 
     // 5. cron tick (품질 루프: gap-detection, knowledge-extract 등)
     cron_engine.tick()
