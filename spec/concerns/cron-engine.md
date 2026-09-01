@@ -83,7 +83,7 @@ force_trigger(job_name):
 - 동기적으로 실행하지 않는다. cron의 `last_run_at`을 리셋할 뿐.
 - gap-detection 등 품질 루프 job에 사용.
 
-> **evaluate는 v6에서 Daemon tick 정규 단계로 이동**. Completed 아이템은 Evaluator가 다음 tick에서 Progressive Pipeline으로 판정한다. 상세: [Evaluator](./evaluator.md)
+> **evaluate는 cron job이 아니라 Daemon tick의 정규 단계다**. Completed 아이템은 Evaluator가 다음 tick에서 Progressive Pipeline으로 판정한다. 상세: [Evaluator](./evaluator.md)
 
 ---
 

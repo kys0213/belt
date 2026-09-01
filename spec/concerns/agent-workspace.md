@@ -10,7 +10,7 @@
 
 분류 로직은 코어에 속한다. Agent와 무관.
 
-**v6 (#722)**: evaluate는 **per-work_id 단위**로 LLM 판정을 실행한다.
+evaluate는 **per-work_id 단위**로 LLM 판정을 실행한다.
 
 ```
 handler 전부 성공 → Completed
@@ -147,7 +147,7 @@ Per-workspace 오버라이드: `~/.belt/workspaces/<name>/agent/system/`
 ## Plugin slash command 통합
 
 ```
-v4 (15개) → v5 (3개):
+슬래시 커맨드 3개:
   /auto   — 데몬 제어 (start/stop/setup/config/dashboard/update)
   /spec   — 스펙 CRUD (add/update/list/status/remove/pause/resume)
   /agent  — 대화 세션 (조회/조작/모니터링을 자연어로, 읽기 전용 CLI 흡수)
@@ -226,7 +226,7 @@ Priority 3: $BELT_HOME/agent-workspace/.claude/rules/    (global, belt agent ini
 ### Evaluator와의 관계
 
 Evaluator의 SemanticStage가 내부적으로 `belt agent -p`를 호출한다. 이때:
-- **per-item**: 각 아이템에 대해 개별 프롬프트 발행 (v6 #722)
+- **per-item**: 각 아이템에 대해 개별 프롬프트 발행
 - LLM이 `belt context $WORK_ID`로 해당 아이템 정보를 조회
 - 판단 후 `belt queue done/hitl` CLI를 직접 호출하여 상태 전이
 - classify-policy.md의 state별 Done 조건이 판단 기준

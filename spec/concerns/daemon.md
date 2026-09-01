@@ -25,7 +25,7 @@ Daemon이 모르는 것: hook이 실제로 무엇을 하는지 (Result만 받음
 
 ---
 
-## 내부 모듈 구조 (#717)
+## 내부 모듈 구조
 
 Daemon은 상태 머신을 순회하며 전이를 결정하고 hook을 트리거하는 CPU이다.
 
@@ -61,18 +61,15 @@ Executor
   │     ├── on_fail()
   │     └── on_escalation()
   │
-  ├── StagnationDetector      실패 시 패턴 탐지
-  │     └── judge: Box<dyn SimilarityJudge>
-  │           └── CompositeSimilarity
-  │                 ├── ExactHash        (w: 0.5)
-  │                 ├── TokenFingerprint (w: 0.3)
-  │                 └── NCD              (w: 0.2)
+  ├── StagnationDetector      실패 시 패턴 탐지 (현재: SpinningDetector + ExactHash만 등록)
   │
-  └── LateralAnalyzer         패턴 감지 시 사고 전환
+  └── LateralAnalyzer         패턴 감지 시 페르소나 선택 + 고정 directive 조합 (LLM 미호출)
         └── personas/          (include_str! 내장)
               hacker.md, architect.md, researcher.md,
               simplifier.md, contrarian.md
 ```
+
+> `CompositeSimilarity`(ExactHash/TokenFingerprint/NCD 가중 합산), `OscillationDetector`, `LateralAnalyzer::analyze()`(LLM 서브프로세스 호출)는 core에 구현되어 있으나 daemon에는 배선되지 않았다. 상세: [Stagnation Detection](./stagnation.md)
 
 ### 모듈 간 의존
 
@@ -87,7 +84,7 @@ Daemon
 
 - 모듈 간 의존은 trait 또는 함수 파라미터로만 전달 (순환 참조 금지)
 - 각 모듈은 독립적으로 단위 테스트 가능
-- StagnationDetector는 `Box<dyn SimilarityJudge>` 하나만 의존 (Composite 또는 단일)
+- StagnationDetector는 `Vec<Box<dyn PatternDetector>>`에 의존하고, 각 PatternDetector가 내부적으로 `Box<dyn SimilarityJudge>`를 가진다 (Composite 또는 단일 judge 선택 가능)
 
 ---
 
@@ -220,7 +217,7 @@ retry로 생성된 새 아이템이 다시 Running에 진입하면, `lateral_pla
 
 ---
 
-## Dependency Gate (#721)
+## Dependency Gate
 
 ### Spec Dependency Gate
 
@@ -316,22 +313,22 @@ SIGINT → on_shutdown:
 - [ ] 상태 전이 시 workspace의 LifecycleHook.on_*()을 트리거한다
 - [ ] hook의 실행 결과(Result)만 받고, 구체적 동작을 모른다
 
-### 내부 모듈 구조 (#717)
+### 내부 모듈 구조
 
 - [ ] phase 전이는 Advancer, handler 실행+hook 트리거+stagnation+lateral은 Executor, HITL은 HitlService
 - [ ] 각 모듈은 독립적으로 단위 테스트 가능하다
 - [ ] 모듈 간 의존은 trait 또는 함수 파라미터로만 전달 (순환 참조 금지)
 
-### Stagnation + Lateral 통합 (#723)
+### Stagnation + Lateral 통합
 
-- [ ] handler/on_enter 실패 시 StagnationDetector가 항상 실행된다
-- [ ] CompositeSimilarity로 outputs/errors를 별도 검사한다
-- [ ] 패턴 감지 시 LateralAnalyzer가 내장 페르소나로 lateral_plan을 생성한다
+- [ ] handler/on_enter 실패 시(과거 실패 이력이 있으면) StagnationDetector가 항상 실행된다
+- [ ] 현재는 SpinningDetector(ExactHash)로 error 메시지만 검사한다 — CompositeSimilarity/OscillationDetector는 core에 구현되어 있으나 미배선이다
+- [ ] 패턴 감지 시 페르소나를 선택하고 고정 directive로 lateral_plan을 구성한다 (LLM 미호출)
 - [ ] lateral_plan이 retry 시 handler prompt에 추가 컨텍스트로 주입된다
 - [ ] hitl 도달 시 모든 lateral 시도 이력이 hitl_notes에 첨부된다
 - [ ] stagnation 이벤트가 transition_events에 기록된다
 
-### Dependency Gate (#721)
+### Dependency Gate
 
 - [ ] queue dependency의 phase 확인은 DB 조회 기준이다
 - [ ] 재시작 후에도 dependency gate가 정확히 동작한다

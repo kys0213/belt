@@ -51,7 +51,7 @@
 └──────────────────────────────────────┘└────────────────────────┘
 ```
 
-> **v6**: Stagnation 카운터 추가 — 현재 stagnation이 감지된 아이템 수를 표시.
+> Stagnation 카운터는 현재 stagnation이 감지된 아이템 수를 표시한다.
 > **Kanban 약어**: P=Pending, Re=Ready, Ru=Running, C=Completed, D=Done, H=HITL, S=Skipped, F=Failed
 
 ### 전이 타임라인 (ItemDetail 오버레이, Enter)
@@ -74,7 +74,7 @@
 └───────────────────────────────────────────────┘
 ```
 
-### 실패 + Lateral Thinking 타임라인 (v6)
+### 실패 + Lateral Thinking 타임라인
 
 ```
 ┌─ #39 Auth refactor ──────────────────────────┐
@@ -86,17 +86,15 @@
 │  13:00 ○ Running  (attempt 1)                │
 │         └ handler: compile error              │
 │  13:08 ⟳ SPINNING detected (score: 0.95)     │
-│         └ lateral: HACKER 페르소나            │
-│         └ plan: tower-sessions crate 시도     │
+│         └ lateral: HACKER 페르소나 directive  │
 │  13:08 ○ Running  (attempt 2, lateral)       │
 │         └ handler: 다른 에러 (progress!)      │
 │  13:18 ⟳ retry_with_comment (2/3)            │
-│         └ lateral: CONTRARIAN 페르소나        │
-│         └ plan: trait object 접근             │
+│         └ lateral: CONTRARIAN 페르소나 directive │
 │  13:18 ○ Running  (attempt 3, lateral)       │
 │         └ handler: 컴파일 성공, 테스트 실패    │
 │  13:28 ● HITL     (3/3)                      │
-│         └ lateral report 첨부                 │
+│         └ lateral 이력 첨부 (hitl_notes)      │
 │         └ 2회 사고 전환 후에도 미해결          │
 │                                               │
 │ Actions: [d] done  [r] retry  [s] skip       │
@@ -209,7 +207,7 @@ HITL 이벤트가 생성되면 사용자에게 다음 경로로 알린다:
 
 별도 push 알림(Slack, email)은 LifecycleHook impl에서 처리한다 (webhook 호출 등).
 
-> **v6**: Stagnation으로 HITL에 진입한 경우, lateral report(시도한 접근법들, 각 분석 결과)가 표시되어 사용자가 지금까지의 접근 전환 이력을 참고할 수 있다.
+> Stagnation으로 HITL에 진입한 경우, lateral 이력(시도한 페르소나, 감지된 패턴, confidence)이 `hitl_notes`에 표시되어 사용자가 지금까지의 접근 전환 이력을 참고할 수 있다.
 
 ---
 

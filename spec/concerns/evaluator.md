@@ -133,13 +133,13 @@ impl EvaluationPipeline {
 }
 ```
 
-**v6 범위**: `MechanicalStage` + `SemanticStage`만 등록. Phase 2(v7+)에서 `ConsensusStage`를 추가하면 코어 변경 0 (OCP).
+현재는 `MechanicalStage` + `SemanticStage`만 등록되어 있다. `ConsensusStage`를 추가하면 코어 변경 없이 확장할 수 있다 (OCP) — 아래 Stage 3 참조.
 
 ---
 
 ## Stage 상세
 
-### Stage 1: MechanicalStage (v6)
+### Stage 1: MechanicalStage
 
 worktree에서 결정적 검증을 실행한다. LLM 비용 0.
 
@@ -170,7 +170,7 @@ evaluate:
     - "cargo clippy -- -D warnings"
 ```
 
-### Stage 2: SemanticStage (v6)
+### Stage 2: SemanticStage
 
 LLM이 작업 맥락을 종합적으로 판단하여 Done/HITL을 판정한다.
 
@@ -198,9 +198,9 @@ impl EvaluationStage for SemanticStage {
 }
 ```
 
-### Stage 3: ConsensusStage (Phase 2, v7+)
+### Stage 3: ConsensusStage (미구현)
 
-> **v6 범위 아님** — trait 경계만 정의. v6에서는 Stage 1·2만 등록된다.
+> trait 경계만 정의된 설계 스케치다. 현재 등록된 Stage는 MechanicalStage·SemanticStage뿐이다.
 
 다중 LLM 투표. 트리거 조건 충족 시에만 실행.
 
@@ -239,9 +239,9 @@ can_judge_from_history(item):
 Daemon (CPU)
   ├── Evaluator              ← tick 루프에서 실행보다 먼저
   │     └── EvaluationPipeline
-  │           ├── MechanicalStage (v6)
-  │           ├── SemanticStage (v6)
-  │           └── ConsensusStage (Phase 2)
+  │           ├── MechanicalStage
+  │           ├── SemanticStage
+  │           └── ConsensusStage (미구현)
   │
   ├── Advancer
   ├── Executor

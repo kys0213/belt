@@ -66,8 +66,10 @@ sources:
       3: hitl
       terminal: skip          # hitl timeout 시 적용 (skip 또는 replan)
 
-    # 참고: on_done/on_fail은 v6 Phase 1에서 ScriptLifecycleHook 어댑터로 처리됨.
-    # Phase 2에서 DataSource별 LifecycleHook impl로 대체 예정.
+    # 주의: github source에는 GitHubLifecycleHook이 항상 우선 적용되고,
+    # 위에서 정의한 on_done script(라벨 전환 등)는 현재 실행되지 않는다.
+    # ScriptLifecycleHook은 전용 Hook이 없는 source_type에만 폴백으로 쓰인다.
+    # 상세: [LifecycleHook](../concerns/lifecycle-hook.md)
 
 runtime:
   default: claude
@@ -109,7 +111,7 @@ belt workspace add --config workspace.yaml
     → "hint: belt workspace remove auth-project로 기존 workspace를 삭제하세요"
 
   DataSource 유형 미지원:
-    → "Error: 'jira' DataSource는 아직 지원되지 않습니다 (v7+)"
+    → "Error: 'jira' DataSource는 아직 지원되지 않습니다"
 ```
 
 모든 검증은 DB 기록 전에 수행된다. 실패 시 부수효과 없음.
@@ -146,7 +148,7 @@ belt workspace remove <name>    # cascade 삭제 (외부 시스템 데이터는 
 | yaml 파싱 실패 | 잘못된 yaml | 등록 거부 | DB 변경 없음, 구체적 에러 메시지 |
 | repo 접근 불가 | 잘못된 URL/인증 | 등록 거부 | DB 변경 없음, 인증 힌트 표시 |
 | 이름 중복 | 기존 workspace와 동일 name | 등록 거부 | DB 변경 없음 |
-| 미지원 DataSource | `sources.jira` (v6) | 등록 거부 | DB 변경 없음 |
+| 미지원 DataSource | `sources.jira` | 등록 거부 | DB 변경 없음 |
 | workspace 삭제 | `belt workspace remove` | DB에서 cascade 삭제 | 외부 시스템(GitHub 이슈 등) 데이터는 유지 |
 
 ---

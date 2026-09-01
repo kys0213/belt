@@ -46,7 +46,7 @@ CREATE TABLE queue_items (
     hitl_notes           TEXT,                    -- 사용자 메모
     hitl_reason          TEXT,                    -- HitlReason enum (snake_case)
     hitl_timeout_at      TEXT,                    -- 만료 시각 (RFC3339)
-    hitl_terminal_action TEXT,                    -- EscalationAction enum (snake_case) ← v6: Option<String> → Option<EscalationAction>
+    hitl_terminal_action TEXT,                    -- EscalationAction enum (snake_case)
 
     -- 추적 필드
     replan_count         INTEGER NOT NULL DEFAULT 0,  -- 재계획 횟수 (max 3)
@@ -54,14 +54,14 @@ CREATE TABLE queue_items (
 );
 ```
 
-**v6 변경 (#720)**: `hitl_terminal_action`은 `EscalationAction` enum 값만 허용한다. DB에는 snake_case 문자열로 저장, 로드 시 `FromStr`로 파싱한다. 유효하지 않은 값은 파싱 에러.
+`hitl_terminal_action`은 `EscalationAction` enum 값만 허용한다. DB에는 snake_case 문자열로 저장, 로드 시 `FromStr`로 파싱한다. 유효하지 않은 값은 파싱 에러.
 
 **인메모리 전용 필드** (DB에 저장하지 않음):
 - `previous_worktree_path: Option<String>` — retry 시 이전 아이템의 worktree 경로를 전달하기 위한 transient 필드
 
 ### history
 
-작업 시도 기록. append-only로만 쓰고, 읽기 전용으로 조회한다. `failure_count`는 이 테이블에서 계산한다. **Stagnation detection도 이 테이블의 summary/error를 입력으로 사용한다.**
+작업 시도 기록. append-only로만 쓰고, 읽기 전용으로 조회한다. `failure_count`는 이 테이블에서 계산한다. **Stagnation detection도 이 테이블의 error를 입력으로 사용한다.**
 
 ```sql
 CREATE TABLE history (
@@ -93,7 +93,7 @@ CREATE TABLE history (
 **파생 쿼리**:
 - `failure_count`: `SELECT COUNT(*) FROM history WHERE source_id = ? AND state = ? AND status = 'failed'`
 - `max_attempt`: `SELECT MAX(attempt) FROM history WHERE source_id = ? AND state = ?`
-- **stagnation 입력**: `SELECT summary, error FROM history WHERE source_id = ? AND state = ? ORDER BY attempt DESC LIMIT ?`
+- **stagnation 입력**: `source_id` 전체 이력을 조회(`SELECT ... FROM history WHERE source_id = ? ORDER BY created_at ASC`)한 뒤, 호출자가 `state`와 `status = 'failed'`로 필터링하여 `error` 값만 모은다. 상세: [Stagnation Detection](./stagnation.md)
 
 ### transition_events
 
@@ -112,13 +112,13 @@ CREATE TABLE transition_events (
 );
 ```
 
-**v6 변경**: `event_type`에 `'stagnation'`과 `'hook'` 추가. 기존 `'on_done'`/`'on_fail'`은 `'hook'`으로 통합 — LifecycleHook 트리거 이벤트를 기록한다. `detail`에 hook 종류(on_enter/on_done/on_fail/on_escalation), 탐지 패턴, confidence, evidence를 JSON으로 기록한다.
+`'hook'` 이벤트는 LifecycleHook 트리거를 기록하며 `detail`에 hook 종류(on_enter/on_done/on_fail/on_escalation)를 JSON으로 담는다. `'stagnation'` 이벤트는 탐지 패턴, confidence, reason, 추천 페르소나를 JSON으로 담는다 (상세: [Stagnation Detection](./stagnation.md)).
 
 ### queue_dependencies
 
 아이템 간 실행 순서 제약. `depends_on` 아이템이 Done이 아니면 `work_id` 아이템은 Ready→Running 전이가 블로킹된다.
 
-**v6 변경 (#721)**: dependency phase 확인은 **DB 조회 기반**이다 (in-memory queue가 아님). 재시작 후에도 정확히 동작한다.
+dependency phase 확인은 **DB 조회 기반**이다 (in-memory queue가 아님). 재시작 후에도 정확히 동작한다.
 
 ```sql
 CREATE TABLE queue_dependencies (
@@ -249,7 +249,7 @@ CREATE TABLE knowledge_base (
 | `Failed` | `"failed"` | No | hook.on_done() 실패 또는 인프라 오류 |
 | `Skipped` | `"skipped"` | **Yes** | escalation skip 또는 preflight 실패 |
 
-**v6 (#718)**: `phase` 필드는 `pub(crate)` 가시성. 외부에서 직접 대입 불가, 반드시 `QueueItem::transit()` 경유. 상세: [QueuePhase 상태 머신](./queue-state-machine.md)
+`phase` 필드는 `pub(crate)` 가시성이다. 외부에서 직접 대입할 수 없고, 반드시 `QueueItem::transit()`을 경유한다. 상세: [QueuePhase 상태 머신](./queue-state-machine.md)
 
 ### SpecStatus
 
@@ -277,7 +277,7 @@ HITL 생성 경로. 직렬화 시 snake_case.
 | `SpecConflict` | `"spec_conflict"` | 스펙 파일 겹침 |
 | `SpecCompletionReview` | `"spec_completion_review"` | 스펙 완료 최종 확인 |
 | `SpecModificationProposed` | `"spec_modification_proposed"` | Agent 수정 제안 |
-| `StagnationDetected` | `"stagnation_detected"` | **v6** 반복 패턴 감지 + lateral thinking 사고 전환 |
+| `StagnationDetected` | `"stagnation_detected"` | 반복 패턴 감지 + lateral thinking 사고 전환 |
 
 ### EscalationAction
 
@@ -293,7 +293,7 @@ failure_count별 대응. 직렬화 시 snake_case.
 
 모든 EscalationAction에서 `hook.on_escalation(action)` 트리거. `on_fail`은 Retry 제외 시 추가 트리거.
 
-**v6 (#720)**: `EscalationAction`은 `FromStr` + `Display` impl을 가진다. `hitl_terminal_action` 필드 타입으로도 사용된다.
+`EscalationAction`은 `FromStr` + `Display` impl을 가진다. `hitl_terminal_action` 필드 타입으로도 사용된다.
 
 ```rust
 impl FromStr for EscalationAction {
@@ -302,7 +302,7 @@ impl FromStr for EscalationAction {
 }
 ```
 
-### StagnationPattern (v6 신규)
+### StagnationPattern
 
 정체 패턴 유형. 직렬화 시 snake_case.
 
@@ -313,9 +313,9 @@ impl FromStr for EscalationAction {
 | `NoDrift` | `"no_drift"` | 진행 점수 정체 |
 | `DiminishingReturns` | `"diminishing_returns"` | 개선폭 감소 |
 
-SPINNING/OSCILLATION은 `CompositeSimilarity`로 유사도 판단, NO_DRIFT/DIMINISHING은 drift score 수치 비교.
+현재 daemon은 SPINNING만 탐지한다(`ExactHash` 직접 사용). OSCILLATION은 core에 구현·테스트되어 있으나 daemon에 배선되지 않았고, NO_DRIFT/DIMINISHING_RETURNS는 detector 구현 자체가 없다. 상세: [Stagnation Detection](./stagnation.md)
 
-### Persona (v6 신규)
+### Persona
 
 Lateral Thinking 사고 전환 페르소나. belt-core에 `include_str!`로 내장. 직렬화 시 snake_case.
 
@@ -359,19 +359,18 @@ handlers:
   - script: "cargo test"
 ```
 
-### ScriptAction (yaml 설정, v6 호환용)
+### ScriptAction (yaml 설정, 호환 계층)
 
-v6 Phase 1에서 기존 yaml과의 호환을 위해 유지. `ScriptLifecycleHook` 어댑터가 이를 소비한다. Phase 2에서 DataSource별 Hook impl로 대체 예정.
+yaml의 `on_done`/`on_fail`/`on_enter` script 설정과의 호환을 위해 유지된다. `ScriptLifecycleHook` 어댑터가 이를 소비해 `LifecycleHook` trait으로 감싼다.
 
 ```yaml
-# v6 Phase 1: 기존 yaml 호환 (ScriptLifecycleHook 어댑터가 처리)
 on_done:
   - script: "gh pr create ..."
 on_fail:
   - script: "gh issue comment ..."
 ```
 
-> **v6 변경**: lifecycle 반응은 `LifecycleHook` trait으로 분리. yaml script는 어댑터를 통해 호환 유지. 상세: [LifecycleHook](./lifecycle-hook.md)
+> lifecycle 반응은 `LifecycleHook` trait으로 분리되어 있다. yaml script는 어댑터를 통해 호환을 유지한다. 상세: [LifecycleHook](./lifecycle-hook.md)
 
 ### Action (런타임 추상화)
 
@@ -411,28 +410,11 @@ sources:
       3: hitl
       terminal: skip              # HITL 만료 시 ('skip' | 'replan')
 
-# v6 신규: stagnation 탐지 + lateral thinking 설정
+# stagnation 탐지 + lateral thinking 설정
 stagnation:
   enabled: true                    # default: true
-  spinning_threshold: 3            # default: 3
-  oscillation_cycles: 2            # default: 2
-  similarity_threshold: 0.8        # composite score 유사 판정 (default: 0.8)
-  no_drift_epsilon: 0.01           # default: 0.01
-  no_drift_iterations: 3           # default: 3
-  diminishing_threshold: 0.01      # default: 0.01
-  confidence_threshold: 0.5        # default: 0.5
-
-  similarity:                      # CompositeSimilarity (Composite Pattern)
-    - judge: exact_hash            # 기본 프리셋
-      weight: 0.5
-    - judge: token_fingerprint
-      weight: 0.3
-    - judge: ncd
-      weight: 0.2
-
   lateral:
     enabled: true                  # default: true
-    max_attempts: 3                # 페르소나 최대 시도 (default: 3)
 
 runtime:
   default: claude
@@ -455,7 +437,7 @@ runtime:
 
 `belt context $WORK_ID --json`이 반환하는 구조. script가 정보를 조회하는 유일한 방법.
 
-**v6 변경 (#719)**: `source_data` 필드 추가. DataSource별 자유 스키마. 기존 `issue`/`pr` 필드는 호환성을 위해 유지.
+`ItemContext`에는 `source_data: serde_json::Value` 필드가 있다 — DataSource가 자유 스키마로 채울 수 있는 OCP 확장점이다. 다만 현재 구현된 모든 DataSource는 이 필드를 `Null`로 고정하고 `issue`/`pr` 필드에 데이터를 채운다. `source_data`가 `Null`이면 JSON 출력에서 해당 키는 생략된다. 상세: [DataSource](./datasource.md)
 
 ```json
 {
@@ -470,27 +452,6 @@ runtime:
     "type": "github",
     "url": "https://github.com/org/repo",
     "default_branch": "main"
-  },
-  "source_data": {
-    "issue": {
-      "number": 42,
-      "title": "...",
-      "body": "...",
-      "labels": ["belt:implement"],
-      "author": "user",
-      "state": "open"
-    },
-    "pr": {
-      "number": 43,
-      "title": "...",
-      "state": "open",
-      "draft": false,
-      "head_branch": "belt/42-implement",
-      "base_branch": "main",
-      "reviews": [
-        { "reviewer": "user", "state": "APPROVED" }
-      ]
-    }
   },
   "issue": {
     "number": 42,
@@ -524,26 +485,7 @@ runtime:
 }
 ```
 
-### source_data 마이그레이션 전략 (#719)
-
-| Phase | 상태 | 설명 |
-|-------|------|------|
-| **1 (v6)** | `source_data` + `issue`/`pr` 양쪽 채움 | 하위 호환. 기존 script 수정 불필요 |
-| **2 (v7+)** | `issue`/`pr` deprecated | script가 `source_data` 경로로 전환 |
-| **3 (v8+)** | `issue`/`pr` 제거 | `source_data`만 사용 |
-
-script에서의 접근:
-```bash
-# v6 (양쪽 모두 가능)
-belt context $WORK_ID --json | jq '.issue.number'
-belt context $WORK_ID --json | jq '.source_data.issue.number'
-
-# v7+ (source_data 권장)
-belt context $WORK_ID --json | jq '.source_data.issue.number'
-
-# Jira DataSource (v7+)
-belt context $WORK_ID --json | jq '.source_data.ticket.key'
-```
+> `source_data` 도입을 둘러싼 단계적 마이그레이션 구상은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md)에 기록되어 있다. 현재 스키마·동작은 위 설명과 코드가 SSOT다.
 
 ---
 
