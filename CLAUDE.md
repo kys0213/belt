@@ -96,3 +96,17 @@ PR 제목도 conventional commit 형식을 따른다 (squash merge 시 커밋 �
 - **언어**: README=영어, spec/rules=한국어 기반, 기술용어=영어 원어 유지
 - **독자**: Rust 개발자 (코드 예시·trait 이름 자유롭게 사용)
 - **구조**: 비교/분류는 테이블 우선, 핵심 제약은 blockquote 강조
+
+## 문서 계층 (Spec / Rules / Plan)
+
+문서는 서술 대상에 따라 3계층으로 나뉜다. 계층이 섞이면 작성 시점의 기록을 현재 정책으로 오독하거나, 구현 세부가 상위 문서를 흔든다.
+
+| 계층 | 위치 | 서술 대상 | 현실과 어긋나면 |
+|------|------|-----------|------------------|
+| Spec | `spec/` (DESIGN.md, concerns/, flows/) | 제품이 **무엇**인가 — 정책·계약·시나리오 | drift — spec 또는 코드를 고친다 |
+| Rules | `CLAUDE.md`, `.claude/rules/` | 작업자가 **어떻게** 일하는가 — 컨벤션·경계 원칙 | 지침을 갱신한다 |
+| Plan | `plans/` | 그 시점에 **왜** 그렇게 결정했는가 | 고치지 않는다 (기록 보존) |
+
+구분 질문: "이 문서와 현실이 어긋나면 문서를 고쳐야 하는가?" 고치면 spec 또는 rules, 그대로 두면 plan이다.
+
+`spec/` 내부 계층(L1 Design/L2 Concern/L3 Flow)과 `spec/draft/`·`spec/archive/`는 `.claude/rules/spec-hierarchy.md`, `plans/`의 파일 규칙은 `plans/README.md`를 따른다.
