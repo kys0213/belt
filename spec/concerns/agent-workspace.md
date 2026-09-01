@@ -205,11 +205,6 @@ Priority 3: $BELT_HOME/agent-workspace/.claude/rules/    (global, belt agent ini
 - 디렉토리는 있지만 `.md` 파일이 없는 경우: 동일하게 built-in rules만 사용.
 - `classify-policy.md`만 없고 다른 `.md`가 있는 경우: 다른 정책 파일은 정상 로드, 분류 정책 가이던스만 빠진 채 실행.
 
-#### 구현 위치
-
-- `crates/belt-cli/src/agent.rs` — `resolve_rules_dir`, `load_rules_from_dir`
-- `crates/belt-cli/src/agent/workspace.rs` — `AgentWorkspace::init`, `default_classify_policy()`
-
 ### LLM이 사용 가능한 도구
 
 `belt agent`로 실행된 LLM은 bash tool을 통해 다음 belt CLI를 호출할 수 있다:

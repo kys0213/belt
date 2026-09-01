@@ -46,7 +46,7 @@ DataSource trait은 collect와 get_context 두 책임만 가진다.
 - worktree 셋업 → 인프라 레이어가 항상 처리
 - escalation → yaml의 escalation 정책을 코어가 결정, hook이 반응
 
-`get_context()`가 반환하는 `ItemContext`에는 `source_data: serde_json::Value` 필드가 있다. DataSource가 자신의 고유 데이터를 자유 스키마로 채울 수 있도록 예약된 OCP 확장점이다. 다만 GitHub DataSource를 포함해 현재 구현된 모든 DataSource는 이 필드를 채우지 않고 `Null`로 고정한다 — 실제 데이터는 `issue`/`pr` 필드에 담긴다. `source_data`가 `Null`이면 `belt context`의 JSON 출력에서 해당 키 자체가 생략된다.
+`get_context()`가 반환하는 `ItemContext`에는 `source_data: serde_json::Value` 필드가 있다. DataSource가 자신의 고유 데이터를 자유 스키마로 채울 수 있도록 예약된 OCP 확장점이다. 현재는 채워지지 않는다(항상 `Null`) — 실제 데이터는 `issue`/`pr` 필드에 담긴다. `source_data`가 `Null`이면 `belt context`의 JSON 출력에서 해당 키 자체가 생략된다. 활용 계획은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
 
 ---
 

@@ -107,7 +107,7 @@ EscalationAction: `retry` | `retry_with_comment` | `hitl` | `skip` | `replan`
 | `enabled` | bool | true | — | 정체 패턴 감지 활성화 |
 | `lateral.enabled` | bool | true | — | lateral thinking 활성화 |
 
-> SpinningDetector의 유사도 threshold(0.9)와 최소 연속 횟수(2)는 daemon 코드에 하드코딩되어 있고 yaml로 노출되지 않는다. `CompositeSimilarity`/`TokenFingerprint`/`NcdJudge`/`OscillationDetector`는 core에 구현·테스트되어 있으나 daemon에는 배선되지 않았다. 상세: [Stagnation Detection](./stagnation.md)
+> 유사도 threshold(0.9)와 최소 연속 횟수(2)는 현재 고정값이며 yaml로 노출되지 않는다. 상세: [Stagnation Detection](./stagnation.md)
 
 ---
 

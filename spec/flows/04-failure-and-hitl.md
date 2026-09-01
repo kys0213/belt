@@ -11,11 +11,10 @@ handler 또는 hook.on_enter() 실패
     │
     ▼
 Stagnation 분석 (같은 source_id+state에 과거 실패 이력이 있으면 항상 실행):
-  이전 실패 error 메시지 + 이번 error를 SpinningDetector(ExactHash)로 비교:
+  이전 실패 error 메시지 + 이번 error를 완전 일치 기준으로 비교:
     │
-    ├── 같은 실패 반복 (SPINNING) — 현재 배선된 유일한 탐지
-    │   (OSCILLATION/진행 정체/개선폭 감소는 core에 있거나 설계만 있고 daemon에는 없음 —
-    │    상세: [Stagnation Detection](../concerns/stagnation.md))
+    ├── 같은 실패 반복 (SPINNING) — 현재 감지되는 유일한 패턴
+    │   (상세: [Stagnation Detection](../concerns/stagnation.md))
     │
     ├── 패턴 없음 ─────── escalation만 적용
     │
@@ -223,7 +222,7 @@ SIGINT → on_shutdown:
 | 1회 실패 | handler 실패 (failure_count=1) | 새 아이템 Pending | retry, on_fail 미실행, lateral plan 주입 |
 | 2회 실패 | handler 실패 (failure_count=2) | 새 아이템 Pending | retry_with_comment, on_fail 실행, lateral plan 주입 |
 | 3회 실패 | handler 실패 (failure_count=3) | HITL | hitl, on_fail 실행, lateral report 첨부 |
-| SPINNING 감지 | 2회 연속 동일 error (ExactHash score ≥ 0.9) | escalation에 따름 | StagnationDetector SPINNING, 페르소나 directive가 담긴 lateral plan 주입 |
+| SPINNING 감지 | 2회 연속 동일 error (유사도 ≥ 0.9) | escalation에 따름 | 페르소나 directive가 담긴 lateral plan 주입 |
 | HITL done 응답 | 사용자 done 선택 | Done | hook.on_done() 트리거, worktree 정리 |
 | HITL retry 응답 | 사용자 retry + 지시 | 새 아이템 Pending | 사용자 지시를 lateral_plan으로 주입, worktree 보존 |
 | HITL skip 응답 | 사용자 skip 선택 | Skipped (terminal) | worktree 정리 |

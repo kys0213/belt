@@ -102,7 +102,7 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 
 ### 13. Stagnation Detection + Lateral Thinking — 실패하면 다르게 시도
 
-실패 횟수만으로는 "같은 실수 반복"과 "다른 시도 실패"를 구분할 수 없다. belt-core는 Composite Pattern 기반 유사도 판단(SimilarityJudge)으로 SPINNING·OSCILLATION 패턴 감지를 구현하고 있으나, daemon은 현재 ExactHash 기반 SpinningDetector만 배선한다. 패턴 감지 시 내장 페르소나(Lateral Thinking)가 접근법을 전환하여 재시도하며, 모든 retry에 lateral plan이 자동 주입되는 것이 기본 동작이다. 상세: [Stagnation Detection](./concerns/stagnation.md)
+실패 횟수만으로는 "같은 실수 반복"과 "다른 시도 실패"를 구분할 수 없다. 정체 감지는 동일 출력이 반복되는 패턴(SPINNING)을 감지한다 — 유사도 판정 기준과 임계값은 현재 고정값이며 설정으로 노출되지 않는다. 패턴 감지 시 내장 페르소나(Lateral Thinking)가 접근법을 전환하여 재시도하며, 모든 retry에 lateral plan이 자동 주입되는 것이 기본 동작이다. 상세: [Stagnation Detection](./concerns/stagnation.md)
 
 ### Agent는 대화형 에이전트
 
@@ -145,12 +145,12 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 ┌─────────────────┐          ┌──────────────────────────────────────┐
 │   Completed      │          │  Stagnation Analyzer (항상 실행)      │
 │                  │          │                                      │
-│  Evaluator가     │          │  ① SpinningDetector가 DB 직접 조회   │
-│  다음 tick에서   │          │     (ExactHash, summary/error)       │
-│  판정            │          │     ※ OscillationDetector·           │
-│                  │          │       CompositeSimilarity는 core에만 │
-│                  │          │       구현, daemon 미배선            │
-│  Progressive:    │          │  ② LateralAnalyzer (패턴 감지 시)    │
+│  Evaluator가     │          │  ① 정체 패턴 감지 (동일 출력 반복)   │
+│  다음 tick에서   │          │     과거/현재 실패 error 비교        │
+│  판정            │          │                                      │
+│                  │          │                                      │
+│                  │          │                                      │
+│  Progressive:    │          │  ② 사고 전환 (패턴 감지 시)          │
 │  Mechanical      │          │     페르소나 선택 → lateral_plan     │
 │   → Semantic     │          │                                      │
 │   → (Consensus)  │          │  ③ Escalation (failure_count 기반)   │
@@ -244,11 +244,9 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 │  │ conflict │  │     → hook.on_done() 트리거                       │ │
 │  │ concurr. │  │  ④ 실패 시:                                       │ │
 │  │          │  │  ┌─────────────────────────────────────────────┐  │ │
-│  │          │  │  │ StagnationDetector                          │  │ │
-│  │          │  │  │  judge: Box<dyn SimilarityJudge>           │  │ │
-│  │          │  │  │  └── ExactHash (SpinningDetector, 배선됨)   │  │ │
-│  │          │  │  │      CompositeSimilarity·Oscillation은     │  │ │
-│  │          │  │  │      core 구현만, daemon 미배선            │  │ │
+│  │          │  │  │ 정체 패턴 감지                              │  │ │
+│  │          │  │  │  동일 출력 반복(SPINNING) 여부를             │  │ │
+│  │          │  │  │  해시 완전 일치 기준으로 판정                │  │ │
 │  │          │  │  └────────────────┬────────────────────────────┘  │ │
 │  │          │  │                   ▼ 패턴 감지 시                   │ │
 │  │          │  │  ┌─────────────────────────────────────────────┐  │ │
@@ -292,28 +290,9 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 
 ---
 
-## Stagnation — 현재 배선과 core 구현 범위
+## Stagnation — 정체 감지
 
-daemon이 현재 실행하는 것은 `SpinningDetector(ExactHash, threshold=0.9, min_repeat=2)` 하나뿐이다.
-동일 (source_id, state)에서 과거 실패 error와 현재 error를 비교해 SHA-256 동일 여부로 SPINNING을 판정한다.
-
-belt-core는 `SimilarityJudge` trait 하나만 의존한다. Composite도 Judge를 구현하므로 중첩 가능하지만, 아래 트리 중 daemon이 실제로 사용하는 노드는 `ExactHash` 뿐이다 — 나머지는 belt-core에 구현·테스트되어 있으나 daemon에서 호출되지 않는다.
-
-```
-trait SimilarityJudge
-  fn score(a, b) → f64
-        │
-        ├── ExactHash           SHA-256 동일=1.0, 다름=0.0                (daemon 배선됨)
-        ├── TokenFingerprint    정규화 후 해시 (숫자/경로/UUID 무시)        (core만, 미배선)
-        ├── NCD                 압축 거리 0.0~1.0                         (core만, 미배선)
-        └── CompositeSimilarity 가중 합산 (자기도 Judge, 중첩 가능)         (core만, 미배선)
-              │
-              ├── (ExactHash, 0.5)
-              ├── (TokenFingerprint, 0.3)
-              └── (NCD, 0.2)
-```
-
-`PatternDetector` 축도 마찬가지다 — `SpinningDetector`는 daemon에 배선되어 있고, `OscillationDetector`는 belt-core에 구현·테스트만 되어 있다.
+정체 감지는 동일 (source_id, state)에서 과거 실패 error와 현재 error를 비교해, 완전 일치 기준(SPINNING)으로 반복 실패 패턴을 판정한다. 새 유사도 알고리즘·패턴 감지 로직은 코어 변경 없이 추가할 수 있는 확장점이다.
 
 상세: [Stagnation Detection](./concerns/stagnation.md)
 
@@ -326,7 +305,7 @@ trait SimilarityJudge
 | Daemon | CPU — 상태 머신 순회 + hook 트리거 + cron 스케줄링 | 0 |
 | Advancer | Pending→Ready→Running 전이, dependency gate (DB), conflict 검출 | 0 |
 | Executor | handler 실행, escalation 결정, hook 트리거 | handler별 |
-| StagnationDetector | ExactHash 기반 SpinningDetector 배선 (CompositeSimilarity·OscillationDetector는 core 구현만, 미배선) | 0 |
+| StagnationDetector | 정체 패턴(SPINNING) 감지 | 0 |
 | LateralAnalyzer | 내장 페르소나로 대안 접근법 분석, lateral_plan 생성 | 분석 시 |
 | HitlService | HITL 응답 처리, timeout 만료, terminal action | 0 |
 | Evaluator | Completed → Done/HITL 분류 (per-item, CLI 도구 호출) | 분류 시 |
@@ -352,8 +331,7 @@ trait SimilarityJudge
 ```
 
 > **예약 필드**: `ItemContext.source_data: serde_json::Value`는 DataSource별 자유 스키마 확장을 위해 예약된 필드다.
-> 현재는 모든 DataSource/LifecycleHook 구현이 `Null`을 채워 넣을 뿐, 실제로 소비하는 곳이 없다.
-> "코어 변경 0"으로 새 컨텍스트를 흘려보내는 확장점은 아직 배선되지 않았다.
+> 현재는 채워지지 않는다(항상 `Null`). 활용 계획은 [source_data와 stagnation 로드맵](../plans/source-data-and-stagnation-roadmap.md) 참조.
 
 ---
 
@@ -364,7 +342,7 @@ trait SimilarityJudge
 | [QueuePhase 상태 머신](./concerns/queue-state-machine.md) | 상태 전이, 전이 캡슐화, worktree 생명주기, on_fail 조건 |
 | [Daemon](./concerns/daemon.md) | 내부 모듈 구조, 실행 루프, dependency gate (DB), concurrency, graceful shutdown |
 | [Evaluator](./concerns/evaluator.md) | Progressive Evaluation Pipeline, Stage trait — 완료 아이템 판정 |
-| [Stagnation Detection](./concerns/stagnation.md) | SPINNING 감지(ExactHash) 배선, Composite/Oscillation 은 core 구현·daemon 미배선 |
+| [Stagnation Detection](./concerns/stagnation.md) | 정체 패턴(SPINNING) 감지, Lateral Thinking 사고 전환 |
 | [LifecycleHook](./concerns/lifecycle-hook.md) | 상태 전이 반응 trait, DataSource별 impl, workspace 바인딩, lazy 로딩 |
 | [DataSource](./concerns/datasource.md) | trait, context 스키마 (source_data), 워크플로우 yaml, escalation |
 | [AgentRuntime](./concerns/agent-runtime.md) | LLM 실행 추상화, RuntimeRegistry |

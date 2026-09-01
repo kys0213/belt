@@ -44,6 +44,20 @@ belt context $WORK_ID --json | jq '.source_data.ticket.key'
 | — | Lateral plan을 LLM(`belt agent -p` 서브프로세스)이 생성하도록 고도화 (`LateralAnalyzer::analyze()`) | core 구현·테스트 완료, daemon 미배선. daemon은 여전히 고정 persona directive 텍스트만 사용 |
 | — | yaml에서 유사도 threshold·window·judge 가중치를 설정 가능하게 함 | 미착수. `StagnationConfig`에는 `enabled`/`lateral.enabled`만 있고, threshold(0.9)·min_consecutive(2)는 daemon 코드에 하드코딩 |
 
+### core 구현 완료 · daemon 미배선 인벤토리
+
+`crates/belt-core/src/stagnation/`에 구현되고 단위 테스트도 갖춰져 있지만, daemon 실행 경로에서는 호출되지 않는 항목들이다. 새로 배선하려면 daemon 코드 변경만 필요하고 core 변경은 필요 없다 (OCP).
+
+| 항목 | 위치 | 현재 상태 |
+|------|------|----------|
+| `SimilarityJudge` 구현체 — `TokenFingerprint`(숫자/경로/UUID 정규화 후 토큰 Jaccard 지수), `NcdJudge`(flate2 gzip 기반 Normalized Compression Distance) | `similarity.rs` | daemon은 `ExactHash`만 직접 사용 |
+| `CompositeSimilarity` — 여러 Judge를 가중 평균으로 합성(자기도 Judge라 중첩 가능). 기본 프리셋: `ExactHash(0.5) + TokenFingerprint(0.3) + NcdJudge(0.2)` | `similarity.rs` | daemon은 호출하지 않음 |
+| `OscillationDetector` — `outputs[i]`와 `outputs[i-2]`를 비교해 A-B-A-B 교대 패턴을 감지, `min_cycles`회 이상 일치 시 OSCILLATION 판정 | `pattern.rs` | `StagnationDetector`에 등록되지 않음 |
+| `LateralAnalyzer::analyze()` — `belt agent -p` 서브프로세스로 LLM에게 실패 분석·대안 접근·실행 계획을 생성시켜 `LateralPlan` 구조체(failure_analysis/alternative_approach/execution_plan/warnings)를 채움 | `lateral.rs` | daemon은 `select_persona()` + 고정 `directive()` 문자열 조합만 사용 |
+| threshold(0.9)·min_consecutive(2) 하드코딩 — `StagnationDetector::new(vec![SpinningDetector::new(Box::new(ExactHash), 0.9, 2)])` | `crates/belt-daemon/src/daemon.rs` | yaml로 노출 안 됨 |
+
+NO_DRIFT/DIMINISHING_RETURNS는 core에도 detector 구현이 없다 — 설계 스케치만 존재한다(아래 참조).
+
 ### 검토했던 설계 — NO_DRIFT / DIMINISHING_RETURNS
 
 drift score 기반 탐지 스케치 (구현 없음, 설계 스케치만 존재):
@@ -128,4 +142,4 @@ Lateral Thinking:
 - [ ] evidence에 각 judge별 score가 포함된다
 - [ ] lateral plan과 페르소나 정보가 event detail에 포함된다
 
-현재 구현 기준으로 이 체크리스트를 다시 검증하려면 [Stagnation Detection](../spec/concerns/stagnation.md)의 "core 구현 완료, daemon 미배선" 절을 참조한다 — 다수 항목이 미충족 상태다.
+현재 구현 기준으로 이 체크리스트를 다시 검증하려면 위 "core 구현 완료 · daemon 미배선 인벤토리"를 참조한다 — 다수 항목이 미충족 상태다.

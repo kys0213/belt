@@ -154,10 +154,6 @@ sources:
 # workspace yaml의 on_done script(ScriptLifecycleHook 경로)에서 별도로 구현해야 한다.
 ```
 
-### hook 동작 커스터마이징 (현재 미구현)
-
-`GitHubLifecycleHook`은 `comment_on_done`(기본 false), `comment_on_fail`(기본 true), `hitl_label`(기본 `belt:needs-human`) 필드를 갖는 `GitHubHookConfig`로 동작을 바꿀 수 있도록 설계되어 있다. 하지만 `SourceConfig`(workspace yaml의 `sources.{type}` 스키마)에는 `hooks` 필드가 없고, hook 로딩 경로(`hook_cache.rs`)도 `HookParams::new(source_type, url)`로 기본값만 생성한다 — yaml로 이 값들을 오버라이드하는 경로는 아직 없다. 커스터마이징하려면 `GitHubHookConfig`/`HookParams` 생성 코드를 직접 바꿔야 한다.
-
 ### Hook impl 동적 로딩
 
 Hook impl은 Daemon 시작 시 일괄 생성하지 않는다. hook 트리거 시점에 DB에서 workspace 정보를 조회하고, 필요한 Hook impl을 동적으로 로드한다.
@@ -319,7 +315,7 @@ impl LifecycleHook for ScriptLifecycleHook {
 
 ### DataSource별 전용 Hook — GitHubLifecycleHook
 
-`crates/belt-infra/src/hooks/github.rs`에 구현되어 있고 `hooks::create_hook()`을 통해 GitHub source에 대해 항상 우선 선택된다(`ScriptLifecycleHook`보다 먼저 시도됨). `GitHubHookConfig`는 코드 상수 기본값(`comment_on_done: false`, `comment_on_fail: true`, `hitl_label: "belt:needs-human"`)으로만 생성되고, yaml에서 오버라이드하는 경로는 없다.
+`hooks::create_hook()`을 통해 GitHub source에 대해 항상 우선 선택된다(`ScriptLifecycleHook`보다 먼저 시도됨). `GitHubHookConfig`는 코드 상수 기본값(`comment_on_done: false`, `comment_on_fail: true`, `hitl_label: "belt:needs-human"`)으로만 생성되고, yaml에서 오버라이드하는 경로는 없다.
 
 ```rust
 pub struct GitHubLifecycleHook {
@@ -376,8 +372,6 @@ pub struct StateConfig {
 }
 ```
 
-이 세 필드를 완전히 제거하고 hook 설정 전부를 DataSource별 Hook impl로 옮기는 것은 아직 하지 않은 변경이다 — 필드를 제거하면 `ScriptLifecycleHook` 경로 자체가 성립하지 않으므로, 제거하려면 모든 지원 source_type에 전용 Hook impl이 먼저 갖춰져야 한다.
-
 ---
 
 ## 동적 로딩과 메모리
@@ -389,7 +383,7 @@ Daemon 시작 → DB에서 workspace 목록만 조회
 hook 트리거 시 → DB(config_path, updated_at) → 캐시 확인 → 미스 시 yaml 파싱 → Hook impl 생성 → 캐시에 저장 → 실행
 ```
 
-workspace가 늘어나도 Daemon의 메모리 부담이 선형 증가하지 않는다. 자주 트리거되는 workspace의 Hook impl은 LRU 캐시(`hook_cache.rs`)로 재사용하고, yaml 변경 시(`updated_at` 비교) 캐시를 무효화한다.
+workspace가 늘어나도 Daemon의 메모리 부담이 선형 증가하지 않는다. 자주 트리거되는 workspace의 Hook impl은 LRU 캐시로 재사용하고, yaml 변경 시(`updated_at` 비교) 캐시를 무효화한다.
 
 ---
 
