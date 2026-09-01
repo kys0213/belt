@@ -1,8 +1,6 @@
-# DESIGN v6
+# Belt Spec — Design
 
-> **Date**: 2026-04-05
-> **Status**: Draft
-> **기준**: v5 운영 피드백 + Multi-LLM 분석 + 7개 이슈(#717~#723) + [Ouroboros](https://github.com/kys0213/ouroboros) resilience 적용
+> 버전 마이그레이션 배경과 변경 이력은 [plans/2026-04-v6-migration.md](../plans/2026-04-v6-migration.md) 참고.
 
 ---
 
@@ -78,9 +76,9 @@ handler(prompt/script)는 yaml에 정의된 작업 자체(분석, 구현, 리뷰
 
 handler prompt는 항상 git worktree 안에서 실행. worktree 생성/정리는 인프라 레이어 담당.
 
-### 7. Evaluate before Execute — 판정이 실행보다 먼저
+### 7. Progressive Evaluation — 판정은 비용 순으로
 
-Daemon tick에서 Evaluator가 Executor보다 먼저 동작한다. 비용이 낮은 검증(Mechanical)부터 단계적으로 수행하여, 이전 기록으로 판정 가능하면 handler 실행을 생략한다. Ouroboros의 progressive evaluation을 차용. 상세: [Evaluator](./concerns/evaluator.md)
+Daemon tick은 execute 이후 evaluate 순서로 동작한다 (collect→advance→execute→evaluate). evaluate는 방금 execute에서 Completed된 아이템과 이전 tick에서 Completed된 아이템을 함께 판정하며, 여기서 해제한 concurrency slot은 다음 tick의 advance가 사용한다. 판정 자체는 비용이 낮은 검증(Mechanical)부터 단계적으로 수행하여, 낮은 단계로 판정 가능하면 이후 단계(Semantic 등)를 생략한다. 상세: [Evaluator](./concerns/evaluator.md)
 
 ### 8. 아이템 계보 (Lineage)
 
@@ -104,7 +102,7 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 
 ### 13. Stagnation Detection + Lateral Thinking — 실패하면 다르게 시도
 
-실패 횟수만으로는 "같은 실수 반복"과 "다른 시도 실패"를 구분할 수 없다. Composite Pattern 기반 유사도 판단(SimilarityJudge)으로 SPINNING·OSCILLATION 패턴을 감지하고, 내장 페르소나(Lateral Thinking)가 접근법을 전환하여 재시도한다. 모든 retry에 lateral plan이 자동 주입되는 것이 기본 동작. 상세: [Stagnation Detection](./concerns/stagnation.md)
+실패 횟수만으로는 "같은 실수 반복"과 "다른 시도 실패"를 구분할 수 없다. belt-core는 Composite Pattern 기반 유사도 판단(SimilarityJudge)으로 SPINNING·OSCILLATION 패턴 감지를 구현하고 있으나, daemon은 현재 ExactHash 기반 SpinningDetector만 배선한다. 패턴 감지 시 내장 페르소나(Lateral Thinking)가 접근법을 전환하여 재시도하며, 모든 retry에 lateral plan이 자동 주입되는 것이 기본 동작이다. 상세: [Stagnation Detection](./concerns/stagnation.md)
 
 ### Agent는 대화형 에이전트
 
@@ -147,10 +145,11 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 ┌─────────────────┐          ┌──────────────────────────────────────┐
 │   Completed      │          │  Stagnation Analyzer (항상 실행)      │
 │                  │          │                                      │
-│  Evaluator가     │          │  ① 각 PatternDetector가 DB 직접 조회 │
-│  다음 tick에서   │          │     SpinningDetector (summary/error) │
-│  판정            │          │     OscillationDetector (summary)    │
-│                  │          │                                      │
+│  Evaluator가     │          │  ① SpinningDetector가 DB 직접 조회   │
+│  다음 tick에서   │          │     (ExactHash, summary/error)       │
+│  판정            │          │     ※ OscillationDetector·           │
+│                  │          │       CompositeSimilarity는 core에만 │
+│                  │          │       구현, daemon 미배선            │
 │  Progressive:    │          │  ② LateralAnalyzer (패턴 감지 시)    │
 │  Mechanical      │          │     페르소나 선택 → lateral_plan     │
 │   → Semantic     │          │                                      │
@@ -200,15 +199,15 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 ```
 매 tick:
   ① collect    — DataSource에서 새 아이템 수집 → Pending
-  ② evaluate   — Completed 아이템을 Done/HITL로 판정 (concurrency slot 해제)
-  ③ advance    — Pending→Ready→Running 전이 (slot 확보)
-  ④ execute    — Running 아이템의 handler 실행 + hook 트리거
+  ② advance    — Pending→Ready→Running 전이 (slot 확보)
+  ③ execute    — Running 아이템의 handler 실행 + hook 트리거
+  ④ evaluate   — Completed 아이템을 Done/HITL로 판정 (concurrency slot 해제)
   ⑤ cron.tick  — 품질 루프 (gap-detection 등)
 ```
 
-> **Evaluate before Execute**: Evaluator가 Executor보다 먼저 동작한다.
-> 이전 tick에서 Completed된 아이템이 현재 tick에서 판정(Done/HITL)되어 concurrency slot이 해제된 후,
-> Advancer가 새 아이템을 Running으로 전이시킨다. 이 순서가 뒤바뀌면 slot 부족으로 불필요한 대기가 발생한다.
+> **slot 해제와 확보는 tick 경계를 넘어 순환한다**: advance는 이전 tick의 evaluate가 해제한 slot으로
+> 아이템을 Running에 올린다. execute가 끝낸 아이템은 같은 tick의 evaluate가 판정해 slot을 해제하고,
+> 그 slot을 다음 tick의 advance가 다시 사용한다.
 
 ### 상태별 소유 모듈
 
@@ -231,7 +230,7 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 ```
 ┌─ Daemon (CPU) ────────────────────────────────────────────────────────┐
 │                                                                       │
-│  loop { collector → evaluator → advancer → executor → cron.tick() }  │
+│  loop { collector → advancer → executor → evaluator → cron.tick() }  │
 │                                                                       │
 │  Daemon이 아는 것: 상태 머신 + 언제 어떤 hook을 트리거할지             │
 │  Daemon이 모르는 것: hook이 실제로 무엇을 하는지                       │
@@ -247,8 +246,9 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 │  │          │  │  ┌─────────────────────────────────────────────┐  │ │
 │  │          │  │  │ StagnationDetector                          │  │ │
 │  │          │  │  │  judge: Box<dyn SimilarityJudge>           │  │ │
-│  │          │  │  │  └── CompositeSimilarity                   │  │ │
-│  │          │  │  │        ExactHash / TokenFingerprint / NCD  │  │ │
+│  │          │  │  │  └── ExactHash (SpinningDetector, 배선됨)   │  │ │
+│  │          │  │  │      CompositeSimilarity·Oscillation은     │  │ │
+│  │          │  │  │      core 구현만, daemon 미배선            │  │ │
 │  │          │  │  └────────────────┬────────────────────────────┘  │ │
 │  │          │  │                   ▼ 패턴 감지 시                   │ │
 │  │          │  │  ┌─────────────────────────────────────────────┐  │ │
@@ -292,23 +292,28 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 
 ---
 
-## Stagnation — Composite Similarity
+## Stagnation — 현재 배선과 core 구현 범위
 
-belt-core는 `SimilarityJudge` trait 하나만 의존. Composite도 Judge를 구현하므로 중첩 가능.
+daemon이 현재 실행하는 것은 `SpinningDetector(ExactHash, threshold=0.9, min_repeat=2)` 하나뿐이다.
+동일 (source_id, state)에서 과거 실패 error와 현재 error를 비교해 SHA-256 동일 여부로 SPINNING을 판정한다.
+
+belt-core는 `SimilarityJudge` trait 하나만 의존한다. Composite도 Judge를 구현하므로 중첩 가능하지만, 아래 트리 중 daemon이 실제로 사용하는 노드는 `ExactHash` 뿐이다 — 나머지는 belt-core에 구현·테스트되어 있으나 daemon에서 호출되지 않는다.
 
 ```
 trait SimilarityJudge
   fn score(a, b) → f64
         │
-        ├── ExactHash           SHA-256 동일=1.0, 다름=0.0
-        ├── TokenFingerprint    정규화 후 해시 (숫자/경로/UUID 무시)
-        ├── NCD                 압축 거리 0.0~1.0
-        └── CompositeSimilarity 가중 합산 (자기도 Judge, 중첩 가능)
+        ├── ExactHash           SHA-256 동일=1.0, 다름=0.0                (daemon 배선됨)
+        ├── TokenFingerprint    정규화 후 해시 (숫자/경로/UUID 무시)        (core만, 미배선)
+        ├── NCD                 압축 거리 0.0~1.0                         (core만, 미배선)
+        └── CompositeSimilarity 가중 합산 (자기도 Judge, 중첩 가능)         (core만, 미배선)
               │
               ├── (ExactHash, 0.5)
               ├── (TokenFingerprint, 0.3)
               └── (NCD, 0.2)
 ```
+
+`PatternDetector` 축도 마찬가지다 — `SpinningDetector`는 daemon에 배선되어 있고, `OscillationDetector`는 belt-core에 구현·테스트만 되어 있다.
 
 상세: [Stagnation Detection](./concerns/stagnation.md)
 
@@ -321,7 +326,7 @@ trait SimilarityJudge
 | Daemon | CPU — 상태 머신 순회 + hook 트리거 + cron 스케줄링 | 0 |
 | Advancer | Pending→Ready→Running 전이, dependency gate (DB), conflict 검출 | 0 |
 | Executor | handler 실행, escalation 결정, hook 트리거 | handler별 |
-| StagnationDetector | CompositeSimilarity로 유사도 판단, 4가지 패턴 탐지 | 0 |
+| StagnationDetector | ExactHash 기반 SpinningDetector 배선 (CompositeSimilarity·OscillationDetector는 core 구현만, 미배선) | 0 |
 | LateralAnalyzer | 내장 페르소나로 대안 접근법 분석, lateral_plan 생성 | 분석 시 |
 | HitlService | HITL 응답 처리, timeout 만료, terminal action | 0 |
 | Evaluator | Completed → Done/HITL 분류 (per-item, CLI 도구 호출) | 분류 시 |
@@ -343,9 +348,12 @@ trait SimilarityJudge
 새 lifecycle 반응  = LifecycleHook impl 추가/변경          → 코어 변경 0
 새 품질 검사       = Cron 등록                             → 코어 변경 0
 새 OS/플랫폼      = ShellExecutor impl 추가               → 코어 변경 0
-새 DataSource 컨텍스트 = source_data 자유 스키마           → 코어 변경 0
 새 유사도 알고리즘  = SimilarityJudge impl 추가            → 코어 변경 0
 ```
+
+> **예약 필드**: `ItemContext.source_data: serde_json::Value`는 DataSource별 자유 스키마 확장을 위해 예약된 필드다.
+> 현재는 모든 DataSource/LifecycleHook 구현이 `Null`을 채워 넣을 뿐, 실제로 소비하는 곳이 없다.
+> "코어 변경 0"으로 새 컨텍스트를 흘려보내는 확장점은 아직 배선되지 않았다.
 
 ---
 
@@ -365,74 +373,3 @@ trait SimilarityJudge
 | [CLI 레퍼런스](./concerns/cli-reference.md) | 3-layer SSOT, belt context, 전체 커맨드 |
 | [Cross-Platform](./concerns/cross-platform.md) | OS 추상화 (ShellExecutor, DaemonNotifier) |
 | [Data Model](./concerns/data-model.md) | SQLite 스키마, 도메인 enum, source_data, stagnation types |
-
----
-
-## v5 → v6 변경 요약
-
-| 항목 | v5 | v6 | 이슈 |
-|------|-----|-----|------|
-| Lifecycle 반응 | on_done/on_fail yaml script, Executor 직접 실행 | `LifecycleHook` trait, DataSource별 impl, workspace 바인딩 | 신규 |
-| Daemon 역할 | yaml script 실행기 | 상태 머신 CPU — hook 트리거만, 실행 책임 없음 | 신규 |
-| Daemon 내부 | 단일 daemon.rs | Orchestrator + Advancer·Executor·HitlService 모듈 분리 | #717 |
-| Phase 전이 | `item.phase =` 직접 대입 | `QueueItem::transit()` 강제, phase `pub(crate)` | #718 |
-| ItemContext | `issue`/`pr` 필드 직접 | `source_data: serde_json::Value` 추가 (OCP) | #719 |
-| hitl_terminal_action | `Option<String>` | `Option<EscalationAction>` (타입 안전) | #720 |
-| Dependency gate | in-memory queue | DB 조회 기반 (restart-safety) | #721 |
-| Evaluate | cron job, workspace 배치 | Daemon tick 정규 단계, Progressive Pipeline (Mechanical→Semantic→Consensus), history-aware 사전 검증 | #722 |
-| 실패 대응 | failure_count → 단순 retry | Composite Similarity 패턴 감지 + Lateral Thinking 사고 전환 | #723 |
-
----
-
-## v4 → v5 변경 요약
-
-| 항목 | v4 | v5 |
-|------|-----|-----|
-| 레포 단위 | `repo` | `workspace` (1:1 매핑) |
-| Daemon 역할 | 수집 + drain + Task 실행 + escalation | 상태 머신 + yaml 액션 실행기 |
-| Task trait | 5개 구현체 | **제거**. prompt/script로 대체 |
-| 파이프라인 단계 | `TaskKind` enum (하드코딩) | yaml states (동적 정의) |
-| 부수효과 (PR, 라벨) | Task.after_invoke() | on_done script (gh CLI 등) |
-| 인프라 (worktree) | Task.before_invoke() | 인프라 레이어, retry 시 보존 |
-| 컨텍스트 조회 | Task 내부 | `belt context` CLI |
-| 환경변수 | DataSource별 다수 | `WORK_ID` + `WORKTREE` 만 |
-| QueuePhase | 5개 | 8개 (+Completed, HITL, Failed) |
-| evaluate | Agent가 판단 | cron 기반 + force_trigger 하이브리드, CLI 도구 호출 |
-| DataSource trait | 5개 메서드 | collect + get_context 만 |
-| Concurrency | InFlightTracker | 2단계 (workspace + global) |
-
----
-
-## 구현 순서
-
-```
-Phase 1: 코어 재구성
-  → workspace 마이그레이션, DataSource trait, QueuePhase 확장
-  → 상태 머신 단순화, belt context CLI
-
-Phase 2: handler 실행기
-  → AgentRuntime trait, prompt/script 실행기, worktree 인프라
-  → Task trait 제거
-
-Phase 3: evaluate + escalation
-  → Evaluator (Daemon tick, Progressive Pipeline)
-  → escalation 정책, on_done/on_fail, Failed 상태
-
-Phase 4: Agent + slash command
-  → /agent, /auto, /spec 통합
-
-Phase 5: TUI + 품질 루프
-  → dashboard, gap-detection, spec completion
-
-Phase 6: 내부 품질 강화 (v6 신규)
-  → #720 hitl_terminal_action 타입 안전
-  → #721 Dependency gate DB 기반
-  → #718 Phase 전이 캡슐화 (QueueItem::transit)
-  → #717 Daemon 모듈 분리 (Advancer, Executor, HitlService)
-  → #722 Evaluator per-item 판정
-  → #719 ItemContext source_data 확장
-  → #723 Stagnation Detection + Lateral Thinking
-        SimilarityJudge trait (Composite Pattern)
-        CompositeSimilarity (ExactHash + TokenFingerprint + NCD)
-        LateralAnalyzer (내장 페르소나 5종)
-```

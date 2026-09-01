@@ -1,8 +1,7 @@
-# Spec v6 Draft
+# Belt Spec
 
-> **Date**: 2026-04-04
-> **Status**: Draft
 > **구조**: 설계 개요 + 관심사별 상세 스펙 + 사용자 플로우
+> 버전 마이그레이션 배경과 변경 이력은 [plans/2026-04-v6-migration.md](../plans/2026-04-v6-migration.md) 참고.
 
 ## 핵심 변경 (v5 → v6)
 
@@ -11,7 +10,7 @@
 - **Stagnation Detection**: 실패 횟수가 아니라 실패 패턴(SPINNING, OSCILLATION)을 감지
 - **Daemon 모듈 분리**: 단일 daemon.rs → Advancer + Executor + HitlService + StagnationDetector 모듈
 - **Phase 전이 캡슐화**: `item.phase` 직접 대입 금지, `QueueItem::transit()` 메서드 강제
-- **ItemContext 확장**: `source_data: serde_json::Value` 추가 — 새 DataSource 추가 시 코어 변경 0
+- **ItemContext 확장**: `source_data: serde_json::Value` 필드 추가. 새 DataSource 컨텍스트를 코어 변경 없이 흘려보내기 위한 예약 필드이며, 현재는 모든 DataSource/LifecycleHook 구현이 `Null`을 채워 넣을 뿐 소비하는 곳은 없다
 - **hitl_terminal_action 타입 안전**: `Option<String>` → `Option<EscalationAction>`
 - **Dependency Gate DB 기반**: in-memory → DB 조회, 재시작 시 순서 보장
 - **Evaluator per-item 판정**: workspace 배치 → per-work_id 개별 LLM 판정
@@ -26,6 +25,7 @@
 
 | 문서 | 설명 |
 |------|------|
+| [workspace.yaml 스키마](./concerns/workspace-schema.md) | workspace.yaml 전체 구조 (SSOT) — sources/runtime/evaluate/stagnation 설정, 각 concern이 참조 |
 | [QueuePhase 상태 머신](./concerns/queue-state-machine.md) | 8개 phase 전이, **전이 캡슐화**, worktree 생명주기, on_fail 조건 |
 | [Daemon](./concerns/daemon.md) | **내부 모듈 구조**, 실행 루프, **DB dependency gate**, concurrency, graceful shutdown |
 | [Evaluator](./concerns/evaluator.md) | **v6 신규** — Progressive Evaluation Pipeline, Evaluate before Execute |
