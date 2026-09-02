@@ -37,9 +37,7 @@ evaluate:
 
 stagnation:
   enabled: true
-  spinning_threshold: 3
-  similarity_threshold: 0.8
-  lateral: { enabled: true, max_attempts: 3 }
+  lateral: { enabled: true }
 ```
 
 > 전체 필드와 기본값은 아래 레퍼런스 테이블 참조. 실제 yaml 예시는 [DataSource](./datasource.md)의 GitHub 워크플로우 참조.
@@ -107,19 +105,9 @@ EscalationAction: `retry` | `retry_with_comment` | `hitl` | `skip` | `replan`
 | 필드 | 타입 | 기본값 | 필수 | 설명 |
 |------|------|--------|------|------|
 | `enabled` | bool | true | — | 정체 패턴 감지 활성화 |
-| `spinning_threshold` | u32 | 3 | — | SPINNING 감지용 최소 연속 유사 출력 수 |
-| `oscillation_cycles` | u32 | 2 | — | OSCILLATION 감지용 최소 교대 사이클 수 (출력 2N개) |
-| `similarity_threshold` | f64 | 0.8 | — | 유사 판정 기준 (0.0~1.0) |
-| `no_drift_epsilon` | f64 | 0.01 | — | drift 변화 임계값 |
-| `no_drift_iterations` | u32 | 3 | — | drift 정체 판정 반복 수 |
-| `diminishing_threshold` | f64 | 0.01 | — | 개선폭 임계값 |
-| `confidence_threshold` | f64 | 0.5 | — | 탐지 유효 최소 confidence (0.0~1.0) |
-| `similarity[].judge` | String | — | ✅ | 판정 알고리즘 (`exact_hash`, `token_fingerprint`, `ncd`) |
-| `similarity[].weight` | f64 | — | ✅ | 가중치 (합산 1.0) |
 | `lateral.enabled` | bool | true | — | lateral thinking 활성화 |
-| `lateral.max_attempts` | u32 | 3 | — | 페르소나 최대 시도 횟수 |
 
-> 기본 프리셋: exact_hash(0.5) + token_fingerprint(0.3) + ncd(0.2)
+> 유사도 threshold(0.9)와 최소 연속 횟수(2)는 현재 고정값이며 yaml로 노출되지 않는다. 상세: [Stagnation Detection](./stagnation.md)
 
 ---
 

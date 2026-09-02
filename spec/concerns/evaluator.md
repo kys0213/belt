@@ -1,6 +1,6 @@
 # Evaluator — Progressive Evaluation Pipeline
 
-> 실행 전에 판정하고, 필요할 때만 실행한다.
+> handler 실행이 끝난 아이템을 판정하고, 판정 결과는 다음 tick의 advance에 반영한다.
 > 비용이 낮은 검증부터 단계적으로 수행하여 불필요한 LLM 호출을 줄인다.
 > Ouroboros의 3-stage progressive evaluation을 차용.
 
@@ -9,7 +9,7 @@
 ## 핵심 원칙
 
 ```
-1. Evaluate before Execute — 실행보다 판정이 먼저
+1. Execute 이후 Evaluate — handler 실행이 끝난 Completed 아이템을 판정하고, 판정 결과는 다음 tick의 advance에 반영된다
 2. Cheapest first — 비용 0 검증 → LLM 1회 → (다중 LLM)
 3. History-aware — 이전 기록으로 판정 가능하면 handler 실행 생략
 ```
@@ -21,9 +21,9 @@
 ```
 loop {
     collect()                    // 수집
-    evaluator.evaluate()         // 판정 — 실행보다 먼저
     advancer.advance()           // 전이
     executor.execute()           // 실행
+    evaluator.evaluate()         // 판정 — 완료 아이템을 Done/HITL로 분류
     cron_engine.tick()           // 품질 루프
 }
 ```
@@ -133,13 +133,13 @@ impl EvaluationPipeline {
 }
 ```
 
-**v6 범위**: `MechanicalStage` + `SemanticStage`만 등록. Phase 2(v7+)에서 `ConsensusStage`를 추가하면 코어 변경 0 (OCP).
+현재는 `MechanicalStage` + `SemanticStage`만 등록되어 있다. `ConsensusStage`를 추가하면 코어 변경 없이 확장할 수 있다 (OCP) — 아래 Stage 3 참조.
 
 ---
 
 ## Stage 상세
 
-### Stage 1: MechanicalStage (v6)
+### Stage 1: MechanicalStage
 
 worktree에서 결정적 검증을 실행한다. LLM 비용 0.
 
@@ -170,7 +170,7 @@ evaluate:
     - "cargo clippy -- -D warnings"
 ```
 
-### Stage 2: SemanticStage (v6)
+### Stage 2: SemanticStage
 
 LLM이 작업 맥락을 종합적으로 판단하여 Done/HITL을 판정한다.
 
@@ -198,9 +198,9 @@ impl EvaluationStage for SemanticStage {
 }
 ```
 
-### Stage 3: ConsensusStage (Phase 2, v7+)
+### Stage 3: ConsensusStage (미구현)
 
-> **v6 범위 아님** — trait 경계만 정의. v6에서는 Stage 1·2만 등록된다.
+> trait 경계만 정의된 설계 스케치다. 현재 등록된 Stage는 MechanicalStage·SemanticStage뿐이다.
 
 다중 LLM 투표. 트리거 조건 충족 시에만 실행.
 
@@ -237,19 +237,19 @@ can_judge_from_history(item):
 
 ```
 Daemon (CPU)
-  ├── Evaluator              ← tick 루프에서 실행보다 먼저
-  │     └── EvaluationPipeline
-  │           ├── MechanicalStage (v6)
-  │           ├── SemanticStage (v6)
-  │           └── ConsensusStage (Phase 2)
-  │
   ├── Advancer
   ├── Executor
+  ├── Evaluator              ← tick 루프에서 Executor 다음, Completed 아이템 판정
+  │     └── EvaluationPipeline
+  │           ├── MechanicalStage
+  │           ├── SemanticStage
+  │           └── ConsensusStage (미구현)
+  │
   ├── HitlService
   └── CronEngine
 ```
 
-Evaluator는 cron job이 아닌 **Daemon tick 루프의 정규 단계**이다. 실행(Executor)보다 먼저 동작하여, 판정 가능한 아이템은 handler 실행 없이 처리한다.
+Evaluator는 cron job이 아닌 **Daemon tick 루프의 정규 단계**이다. Executor가 끝낸 Completed 아이템을 판정하며, 판정 결과(Done/HITL)는 다음 tick의 Advancer에 반영된다.
 
 ---
 
@@ -257,7 +257,7 @@ Evaluator는 cron job이 아닌 **Daemon tick 루프의 정규 단계**이다. �
 
 | 변경 | 내용 |
 |------|------|
-| Daemon tick 순서 | evaluate → advance → execute → cron |
+| Daemon tick 순서 | collect → advance → execute → evaluate → cron |
 | Evaluator 위치 | cron job → Daemon 모듈 |
 | CronEngine | evaluate 제거, 품질 루프(gap-detection 등)만 담당 |
 | workspace yaml | `evaluate.mechanical` 섹션 추가 (검증 커맨드) |
@@ -266,7 +266,7 @@ Evaluator는 cron job이 아닌 **Daemon tick 루프의 정규 단계**이다. �
 
 ## 수용 기준
 
-- [ ] Evaluator가 Daemon tick에서 Executor보다 먼저 실행된다
+- [ ] Evaluator가 Daemon tick에서 Executor 다음에 실행되어 Completed 아이템을 판정한다
 - [ ] EvaluationPipeline이 Stage를 비용 순으로 순차 실행한다
 - [ ] MechanicalStage가 worktree에서 결정적 검증을 수행한다 (비용 0)
 - [ ] SemanticStage가 작업 맥락(이슈 원문, handler 출력, 이력, classify-policy.md)을 LLM에 전달하여 Done/HITL 판정한다

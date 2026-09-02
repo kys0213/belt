@@ -8,8 +8,9 @@ paths:
 > 이 레이어에서 정의한 타입은 프로젝트 전체가 의존한다. 호출부만 보고 제약과 의도를 인지할 수 있어야 한다.
 
 ## 외부 의존성 최소화
-- core에는 serde, thiserror, async-trait, chrono 수준만 허용한다.
-- tokio, rusqlite 등 인프라 의존성을 core에 끌어오지 마라.
+- core는 도메인 표현·에러·직렬화 수준의 의존성만 허용한다 (예: serde 계열, thiserror, anyhow, async-trait, chrono, tracing, 압축·정규식 등 순수 로직 라이브러리).
+- tokio, rusqlite 등 인프라(비동기 런타임·DB) 의존성을 core에 끌어오지 마라.
+- 새 의존성을 core에 추가할 때는 "인프라에 묶이지 않는가"를 기준으로 판단한다.
 
 ## 타입으로 제약을 표현하라
 - 함수가 특정 enum variant만 허용한다면, enum 전체가 아닌 해당 variant 전용 struct를 파라미터로 받아라.
@@ -21,7 +22,7 @@ paths:
 
 ## 상태 전이는 메서드로 캡슐화하라
 - pub 필드 직접 변경으로 상태를 바꾸지 마라. 전이 의도를 표현하는 메서드를 제공한다.
-- QueuePhase 전이는 반드시 `can_transition_to()`를 거쳐 유효성을 검증한다.
+- 상태 enum의 전이는 반드시 유효성 검증 메서드를 거치게 하여, 정의되지 않은 전이를 런타임에 즉시 걸러낸다.
 
 ## 문자열 대신 enum을 사용하라
 - 프로젝트에 이미 enum이 정의된 값을 `&str`로 받는 함수가 있으면 즉시 교체한다.

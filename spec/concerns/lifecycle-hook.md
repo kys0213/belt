@@ -6,27 +6,16 @@
 
 ---
 
-## 문제 — 현재 구조
+## 설계 배경
 
-현재 on_done/on_fail/on_enter는 yaml `Vec<ScriptAction>`으로 정의되어 Daemon(Executor)이 직접 실행한다.
+`LifecycleHook` trait이 없던 시절에는 on_done/on_fail/on_enter가 yaml `Vec<ScriptAction>`으로만 정의되어 Daemon(Executor)이 이를 직접 subprocess로 실행했다. 이 구조에는 다음 문제가 있었다.
 
-```
-현재:
-  StateConfig {
-      handlers: Vec<HandlerConfig>,     // 작업
-      on_enter: Vec<ScriptAction>,      // lifecycle — yaml script
-      on_done:  Vec<ScriptAction>,      // lifecycle — yaml script
-      on_fail:  Vec<ScriptAction>,      // lifecycle — yaml script
-  }
-
-  Executor가 상태 전이 시 on_* script를 직접 subprocess로 실행
-```
-
-문제점:
 1. **handler와 hook이 같은 곳(yaml)에 혼재** — 성격이 다른 관심사가 구분되지 않음
 2. **DataSource별 반응을 정의할 수 없음** — GitHub/Jira/Slack 모두 bash script로만 표현
 3. **on_escalation이 없음** — escalation 발생 시 외부 시스템 반응 경로가 없음
 4. **Daemon이 도메인을 침범** — Executor가 `gh issue comment` 같은 script를 직접 실행
+
+아래 설계로 handler(yaml 정의)와 hook(trait impl)을 분리해 이 문제들을 해소했다.
 
 ---
 
@@ -153,33 +142,17 @@ sources:
         handlers:
           - prompt: "이슈를 구현해줘"    # handler — 작업
 
-# hook 동작은 DataSource 유형(github)이 결정
-# GitHubLifecycleHook이 sources.github 설정을 기반으로 동작:
-#   on_done  → PR 생성, 라벨 전환 (belt:implement → belt:review)
-#   on_fail  → 이슈에 실패 코멘트
-#   on_escalation(hitl) → 이슈에 라벨 추가 (belt:needs-human)
+# hook 동작은 DataSource 유형(github)이 결정한다.
+# GitHubLifecycleHook의 현재 동작 (모두 `gh` CLI 기반):
+#   on_enter     → 이슈에 "작업 시작" 코멘트
+#   on_done      → 이슈에 "완료" 코멘트 (comment_on_done, 기본 false → 기본은 무동작)
+#   on_fail      → 이슈에 실패 코멘트 (comment_on_fail, 기본 true)
+#   on_escalation(hitl/replan) → 이슈에 라벨 추가(기본 belt:needs-human) + 코멘트
+#   on_escalation(retry_with_comment) → 코멘트만
+#   on_escalation(retry) → 무동작 (조용한 재시도)
+# PR 생성이나 라벨 전환(belt:implement → belt:review)은 이 hook이 아니라
+# workspace yaml의 on_done script(ScriptLifecycleHook 경로)에서 별도로 구현해야 한다.
 ```
-
-### yaml에서 hook 커스터마이징
-
-DataSource 유형의 기본 동작 위에 workspace별 오버라이드가 가능하다.
-
-```yaml
-sources:
-  github:
-    url: https://github.com/org/repo
-    hooks:                              # 선택적 오버라이드
-      on_done:
-        label_remove: "belt:implement"
-        label_add: "belt:review"
-        create_pr: true
-      on_fail:
-        comment: true                   # 실패 코멘트 작성 여부
-      on_escalation:
-        hitl_label: "needs-human"       # HITL 시 추가할 라벨
-```
-
-yaml `hooks` 섹션이 없으면 DataSource 유형의 기본 동작을 사용한다.
 
 ### Hook impl 동적 로딩
 
@@ -187,16 +160,15 @@ Hook impl은 Daemon 시작 시 일괄 생성하지 않는다. hook 트리거 시
 
 ```
 hook 트리거 시점 (on_enter, on_done, on_fail, on_escalation):
-  1. DB에서 workspace 조회 (config_path)
-  2. yaml 파싱 → sources 키에서 DataSource 유형 식별
-  3. DataSource 유형 → Hook impl 생성:
-       github → GitHubLifecycleHook (Phase 2)
-       jira   → JiraLifecycleHook   (v7+)
-       ...
-     Phase 1 fallback: 매핑이 없거나 yaml에 on_done/on_fail script가 존재하면
+  1. DB에서 workspace 조회 (config_path), updated_at으로 캐시 유효성 확인
+  2. 캐시 미스 시 yaml 파싱 → sources 키에서 DataSource 유형 식별
+  3. DataSource 유형별 전용 Hook을 우선 시도:
+       github → GitHubLifecycleHook
+       그 외(jira 등) → 아직 전용 impl 없음, 다음 단계로 폴백
+  4. 전용 Hook이 없고 yaml에 on_enter/on_done/on_fail script가 존재하면
        → ScriptLifecycleHook 어댑터 사용
-  4. yaml의 hooks 섹션으로 오버라이드 적용 (없으면 기본값)
-  5. hook.on_*() 실행
+  5. 둘 다 없으면 NoopLifecycleHook
+  6. hook.on_*() 실행
 ```
 
 동적 로딩의 이점:
@@ -311,15 +283,15 @@ fn handle_failure(item, hook):
 
 ---
 
-## 기존 yaml on_done/on_fail/on_enter 마이그레이션
+## 기존 yaml on_done/on_fail/on_enter와의 호환
 
-### Phase 1 (v6): 호환 유지
+### ScriptLifecycleHook — 호환 어댑터
 
-`ScriptLifecycleHook` — 기존 yaml script를 LifecycleHook trait으로 감싸는 어댑터.
+`ScriptLifecycleHook` — 기존 yaml script를 LifecycleHook trait으로 감싸는 어댑터. DataSource별 전용 Hook이 없을 때(또는 해당 source_type이 아직 지원되지 않을 때) 폴백으로 쓰인다.
 
 ```rust
 /// 기존 yaml script 기반 hook을 LifecycleHook trait으로 감싸는 어댑터.
-/// v6에서 기존 workspace yaml과의 호환성을 유지한다.
+/// 기존 workspace yaml과의 호환성을 유지한다.
 struct ScriptLifecycleHook {
     state_configs: HashMap<String, StateConfig>,
 }
@@ -341,55 +313,56 @@ impl LifecycleHook for ScriptLifecycleHook {
 }
 ```
 
-### Phase 2 (v7+): DataSource별 전용 Hook
+### DataSource별 전용 Hook — GitHubLifecycleHook
+
+`hooks::create_hook()`을 통해 GitHub source에 대해 항상 우선 선택된다(`ScriptLifecycleHook`보다 먼저 시도됨). `GitHubHookConfig`는 코드 상수 기본값(`comment_on_done: false`, `comment_on_fail: true`, `hitl_label: "belt:needs-human"`)으로만 생성되고, yaml에서 오버라이드하는 경로는 없다.
 
 ```rust
-struct GitHubLifecycleHook {
-    config: GitHubHookConfig,  // yaml hooks 섹션에서 파싱
+pub struct GitHubLifecycleHook {
+    config: GitHubHookConfig,
+    shell: Arc<dyn ShellExecutor>,
 }
 
-#[async_trait]
 impl LifecycleHook for GitHubLifecycleHook {
-    async fn on_done(&self, ctx: &HookContext) -> Result<()> {
-        // PR 생성, 라벨 전환 등 — GitHub API/CLI 직접 사용
+    async fn on_enter(&self, ctx: &HookContext) -> Result<()> {
+        // 이슈에 "작업 시작" 코멘트 (gh issue comment)
     }
-
+    async fn on_done(&self, ctx: &HookContext) -> Result<()> {
+        // comment_on_done이 true일 때만 "완료" 코멘트
+    }
+    async fn on_fail(&self, ctx: &HookContext) -> Result<()> {
+        // comment_on_fail이 true일 때 실패 코멘트
+    }
     async fn on_escalation(&self, ctx: &HookContext, action: EscalationAction) -> Result<()> {
         match action {
-            EscalationAction::Hitl => {
-                // 이슈에 needs-human 라벨 추가
-                // lateral report를 코멘트로 작성
+            EscalationAction::Hitl | EscalationAction::Replan => {
+                // hitl_label 추가 + escalation 코멘트
             }
             EscalationAction::RetryWithComment => {
-                // 이슈에 실패 코멘트 작성
+                // 재시도 코멘트만
             }
-            _ => {}
+            EscalationAction::Retry => {} // 조용한 재시도 — 무동작
+            EscalationAction::Skip => {
+                // skip 코멘트
+            }
         }
         Ok(())
     }
 }
 ```
 
+`jira` 등 다른 source_type은 아직 전용 Hook impl이 없다 — `hooks::create_hook()`이 "unsupported" 에러를 반환하고 `ScriptLifecycleHook` 또는 `NoopLifecycleHook`으로 폴백한다. 새 DataSource 유형을 추가하려면 `LifecycleHook`을 구현하고 `hooks::create_hook()`의 매치암에 등록하면 된다(코어 변경 없음, OCP).
+
 ---
 
-## StateConfig 변경
+## StateConfig (현재 구조)
+
+`on_enter`/`on_done`/`on_fail`은 `#[serde(default)]`로 남아 있어 기존 yaml과 호환되며, `ScriptLifecycleHook` 어댑터가 이를 소비한다. `handlers`만 필수로 채우면 되고, 이 세 필드는 비워도 된다.
 
 ```rust
-// v5 (현재)
 pub struct StateConfig {
     pub trigger: TriggerConfig,
     pub handlers: Vec<HandlerConfig>,
-    pub on_enter: Vec<ScriptAction>,      // lifecycle — yaml에 혼재
-    pub on_done: Vec<ScriptAction>,
-    pub on_fail: Vec<ScriptAction>,
-}
-
-// v6 (Phase 1 — 호환 유지)
-pub struct StateConfig {
-    pub trigger: TriggerConfig,
-    pub handlers: Vec<HandlerConfig>,     // handler만 남음
-    // on_enter/on_done/on_fail은 ScriptLifecycleHook 어댑터가 처리
-    // 기존 yaml 호환을 위해 파싱은 유지하되, StateConfig에서 LifecycleHook 생성 시 소비
     #[serde(default)]
     pub on_enter: Vec<ScriptAction>,
     #[serde(default)]
@@ -397,25 +370,17 @@ pub struct StateConfig {
     #[serde(default)]
     pub on_fail: Vec<ScriptAction>,
 }
-
-// v7+ (Phase 2 — 완전 분리)
-pub struct StateConfig {
-    pub trigger: TriggerConfig,
-    pub handlers: Vec<HandlerConfig>,     // handler만
-}
-// on_*/hooks는 SourceConfig.hooks 또는 DataSource별 Hook impl로 이동
 ```
 
 ---
 
 ## 동적 로딩과 메모리
 
-Hook impl은 트리거 시점에 생성되고, 실행 후 해제된다. Daemon은 workspace 메타정보(DB)만 유지한다.
+Hook impl은 트리거 시점에 생성되고, 실행 후 캐시된다. Daemon은 workspace 메타정보(DB)만 상시 유지하고, 전체 yaml을 미리 파싱해 메모리에 올려두지 않는다.
 
 ```
-v5: Daemon 시작 → 모든 yaml 파싱 → 전체 StateConfig 메모리 상주
-v6: Daemon 시작 → DB에서 workspace 목록만 조회
-    hook 트리거 시 → DB → yaml 파싱 → Hook impl 생성 → 실행 → 해제
+Daemon 시작 → DB에서 workspace 목록만 조회
+hook 트리거 시 → DB(config_path, updated_at) → 캐시 확인 → 미스 시 yaml 파싱 → Hook impl 생성 → 캐시에 저장 → 실행
 ```
 
 workspace가 늘어나도 Daemon의 메모리 부담이 선형 증가하지 않는다. 자주 트리거되는 workspace의 Hook impl은 LRU 캐시로 재사용하고, yaml 변경 시(`updated_at` 비교) 캐시를 무효화한다.

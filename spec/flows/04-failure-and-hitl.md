@@ -10,28 +10,26 @@
 handler 또는 hook.on_enter() 실패
     │
     ▼
-Stagnation 분석 (항상 실행):
-  이전 시도 기록을 분석하여 정체 패턴을 감지:
+Stagnation 분석 (같은 source_id+state에 과거 실패 이력이 있으면 항상 실행):
+  이전 실패 error 메시지 + 이번 error를 완전 일치 기준으로 비교:
     │
-    ├── 같은 실패 반복 (SPINNING)
-    ├── A↔B 교대 반복 (OSCILLATION)
-    └── (Phase 2) 진행 정체, 개선폭 감소
+    ├── 같은 실패 반복 (SPINNING) — 현재 감지되는 유일한 패턴
+    │   (상세: [Stagnation Detection](../concerns/stagnation.md))
     │
-    ├── 패턴 없음 ─────── escalation 적용 (기존 방식으로 재시도)
+    ├── 패턴 없음 ─────── escalation만 적용
     │
     └── 패턴 감지 ─┐
                     ▼
   사고 전환 (Lateral Thinking):
-     패턴에 맞는 다른 접근법을 선택 (이전 시도와 중복 없이)
-     예: 반복 실패 → 워크어라운드 시도, 교대 반복 → 구조 재설계
-     → 대안 접근 계획(lateral plan) 생성
+     패턴에 맞는 페르소나를 선택 (이전 시도와 중복 없이)
+     선택된 페르소나의 고정 directive 문구로 lateral plan 텍스트를 조합 (LLM 미호출)
                     │
                     ▼
   Escalation (실패 횟수 기반, lateral plan 포함):
     │
     ├── retry             → hook.on_escalation(retry), lateral_plan 주입, 재시도 (worktree 보존)
     ├── retry_with_comment → hook.on_escalation + hook.on_fail, lateral_plan 주입, 재시도
-    └── hitl              → hook.on_escalation + hook.on_fail, lateral_report 첨부, HITL 이벤트
+    └── hitl              → hook.on_escalation + hook.on_fail, lateral 이력을 hitl_notes에 첨부, HITL 이벤트
                               └── 사람 응답: done / retry / skip / replan
                               └── timeout → terminal 액션 (skip 또는 replan)
 ```
@@ -45,6 +43,8 @@ Daemon은 hook을 트리거만 하고, 실행 책임은 workspace의 LifecycleHo
 
 retry로 생성된 새 아이템이 다시 Running에 진입하면, lateral_plan이 handler prompt에 추가 컨텍스트로 주입된다:
 
+daemon은 선택된 페르소나의 고정 directive 문구로 아래 형태의 텍스트를 조립해 handler prompt 뒤에 붙인다(LLM을 호출해 맞춤 분석을 생성하지 않는다):
+
 ```
 원래 handler prompt:
   "이슈를 구현해줘"
@@ -52,17 +52,15 @@ retry로 생성된 새 아이템이 다시 Running에 진입하면, lateral_plan
 lateral retry 시 합성:
   "이슈를 구현해줘
 
-   ⚠ Stagnation Analysis (attempt 2/3)
-   Pattern: SPINNING | Persona: HACKER
+   ## Lateral Plan
+   Stagnation Analysis (attempt 2)
+   Pattern: spinning | Persona: hacker
 
-   실패 원인: 이전 2회 시도에서 동일한 컴파일 에러 반복
-     error[E0433]: cannot find type Session in auth::middleware
-   대안 접근법: 기존 Session 직접 구현 대신 tower-sessions crate 활용
-   실행 계획:
-     1. Cargo.toml에 tower-sessions 추가
-     2. Session 타입 참조를 교체
-     3. middleware에 SessionManagerLayer 등록
-   주의: 이전과 동일한 접근은 같은 실패를 반복합니다"
+   Take the most pragmatic shortcut. Hardcode, monkey-patch, or use an
+   escape hatch — make it work first, clean up later.
+
+   Warning: Previous approaches produced similar failures. You MUST try
+   a fundamentally different approach."
 ```
 
 ---
@@ -80,21 +78,13 @@ sources:
 
 stagnation:
   enabled: true
-  similarity:
-    - judge: exact_hash
-      weight: 0.5
-    - judge: token_fingerprint
-      weight: 0.3
-    - judge: ncd
-      weight: 0.2
   lateral:
     enabled: true
-    max_attempts: 3
 ```
 
-- escalation 레벨은 기존과 동일 (failure_count 기반)
-- stagnation + lateral은 **모든 retry의 품질을 투명하게 높이는 내장 레이어**
-- `stagnation.enabled: false`이면 lateral 없이 기존 v5 동작
+- escalation 레벨은 failure_count 기반이다
+- stagnation + lateral은 패턴이 감지된 retry에 한해 lateral plan을 얹는 내장 레이어다
+- `stagnation.enabled: false`이면 stagnation 분석 자체를 건너뛰고 failure_count 기반 escalation만 적용된다
 
 ### on_fail script 예시
 
@@ -232,7 +222,7 @@ SIGINT → on_shutdown:
 | 1회 실패 | handler 실패 (failure_count=1) | 새 아이템 Pending | retry, on_fail 미실행, lateral plan 주입 |
 | 2회 실패 | handler 실패 (failure_count=2) | 새 아이템 Pending | retry_with_comment, on_fail 실행, lateral plan 주입 |
 | 3회 실패 | handler 실패 (failure_count=3) | HITL | hitl, on_fail 실행, lateral report 첨부 |
-| SPINNING 감지 | 3회 연속 유사 출력 (score ≥ 0.8) | escalation에 따름 | StagnationDetector SPINNING, lateral plan에 대안 접근법 |
+| SPINNING 감지 | 동일 error 3회 연속 (유사도 ≥ 0.9, 인접 쌍 일치 2회) | escalation에 따름 | 페르소나 directive가 담긴 lateral plan 주입 |
 | HITL done 응답 | 사용자 done 선택 | Done | hook.on_done() 트리거, worktree 정리 |
 | HITL retry 응답 | 사용자 retry + 지시 | 새 아이템 Pending | 사용자 지시를 lateral_plan으로 주입, worktree 보존 |
 | HITL skip 응답 | 사용자 skip 선택 | Skipped (terminal) | worktree 정리 |

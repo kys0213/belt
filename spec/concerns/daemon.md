@@ -25,7 +25,7 @@ Daemon이 모르는 것: hook이 실제로 무엇을 하는지 (Result만 받음
 
 ---
 
-## 내부 모듈 구조 (#717)
+## 내부 모듈 구조
 
 Daemon은 상태 머신을 순회하며 전이를 결정하고 hook을 트리거하는 CPU이다.
 
@@ -33,9 +33,9 @@ Daemon은 상태 머신을 순회하며 전이를 결정하고 hook을 트리거
 Daemon (CPU)
   loop {
     collector.collect()
-    evaluator.evaluate()     // 판정 — 실행보다 먼저
     advancer.advance()
     executor.execute()       // handler 실행 + hook 트리거
+    evaluator.evaluate()     // 판정 — Completed 아이템을 Done/HITL로 분류
     cron_engine.tick()
   }
 ```
@@ -61,18 +61,15 @@ Executor
   │     ├── on_fail()
   │     └── on_escalation()
   │
-  ├── StagnationDetector      실패 시 패턴 탐지
-  │     └── judge: Box<dyn SimilarityJudge>
-  │           └── CompositeSimilarity
-  │                 ├── ExactHash        (w: 0.5)
-  │                 ├── TokenFingerprint (w: 0.3)
-  │                 └── NCD              (w: 0.2)
+  ├── StagnationDetector      실패 시 패턴 탐지 (완전 일치 비교 기준, SPINNING만 감지)
   │
-  └── LateralAnalyzer         패턴 감지 시 사고 전환
+  └── LateralAnalyzer         패턴 감지 시 페르소나 선택 + 고정 directive 조합 (LLM 미호출)
         └── personas/          (include_str! 내장)
               hacker.md, architect.md, researcher.md,
               simplifier.md, contrarian.md
 ```
+
+> 유사도 판단·패턴 감지는 코어 변경 없이 확장 가능한 지점(OCP)이다. 상세: [Stagnation Detection](./stagnation.md)
 
 ### 모듈 간 의존
 
@@ -87,7 +84,7 @@ Daemon
 
 - 모듈 간 의존은 trait 또는 함수 파라미터로만 전달 (순환 참조 금지)
 - 각 모듈은 독립적으로 단위 테스트 가능
-- StagnationDetector는 `Box<dyn SimilarityJudge>` 하나만 의존 (Composite 또는 단일)
+- StagnationDetector는 `Vec<Box<dyn PatternDetector>>`에 의존하고, 각 PatternDetector가 내부적으로 `Box<dyn SimilarityJudge>`를 가진다 (Composite 또는 단일 judge 선택 가능)
 
 ---
 
@@ -114,16 +111,11 @@ loop {
             items = source.collect()
             queue.push(Pending, items)
 
-    // 2. 판정 (Evaluator) — 실행보다 먼저
-    //    Completed 아이템을 비용 순으로 판정: Mechanical → Semantic → (Consensus)
-    //    Ready 아이템 중 이전 기록으로 판정 가능한 것은 handler 실행 없이 판정
-    evaluator.evaluate()
-
-    // 3. 자동 전이 (Advancer)
+    // 2. 자동 전이 (Advancer)
     advancer.advance_pending_to_ready()         // spec dep gate (DB)
     advancer.advance_ready_to_running(limit)    // queue dep gate (DB) + concurrency
 
-    // 4. 실행 (Executor)
+    // 3. 실행 (Executor)
     for item in queue.get_new(Running):
         binding = lookup_workspace_binding(item)
         hook = binding.hook                     // 이 workspace의 LifecycleHook
@@ -146,6 +138,11 @@ loop {
                 break
         else:
             item.transit(Completed)
+
+    // 4. 판정 (Evaluator) — Executor가 끝낸 Completed 아이템을 비용 순으로 판정: Mechanical → Semantic → (Consensus)
+    //    Ready 아이템 중 이전 기록으로 판정 가능한 것은 handler 실행 없이 판정
+    //    판정 결과(Done/HITL)는 다음 tick의 advance에 반영된다
+    evaluator.evaluate()
 
     // 5. cron tick (품질 루프: gap-detection, knowledge-extract 등)
     cron_engine.tick()
@@ -220,7 +217,7 @@ retry로 생성된 새 아이템이 다시 Running에 진입하면, `lateral_pla
 
 ---
 
-## Dependency Gate (#721)
+## Dependency Gate
 
 ### Spec Dependency Gate
 
@@ -316,22 +313,22 @@ SIGINT → on_shutdown:
 - [ ] 상태 전이 시 workspace의 LifecycleHook.on_*()을 트리거한다
 - [ ] hook의 실행 결과(Result)만 받고, 구체적 동작을 모른다
 
-### 내부 모듈 구조 (#717)
+### 내부 모듈 구조
 
 - [ ] phase 전이는 Advancer, handler 실행+hook 트리거+stagnation+lateral은 Executor, HITL은 HitlService
 - [ ] 각 모듈은 독립적으로 단위 테스트 가능하다
 - [ ] 모듈 간 의존은 trait 또는 함수 파라미터로만 전달 (순환 참조 금지)
 
-### Stagnation + Lateral 통합 (#723)
+### Stagnation + Lateral 통합
 
-- [ ] handler/on_enter 실패 시 StagnationDetector가 항상 실행된다
-- [ ] CompositeSimilarity로 outputs/errors를 별도 검사한다
-- [ ] 패턴 감지 시 LateralAnalyzer가 내장 페르소나로 lateral_plan을 생성한다
+- [ ] handler/on_enter 실패 시(과거 실패 이력이 있으면) StagnationDetector가 항상 실행된다
+- [ ] 현재는 완전 일치(해시 비교) 기준으로 error 메시지만 검사한다 (SPINNING 패턴만 감지)
+- [ ] 패턴 감지 시 페르소나를 선택하고 고정 directive로 lateral_plan을 구성한다 (LLM 미호출)
 - [ ] lateral_plan이 retry 시 handler prompt에 추가 컨텍스트로 주입된다
 - [ ] hitl 도달 시 모든 lateral 시도 이력이 hitl_notes에 첨부된다
 - [ ] stagnation 이벤트가 transition_events에 기록된다
 
-### Dependency Gate (#721)
+### Dependency Gate
 
 - [ ] queue dependency의 phase 확인은 DB 조회 기준이다
 - [ ] 재시작 후에도 dependency gate가 정확히 동작한다

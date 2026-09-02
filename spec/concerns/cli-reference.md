@@ -20,19 +20,9 @@ Layer 3: belt CLI (SSOT)
 
 ---
 
-## Slash Command 매핑 (v4 → v5)
-
-| v4 | v5 |
-|----|-----|
-| /auto, /auto-setup, /auto-config, /auto-dashboard, /update | /auto (서브커맨드) |
-| /add-spec, /update-spec, /spec | /spec (서브커맨드) |
-| /status, /board, /decisions, /hitl, /repo, /claw, /cron | /agent (자연어) |
-
----
-
 ## belt CLI 전체 참조
 
-### Phase 1: 코어 CLI (v5 초기 구현)
+### Phase 1: 코어 CLI
 
 상태 변경, 데몬 제어, CRUD — 직접 CLI로 노출.
 
@@ -60,15 +50,12 @@ belt
 ├── cron
 │   ├── list / add / update
 │   ├── pause / resume / remove / trigger
-├── agent                                    ← 서브커맨드 없이 실행 시 대화형 세션 시작
-│   ├── [default]                            # 대화형 세션 (글로벌 rules 로드)
-│   ├── [-p <prompt>]                        # 비대화형 실행 (Evaluator가 호출)
-│   ├── [--workspace <name>]                 # 대상 workspace 지정
-│   ├── [--plan]                             # 실행 계획만 출력
-│   ├── [--json]                             # JSON 출력
+├── agent                                    ← 서브커맨드 필수
 │   ├── init [--force]                       # agent 워크스페이스 초기화
 │   ├── rules                                # 규칙 조회
 │   ├── edit [rule]                          # 규칙 편집
+│   ├── session [--workspace <name>] [-p/--prompt <prompt>] [--plan] [--json]
+│   │                                        # LLM 에이전트 세션 실행
 │   ├── plugin [--install-dir]               # /agent 슬래시 커맨드 설치
 │   └── context                              # 시스템 컨텍스트 수집 (agent injection용)
 ├── bootstrap                                ← .claude/rules 컨벤션 파일 생성
@@ -88,7 +75,7 @@ belt
 │       └── status [--project <dir>]              # 플러그인 설치 상태 확인
 ```
 
-> **v4 대비 변경**: `queue advance` 제거 (Pending→Ready 자동 전이), `context` 서브커맨드 추가, `repo` → `workspace` 리네이밍. `claw` + `agent` → `agent`로 통합.
+> `belt claw`는 `belt agent`와 동일한 서브커맨드 집합(`AgentCommands`)을 갖는 deprecated alias다. 신규 사용은 `belt agent`를 쓴다.
 
 ### Phase 2: /agent 위임 (읽기 전용)
 
@@ -199,6 +186,6 @@ belt auto plugin status
 
 ### 관련 문서
 
-- [DESIGN-v5](../DESIGN-v5.md) — 전체 아키텍처
+- [DESIGN](../DESIGN.md) — 전체 아키텍처
 - [DataSource](./datasource.md) — context 스키마
 - [Agent](./agent-workspace.md) — /agent 세션

@@ -41,12 +41,12 @@ pub trait DataSource: Send + Sync {
 }
 ```
 
-v4 대비 대폭 축소. `on_phase_enter`, `on_failed`, `on_done`, `before_task`, `after_task` 모두 제거.
+DataSource trait은 collect와 get_context 두 책임만 가진다.
 - on_done/on_fail/on_enter/on_escalation → `LifecycleHook` trait으로 분리. 상세: [LifecycleHook](./lifecycle-hook.md)
 - worktree 셋업 → 인프라 레이어가 항상 처리
 - escalation → yaml의 escalation 정책을 코어가 결정, hook이 반응
 
-**v6 (#719)**: `get_context()`가 반환하는 `ItemContext`에 `source_data: serde_json::Value` 필드가 추가된다. DataSource는 자신의 고유 데이터를 `source_data`에 자유 스키마로 채운다.
+`get_context()`가 반환하는 `ItemContext`에는 `source_data: serde_json::Value` 필드가 있다. DataSource가 자신의 고유 데이터를 자유 스키마로 채울 수 있도록 예약된 OCP 확장점이다. 현재는 채워지지 않는다(항상 `Null`) — 실제 데이터는 `issue`/`pr` 필드에 담긴다. `source_data`가 `Null`이면 `belt context`의 JSON 출력에서 해당 키 자체가 생략된다. 활용 계획은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
 
 ---
 
@@ -71,7 +71,7 @@ Daemon이 주입하는 환경변수는 **2개만**:
 
 ### GitHub context 스키마
 
-**v6 (#719)**: `source_data` 필드에 DataSource 고유 데이터를 담는다. 기존 `issue`/`pr` 필드는 Phase 1에서 호환성을 위해 유지.
+GitHub DataSource는 `issue`/`pr` 필드에 데이터를 채운다. `source_data`는 위에서 설명한 대로 항상 `Null`이므로 출력에 나타나지 않는다.
 
 ```json
 {
@@ -86,20 +86,6 @@ Daemon이 주입하는 환경변수는 **2개만**:
     "type": "github",
     "url": "https://github.com/org/repo",
     "default_branch": "main"
-  },
-  "source_data": {
-    "issue": {
-      "number": 42,
-      "title": "JWT middleware 구현",
-      "body": "...",
-      "labels": ["belt:implement"],
-      "author": "irene"
-    },
-    "pr": {
-      "number": 87,
-      "head_branch": "feat/jwt-middleware",
-      "review_comments": []
-    }
   },
   "issue": {
     "number": 42,
@@ -122,8 +108,6 @@ Daemon이 주입하는 환경변수는 **2개만**:
 }
 ```
 
-> **source_data 마이그레이션**: Phase 1(v6)에서는 `issue`/`pr`과 `source_data` 양쪽 모두 채운다. Phase 2(v7+)에서 기존 필드 deprecated, Phase 3(v8+)에서 제거. 상세: [Data Model](./data-model.md#source_data-마이그레이션-전략-719)
-
 ### history는 append-only
 
 같은 `source_id`의 모든 이벤트가 시간순으로 축적된다. 실패 횟수는 history에서 계산:
@@ -135,7 +119,9 @@ FAILURES=$(echo $CTX | jq '[.history[] | select(.status=="failed" and .state=="i
 
 별도 `failure_count` 컬럼 없이 history 조회만으로 충분.
 
-### Jira context 스키마 (v7+)
+### Jira context 스키마 (확장 예시 — 미구현)
+
+Jira DataSource는 아직 구현되지 않았다. 아래는 `source_data`를 통한 OCP 확장이 어떤 형태가 될지 보여주는 예시다.
 
 ```json
 {
@@ -168,7 +154,7 @@ FAILURES=$(echo $CTX | jq '[.history[] | select(.status=="failed" and .state=="i
 
 ## 상태 기반 워크플로우
 
-각 DataSource는 자기 시스템의 상태 표현으로 워크플로우를 정의한다. v6는 GitHub에 집중한다.
+각 DataSource는 자기 시스템의 상태 표현으로 워크플로우를 정의한다. 현재 구현은 GitHub DataSource에 집중되어 있다.
 
 ### GitHub (라벨 기반)
 
@@ -226,7 +212,9 @@ sources:
       terminal: skip          # hitl timeout 시 적용 (skip 또는 replan)
 ```
 
-### 향후 확장 (v7+)
+> **주의**: 위 `on_done` script는 hook 로딩 우선순위상 실제로 실행되지 않는다. github source에는 `GitHubLifecycleHook`이 항상 우선 적용되고(`ScriptLifecycleHook`은 전용 Hook이 없는 source_type에만 폴백으로 쓰인다), `GitHubLifecycleHook`은 yaml script를 실행하지 않고 코드에 고정된 `gh issue comment`/`gh issue edit --add-label` 동작만 수행한다. 라벨 전환·PR 생성을 이 방식으로 하려면 현재는 `LifecycleHook` impl을 직접 확장해야 한다. 상세: [LifecycleHook](./lifecycle-hook.md)
+
+### 향후 확장
 
 DataSource trait을 구현하면 코어 변경 없이 새 외부 시스템을 추가할 수 있다. `source_data`를 통해 코어 타입 변경도 불필요.
 
@@ -257,7 +245,7 @@ handler 배열은 Running 상태에서 순차 실행. 하나라도 실패 시 on
 
 ## Lifecycle Hook — LifecycleHook trait으로 분리
 
-v6에서 on_done/on_fail/on_enter/on_escalation은 `LifecycleHook` trait으로 분리된다. Daemon은 상태 전이 시 hook을 트리거만 하고, 실행 책임은 Hook impl이 가진다.
+on_done/on_fail/on_enter/on_escalation은 `LifecycleHook` trait으로 분리되어 있다. Daemon은 상태 전이 시 hook을 트리거만 하고, 실행 책임은 Hook impl이 가진다.
 
 상세: [LifecycleHook](./lifecycle-hook.md)
 
@@ -288,7 +276,7 @@ escalation:
                           # 선택지: skip (종료) 또는 replan (스펙 수정 제안)
 ```
 
-> **v6 Stagnation과 Escalation의 관계**: escalation은 failure_count 기반으로 결정되고, stagnation은 lateral_plan 주입에 집중한다. 두 관심사는 직교한다 — escalation이 "언제 멈출지"를 결정하고, stagnation이 "다르게 시도할지"를 결정한다. escalation 발생 시 `LifecycleHook.on_escalation()`이 DataSource별 반응을 처리한다. 상세: [LifecycleHook](./lifecycle-hook.md)
+> **Stagnation과 Escalation의 관계**: escalation은 failure_count 기반으로 결정되고, stagnation은 lateral_plan 주입에 집중한다. 두 관심사는 직교한다 — escalation이 "언제 멈출지"를 결정하고, stagnation이 "다르게 시도할지"를 결정한다. escalation 발생 시 `LifecycleHook.on_escalation()`이 DataSource별 반응을 처리한다. 상세: [LifecycleHook](./lifecycle-hook.md)
 
 ### on_fail 실행 조건
 
@@ -336,4 +324,4 @@ queue_items 테이블:
 - [Stagnation Detection](./stagnation.md) — 실패 패턴 감지
 - [Cron 엔진](./cron-engine.md) — 품질 루프
 - [CLI 레퍼런스](./cli-reference.md) — belt context CLI
-- [Data Model](./data-model.md) — source_data 마이그레이션 전략
+- [Data Model](./data-model.md) — QueueItem/ItemContext 스키마

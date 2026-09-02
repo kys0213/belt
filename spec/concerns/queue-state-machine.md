@@ -20,10 +20,10 @@
 
 ---
 
-## Phase 전이 캡슐화 (v6 #718)
+## Phase 전이 캡슐화
 
 `QueueItem.phase` 필드를 직접 대입하면 `can_transition_to()` 검증을 우회할 수 있다.
-v6에서는 모든 전이를 `QueueItem::transit()` 메서드로 강제한다.
+모든 전이는 `QueueItem::transit()` 메서드로 강제된다.
 
 ```rust
 impl QueueItem {
@@ -94,11 +94,11 @@ QueueItem::builder()
           ┌─────────────────┐    ┌─────────────────────────────┐
           │    Completed     │    │  Stagnation Analyzer (항상 실행)│
           │                  │    │                               │
-          │  handler 완료    │    │  ① CompositeSimilarity로     │
-          │  evaluate 대기   │    │    outputs/errors 유사도 분석 │
+          │  handler 완료    │    │  ① 완전 일치 비교로           │
+          │  evaluate 대기   │    │    실패 이력 유사도 분석      │
           │                  │    │  ② 패턴 감지 시              │
-          │  force_trigger   │    │    LateralAnalyzer가         │
-          │  ("evaluate")    │    │    내장 페르소나로 대안 분석   │
+          │  force_trigger   │    │    페르소나 선택 →           │
+          │  ("evaluate")    │    │    고정 directive로 조합      │
           └────────┬────────┘    │    → lateral_plan 생성        │
                    │              │                               │
                    │              │  Escalation (failure_count):  │
@@ -115,7 +115,7 @@ QueueItem::builder()
                    │              │     → worktree 보존          │
                    │              │                               │
                    │              │  3: hitl                      │
-                   │              │     → lateral_report 첨부     │
+                   │              │     → lateral 이력 첨부(hitl_notes) │
                    │              │     → on_fail script 실행     │
                    │              │     → HITL 이벤트 생성 ───────┐│
                    │              │     → worktree 보존          ││
@@ -189,7 +189,7 @@ QueueItem::builder()
 
 failure_count는 append-only history에서 계산한다: `history | filter(state, failed) | count`. on_enter 실패도 handler 실패와 동일하게 failure_count에 포함된다.
 
-> **v6 (#723)**: 모든 실패에서 StagnationDetector가 CompositeSimilarity로 유사도 분석을 수행한다. 패턴이 감지되면 LateralAnalyzer가 내장 페르소나(HACKER, ARCHITECT 등)로 대안 접근법을 분석하고, lateral_plan을 생성하여 retry 시 handler prompt에 주입한다. escalation 자체는 기존 failure_count 기반 그대로이되, **모든 retry가 lateral plan으로 강화**된다. 상세: [Stagnation Detection](./stagnation.md)
+> 과거 실패 이력이 있는 모든 실패에서 완전 일치 비교 기준으로 유사도 분석을 수행한다. 패턴이 감지되면 내장 페르소나(HACKER, ARCHITECT 등) 중 하나가 선택되고, 그 페르소나의 고정 directive로 lateral_plan을 구성하여 retry 시 handler prompt에 주입한다. escalation 자체는 기존 failure_count 기반 그대로이되, **패턴이 감지된 retry는 lateral plan으로 강화**된다. 상세: [Stagnation Detection](./stagnation.md)
 
 ---
 
@@ -203,7 +203,7 @@ failure_count는 append-only history에서 계산한다: `history | filter(state
 
 3. **state별 구체 기준은 agent-workspace rules에 위임** — `~/.belt/agent-workspace/.claude/rules/classify-policy.md`에 state별 Done 조건을 정의한다. 코어는 rules를 모르고, `belt agent`가 rules를 참조하여 판단한다.
 
-### Per-Item 판정 (v6 #722)
+### Per-Item 판정
 
 evaluate는 **per-work_id 단위**로 LLM 판정을 실행한다. 각 Completed 아이템에 대해 개별 프롬프트를 발행하고, 해당 아이템의 context를 포함한다.
 
@@ -234,7 +234,7 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 ## 수용 기준
 
-### Phase 전이 캡슐화 (#718)
+### Phase 전이 캡슐화
 
 - [ ] `QueueItem.phase` 필드는 `pub(crate)` 가시성으로, belt-core 외부에서 직접 대입 불가
 - [ ] 모든 phase 변경은 `QueueItem::transit(to)` 메서드를 경유한다
@@ -257,7 +257,7 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 - [ ] on_enter 실패도 failure_count에 포함된다
 - [ ] 모든 실패에서 stagnation 분석이 실행되고, 패턴 감지 시 lateral_plan이 retry에 주입된다
 
-### Evaluate (per-item, #722)
+### Evaluate (per-item)
 
 - [ ] evaluate는 per-work_id 단위로 LLM 판정을 실행한다
 - [ ] 각 판정에 해당 아이템의 context가 포함된다

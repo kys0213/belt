@@ -17,6 +17,7 @@ paths:
 - core/infra/daemon 내부가 리팩토링되어도 CLI 테스트는 깨지지 않아야 한다.
 
 ## 출력 포맷
-- 모든 커맨드는 `--format text|json|rich` 또는 `--json` 플래그를 지원한다.
-- JSON 출력은 Claw가 파싱하는 구조화된 데이터.
-- rich 출력은 색상 + 박스 + 진행률 바 (터미널용).
+- 기본은 `--json` on/off 플래그다. 새 커맨드에 출력 포맷을 추가할 때는 이 방식을 따른다.
+- 일부 커맨드(예: `status`, `hitl list`)만 `--format text|json` 또는 `--format text|json|rich`를 지원한다. 전체 커맨드에 일괄 확장하지 않는다.
+- JSON 출력은 `/agent`가 파싱하는 구조화된 데이터.
+- rich 출력은 색상 + 박스 + 진행률 바 (터미널용) — `--format` 지원 커맨드 중 일부에만 존재한다.
