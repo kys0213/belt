@@ -8,6 +8,16 @@ use belt_core::queue::QueueItem;
 use belt_core::source::DataSource;
 use belt_core::workspace::WorkspaceConfig;
 
+/// `gh issue view` 응답을 분해한 (title, body, labels, author, state, source_data) 튜플.
+type IssueParts = (
+    String,
+    Option<String>,
+    Vec<String>,
+    String,
+    String,
+    serde_json::Value,
+);
+
 /// GitHub DataSource — gh CLI를 통해 이슈/PR을 스캔.
 pub struct GitHubDataSource {
     source_url: String,
@@ -39,17 +49,7 @@ impl GitHubDataSource {
     }
 
     /// `gh` CLI로 이슈 상세 정보를 조회한다.
-    async fn fetch_issue(
-        repo: &str,
-        number: i64,
-    ) -> Option<(
-        String,
-        Option<String>,
-        Vec<String>,
-        String,
-        String,
-        serde_json::Value,
-    )> {
+    async fn fetch_issue(repo: &str, number: i64) -> Option<IssueParts> {
         let output = tokio::process::Command::new("gh")
             .args([
                 "issue",
@@ -72,16 +72,7 @@ impl GitHubDataSource {
 
     /// `gh issue view --json ...` 응답을 `IssueContext` 필드와 `source_data`용
     /// 원본 JSON으로 분해한다. 이미 조회한 응답을 재사용할 뿐 추가 API 호출은 없다.
-    fn parse_issue_json(
-        val: serde_json::Value,
-    ) -> (
-        String,
-        Option<String>,
-        Vec<String>,
-        String,
-        String,
-        serde_json::Value,
-    ) {
+    fn parse_issue_json(val: serde_json::Value) -> IssueParts {
         let title = val["title"].as_str().unwrap_or("").to_string();
         let body = val["body"].as_str().map(|s| s.to_string());
         let labels = val["labels"]
@@ -95,7 +86,11 @@ impl GitHubDataSource {
         let author = val["author"]["login"].as_str().unwrap_or("").to_string();
         let state = val["state"].as_str().unwrap_or("open").to_string();
 
-        (title, body, labels, author, state, val)
+        // 소스 종류별 네임스페이스로 감싼다 — source_data 루트에 그대로 올리면
+        // 나중에 추가될 PR 데이터 등과 키가 충돌한다.
+        let source_data = serde_json::json!({ "issue": val });
+
+        (title, body, labels, author, state, source_data)
     }
 
     /// `gh` CLI로 해당 이슈에 연결된 PR을 조회한다.
@@ -388,6 +383,58 @@ impl GitHubDataSource {
             .as_str()
             .map(|s| s.to_string())
     }
+
+    /// `get_context`가 병렬로 조회한 이슈/PR/기본 브랜치 데이터를 `ItemContext`로
+    /// 조립한다. `issue_data`가 `None`이면 (gh CLI 조회 실패) 아이템에 이미 있던
+    /// 제목으로 대체하고 `source_data`는 `Null`로 둔다. I/O가 없는 순수 함수라
+    /// gh CLI 없이도 조립 경로를 직접 검증할 수 있다.
+    fn assemble_item_context(
+        item: &QueueItem,
+        source_url: &str,
+        issue_number: i64,
+        issue_data: Option<IssueParts>,
+        pr_data: Option<PrContext>,
+        default_branch: Option<String>,
+    ) -> ItemContext {
+        let (title, body, labels, author, issue_state, source_data) =
+            issue_data.unwrap_or_else(|| {
+                (
+                    item.title.clone().unwrap_or_default(),
+                    None,
+                    vec![],
+                    String::new(),
+                    "open".to_string(),
+                    serde_json::Value::Null,
+                )
+            });
+
+        ItemContext {
+            work_id: item.work_id.clone(),
+            workspace: item.workspace_id.clone(),
+            queue: QueueContext {
+                phase: item.phase().as_str().to_string(),
+                state: item.state.clone(),
+                source_id: item.source_id.clone(),
+            },
+            source: SourceContext {
+                source_type: "github".to_string(),
+                url: source_url.to_string(),
+                default_branch: default_branch.or(Some("main".to_string())),
+            },
+            issue: Some(IssueContext {
+                number: issue_number,
+                title,
+                body,
+                labels,
+                author,
+                state: issue_state,
+            }),
+            pr: pr_data,
+            history: vec![],
+            worktree: None,
+            source_data,
+        }
+    }
 }
 
 #[async_trait]
@@ -503,44 +550,14 @@ impl DataSource for GitHubDataSource {
             Self::fetch_default_branch(&repo_name),
         );
 
-        let (title, body, labels, author, issue_state, source_data) =
-            issue_data.unwrap_or_else(|| {
-                (
-                    item.title.clone().unwrap_or_default(),
-                    None,
-                    vec![],
-                    String::new(),
-                    "open".to_string(),
-                    serde_json::Value::Null,
-                )
-            });
-
-        Ok(ItemContext {
-            work_id: item.work_id.clone(),
-            workspace: item.workspace_id.clone(),
-            queue: QueueContext {
-                phase: item.phase().as_str().to_string(),
-                state: item.state.clone(),
-                source_id: item.source_id.clone(),
-            },
-            source: SourceContext {
-                source_type: "github".to_string(),
-                url: self.source_url.clone(),
-                default_branch: default_branch.or(Some("main".to_string())),
-            },
-            issue: Some(IssueContext {
-                number: issue_number,
-                title,
-                body,
-                labels,
-                author,
-                state: issue_state,
-            }),
-            pr: pr_data,
-            history: vec![],
-            worktree: None,
-            source_data,
-        })
+        Ok(Self::assemble_item_context(
+            item,
+            &self.source_url,
+            issue_number,
+            issue_data,
+            pr_data,
+            default_branch,
+        ))
     }
 }
 
@@ -870,10 +887,59 @@ sources:
         assert_eq!(labels, vec!["bug".to_string()]);
         assert_eq!(author, "octocat");
         assert_eq!(state, "OPEN");
-        // source_data must carry the untouched raw gh response, not a
-        // re-derived subset -- this is the OCP escape hatch ItemContext
-        // documents for custom source types.
-        assert_eq!(source_data, val);
+        // source_data must carry the untouched raw gh response under an
+        // "issue" namespace key -- this is the OCP escape hatch ItemContext
+        // documents for custom source types, and the namespace keeps future
+        // PR-derived source_data from colliding with issue keys.
+        assert_eq!(source_data["issue"], val);
+    }
+
+    // ── assemble_item_context() ──────────────────────────────────────────────
+
+    #[test]
+    fn assemble_item_context_wires_source_data_from_issue_data() {
+        // Verifies the seam between parse_issue_json's output and the
+        // ItemContext actually built by get_context — a pure function, so
+        // this exercises the wiring without requiring the gh CLI.
+        let item = make_queue_item("github:org/repo#55", "analyze");
+        let source_data = serde_json::json!({"issue": {"title": "Fix bug"}});
+        let issue_data = Some((
+            "Fix bug".to_string(),
+            Some("body text".to_string()),
+            vec!["bug".to_string()],
+            "octocat".to_string(),
+            "OPEN".to_string(),
+            source_data.clone(),
+        ));
+
+        let ctx = GitHubDataSource::assemble_item_context(
+            &item,
+            "https://github.com/org/repo",
+            55,
+            issue_data,
+            None,
+            None,
+        );
+
+        assert_eq!(ctx.source_data, source_data);
+        assert_eq!(ctx.issue.as_ref().unwrap().title, "Fix bug");
+        assert_eq!(ctx.issue.as_ref().unwrap().number, 55);
+    }
+
+    #[test]
+    fn assemble_item_context_falls_back_to_null_source_data_when_issue_data_absent() {
+        let item = make_queue_item("github:org/repo#66", "analyze");
+
+        let ctx = GitHubDataSource::assemble_item_context(
+            &item,
+            "https://github.com/org/repo",
+            66,
+            None,
+            None,
+            None,
+        );
+
+        assert!(ctx.source_data.is_null());
     }
 
     // ── work_id construction ─────────────────────────────────────────────────

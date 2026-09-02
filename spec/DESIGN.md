@@ -330,8 +330,8 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 새 유사도 알고리즘  = SimilarityJudge impl 추가            → 코어 변경 0
 ```
 
-> **예약 필드**: `ItemContext.source_data: serde_json::Value`는 DataSource별 자유 스키마 확장을 위해 예약된 필드다.
-> 현재는 채워지지 않는다(항상 `Null`). 활용 계획은 [source_data와 stagnation 로드맵](../plans/source-data-and-stagnation-roadmap.md) 참조.
+> **자유 스키마 확장점**: `ItemContext.source_data: serde_json::Value`는 DataSource별 자유 스키마 확장을 위한 필드다.
+> 각 DataSource는 원본 응답을 소스 종류별 키(예: GitHub는 `issue`) 아래에 담아 소스 간 데이터가 서로 충돌하지 않게 한다. 활용 계획은 [source_data와 stagnation 로드맵](../plans/source-data-and-stagnation-roadmap.md) 참조.
 
 ---
 

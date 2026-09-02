@@ -46,7 +46,7 @@ DataSource trait은 collect와 get_context 두 책임만 가진다.
 - worktree 셋업 → 인프라 레이어가 항상 처리
 - escalation → yaml의 escalation 정책을 코어가 결정, hook이 반응
 
-`get_context()`가 반환하는 `ItemContext`에는 `source_data: serde_json::Value` 필드가 있다. DataSource가 자신의 고유 데이터를 자유 스키마로 채울 수 있도록 예약된 OCP 확장점이다. GitHub DataSource는 이슈 조회에 성공하면 원본 이슈 응답(제목·본문·라벨·작성자·상태)을 가공 없이 그대로 담는다 — `issue` 필드가 사람이 읽기 좋게 정제한 뷰라면, `source_data`는 그 원본이다. 이슈 조회가 실패하면 `Null`로 남는다. `source_data`가 `Null`이면 `belt context`의 JSON 출력에서 해당 키 자체가 생략된다. 활용 계획은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
+`get_context()`가 반환하는 `ItemContext`에는 `source_data: serde_json::Value` 필드가 있다. DataSource가 자신의 고유 데이터를 자유 스키마로 채울 수 있도록 예약된 OCP 확장점이다. GitHub DataSource는 이슈 조회에 성공하면 원본 이슈 응답(제목·본문·라벨·작성자·상태)을 가공 없이 `issue` 키 아래에 담는다 — `issue` 최상위 필드가 사람이 읽기 좋게 정제한 뷰라면, `source_data.issue`는 그 원본이다. 소스 종류별로 키를 나누는 이유는 향후 PR 등 다른 원본 데이터가 추가돼도 서로 충돌하지 않게 하기 위해서다. 이슈 조회가 실패하면 `Null`로 남는다. `source_data`가 `Null`이면 `belt context`의 JSON 출력에서 해당 키 자체가 생략된다. 활용 계획은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
 
 ---
 
@@ -71,7 +71,7 @@ Daemon이 주입하는 환경변수는 **2개만**:
 
 ### GitHub context 스키마
 
-GitHub DataSource는 `issue`/`pr` 필드에 정제된 데이터를 채우고, `source_data`에는 이슈 조회 원본 응답을 그대로 담는다.
+GitHub DataSource는 `issue`/`pr` 필드에 정제된 데이터를 채우고, `source_data.issue`에는 이슈 조회 원본 응답을 그대로 담는다.
 
 ```json
 {
@@ -100,11 +100,13 @@ GitHub DataSource는 `issue`/`pr` 필드에 정제된 데이터를 채우고, `s
     "review_comments": []
   },
   "source_data": {
-    "title": "JWT middleware 구현",
-    "body": "...",
-    "labels": [{ "name": "belt:implement" }],
-    "author": { "login": "irene" },
-    "state": "OPEN"
+    "issue": {
+      "title": "JWT middleware 구현",
+      "body": "...",
+      "labels": [{ "name": "belt:implement" }],
+      "author": { "login": "irene" },
+      "state": "OPEN"
+    }
   },
   "history": [
     { "state": "analyze", "status": "done", "attempt": 1, "summary": "구현 가능" },
