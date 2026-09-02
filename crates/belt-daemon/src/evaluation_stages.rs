@@ -1,7 +1,7 @@
 //! Concrete evaluation stage implementations for the progressive pipeline.
 //!
 //! - [`MechanicalStage`] — runs deterministic shell commands in the worktree (cost $0).
-//! - [`SemanticStage`] — delegates to an LLM via `belt agent -p` subprocess (cost: 1 LLM call).
+//! - [`SemanticStage`] — delegates to an LLM via `belt agent session -p` subprocess (cost: 1 LLM call).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -123,7 +123,7 @@ impl EvaluationStage for MechanicalStage {
 
 /// Stage 2: LLM-based semantic judgment.
 ///
-/// Wraps the existing `belt agent -p` subprocess invocation. The LLM
+/// Wraps the existing `belt agent session -p` subprocess invocation. The LLM
 /// evaluates whether the completed work is sufficient based on the issue
 /// context, handler output, and history.
 ///

@@ -335,7 +335,7 @@ impl Evaluator {
 COMPLETED=$(belt queue list --phase completed --json 2>/dev/null | jq 'length' 2>/dev/null)
 if [ "$COMPLETED" = "0" ] || [ -z "$COMPLETED" ]; then exit 0; fi
 
-belt agent --workspace "{ws}" -p \
+belt agent session --workspace "{ws}" -p \
   "Completed 아이템의 완료 여부를 판단하고, belt queue done 또는 belt queue hitl 을 실행해줘"
 "#,
             ws = self.workspace_name
@@ -617,7 +617,7 @@ mod tests {
         let evaluator = Evaluator::new("auth-project");
         let script = evaluator.build_evaluate_script();
         assert!(script.contains("auth-project"));
-        assert!(script.contains("belt agent"));
+        assert!(script.contains(r#"belt agent session --workspace "auth-project""#));
         assert!(script.contains("belt queue done"));
     }
 

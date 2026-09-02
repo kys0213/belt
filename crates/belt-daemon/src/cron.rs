@@ -2326,15 +2326,24 @@ fn build_extraction_prompt(pr: &MergedPrInfo, diff: Option<&str>) -> String {
     prompt
 }
 
+/// Build the `std::process::Command` for the LLM extraction subprocess.
+///
+/// Extracted for testability: callers can inspect the command's args without
+/// actually spawning a process.
+#[doc(hidden)]
+fn build_extraction_command(prompt: &str) -> std::process::Command {
+    let mut cmd = std::process::Command::new("belt");
+    cmd.args(["agent", "session", "-p", prompt, "--json"]);
+    cmd
+}
+
 /// Invoke the LLM subprocess to extract knowledge from a PR.
 ///
 /// Falls back to heuristic extraction if the LLM call fails.
 fn invoke_llm_extraction(prompt: &str) -> Option<Vec<(String, String)>> {
-    // Use `belt agent` subprocess for LLM invocation, similar to the evaluator.
-    // If belt binary is not available, we fall back gracefully.
-    let output = std::process::Command::new("belt")
-        .args(["agent", "-p", prompt, "--json"])
-        .output();
+    // Use `belt agent session` subprocess for LLM invocation, similar to the
+    // evaluator. If belt binary is not available, we fall back gracefully.
+    let output = build_extraction_command(prompt).output();
 
     let output = match output {
         Ok(o) if o.status.success() => o,
@@ -5414,6 +5423,38 @@ fn middleware(request: Request, secret: &[u8], rules: &[ValidationRule]) -> Resp
         assert!(prompt.contains("diff content"));
         assert!(prompt.contains("decision"));
         assert!(prompt.contains("pattern"));
+    }
+
+    #[test]
+    fn build_extraction_command_invokes_agent_session_subcommand() {
+        // `belt agent` requires an `AgentCommands` subcommand (see
+        // belt-cli's `Agent { #[command(subcommand)] command: AgentCommands }`).
+        // The `-p/--json` flags belong to `AgentCommands::Session`, so the
+        // subprocess argv must be `agent session ...`, not bare `agent ...`
+        // (which clap rejects as a usage error).
+        let cmd = build_extraction_command("some prompt");
+
+        assert_eq!(
+            cmd.get_program(),
+            "belt",
+            "command program should be 'belt'"
+        );
+
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("agent"),
+            "first arg should be 'agent': {args:?}"
+        );
+        assert_eq!(
+            args.get(1).map(String::as_str),
+            Some("session"),
+            "second arg should be 'session' subcommand: {args:?}"
+        );
     }
 
     #[test]
