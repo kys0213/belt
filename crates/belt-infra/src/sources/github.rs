@@ -42,7 +42,14 @@ impl GitHubDataSource {
     async fn fetch_issue(
         repo: &str,
         number: i64,
-    ) -> Option<(String, Option<String>, Vec<String>, String, String)> {
+    ) -> Option<(
+        String,
+        Option<String>,
+        Vec<String>,
+        String,
+        String,
+        serde_json::Value,
+    )> {
         let output = tokio::process::Command::new("gh")
             .args([
                 "issue",
@@ -60,6 +67,21 @@ impl GitHubDataSource {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let val: serde_json::Value = serde_json::from_str(&stdout).ok()?;
 
+        Some(Self::parse_issue_json(val))
+    }
+
+    /// `gh issue view --json ...` 응답을 `IssueContext` 필드와 `source_data`용
+    /// 원본 JSON으로 분해한다. 이미 조회한 응답을 재사용할 뿐 추가 API 호출은 없다.
+    fn parse_issue_json(
+        val: serde_json::Value,
+    ) -> (
+        String,
+        Option<String>,
+        Vec<String>,
+        String,
+        String,
+        serde_json::Value,
+    ) {
         let title = val["title"].as_str().unwrap_or("").to_string();
         let body = val["body"].as_str().map(|s| s.to_string());
         let labels = val["labels"]
@@ -73,7 +95,7 @@ impl GitHubDataSource {
         let author = val["author"]["login"].as_str().unwrap_or("").to_string();
         let state = val["state"].as_str().unwrap_or("open").to_string();
 
-        Some((title, body, labels, author, state))
+        (title, body, labels, author, state, val)
     }
 
     /// `gh` CLI로 해당 이슈에 연결된 PR을 조회한다.
@@ -481,15 +503,17 @@ impl DataSource for GitHubDataSource {
             Self::fetch_default_branch(&repo_name),
         );
 
-        let (title, body, labels, author, issue_state) = issue_data.unwrap_or_else(|| {
-            (
-                item.title.clone().unwrap_or_default(),
-                None,
-                vec![],
-                String::new(),
-                "open".to_string(),
-            )
-        });
+        let (title, body, labels, author, issue_state, source_data) =
+            issue_data.unwrap_or_else(|| {
+                (
+                    item.title.clone().unwrap_or_default(),
+                    None,
+                    vec![],
+                    String::new(),
+                    "open".to_string(),
+                    serde_json::Value::Null,
+                )
+            });
 
         Ok(ItemContext {
             work_id: item.work_id.clone(),
@@ -515,7 +539,7 @@ impl DataSource for GitHubDataSource {
             pr: pr_data,
             history: vec![],
             worktree: None,
-            source_data: serde_json::Value::Null,
+            source_data,
         })
     }
 }
@@ -814,6 +838,42 @@ sources:
         let item = make_queue_item("github:org/repo#12", "analyze");
         let ctx = ds.get_context(&item).await.unwrap();
         assert!(ctx.worktree.is_none());
+    }
+
+    #[tokio::test]
+    async fn get_context_source_data_is_null_when_gh_unavailable() {
+        // "org/repo" does not exist, so `gh issue view` fails and get_context
+        // must fall back to Null rather than fabricating source_data.
+        let ds = GitHubDataSource::new("https://github.com/org/repo");
+        let item = make_queue_item("github:org/repo#77", "analyze");
+        let ctx = ds.get_context(&item).await.unwrap();
+        assert!(ctx.source_data.is_null());
+    }
+
+    // ── parse_issue_json() ───────────────────────────────────────────────────
+
+    #[test]
+    fn parse_issue_json_populates_source_data_with_raw_response() {
+        let val = serde_json::json!({
+            "title": "Fix bug",
+            "body": "steps to repro",
+            "labels": [{"name": "bug"}],
+            "author": {"login": "octocat"},
+            "state": "OPEN",
+        });
+
+        let (title, body, labels, author, state, source_data) =
+            GitHubDataSource::parse_issue_json(val.clone());
+
+        assert_eq!(title, "Fix bug");
+        assert_eq!(body, Some("steps to repro".to_string()));
+        assert_eq!(labels, vec!["bug".to_string()]);
+        assert_eq!(author, "octocat");
+        assert_eq!(state, "OPEN");
+        // source_data must carry the untouched raw gh response, not a
+        // re-derived subset -- this is the OCP escape hatch ItemContext
+        // documents for custom source types.
+        assert_eq!(source_data, val);
     }
 
     // ── work_id construction ─────────────────────────────────────────────────

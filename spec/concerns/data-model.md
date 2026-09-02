@@ -437,7 +437,7 @@ runtime:
 
 `belt context $WORK_ID --json`이 반환하는 구조. script가 정보를 조회하는 유일한 방법.
 
-`ItemContext`에는 `source_data: serde_json::Value` 필드가 있다 — DataSource가 자유 스키마로 채울 수 있는 OCP 확장점이다. 현재는 채워지지 않는다(항상 `Null`, `issue`/`pr` 필드에 데이터가 담긴다). `source_data`가 `Null`이면 JSON 출력에서 해당 키는 생략된다. 상세: [DataSource](./datasource.md)
+`ItemContext`에는 `source_data: serde_json::Value` 필드가 있다 — DataSource가 자유 스키마로 채울 수 있는 OCP 확장점이다. GitHub DataSource는 이슈 조회 원본 응답을 가공 없이 여기에 담는다(정제된 데이터는 `issue`/`pr` 필드에 담긴다). 이슈 조회에 실패하면 `Null`로 남는다. `source_data`가 `Null`이면 JSON 출력에서 해당 키는 생략된다. 상세: [DataSource](./datasource.md)
 
 ```json
 {
@@ -481,7 +481,14 @@ runtime:
       "created_at": "2026-03-25T10:00:00Z"
     }
   ],
-  "worktree": "/tmp/belt/worktrees/42-implement"
+  "worktree": "/tmp/belt/worktrees/42-implement",
+  "source_data": {
+    "title": "...",
+    "body": "...",
+    "labels": [{ "name": "belt:implement" }],
+    "author": { "login": "user" },
+    "state": "OPEN"
+  }
 }
 ```
 
