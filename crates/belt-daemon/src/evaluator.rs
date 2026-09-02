@@ -352,7 +352,7 @@ belt agent --workspace "{ws}" -p \
         let prompt = self.build_evaluate_prompt();
 
         let mut cmd = tokio::process::Command::new("belt");
-        cmd.arg("agent");
+        cmd.arg("agent").arg("session");
 
         // Pass workspace config path if available.
         if let Some(ref config_path) = self.workspace_config_path {
@@ -370,9 +370,9 @@ belt agent --workspace "{ws}" -p \
         cmd
     }
 
-    /// Run the evaluate step as a subprocess via `belt agent`.
+    /// Run the evaluate step as a subprocess via `belt agent session`.
     ///
-    /// Spawns `belt agent --workspace <config> -p <prompt> --json` with
+    /// Spawns `belt agent session --workspace <config> -p <prompt> --json` with
     /// workspace-isolated environment variables (`WORKSPACE`, `BELT_HOME`,
     /// `BELT_DB`). The subprocess output is collected as JSON via stdout
     /// (IPC) and parsed into an [`EvaluateResult`].
@@ -1296,6 +1296,35 @@ exit {exit_code}
             std_cmd.get_program(),
             "belt",
             "command program should be 'belt'"
+        );
+    }
+
+    #[test]
+    fn build_evaluate_command_invokes_agent_session_subcommand() {
+        // `belt agent` requires an `AgentCommands` subcommand (see
+        // belt-cli's `Agent { #[command(subcommand)] command: AgentCommands }`).
+        // The `--workspace/-p/--json` flags belong to `AgentCommands::Session`,
+        // so the subprocess argv must be `agent session ...`, not bare `agent ...`
+        // (which clap rejects as a usage error).
+        let evaluator = Evaluator::new("test-ws");
+        let belt_home = Path::new("/tmp/belt-home");
+        let cmd = evaluator.build_evaluate_command(belt_home);
+        let std_cmd = cmd.as_std();
+
+        let args: Vec<String> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("agent"),
+            "first arg should be 'agent': {args:?}"
+        );
+        assert_eq!(
+            args.get(1).map(String::as_str),
+            Some("session"),
+            "second arg should be 'session' subcommand: {args:?}"
         );
     }
 
