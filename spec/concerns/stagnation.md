@@ -15,8 +15,9 @@ handler 실패
     ▼
 Stagnation 분석 (같은 source_id + state에서 실패 이력이 있으면 항상 실행)
     │
-    ├── ① 유사도 판단 (완전 일치 비교, threshold 0.9 / 동일 출력 3회 연속(인접 쌍 일치 2회))
-    │     과거 실패 error 메시지 + 이번 error를 순서대로 비교
+    ├── ① 유사도 판단 (완전 일치·토큰 중복도·압축 유사도의 가중 합성, threshold 0.9)
+    │     과거 실패 error 메시지 + 이번 error를 순서대로 비교해
+    │     SPINNING(동일 출력 3회 연속)·OSCILLATION(A→B→A→B 교대 반복) 여부를 판정
     │
     ├── ② Lateral Plan 생성 (패턴 감지 시)
     │     페르소나 선택 후 정적 directive 텍스트를 조합 (LLM 미호출)
@@ -33,9 +34,9 @@ Stagnation 분석 (같은 source_id + state에서 실패 이력이 있으면 항
 
 ## 탐지 대상: 정체 패턴
 
-현재 실제로 감지되는 패턴은 **SPINNING**(A→A→A, 동일/유사 출력 반복) 하나다. 예: 같은 코드 생성 → 같은 컴파일 에러 반복.
+현재 실제로 감지되는 패턴은 **SPINNING**(A→A→A, 동일/유사 출력 반복)과 **OSCILLATION**(A→B→A→B, 두 출력 사이를 교대로 반복)이다. 예: 같은 컴파일 에러가 반복되면 SPINNING, 서로 다른 두 수정안을 번갈아 시도하면 OSCILLATION.
 
-패턴 유형 전체 정의(enum)는 [Data Model](./data-model.md#stagnationpattern) 참조. SPINNING 외 패턴의 확장 로드맵은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
+패턴 유형 전체 정의(enum)는 [Data Model](./data-model.md#stagnationpattern) 참조. SPINNING·OSCILLATION 외 패턴(NO_DRIFT, DIMINISHING_RETURNS)의 확장 로드맵은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
 
 ---
 
@@ -91,7 +92,7 @@ pub trait SimilarityJudge: Send + Sync {
 }
 ```
 
-현재 daemon이 사용하는 구현체는 완전 일치 비교(동일=1.0/다름=0.0) 하나뿐이다. 다른 알고리즘 구성과 가중 합산 방식의 로드맵은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
+현재 daemon은 완전 일치 비교·토큰 중복도(정규화 후 Jaccard 유사도)·압축 유사도(NCD)를 0.5 : 0.3 : 0.2 가중치로 합산한 판정을 사용한다. 가중치를 yaml로 노출하는 등의 추가 확장 로드맵은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
 
 ---
 
@@ -112,14 +113,14 @@ impl StagnationDetector {
 
 ### 현재 판정 기준
 
-정체 판정은 완전 일치 비교 하나만 사용한다: 유사도 threshold 0.9, 동일 출력 3회 연속(인접 쌍 일치 2회) — 두 값 모두 현재 고정값이며 yaml로 노출되지 않는다.
+정체 판정은 완전 일치·토큰 중복도·압축 유사도의 가중 합성 점수(threshold 0.9)를 기준으로 한다. SPINNING은 동일 출력 3회 연속(인접 쌍 일치 2회), OSCILLATION은 두 출력이 2회 이상 교대로 반복되면(A→B→A→B) 판정한다 — threshold와 반복 횟수 모두 현재 고정값이며 yaml로 노출되지 않는다. 두 조건이 동시에 성립하면(예: 동일 출력이 4회 이상 이어지면 교대 조건도 우연히 성립한다) confidence가 더 높은 쪽을 채택하고, confidence가 같으면 SPINNING을 우선한다.
 
 - 입력(`outputs`)은 같은 `source_id` + `state`의 과거 실패 error 메시지(DB `history` 조회, DB 조회 실패 시 in-memory 이력으로 폴백)에 이번 실패의 error를 이어붙인 배열이다.
 - 과거 실패 이력이 하나도 없으면(첫 실패) stagnation 분석 자체를 생략한다.
 
 ### 판정 알고리즘
 
-연속된 두 출력을 비교해, threshold 이상인 쌍이 최소 연속 횟수만큼 이어지면 SPINNING으로 판정한다.
+**SPINNING**: 연속된 두 출력을 비교해, threshold 이상인 쌍이 최소 연속 횟수만큼 이어지면 판정한다.
 
 ```
 for pair in outputs.windows(2):
@@ -130,6 +131,17 @@ for pair in outputs.windows(2):
         consecutive = 0
     if consecutive >= min_consecutive:
         return Spinning(confidence = 연속 구간 평균 score)
+```
+
+**OSCILLATION**: 두 칸 떨어진 출력끼리 비교해(A→B→A 교대 패턴), threshold 이상인 쌍이 최소 반복 횟수 이상이면 판정한다.
+
+```
+for i in 2..outputs.len():
+    score = similarity(outputs[i], outputs[i - 2])
+    if score >= threshold:
+        cycles += 1
+if cycles >= min_cycles:
+    return Oscillation(confidence = 일치한 쌍의 평균 score)
 ```
 
 ---
@@ -198,7 +210,8 @@ handler/on_enter 실행 실패
     │
     ▼
 ② 정체 패턴 판정
-   기준: 완전 일치 비교, threshold=0.9, min_consecutive=2
+   기준: 완전 일치·토큰 중복도·압축 유사도 가중 합성, threshold=0.9
+   (SPINNING: min_consecutive=2, OSCILLATION: min_cycles=2)
     │
     ▼
 ③ Lateral Plan 생성 (패턴 감지 시)
@@ -262,7 +275,7 @@ pub struct LateralConfig {
 
 ## 확장 여지
 
-SPINNING 이외의 패턴 감지, 유사도 알고리즘 조합, LLM 기반 lateral 분석은 코어 변경 없이 daemon 배선만 바꾸면 추가할 수 있는 OCP 확장점이다. 현재 구현 범위의 상세 인벤토리와 로드맵은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
+SPINNING·OSCILLATION 이외의 패턴 감지(NO_DRIFT, DIMINISHING_RETURNS), 유사도 가중치의 yaml 노출, LLM 기반 lateral 분석은 코어 변경 없이 daemon 배선만 바꾸면 추가할 수 있는 OCP 확장점이다. 현재 구현 범위의 상세 인벤토리와 로드맵은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
 
 ---
 

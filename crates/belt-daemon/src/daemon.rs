@@ -17,7 +17,8 @@ use belt_core::queue::{HistoryEvent, HitlReason, HitlRespondAction, QueueItem};
 use belt_core::runtime::RuntimeRegistry;
 use belt_core::source::DataSource;
 use belt_core::stagnation::{
-    ExactHash, LateralAnalyzer, Persona, SpinningDetector, StagnationDetector,
+    CompositeSimilarity, LateralAnalyzer, OscillationDetector, Persona, SpinningDetector,
+    StagnationDetector,
 };
 use belt_core::workspace::{StateConfig, WorkspaceConfig};
 use belt_infra::db::{Database, TransitionEvent};
@@ -2202,9 +2203,9 @@ impl Daemon {
     /// Detect stagnation from failure history and generate a lateral plan directive.
     ///
     /// Collects error messages from `history_events` for the given source/state,
-    /// runs them through a `StagnationDetector` (spinning detection via `ExactHash`),
-    /// and if a pattern is detected, selects a persona via `LateralAnalyzer` and
-    /// builds a directive-based lateral plan string.
+    /// runs them through a `StagnationDetector` (spinning + oscillation detection via
+    /// `CompositeSimilarity`), and if a pattern is detected, selects a persona via
+    /// `LateralAnalyzer` and builds a directive-based lateral plan string.
     fn detect_stagnation_and_generate_plan(
         &self,
         work_id: &str,
@@ -2255,12 +2256,36 @@ impl Daemon {
         let mut outputs: Vec<&str> = errors.iter().map(|s| s.as_str()).collect();
         outputs.push(current_error);
 
-        // Run stagnation detection with ExactHash similarity.
-        let detector = StagnationDetector::new(vec![Box::new(SpinningDetector::new(
-            Box::new(ExactHash),
-            0.9,
-            2,
-        ))]);
+        // Similarity threshold and repeat counts follow the existing SpinningDetector /
+        // OscillationDetector unit-test convention in belt_core::stagnation::pattern
+        // (threshold=0.9, count=2) -- kept as code constants, not exposed via yaml.
+        const SIMILARITY_THRESHOLD: f64 = 0.9;
+        const SPINNING_MIN_CONSECUTIVE: usize = 2;
+        const OSCILLATION_MIN_CYCLES: usize = 2;
+
+        // Run stagnation detection with the CompositeSimilarity default preset
+        // (ExactHash 0.5 + TokenFingerprint 0.3 + NcdJudge 0.2, see
+        // belt_core::stagnation::similarity::CompositeSimilarity::default), checking for
+        // both oscillation (A-B-A-B) and spinning (consecutive-pair) patterns.
+        //
+        // OscillationDetector is registered before SpinningDetector: StagnationDetector::detect
+        // picks the highest-confidence match and, on a tie, `Iterator::max_by` returns the last
+        // one seen. A run of identical outputs trivially satisfies the A-B-A-B check too (A~A),
+        // tying both detectors' confidence -- registering Spinning last keeps a true repeat
+        // labeled Spinning, its more specific pattern, while a genuine A/B alternation (where
+        // Spinning never fires) is still labeled Oscillation.
+        let detector = StagnationDetector::new(vec![
+            Box::new(OscillationDetector::new(
+                Box::new(CompositeSimilarity::default()),
+                SIMILARITY_THRESHOLD,
+                OSCILLATION_MIN_CYCLES,
+            )),
+            Box::new(SpinningDetector::new(
+                Box::new(CompositeSimilarity::default()),
+                SIMILARITY_THRESHOLD,
+                SPINNING_MIN_CONSECUTIVE,
+            )),
+        ]);
 
         let detection = detector.detect(&outputs)?;
 
@@ -2355,7 +2380,7 @@ impl Daemon {
 
     /// Record token usage parsed from evaluate subprocess IPC JSON output.
     ///
-    /// When the evaluate subprocess runs via `belt agent --json`, the stdout
+    /// When the evaluate subprocess runs via `belt agent session --json`, the stdout
     /// JSON may contain `token_usage`, `runtime_name`, and `model` fields.
     /// This method extracts those and records them to the DB.
     fn try_record_ipc_token_usage(
@@ -5733,6 +5758,82 @@ sources:
         assert!(detail["confidence"].as_f64().unwrap() > 0.0);
         assert!(detail["recommended_persona"].as_str().is_some());
         assert!(detail["failure_count"].as_u64().unwrap() >= 1);
+    }
+
+    #[test]
+    fn detect_stagnation_spinning_uses_composite_similarity() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let daemon = setup_daemon(&tmp, source, vec![0]);
+
+        let db = Database::open_in_memory().unwrap();
+        let mut daemon = daemon.with_db(db);
+
+        let item = test_item("src:1", "implement");
+        for _ in 0..3 {
+            daemon.record_history_event(&item, "failed", Some("compile error X".to_string()));
+        }
+
+        let result = daemon.detect_stagnation_and_generate_plan(
+            &item.work_id,
+            "src:1",
+            "implement",
+            "compile error X",
+        );
+        assert!(result.is_some(), "expected spinning detection");
+
+        let events = daemon
+            .db
+            .as_ref()
+            .unwrap()
+            .list_transition_events(&item.work_id)
+            .unwrap();
+        let detail: serde_json::Value = serde_json::from_str(
+            events
+                .iter()
+                .find(|e| e.event_type == "stagnation")
+                .unwrap()
+                .detail
+                .as_deref()
+                .unwrap(),
+        )
+        .unwrap();
+        let confidence = detail["confidence"].as_f64().unwrap();
+        // Pure ExactHash always yields exactly 1.0 for identical strings. CompositeSimilarity's
+        // NcdJudge component adds gzip framing overhead even for identical input (see
+        // belt_core::stagnation::similarity::composite_default_includes_ncd), so a composite-backed
+        // confidence for identical strings must land strictly below 1.0 while staying above the
+        // 0.9 spinning threshold.
+        assert!(
+            confidence > 0.9 && confidence < 1.0,
+            "expected composite similarity confidence in (0.9, 1.0), got {confidence}"
+        );
+    }
+
+    #[test]
+    fn detect_stagnation_oscillation_pattern_detected() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![0]);
+
+        let item = test_item("src:1", "implement");
+        // History: A, B, A. Current: B. Combined outputs = [A, B, A, B] -- an A-B-A-B
+        // oscillation (2 cycles: outputs[2]~outputs[0], outputs[3]~outputs[1]).
+        daemon.record_history_event(&item, "failed", Some("fix A".to_string()));
+        daemon.record_history_event(&item, "failed", Some("fix B".to_string()));
+        daemon.record_history_event(&item, "failed", Some("fix A".to_string()));
+
+        let result =
+            daemon.detect_stagnation_and_generate_plan("w:1", "src:1", "implement", "fix B");
+        assert!(
+            result.is_some(),
+            "expected oscillation pattern to be detected"
+        );
+        let plan = result.unwrap();
+        assert!(
+            plan.contains("Pattern: oscillation"),
+            "expected oscillation pattern in plan, got: {plan}"
+        );
     }
 
     #[test]
