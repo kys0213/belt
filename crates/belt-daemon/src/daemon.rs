@@ -2256,8 +2256,8 @@ impl Daemon {
         let mut outputs: Vec<&str> = errors.iter().map(|s| s.as_str()).collect();
         outputs.push(current_error);
 
-        // Similarity threshold and repeat counts follow the existing SpinningDetector /
-        // OscillationDetector unit-test convention in belt_core::stagnation::pattern
+        // Similarity threshold and repeat counts match the documented defaults on
+        // SpinningDetector::new / OscillationDetector::new in belt_core::stagnation::pattern
         // (threshold=0.9, count=2) -- kept as code constants, not exposed via yaml.
         const SIMILARITY_THRESHOLD: f64 = 0.9;
         const SPINNING_MIN_CONSECUTIVE: usize = 2;
@@ -5761,7 +5761,9 @@ sources:
     }
 
     #[test]
-    fn detect_stagnation_spinning_uses_composite_similarity() {
+    fn detect_stagnation_spinning_confidence_matches_composite_default() {
+        use belt_core::stagnation::SimilarityJudge;
+
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let daemon = setup_daemon(&tmp, source, vec![0]);
@@ -5770,16 +5772,13 @@ sources:
         let mut daemon = daemon.with_db(db);
 
         let item = test_item("src:1", "implement");
+        let err = "compile error X";
         for _ in 0..3 {
-            daemon.record_history_event(&item, "failed", Some("compile error X".to_string()));
+            daemon.record_history_event(&item, "failed", Some(err.to_string()));
         }
 
-        let result = daemon.detect_stagnation_and_generate_plan(
-            &item.work_id,
-            "src:1",
-            "implement",
-            "compile error X",
-        );
+        let result =
+            daemon.detect_stagnation_and_generate_plan(&item.work_id, "src:1", "implement", err);
         assert!(result.is_some(), "expected spinning detection");
 
         let events = daemon
@@ -5798,15 +5797,18 @@ sources:
                 .unwrap(),
         )
         .unwrap();
+        // Registration order (Oscillation before Spinning) means a tie on identical
+        // outputs is won by Spinning -- pin that precedence contract here too.
+        assert_eq!(detail["pattern_type"], "spinning");
+
         let confidence = detail["confidence"].as_f64().unwrap();
-        // Pure ExactHash always yields exactly 1.0 for identical strings. CompositeSimilarity's
-        // NcdJudge component adds gzip framing overhead even for identical input (see
-        // belt_core::stagnation::similarity::composite_default_includes_ncd), so a composite-backed
-        // confidence for identical strings must land strictly below 1.0 while staying above the
-        // 0.9 spinning threshold.
+        // Pin the confidence to whatever CompositeSimilarity::default() actually computes,
+        // rather than a hand-picked range -- this fails the moment the wired detector drifts
+        // from the documented default preset (ExactHash 0.5 + TokenFingerprint 0.3 + NcdJudge 0.2).
+        let expected = CompositeSimilarity::default().score(err, err);
         assert!(
-            confidence > 0.9 && confidence < 1.0,
-            "expected composite similarity confidence in (0.9, 1.0), got {confidence}"
+            (confidence - expected).abs() < 1e-9,
+            "expected confidence to equal CompositeSimilarity::default() score {expected}, got {confidence}"
         );
     }
 

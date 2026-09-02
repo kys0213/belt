@@ -115,6 +115,8 @@ impl StagnationDetector {
 
 정체 판정은 완전 일치·토큰 중복도·압축 유사도의 가중 합성 점수(threshold 0.9)를 기준으로 한다. SPINNING은 동일 출력 3회 연속(인접 쌍 일치 2회), OSCILLATION은 두 출력이 2회 이상 교대로 반복되면(A→B→A→B) 판정한다 — threshold와 반복 횟수 모두 현재 고정값이며 yaml로 노출되지 않는다. 두 조건이 동시에 성립하면(예: 동일 출력이 4회 이상 이어지면 교대 조건도 우연히 성립한다) confidence가 더 높은 쪽을 채택하고, confidence가 같으면 SPINNING을 우선한다.
 
+완전 일치가 아닌 유사 반복(near-miss)은 현재 가중치·threshold 조합에서 SPINNING·OSCILLATION 어느 쪽으로도 판정되지 않는다 — 완전 일치 요소(가중치 0.5)가 어긋나면 나머지 요소가 만점이어도 합성 점수 상한이 0.5로, threshold 0.9에 도달할 수 없다. 오탐을 늘리지 않기 위해 의도적으로 남겨둔 경계다.
+
 - 입력(`outputs`)은 같은 `source_id` + `state`의 과거 실패 error 메시지(DB `history` 조회, DB 조회 실패 시 in-memory 이력으로 폴백)에 이번 실패의 error를 이어붙인 배열이다.
 - 과거 실패 이력이 하나도 없으면(첫 실패) stagnation 분석 자체를 생략한다.
 

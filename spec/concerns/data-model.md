@@ -313,7 +313,7 @@ impl FromStr for EscalationAction {
 | `NoDrift` | `"no_drift"` | 진행 점수 정체 |
 | `DiminishingReturns` | `"diminishing_returns"` | 개선폭 감소 |
 
-현재 실제로 감지되는 패턴은 SPINNING뿐이다. 상세: [Stagnation Detection](./stagnation.md)
+현재 실제로 감지되는 패턴은 SPINNING·OSCILLATION이다. 상세: [Stagnation Detection](./stagnation.md)
 
 ### Persona
 
