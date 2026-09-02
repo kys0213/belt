@@ -13,7 +13,30 @@ use belt_daemon::cron::{CronContext, CronHandler, GapAnalysisReport, GapDetectio
 use belt_infra::db::Database;
 use chrono::Utc;
 
+/// Force `GapDetectionJob` to use its deterministic keyword-based fallback
+/// instead of shelling out to a real `claude` CLI.
+///
+/// Without this, `llm_analyze_coverage` (see `belt_daemon::cron`) invokes
+/// whatever `claude` binary is on `PATH`. On a machine where that binary is
+/// installed and authenticated, its free-text response varies between runs,
+/// which made these tests flaky (they assert on exact keyword-based
+/// output, per this file's module doc). `Once` ensures the env var is
+/// written exactly once, and every caller blocks until that write
+/// completes, so no test ever reads it before it is set.
+fn disable_external_llm() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: set exactly once, before any test reads it (see `Once`
+        // semantics above) and never mutated again -- no concurrent
+        // reader/writer race.
+        unsafe {
+            std::env::set_var("BELT_DISABLE_LLM_GAP_DETECTION", "1");
+        }
+    });
+}
+
 fn test_db() -> Arc<Database> {
+    disable_external_llm();
     Arc::new(Database::open_in_memory().expect("in-memory DB"))
 }
 

@@ -1151,9 +1151,32 @@ pub struct GapDetectionJob {
     coverage_threshold: f64,
 }
 
+/// Sets `BELT_DISABLE_LLM_GAP_DETECTION` exactly once for the test process.
+///
+/// `Once` guarantees the write happens-before any later read: concurrent
+/// callers block on `call_once` until the first caller's write completes,
+/// so no unit test can observe the variable in an unset state.
+#[cfg(test)]
+fn disable_llm_gap_detection_for_unit_tests() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        // SAFETY: set exactly once (see `Once` semantics above) and never
+        // mutated again -- no concurrent reader/writer race.
+        unsafe {
+            std::env::set_var("BELT_DISABLE_LLM_GAP_DETECTION", "1");
+        }
+    });
+}
+
 impl GapDetectionJob {
     /// Create a new `GapDetectionJob` with the default coverage threshold.
     pub fn new(db: Arc<Database>, workspace_root: std::path::PathBuf) -> Self {
+        // Unit tests assert on deterministic keyword-based `missing_items`.
+        // Guard against a real `claude` binary on the host `PATH` making
+        // those assertions flaky by forcing the keyword-based fallback.
+        #[cfg(test)]
+        disable_llm_gap_detection_for_unit_tests();
+
         Self {
             db,
             workspace_root,
@@ -1503,7 +1526,16 @@ struct LlmCoverageResult {
 ///
 /// Returns `None` when the CLI is unavailable or the response cannot be
 /// parsed, allowing the caller to fall back to keyword-based analysis.
+///
+/// Also returns `None` immediately when `BELT_DISABLE_LLM_GAP_DETECTION` is
+/// set. This exists so integration tests that assert on deterministic
+/// keyword-based output are not silently made flaky by a real `claude`
+/// binary happening to be present on the developer/CI machine's `PATH`.
 fn llm_analyze_coverage(spec_content: &str, code_summary: &str) -> Option<LlmCoverageResult> {
+    if std::env::var_os("BELT_DISABLE_LLM_GAP_DETECTION").is_some() {
+        return None;
+    }
+
     let prompt = format!(
         "You are a code coverage analyst. Given the SPEC REQUIREMENTS and CODE SUMMARY below, \
          evaluate how well the codebase implements the spec requirements.\n\n\
