@@ -257,6 +257,7 @@ on_done:
 | `source_data` | DataSource가 채우는 자유 스키마 확장점 |
 
 - `source_data`는 소스 원본 응답을 가공 없이 담는다. GitHub은 이슈 원본을 `issue` 키 아래에 둔다. 소스 종류별로 키를 나눠 다른 원본이 추가돼도 충돌하지 않는다.
+- `issue.number`, `source.url`, `history[].status` 같은 하위 필드의 상세는 [DataSource](./datasource.md#github-context-스키마)가 단일 출처다.
 - 이슈 조회에 실패하면 `source_data`는 비고, 비어 있으면 JSON 출력에서 키가 생략된다. 상세: [DataSource](./datasource.md)
 
 > `source_data` 도입의 단계적 마이그레이션 구상은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md)에 기록되어 있다.
@@ -285,8 +286,6 @@ erDiagram
     HITL_REQUEST ||--o{ DELIVERY : delivered_by
     SPEC ||--o{ SPEC_LINK : links
 ```
-
-> 참고: 기록 간 정합성은 애플리케이션 계층이 보장한다. 외래 키 제약은 선언하지 않는다.
 
 ---
 

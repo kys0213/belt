@@ -97,7 +97,7 @@ sequenceDiagram
 - 만료도 응답과 마찬가지로 한 번만 확정된다. 응답이 먼저면 만료 시도는 `already_handled`로 끝나고 아이템에 영향이 없다.
 - cron은 phase를 직접 바꾸지 않는다. 만료된 요청의 terminal action 적용(worktree 정리 포함)과 결과 전이는 daemon tick의 후처리가 한다. 상세: [Daemon](./daemon.md#hitl-해결-후처리)
 - 만료 시점부터 후처리가 끝날 때까지 아이템은 처리 중이고, 다른 경로의 전이는 `busy`다. 상세: [QueuePhase 상태 머신](./queue-state-machine.md#처리-중-잠금)
-- 경합 규칙의 전체는 [Notification](./notification.md)을 따른다.
+- 경합 규칙의 전체는 [Notification](./notification.md#첫-응답-승리)을 따른다.
 
 ---
 

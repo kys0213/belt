@@ -41,6 +41,7 @@
 ```mermaid
 stateDiagram-v2
     [*] --> Pending: DataSource 수집
+    [*] --> Hitl: replan 아이템 또는 spec 완료 아이템을 HITL 로 직접 생성
     Pending --> Ready: 자동 전이
     Pending --> Skipped: skip
     Ready --> Running: 점유 concurrency 제한
@@ -50,6 +51,7 @@ stateDiagram-v2
 
     Running --> Completed: handler 전부 성공
     Running --> Failed: handler 또는 on_enter 실패
+    Running --> Hitl: escalation hitl 또는 replan
     Running --> Skipped: 실행 중 취소
     Running --> Pending: 롤백 shutdown 또는 재시작
 
@@ -389,7 +391,7 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 - [ ] Pending→Ready 전이는 Daemon tick마다 자동 수행된다
 - [ ] Ready→Running 전이는 workspace.concurrency와 daemon.max_concurrent 모두 만족할 때만 수행된다
-- [ ] queue_dependencies에 미완료(Done이 아닌) 의존이 있으면 Ready→Running 전이가 블로킹된다
+- [ ] 아이템 의존에 미완료(Done이 아닌) 의존이 있으면 Ready→Running 전이가 블로킹된다
 
 ### Escalation 정책
 
@@ -404,7 +406,7 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 - [ ] evaluate는 per-work_id 단위로 LLM 판정을 실행한다
 - [ ] 각 판정에 해당 아이템의 context가 포함된다
 - [ ] 개별 판정 실패 시 해당 아이템만 Completed에 머물고, 다른 아이템에 영향 없다
-- [ ] evaluate 반복 실패(3회)로 HITL 에스컬레이션 시 사유가 `EvaluateFailure`로 기록된다
+- [ ] evaluate 반복 실패(3회)로 HITL 에스컬레이션 시 사유가 `evaluate_failure`로 기록된다
 - [ ] on_done script 실패 시 Failed 전이되고, on_fail은 실행하지 않는다
 
 ### Worktree 생명주기

@@ -33,7 +33,7 @@ Daemon이 모르는 것: hook이 실제로 무엇을 하는지 (결과만 받음
 
 | 구성 요소 | 책임 |
 |-----------|------|
-| **Advancer** | Pending→Ready→Running 전이, dependency gate (DB), conflict 검출 |
+| **Advancer** | Pending→Ready→Running 전이, dependency gate (DB), spec 충돌 검출 |
 | **Executor** | handler 실행 + hook 트리거, 실패 시 stagnation 분석 + lateral plan + escalation |
 | **Evaluator** | Completed → Done/HITL 분류 (per-item) |
 | **HitlService** | HITL 열기·판정·timeout 만료의 단일 계약. 후처리와 phase 전이는 하지 않는다 |
@@ -68,13 +68,14 @@ flowchart TD
     S0 --> S1["1 DB 관찰: 작업 사본을 DB 에 맞춤"]
     S1 --> S2["2 수집: DataSource 결과를 즉시 DB 에 Pending 기록"]
     S2 --> S3["3 HITL 후처리: resolved 또는 expired 이면서 미완료"]
-    S3 --> S4["4 HITL 요청 전달: 상태 기반, 다음 tick 재시도"]
+    S3 --> S4["4 HITL 요청 전달: 상태 기반, 다음 tick 재시도, 전달 재시도 상한"]
     S4 --> S5["5 응답 polling: 1회 처리, allowlist, 판정"]
     S5 --> S6["6 진행 알림: 전이 이력 순서, best-effort"]
     S6 --> S7["7 advance, execute, evaluate, cron"]
     S7 --> W
 ```
 
+- 4단계의 HITL 요청 전달은 실패하면 이후 tick에서 다시 시도하며, **전달 재시도 상한**에 이르면 멈춘다. 상한의 값은 구현이 정한다. 이 값은 [HITL 해결 후처리](#hitl-해결-후처리)의 **후처리 실패 상한**(N)과 별개의 카운터다.
 - wake 신호는 취소 요청처럼 tick을 기다리면 안 되는 용도를 **다른 용도의 wake와 구분**해야 한다. 구분 없이 일반 깨움으로 취급하면 취소 처리가 tick 간격만큼 늦어진다. 구분 수단은 구현이 정한다.
 - wake 신호를 받으면 0번부터 즉시 실행한다.
 - **handler 실행 중에도 취소 요청을 받을 수 있어야 한다.** 한 바퀴가 handler 완료를 기다리며 막히지 않는다.
@@ -190,7 +191,8 @@ daemon의 작업 사본은 DB와 어긋날 수 있다(CLI·TUI·evaluator의 전
 | evaluator 판정 전이 (Completed→Hitl 등) | DB phase를 따르고 판정 결과를 버린다. 이미 쓴 평가 비용은 버려진다 |
 | 그 밖의 결과 전이 (Running→X) | 잠금 덕분에 정상 흐름에서는 없다. 무응답 오판이나 수동 DB 조작에서만 생긴다. DB phase를 따르고, **그 실행의 hook과 escalation을 실행하지 않는다**. 시도 이력은 쓰지 않고 토큰 사용량은 기록한다. `transition_conflict`를 이력에 남긴다 |
 
-- 전이는 그 전이의 hook보다 먼저 commit된다. 그래서 conflict로 끝난 실행은 hook을 실행하지 않는다.
+- Running에서 나가는 결과 전이는 그 결과에 따른 `on_fail`·`on_escalation`보다 먼저 commit된다. 그래서 conflict로 끝난 실행은 이 hook을 실행하지 않는다.
+- `on_done`은 Done 전이의 선행 조건이다. 정상 완료와 HITL 후처리 모두 on_done이 성공한 뒤에만 Done이 되고, 실패하면 Failed가 된다.
 - worktree는 DB에 남은 phase의 생명주기 규칙을 따른다. 상세: [QueuePhase 상태 머신](./queue-state-machine.md#worktree-생명주기)
 
 ---
@@ -231,7 +233,7 @@ flowchart TD
 | on_done 실패 | Hitl→Failed. on_done 계약을 HITL 경로에서도 지킨다 |
 | 그 밖의 단계 실패 | 비치명. `post_processing_error`를 이력에 남기고 dashboard에 경고한 뒤 다음 단계로 진행한다 |
 | 결과 전이 실패 | 다음 tick에 재시도하고 dashboard에 "후처리 재시도 중"을 표시한다 |
-| 연속 N회 결과 전이 실패 | Hitl→Failed로 탈출하고 `post_processing_failed`를 이력에 남긴다. 이후는 Failed 아이템의 기존 경로를 따른다. N의 기본값은 구현이 정한다 |
+| 연속 N회 결과 전이 실패 | Hitl→Failed로 탈출하고 `post_processing_failed`를 이력에 남긴다. 이후는 Failed 아이템의 기존 경로를 따른다. N(후처리 실패 상한)의 기본값은 구현이 정한다. 전달 재시도 상한과는 별개다 |
 
 > 후처리가 처리 중 잠금을 영원히 쥐지 않는다. 결과 전이가 계속 실패해도 N회 뒤 Failed로 빠져 아이템이 영구히 `busy`로 남지 않는다.
 
@@ -359,7 +361,8 @@ flowchart TD
 - [ ] 수집한 아이템은 즉시 DB에 Pending으로 기록된다
 - [ ] 점유가 conflict면 handler를 띄우지 않고 on_enter와 `started` 이벤트도 없다
 - [ ] evaluator 판정 전이가 conflict면 판정 결과를 버린다
-- [ ] 전이는 그 전이의 hook보다 먼저 commit되어, conflict로 끝난 실행은 hook을 실행하지 않는다
+- [ ] Running에서 나가는 결과 전이는 on_fail·on_escalation보다 먼저 commit되어, conflict로 끝난 실행은 이 hook을 실행하지 않는다
+- [ ] on_done은 Done 전이의 선행 조건이어서, 성공해야 Done이 되고 실패하면 Failed가 된다 (정상 완료와 HITL 후처리 모두)
 - [ ] Running→X conflict 시 시도 이력은 쓰지 않고 토큰 사용량은 기록하며 `transition_conflict`가 남는다
 
 ### HITL 후처리
