@@ -157,7 +157,7 @@ sequenceDiagram
     end
 ```
 
-HITL 요청 전달 상태는 `belt hitl show`와 dashboard에서 channel별로 볼 수 있다. 상한 횟수 N의 기본값은 [Daemon](./daemon.md)이 정한다.
+HITL 요청 전달 상태는 `belt hitl show`와 dashboard에서 channel별로 볼 수 있다. 전달 재시도 상한([Daemon](./daemon.md#실행-루프))의 값은 구현이 정하며, daemon의 "후처리 실패 상한"과는 별개다.
 
 ---
 

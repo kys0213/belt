@@ -185,7 +185,7 @@ sequenceDiagram
         D->>D: Hitl → Pending
     else expired (timeout)
         D->>HK: on_hitl_resolved (비치명)
-        D->>D: Hitl → Skipped 또는 Pending (terminal 설정에 따름)
+        D->>D: Hitl → Skipped (terminal skip) / Pending (terminal replan) / Failed (replan 상한 초과 또는 terminal 해석 불가 시 기본값)
     end
 ```
 

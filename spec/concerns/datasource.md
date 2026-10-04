@@ -233,7 +233,7 @@ sources:
       terminal: skip          # hitl timeout 시 적용 (skip 또는 replan)
 ```
 
-> **주의**: 위 `on_done` script는 hook 로딩 우선순위상 실제로 실행되지 않는다. github source에는 `GitHubLifecycleHook`이 항상 우선 적용되고(`ScriptLifecycleHook`은 전용 Hook이 없는 source_type에만 폴백으로 쓰인다), `GitHubLifecycleHook`은 yaml script를 실행하지 않고 HITL 라벨 추가·제거만 수행한다(이슈 코멘트는 origin channel이 작성한다). 라벨 전환·PR 생성을 이 방식으로 하려면 현재는 `LifecycleHook` impl을 직접 확장해야 한다. 상세: [LifecycleHook](./lifecycle-hook.md)
+> **주의**: 위 `on_done` script는 hook과 무관하게 evaluate 성공 후 daemon이 실행한다. GitHub lifecycle hook은 HITL 라벨 추가·제거만 수행하고, 이슈 코멘트는 origin channel이 작성한다. PR 생성과 라벨 전환은 이 script의 몫이다. 상세: [LifecycleHook](./lifecycle-hook.md)
 
 ### 향후 확장
 
