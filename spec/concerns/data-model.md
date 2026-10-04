@@ -1,355 +1,231 @@
 # Data Model
 
-> 관련 문서: [DESIGN](../DESIGN.md), [QueuePhase 상태 머신](./queue-state-machine.md), [DataSource](./datasource.md), [LifecycleHook](./lifecycle-hook.md), [Evaluator](./evaluator.md), [Cron 엔진](./cron-engine.md), [Stagnation](./stagnation.md)
+> 관련 문서: [DESIGN](../DESIGN.md), [QueuePhase 상태 머신](./queue-state-machine.md), [DataSource](./datasource.md), [LifecycleHook](./lifecycle-hook.md), [Evaluator](./evaluator.md), [Cron 엔진](./cron-engine.md), [Stagnation](./stagnation.md), [Notification](./notification.md)
 
-Belt의 모든 상태는 SQLite 단일 파일(`~/.belt/belt.db`)에 저장된다. 이 문서는 테이블 스키마, 도메인 모델, 직렬화 규칙을 한 곳에 정의한다.
-
----
-
-## 테이블 개요
-
-| 테이블 | 역할 | PK |
-|--------|------|----|
-| `queue_items` | 컨베이어 벨트 위의 작업 단위 | `work_id` |
-| `history` | 작업 시도 기록 (append-only) | `id` (auto) |
-| `transition_events` | phase 전이 이벤트 로그 | `id` |
-| `queue_dependencies` | 아이템 간 실행 순서 제약 | `(work_id, depends_on)` |
-| `specs` | 스펙 정의 및 라이프사이클 | `id` |
-| `spec_links` | 스펙 ↔ 외부 리소스 연결 | `id` |
-| `workspaces` | 등록된 워크스페이스 메타 | `name` |
-| `cron_jobs` | 예약 작업 정의 | `name` |
-| `token_usage` | LLM 토큰 사용량 추적 | `id` (auto) |
-| `knowledge_base` | PR에서 추출한 지식 | `id` (auto) |
+Belt의 모든 상태는 SQLite 단일 파일(`~/.belt/belt.db`)에 저장된다. 이 문서는 **밖에서 관찰되는 데이터 계약** — 어떤 기록이 있고, 어떤 생명주기를 따르며, 어떤 보장을 하는가 — 을 정의한다. 저장 형식(테이블 구조, 컬럼, 직렬화)은 코드가 단일 출처이고 이 문서의 대상이 아니다.
 
 ---
 
-## 테이블 스키마
+## 기록 개요
 
-### queue_items
+| 기록 | 역할 | 쓰기 규칙 |
+|------|------|-----------|
+| 큐 아이템 | 컨베이어 벨트 위의 작업 단위. phase의 유일한 권위 | 전이 계약으로만 phase 변경 |
+| 전이 이력 | 아이템별 사건 기록 (phase 전이 + 부가 사건) | append-only, phase 변경과 같은 트랜잭션 |
+| 시도 이력 | 작업 시도 결과. failure_count와 stagnation 입력 | append-only |
+| HITL 요청 | HITL 인스턴스. 응답 확정의 권위 | 첫 응답만 확정 |
+| HITL 요청 전달 기록 | HITL 요청 알림의 channel별 전달 상태 | 상태 기반 재시도 |
+| 외부 응답 기록 | 외부 channel 응답의 1회 처리 보장 | 유일성 보장 |
+| 취소 요청 | 실행 중 아이템의 취소 의도와 결과 | 아이템당 열린 요청 하나 |
+| handler 프로세스 식별 정보 | Running 아이템의 handler 프로세스 정리용 | Running 동안만 유효 |
+| 아이템 의존 | 아이템 간 실행 순서 제약 | 순환 거부 |
+| 스펙 / 스펙 연결 | 스펙 정의와 외부 리소스 연결 | — |
+| 워크스페이스 / cron job | 등록 정보 | — |
+| 토큰 사용량 | LLM 호출 비용 | append-only |
+| 지식 베이스 | PR에서 추출한 지식 | — |
 
-컨베이어 벨트의 작업 단위. 하나의 아이템은 하나의 워크플로우 상태(analyze, implement 등)에 대응한다.
+> 큐 아이템은 하나의 워크플로우 상태(analyze, implement 등)에 대응하며, 식별자는 `{source_id}:{state}` 형태의 `work_id`다. 같은 외부 엔티티(`source_id`)를 공유하는 아이템들은 서로 연결된다.
 
-```sql
-CREATE TABLE queue_items (
-    work_id              TEXT PRIMARY KEY,       -- '{source_id}:{state}'
-    source_id            TEXT NOT NULL,           -- 'github:org/repo#42'
-    workspace_id         TEXT NOT NULL,           -- workspace 이름
-    state                TEXT NOT NULL,           -- 워크플로우 상태 ('analyze', 'implement' 등)
-    phase                TEXT NOT NULL,           -- QueuePhase enum (lowercase)
-    title                TEXT,                    -- 표시용 제목
-    created_at           TEXT NOT NULL,           -- RFC3339
-    updated_at           TEXT NOT NULL,           -- RFC3339
+---
 
-    -- HITL 메타데이터 (phase = 'hitl' 일 때 유효)
-    hitl_created_at      TEXT,                    -- HITL 진입 시각
-    hitl_respondent      TEXT,                    -- 응답한 사용자
-    hitl_notes           TEXT,                    -- 사용자 메모
-    hitl_reason          TEXT,                    -- HitlReason enum (snake_case)
-    hitl_timeout_at      TEXT,                    -- 만료 시각 (RFC3339)
-    hitl_terminal_action TEXT,                    -- EscalationAction enum (snake_case)
+## 큐 상태 소유권
 
-    -- 추적 필드
-    replan_count         INTEGER NOT NULL DEFAULT 0,  -- 재계획 횟수 (max 3)
-    worktree_preserved   INTEGER NOT NULL DEFAULT 0   -- 1 = worktree 보존됨
-);
-```
+> 큐 아이템과 phase의 유일한 권위는 SQLite다. daemon의 in-memory 큐는 작업용 사본이고, 어긋나면 DB를 따른다. 상세: [QueuePhase 상태 머신](./queue-state-machine.md#상태-소유권)
 
-`hitl_terminal_action`은 `EscalationAction` enum 값만 허용한다. DB에는 snake_case 문자열로 저장, 로드 시 `FromStr`로 파싱한다. 유효하지 않은 값은 파싱 에러.
+---
 
-**인메모리 전용 필드** (DB에 저장하지 않음):
-- `previous_worktree_path: Option<String>` — retry 시 이전 아이템의 worktree 경로를 전달하기 위한 transient 필드
+## 전이 이력과 시도 이력
 
-### history
+두 이력은 역할이 다르다.
 
-작업 시도 기록. append-only로만 쓰고, 읽기 전용으로 조회한다. `failure_count`는 이 테이블에서 계산한다. **Stagnation detection도 이 테이블의 error를 입력으로 사용한다.**
+| | 전이 이력 | 시도 이력 |
+|---|---|---|
+| 질문 | "이 아이템에 무슨 일이 있었는가" | "이 작업을 몇 번 시도했고 어떻게 실패했는가" |
+| 단위 | 아이템(work_id) | 아이템 계열(source_id + state) |
+| 입력으로 쓰는 곳 | dashboard, 진행 알림, 감사 | failure_count, stagnation 분석 |
+| phase 권위 | 아니오 (상태를 재구성하지 않는다) | 아니오 |
 
-```sql
-CREATE TABLE history (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    work_id    TEXT NOT NULL,
-    source_id  TEXT NOT NULL,
-    state      TEXT NOT NULL,           -- 워크플로우 상태
-    status     TEXT NOT NULL,           -- 'running' | 'done' | 'failed' | 'skipped' | 'hitl'
-    attempt    INTEGER NOT NULL,        -- 시도 번호 (1-based)
-    summary    TEXT,                    -- 결과 요약
-    error      TEXT,                    -- 에러 메시지 (실패 시)
-    created_at TEXT NOT NULL            -- RFC3339
-);
-```
+### 전이 이력 계약
 
-**QueuePhase ↔ history.status 매핑**:
+- **append-only**다. 쓰기만 하고 수정하지 않는다.
+- phase 전이는 **phase 변경과 같은 트랜잭션**에서 기록된다. phase는 바뀌었는데 이력이 없거나 그 반대인 상태가 없다.
+- **전역 단조 증가 순서**를 가진다. log-cleanup 등으로 기록이 삭제되어도 순서 번호는 재사용되지 않는다. 진행 알림 같은 소비자는 이 순서를 따라 읽는다.
+- 새 아이템을 처음부터 Hitl로 만드는 경우에도 생성 사건이 기록된다 (이전 phase 없음).
+- 누가 했는지(actor)를 남긴다: daemon, cli, tui, cron, 외부 channel 이름.
+- 전이가 아닌 사건도 종류(kind)로 남긴다.
 
-| QueuePhase | history.status | 비고 |
+| 사건 종류 | 의미 |
+|-----------|------|
+| phase 전이 | phase 진입 |
+| hook | LifecycleHook 트리거 결과 |
+| stagnation | 탐지 패턴, confidence, reason, 추천 페르소나 |
+| `transition_rejected` | 처리 중 아이템에 대한 전이가 `busy`로 거절됨 |
+| `transition_conflict` | 기대 phase가 달라져 `conflict`로 끝남 (daemon 자기 전이 포함) |
+| `hitl_resolved` | HITL 요청 확정 (응답 또는 만료) |
+| `hitl_response_rejected` | 거절된 HITL 응답 (`already_handled`, `unauthorized` 등) |
+| `notification_failed` | 진행 알림 또는 거절 회신 발송 실패 |
+| `cancel_requested` / `cancel_accepted` / `cancel_closed` | 취소 요청 접수, daemon의 수락, 결과 종결 |
+| `post_processing_error` | HITL 후처리의 비치명 단계 실패 |
+| `post_processing_failed` | 후처리 결과 전이가 연속 실패해 Hitl→Failed로 탈출 |
+
+### 시도 이력 계약
+
+- append-only이고 읽기 전용으로 조회한다.
+- `failure_count`는 같은 아이템 계열의 실패 기록 수다. on_enter 실패도 포함한다.
+- stagnation 분석은 같은 `source_id`의 이전 실패 에러 메시지를 입력으로 쓴다. 상세: [Stagnation Detection](./stagnation.md)
+- 취소된 실행은 `skipped`로 기록되어 failure_count에 영향이 없다.
+- 전이 `conflict`로 버려진 실행은 기록하지 않는다 (failure_count 왜곡 방지). 이미 쓴 토큰 사용량은 기록한다.
+
+| QueuePhase | 시도 이력 상태 | 비고 |
 |------------|---------------|------|
-| Pending | — | 시도 아님, 기록 안 함 |
-| Ready | — | 시도 아님, 기록 안 함 |
+| Pending, Ready | — | 시도 아님 |
 | Running | `running` | handler 실행 중 |
-| Completed | — | 전이 상태, history에 기록 안 함 (`"completed"` 파싱 시 `Done`으로 매핑) |
+| Completed | — | 전이 상태 |
 | Done | `done` | 완료 |
 | Hitl | `hitl` | 사람 대기 |
 | Failed | `failed` | 실패 |
-| Skipped | `skipped` | 건너뜀 |
-
-**파생 쿼리**:
-- `failure_count`: `SELECT COUNT(*) FROM history WHERE source_id = ? AND state = ? AND status = 'failed'`
-- `max_attempt`: `SELECT MAX(attempt) FROM history WHERE source_id = ? AND state = ?`
-- **stagnation 입력**: `source_id` 전체 이력을 조회(`SELECT ... FROM history WHERE source_id = ? ORDER BY created_at ASC`)한 뒤, 호출자가 `state`와 `status = 'failed'`로 필터링하여 `error` 값만 모은다. 상세: [Stagnation Detection](./stagnation.md)
-
-### transition_events
-
-phase 전이 이벤트. history와 달리 phase 변경에 초점을 맞춘 상세 로그.
-
-```sql
-CREATE TABLE transition_events (
-    id         TEXT PRIMARY KEY,        -- UUID
-    work_id    TEXT NOT NULL,
-    source_id  TEXT NOT NULL,
-    event_type TEXT NOT NULL,           -- 'phase_enter' | 'handler' | 'evaluate' | 'hook' | 'stagnation'
-    phase      TEXT,                    -- 진입한 phase
-    from_phase TEXT,                    -- 이전 phase
-    detail     TEXT,                    -- 사람이 읽을 수 있는 설명
-    created_at TEXT NOT NULL            -- RFC3339
-);
-```
-
-`'hook'` 이벤트는 LifecycleHook 트리거를 기록하며 `detail`에 hook 종류(on_enter/on_done/on_fail/on_escalation)를 JSON으로 담는다. `'stagnation'` 이벤트는 탐지 패턴, confidence, reason, 추천 페르소나를 JSON으로 담는다 (상세: [Stagnation Detection](./stagnation.md)).
-
-### queue_dependencies
-
-아이템 간 실행 순서 제약. `depends_on` 아이템이 Done이 아니면 `work_id` 아이템은 Ready→Running 전이가 블로킹된다.
-
-dependency phase 확인은 **DB 조회 기반**이다 (in-memory queue가 아님). 재시작 후에도 정확히 동작한다.
-
-```sql
-CREATE TABLE queue_dependencies (
-    work_id    TEXT NOT NULL,
-    depends_on TEXT NOT NULL,
-    created_at TEXT NOT NULL,           -- RFC3339
-    PRIMARY KEY (work_id, depends_on)
-);
-```
-
-### specs
-
-스펙 정의. 6-status 라이프사이클을 따른다.
-
-```sql
-CREATE TABLE specs (
-    id                TEXT PRIMARY KEY,     -- UUID
-    workspace_id      TEXT NOT NULL,
-    name              TEXT NOT NULL,
-    status            TEXT NOT NULL,         -- SpecStatus enum (lowercase)
-    content           TEXT NOT NULL,         -- 마크다운 본문
-    priority          INTEGER,              -- 낮을수록 높은 우선순위
-    labels            TEXT,                 -- 쉼표 구분 레이블
-    depends_on        TEXT,                 -- 쉼표 구분 의존 spec ID
-    entry_point       TEXT,                 -- 쉼표 구분 파일/모듈 경로
-    decomposed_issues TEXT,                 -- 쉼표 구분 GitHub 이슈 번호
-    test_commands     TEXT,                 -- 쉼표 구분 검증 명령어
-    created_at        TEXT NOT NULL,         -- RFC3339
-    updated_at        TEXT NOT NULL          -- RFC3339
-);
-```
-
-### spec_links
-
-스펙과 외부 리소스(이슈 URL, PR 등) 간 연결.
-
-```sql
-CREATE TABLE spec_links (
-    id         TEXT PRIMARY KEY,
-    spec_id    TEXT NOT NULL,
-    target     TEXT NOT NULL,           -- URL 또는 'owner/repo#123'
-    created_at TEXT NOT NULL,
-    UNIQUE(spec_id, target)
-);
-```
-
-### workspaces
-
-등록된 워크스페이스. yaml 파일 경로를 참조한다.
-
-```sql
-CREATE TABLE workspaces (
-    name        TEXT PRIMARY KEY,
-    config_path TEXT NOT NULL,          -- workspace.yaml 절대 경로
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL
-);
-```
-
-### cron_jobs
-
-예약 작업. built-in(evaluate, hitl-timeout 등)과 사용자 정의 모두 저장.
-
-```sql
-CREATE TABLE cron_jobs (
-    name        TEXT PRIMARY KEY,
-    schedule    TEXT NOT NULL,           -- cron 표현식 ('*/5 * * * *')
-    script      TEXT NOT NULL DEFAULT '',
-    workspace   TEXT,                    -- NULL = 글로벌
-    enabled     INTEGER NOT NULL DEFAULT 1,
-    last_run_at TEXT,                    -- RFC3339, force_trigger 시 NULL로 리셋
-    created_at  TEXT NOT NULL,
-    updated_at  TEXT NOT NULL DEFAULT ''
-);
-```
-
-### token_usage
-
-LLM 호출 토큰 사용량. `belt status`와 TUI Dashboard에서 집계 표시.
-
-```sql
-CREATE TABLE token_usage (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    work_id            TEXT NOT NULL,
-    workspace          TEXT NOT NULL,
-    runtime            TEXT NOT NULL,       -- 'claude' | 'gemini' | 'codex'
-    model              TEXT NOT NULL,       -- 'opus' | 'sonnet' | 'haiku' 등
-    input_tokens       INTEGER NOT NULL,
-    output_tokens      INTEGER NOT NULL,
-    cache_read_tokens  INTEGER,
-    cache_write_tokens INTEGER,
-    duration_ms        INTEGER,
-    created_at         TEXT NOT NULL        -- RFC3339
-);
-```
-
-### knowledge_base
-
-merged PR에서 추출한 지식. knowledge-extract cron이 저장.
-
-```sql
-CREATE TABLE knowledge_base (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    workspace  TEXT NOT NULL,
-    source_ref TEXT NOT NULL,           -- 'PR #42'
-    category   TEXT NOT NULL,           -- 'decision' | 'pattern' | 'domain' | 'review_feedback'
-    content    TEXT NOT NULL,
-    created_at TEXT NOT NULL
-);
-```
+| Skipped | `skipped` | 건너뜀, 취소 포함 |
 
 ---
 
-## 도메인 Enum
+## HITL 요청
 
-### QueuePhase
+HITL 요청은 아이템과 별개의 **인스턴스**다. 같은 `work_id`가 HITL에 재진입(retry)할 수 있으므로, 아이템 id만으로 응답을 연결하면 이전 HITL에 대한 늦은 응답이 새 HITL을 닫는다. 요청마다 고유 `hitl_id`를 가진다.
 
-8개 상태. 직렬화 시 lowercase.
-
-| Variant | 직렬화 | Terminal | 설명 |
-|---------|--------|----------|------|
-| `Pending` | `"pending"` | No | DataSource가 감지, 큐 대기 |
-| `Ready` | `"ready"` | No | 실행 준비 완료 (자동 전이) |
-| `Running` | `"running"` | No | worktree 생성 + handler 실행 중 |
-| `Completed` | `"completed"` | No | handler 성공, evaluate 대기 |
-| `Done` | `"done"` | **Yes** | evaluate 완료 + hook.on_done() 성공 |
-| `Hitl` | `"hitl"` | No | 사람 판단 필요 |
-| `Failed` | `"failed"` | No | hook.on_done() 실패 또는 인프라 오류 |
-| `Skipped` | `"skipped"` | **Yes** | escalation skip 또는 preflight 실패 |
-
-`phase` 필드는 `pub(crate)` 가시성이다. 외부에서 직접 대입할 수 없고, 반드시 `QueueItem::transit()`을 경유한다. 상세: [QueuePhase 상태 머신](./queue-state-machine.md)
-
-### SpecStatus
-
-6개 상태. 직렬화 시 lowercase.
-
-| Variant | 직렬화 | 설명 |
-|---------|--------|------|
-| `Draft` | `"draft"` | 초기 상태 |
-| `Active` | `"active"` | 활성 (이슈 생성/처리 진행) |
-| `Paused` | `"paused"` | 일시 중단 |
-| `Completing` | `"completing"` | 모든 이슈 Done + gap 없음, HITL 대기 |
-| `Completed` | `"completed"` | 최종 완료 |
-| `Archived` | `"archived"` | 소프트 삭제 |
-
-### HitlReason
-
-HITL 생성 경로. 직렬화 시 snake_case.
-
-| Variant | 직렬화 | 설명 |
-|---------|--------|------|
-| `EvaluateFailure` | `"evaluate_failure"` | evaluate 반복 실패 |
-| `RetryMaxExceeded` | `"retry_max_exceeded"` | 재시도 횟수 초과 |
-| `Timeout` | `"timeout"` | 실행 타임아웃 |
-| `ManualEscalation` | `"manual_escalation"` | 사용자 수동 요청 |
-| `SpecConflict` | `"spec_conflict"` | 스펙 파일 겹침 |
-| `SpecCompletionReview` | `"spec_completion_review"` | 스펙 완료 최종 확인 |
-| `SpecModificationProposed` | `"spec_modification_proposed"` | Agent 수정 제안 |
-| `StagnationDetected` | `"stagnation_detected"` | 반복 패턴 감지 + lateral thinking 사고 전환 |
-
-### EscalationAction
-
-failure_count별 대응. 직렬화 시 snake_case.
-
-| Variant | 직렬화 | hook.on_fail 트리거 | 설명 |
-|---------|--------|:------------------:|------|
-| `Retry` | `"retry"` | **No** | 조용한 재시도 |
-| `RetryWithComment` | `"retry_with_comment"` | Yes | hook.on_fail + 재시도 |
-| `Hitl` | `"hitl"` | Yes | hook.on_fail + HITL 생성 |
-| `Skip` | `"skip"` | Yes | hook.on_fail + Skipped |
-| `Replan` | `"replan"` | Yes | hook.on_fail + HITL(replan) |
-
-모든 EscalationAction에서 `hook.on_escalation(action)` 트리거. `on_fail`은 Retry 제외 시 추가 트리거.
-
-`EscalationAction`은 `FromStr` + `Display` impl을 가진다. `hitl_terminal_action` 필드 타입으로도 사용된다.
-
-```rust
-impl FromStr for EscalationAction {
-    type Err = BeltError;
-    fn from_str(s: &str) -> Result<Self, Self::Err> { /* snake_case 파싱 */ }
-}
+```mermaid
+stateDiagram-v2
+    [*] --> open: HITL 열기
+    open --> resolved: 첫 확정 응답
+    open --> expired: timeout 만료
+    resolved --> PostProcessed: daemon 후처리 완료
+    expired --> PostProcessed: daemon 후처리 완료
+    PostProcessed --> [*]
 ```
 
-### StagnationPattern
+| 단계 | 아이템 phase | 처리 중 잠금 |
+|------|--------------|--------------|
+| open | Hitl | 아니오 |
+| resolved / expired, 후처리 미완료 | Hitl 유지 | 예 (후처리) |
+| 후처리 완료 | 결과 전이로 Done / Failed / Skipped / Pending | 해제 |
 
-정체 패턴 유형. 직렬화 시 snake_case.
+- **열기 계약** (한 트랜잭션): 모든 HITL 진입은 아래 둘 중 하나다.
+  - 기존 아이템: 전이 계약(X→Hitl) + 요청 open
+  - 새 아이템을 Hitl로 생성: 아이템 생성 + 생성 이력 + 요청 open (replan, spec 완료 경로)
+- **확정 계약**: 요청은 open일 때만 확정(resolved)되거나 만료(expired)된다. 동시 응답과 timeout은 하나만 이기고 나머지는 `already_handled`로 끝난다. DB 에러로 끝나지 않는다.
+- 확정 정보: 응답 액션, 응답자, 응답 경로(직접 / 자연어 확정), 시각, 메모. 만료 시각과 만료 시 terminal action도 요청에 속한다.
+- 후처리 완료 시각은 crash-safe 후처리 계약의 일부다. 결과 전이와 완료 표시는 한 트랜잭션이다.
+- **불변식**: open 요청이 있으면 그 아이템의 phase는 Hitl이다.
 
-| Variant | 직렬화 | 설명 |
-|---------|--------|------|
-| `Spinning` | `"spinning"` | 동일/유사 출력 반복 (A→A→A) |
-| `Oscillation` | `"oscillation"` | 교대 반복 (A→B→A→B) |
-| `NoDrift` | `"no_drift"` | 진행 점수 정체 |
-| `DiminishingReturns` | `"diminishing_returns"` | 개선폭 감소 |
+HITL 사유(`HitlReason`)는 생성 경로를 구분한다.
 
-현재 실제로 감지되는 패턴은 SPINNING·OSCILLATION이다. 상세: [Stagnation Detection](./stagnation.md)
+| 사유 | 설명 |
+|------|------|
+| `evaluate_failure` | evaluate 반복 실패 |
+| `retry_max_exceeded` | 재시도 횟수 초과 |
+| `timeout` | 실행 타임아웃 |
+| `manual_escalation` | 사용자 수동 요청 |
+| `spec_conflict` | 스펙 파일 겹침 |
+| `spec_completion_review` | 스펙 완료 최종 확인 |
+| `spec_modification_proposed` | Agent 수정 제안 |
+| `stagnation_detected` | 반복 패턴 감지 + lateral thinking |
 
-### Persona
+### HITL 요청 전달 기록
 
-Lateral Thinking 사고 전환 페르소나. belt-core에 `include_str!`로 내장. 직렬화 시 snake_case.
+HITL 요청 알림이 channel별로 어디까지 전달됐는지의 기록이다. 상세: [Notification](./notification.md)
 
-| Variant | 직렬화 | 패턴 친화도 | 전략 |
-|---------|--------|-----------|------|
-| `Hacker` | `"hacker"` | SPINNING | 제약 우회, 워크어라운드 |
-| `Architect` | `"architect"` | OSCILLATION | 구조 재설계, 관점 전환 |
-| `Researcher` | `"researcher"` | NO_DRIFT | 정보 수집, 체계적 디버깅 |
-| `Simplifier` | `"simplifier"` | DIMINISHING | 복잡도 축소, 가정 제거 |
-| `Contrarian` | `"contrarian"` | 복합/기타 | 가정 뒤집기, 문제 역전 |
+- `hitl_id` × channel 단위로 하나이고, 상태는 pending / sent / failed다.
+- 전달된 메시지의 참조(message_ref)를 남겨 외부 응답을 요청에 연결한다.
+- 상태 기반으로 다음 tick에 재시도하고 상한 뒤 failed가 된다. failed는 dashboard에 노출된다.
 
-상세: [Stagnation Detection](./stagnation.md)
+### 외부 응답 기록
 
-### HistoryStatus
+- `(channel, external_response_id)`는 유일하다. 같은 외부 응답은 재시작 후에도 한 번만 처리된다.
+- 승자의 응답을 다시 polling해도 거절로 처리되지 않는다.
 
-history 테이블의 status 컬럼. 직렬화 시 lowercase.
+---
 
-| Variant | 직렬화 |
-|---------|--------|
-| `Running` | `"running"` |
-| `Done` | `"done"` |
-| `Failed` | `"failed"` |
-| `Skipped` | `"skipped"` |
-| `Hitl` | `"hitl"` |
+## 취소 요청
+
+실행 중 아이템의 취소 의도를 담는 기록이다. 상세 경로: [실행 중 취소](./queue-state-machine.md#실행-중-취소)
+
+```mermaid
+stateDiagram-v2
+    [*] --> Requested: 요청자가 기록
+    Requested --> Accepted: daemon 수락
+    Accepted --> canceled: handler 종료 후 Running to Skipped
+    Requested --> canceled_directly: daemon 부재 또는 무응답, CLI 직접 전이
+    Requested --> too_late: 이미 Running을 벗어남
+    Accepted --> too_late: 이미 Running을 벗어남
+    canceled --> [*]
+    canceled_directly --> [*]
+    too_late --> [*]
+```
+
+- 아이템당 **열린 요청은 하나**다. 중복 요청은 같은 요청으로 본다.
+- 요청자(respondent)와 경로(cli / tui), 요청 시각, 결과를 남긴다.
+- 결과는 `canceled`, `canceled_directly`, `too_late` 중 하나이고 dashboard에 노출된다.
+
+## handler 프로세스 식별 정보
+
+- Running 진입 시 기록하고 Running을 벗어나면 비운다.
+- daemon이 없을 때 CLI의 직접 취소와 daemon 시작 시 정리가, 남은 handler 프로세스(하위 프로세스 포함)를 종료하는 데 쓴다.
+- 프로세스 식별 형식과 재사용 오인 방지는 구현이 맡는다.
+
+---
+
+## 아이템 의존
+
+`depends_on` 아이템이 Done이 아니면 해당 아이템은 Ready→Running 점유가 블로킹된다. 확인은 **DB 조회 기반**이라 재시작 후에도 정확하다. 순환과 자기 의존은 등록 시점에 거부한다. 상세: [Daemon](./daemon.md#dependency-gate)
+
+---
+
+## 도메인 어휘
+
+### 스펙 상태
+
+| 상태 | 설명 |
+|------|------|
+| `draft` | 초기 상태 |
+| `active` | 활성 (이슈 생성/처리 진행) |
+| `paused` | 일시 중단 |
+| `completing` | 모든 이슈 Done + gap 없음, HITL 대기 |
+| `completed` | 최종 완료 |
+| `archived` | 소프트 삭제 |
+
+### Escalation 액션
+
+| 액션 | on_fail 트리거 | 설명 |
+|------|:--------------:|------|
+| `retry` | 아니오 | 조용한 재시도 |
+| `retry_with_comment` | 예 | on_fail + 재시도 |
+| `hitl` | 예 | on_fail + HITL 생성 |
+| `skip` | 예 | on_fail + Skipped |
+| `replan` | 예 | on_fail + HITL(replan) |
+
+모든 액션에서 `on_escalation(action)`이 트리거되고, `on_fail`은 `retry`를 제외하고 추가로 트리거된다. HITL 요청의 terminal action은 이 중 허용된 값만 가진다. 유효하지 않은 값은 거부된다.
+
+### Stagnation 패턴과 페르소나
+
+| 패턴 | 설명 | 친화 페르소나 |
+|------|------|---------------|
+| `spinning` | 동일/유사 출력 반복 | `hacker` |
+| `oscillation` | 교대 반복 | `architect` |
+| `no_drift` | 진행 점수 정체 | `researcher` |
+| `diminishing_returns` | 개선폭 감소 | `simplifier` |
+| (복합/기타) | — | `contrarian` |
+
+현재 실제로 감지되는 패턴은 spinning·oscillation이다. 상세: [Stagnation Detection](./stagnation.md)
 
 ---
 
 ## 액션 타입
 
-handler와 lifecycle hook은 서로 다른 타입을 사용한다.
+handler와 lifecycle hook은 서로 다른 설정을 사용한다.
 
-### HandlerConfig (yaml 설정)
-
-handler 배열에서 사용. prompt + script 모두 가능.
+| 구분 | 설정 | 실행 |
+|------|------|------|
+| handler | `prompt` 또는 `script` | Daemon이 직접 실행. prompt는 LLM(worktree 안), script는 bash |
+| lifecycle 반응 | `on_enter` / `on_done` / `on_fail` script | script 어댑터가 LifecycleHook으로 감싸 실행 |
 
 ```yaml
 handlers:
@@ -357,182 +233,87 @@ handlers:
     runtime: claude            # optional
     model: sonnet              # optional
   - script: "cargo test"
-```
 
-### ScriptAction (yaml 설정, 호환 계층)
-
-yaml의 `on_done`/`on_fail`/`on_enter` script 설정과의 호환을 위해 유지된다. `ScriptLifecycleHook` 어댑터가 이를 소비해 `LifecycleHook` trait으로 감싼다.
-
-```yaml
 on_done:
   - script: "gh pr create ..."
-on_fail:
-  - script: "gh issue comment ..."
 ```
 
-> lifecycle 반응은 `LifecycleHook` trait으로 분리되어 있다. yaml script는 어댑터를 통해 호환을 유지한다. 상세: [LifecycleHook](./lifecycle-hook.md)
-
-### Action (런타임 추상화)
-
-코어의 실행 단위. handler의 `HandlerConfig`가 `Action`으로 변환되어 Executor가 실행한다.
-
-```
-HandlerConfig::Prompt  → Action::Prompt { text, runtime, model }
-HandlerConfig::Script  → Action::Script { command }
-ScriptAction           → Action::Script { command }
-```
-
----
-
-## Workspace yaml 설정 모델
-
-### WorkspaceConfig
-
-```yaml
-name: my-project
-concurrency: 2                    # workspace 동시 Running 수 (default: 1)
-
-sources:
-  github:
-    url: "https://github.com/org/repo"
-    scan_interval_secs: 300       # default: 300
-    states:
-      analyze:
-        trigger: { label: "belt:analyze" }
-        handlers:
-          - prompt: "이슈를 분석하세요"
-        on_done:
-          - script: "gh issue edit ... --add-label belt:implement"
-      # ... 추가 states
-    escalation:
-      1: retry
-      2: retry_with_comment
-      3: hitl
-      terminal: skip              # HITL 만료 시 ('skip' | 'replan')
-
-# stagnation 탐지 + lateral thinking 설정
-stagnation:
-  enabled: true                    # default: true
-  lateral:
-    enabled: true                  # default: true
-
-runtime:
-  default: claude
-  claude:
-    model: sonnet
-  gemini:
-    model: pro
-```
-
-### TriggerConfig
-
-| 필드 | 타입 | 설명 |
-|------|------|------|
-| `label` | `Option<String>` | 라벨 매칭 트리거 |
-| `changes_requested` | `bool` | PR CHANGES_REQUESTED 트리거 (default: false) |
+> workspace yaml 전체 스키마는 [workspace-schema](./workspace-schema.md)가 단일 출처다. 상세: [LifecycleHook](./lifecycle-hook.md)
 
 ---
 
 ## 컨텍스트 모델 (belt context 출력)
 
-`belt context $WORK_ID --json`이 반환하는 구조. script가 정보를 조회하는 유일한 방법.
+`belt context $WORK_ID --json`이 반환하는 구조. script가 정보를 조회하는 유일한 방법이다.
 
-`ItemContext`에는 `source_data: serde_json::Value` 필드가 있다 — DataSource가 자유 스키마로 채울 수 있는 OCP 확장점이다. GitHub DataSource는 이슈 조회 원본 응답을 가공 없이 `issue` 키 아래에 담는다(정제된 데이터는 최상위 `issue`/`pr` 필드에 담긴다). 소스 종류별로 키를 나누는 이유는 향후 PR 등 다른 원본 데이터가 추가돼도 서로 충돌하지 않게 하기 위해서다. 이슈 조회에 실패하면 `Null`로 남는다. `source_data`가 `Null`이면 JSON 출력에서 해당 키는 생략된다. 상세: [DataSource](./datasource.md)
+| 키 | 내용 |
+|----|------|
+| `work_id`, `workspace` | 아이템과 소속 workspace |
+| `queue` | 현재 phase, state, source_id |
+| `source` | source 종류, URL, 기본 브랜치 |
+| `issue`, `pr` | 정제된 이슈·PR 정보 (PR은 리뷰 포함) |
+| `history` | 같은 source의 시도 기록 |
+| `worktree` | worktree 경로 |
+| `source_data` | DataSource가 채우는 자유 스키마 확장점 |
 
-```json
-{
-  "work_id": "github:org/repo#42:implement",
-  "workspace": "my-project",
-  "queue": {
-    "phase": "running",
-    "state": "implement",
-    "source_id": "github:org/repo#42"
-  },
-  "source": {
-    "type": "github",
-    "url": "https://github.com/org/repo",
-    "default_branch": "main"
-  },
-  "issue": {
-    "number": 42,
-    "title": "...",
-    "body": "...",
-    "labels": ["belt:implement"],
-    "author": "user",
-    "state": "open"
-  },
-  "pr": {
-    "number": 43,
-    "title": "...",
-    "state": "open",
-    "draft": false,
-    "head_branch": "belt/42-implement",
-    "base_branch": "main",
-    "reviews": [
-      { "reviewer": "user", "state": "APPROVED" }
-    ]
-  },
-  "history": [
-    {
-      "work_id": "github:org/repo#42:analyze",
-      "state": "analyze",
-      "status": "done",
-      "attempt": 1,
-      "created_at": "2026-03-25T10:00:00Z"
-    }
-  ],
-  "worktree": "/tmp/belt/worktrees/42-implement",
-  "source_data": {
-    "issue": {
-      "title": "...",
-      "body": "...",
-      "labels": [{ "name": "belt:implement" }],
-      "author": { "login": "user" },
-      "state": "OPEN"
-    }
-  }
-}
-```
+- `source_data`는 소스 원본 응답을 가공 없이 담는다. GitHub은 이슈 원본을 `issue` 키 아래에 둔다. 소스 종류별로 키를 나눠 다른 원본이 추가돼도 충돌하지 않는다.
+- 이슈 조회에 실패하면 `source_data`는 비고, 비어 있으면 JSON 출력에서 키가 생략된다. 상세: [DataSource](./datasource.md)
 
-> `source_data` 도입을 둘러싼 단계적 마이그레이션 구상은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md)에 기록되어 있다. 현재 스키마·동작은 위 설명과 코드가 SSOT다.
+> `source_data` 도입의 단계적 마이그레이션 구상은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md)에 기록되어 있다.
 
 ---
 
 ## 타임스탬프 규칙
 
-- 모든 `created_at`, `updated_at`: **RFC3339 문자열** (`"2026-03-27T12:30:45Z"`)
-- 생성 시: `Utc::now().to_rfc3339()`
-- 파싱 시: `DateTime::parse_from_rfc3339()` → `DateTime<Utc>`
-- SQLite에 TEXT로 저장 (네이티브 datetime 미사용)
-
-## 직렬화 규칙
-
-| 대상 | serde 설정 |
-|------|-----------|
-| enum variant | `#[serde(rename_all = "lowercase")]` 또는 `"snake_case"` |
-| Optional 필드 | `#[serde(skip_serializing_if = "Option::is_none")]` |
-| bool default false | `#[serde(default, skip_serializing_if = "std::ops::Not::not")]` |
-| Vec default empty | `#[serde(default, skip_serializing_if = "Vec::is_empty")]` |
-| u32 default 0 | `#[serde(default, skip_serializing_if = "is_zero")]` |
+모든 기록 시각은 RFC3339 문자열(UTC)로 표현된다 (예: `2026-03-27T12:30:45Z`).
 
 ---
 
-## 테이블 관계
+## 기록 관계
 
+```mermaid
+erDiagram
+    WORKSPACE ||--o{ QUEUE_ITEM : owns
+    WORKSPACE ||--o{ SPEC : owns
+    WORKSPACE ||--o{ CRON_JOB : scopes
+    QUEUE_ITEM ||--o{ TRANSITION_EVENT : records
+    QUEUE_ITEM ||--o{ ATTEMPT : records
+    QUEUE_ITEM ||--o{ HITL_REQUEST : opens
+    QUEUE_ITEM ||--o{ CANCEL_REQUEST : receives
+    QUEUE_ITEM ||--o{ TOKEN_USAGE : consumes
+    QUEUE_ITEM ||--o{ DEPENDENCY : depends
+    HITL_REQUEST ||--o{ DELIVERY : delivered_by
+    SPEC ||--o{ SPEC_LINK : links
 ```
-queue_items.work_id ──< history.work_id
-queue_items.work_id ──< transition_events.work_id
-queue_items.work_id ──< token_usage.work_id
-queue_items.work_id ──< queue_dependencies.work_id
-queue_items.source_id ─── (같은 외부 엔티티를 공유하는 아이템들을 연결)
 
-specs.id ──< spec_links.spec_id
+> 참고: 기록 간 정합성은 애플리케이션 계층이 보장한다. 외래 키 제약은 선언하지 않는다.
 
-workspaces.name ──< queue_items.workspace_id
-workspaces.name ──< specs.workspace_id
-workspaces.name ──< cron_jobs.workspace
-workspaces.name ──< token_usage.workspace
-workspaces.name ──< knowledge_base.workspace
-```
+---
 
-> 참고: FK 제약은 SQLite에서 명시적으로 선언하지 않는다. 애플리케이션 레이어에서 정합성을 보장한다.
+## 수용 기준
+
+### 전이 이력
+
+- [ ] 모든 phase 전이는 같은 트랜잭션으로 전이 이력에 남는다
+- [ ] 전이 이력의 순서는 전역 단조 증가이고, 기록이 삭제되어도 재사용되지 않는다
+- [ ] `busy` 거절, `conflict`, 취소 요청·수락·종결, 후처리 오류가 이력 종류로 남는다
+- [ ] 시도 이력은 failure_count와 stagnation 입력으로만 쓰이고 phase 권위가 아니다
+
+### HITL 요청
+
+- [ ] HITL 요청마다 고유 식별자를 가지고, 같은 work_id의 재진입이 이전 요청에 대한 응답과 섞이지 않는다
+- [ ] 동시 응답과 timeout 중 하나만 확정되고 나머지는 `already_handled`다
+- [ ] 결과 전이와 후처리 완료 표시는 한 트랜잭션이다
+- [ ] open 요청이 있는 아이템의 phase는 항상 Hitl이다
+- [ ] 같은 외부 응답은 재시작 후에도 한 번만 처리된다
+
+### 취소 요청
+
+- [ ] 아이템당 열린 취소 요청은 하나이고, 요청자·경로·결과가 남는다
+- [ ] Running 진입 시 handler 프로세스 식별 정보가 기록되고 Running을 벗어나면 비워진다
+
+### 일반
+
+- [ ] queue dependency의 phase 확인은 DB 조회 기준이다
+- [ ] 순환 의존과 자기 의존은 등록 시점에 거부된다
+- [ ] 모든 시각은 RFC3339 UTC 문자열이다

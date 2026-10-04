@@ -1,6 +1,6 @@
 # QueuePhase 상태 머신
 
-> 큐 아이템의 전체 생명주기를 정의한다.
+> 큐 아이템의 전체 생명주기와 상태 소유권을 정의한다.
 > 상위 설계는 [DESIGN](../DESIGN.md) 참조.
 
 ---
@@ -9,150 +9,255 @@
 
 | Phase | 설명 |
 |-------|------|
-| **Pending** | DataSource.collect()가 감지, 큐 대기 |
+| **Pending** | DataSource가 감지, 큐 대기 |
 | **Ready** | 실행 준비 완료 (자동 전이) |
-| **Running** | worktree 생성 + handler 실행 중 |
-| **Completed** | handler 전부 성공, evaluate 대기 |
-| **Done** | evaluate 완료 판정 + on_done script 성공 |
-| **HITL** | evaluate가 사람 판단 필요로 분류 |
-| **Skipped** | escalation skip 또는 preflight 실패 |
-| **Failed** | on_done script 실패, 인프라 오류 등 |
+| **Running** | worktree 생성 + handler 실행 중 (처리 중 잠금) |
+| **Completed** | handler 전부 성공, evaluate 대기 (잠금 아님) |
+| **Done** | evaluate 완료 판정 + on_done script 성공 (terminal) |
+| **Hitl** | 사람 판단 필요 (응답 확정 후 후처리 중이면 처리 중 잠금) |
+| **Skipped** | escalation skip, preflight 실패, 실행 중 취소 (terminal) |
+| **Failed** | on_done script 실패, 인프라 오류, HITL 후처리 실패 등 |
 
 ---
 
-## Phase 전이 캡슐화
+## 상태 소유권
 
-`QueueItem.phase` 필드를 직접 대입하면 `can_transition_to()` 검증을 우회할 수 있다.
-모든 전이는 `QueueItem::transit()` 메서드로 강제된다.
+> 큐 아이템과 phase의 유일한 권위는 SQLite다. daemon의 in-memory 큐는 작업용 사본이며, 사본과 DB가 다르면 DB를 따른다.
 
-```rust
-impl QueueItem {
-    /// phase 필드는 pub(crate) — belt-core 외부에서 직접 대입 불가
-    /// 읽기는 pub getter: fn phase(&self) -> QueuePhase
+| 행위자 | 상태에 대한 권한 |
+|--------|------------------|
+| daemon | 처리 소유자. handler 실행·HITL 후처리의 결과로 phase를 바꾼다 |
+| CLI / TUI | 전이 계약을 통해서만 phase를 바꾼다. 처리 중인 아이템에는 취소 요청만 남긴다 |
+| evaluator | Completed 아이템을 전이 계약으로 Done 또는 Hitl로 바꾸는 정당한 행위자다 |
+| cron (hitl-timeout 등) | HITL 요청을 만료시키는 경합에 참여한다. phase는 직접 바꾸지 않는다 |
 
-    pub fn transit(&mut self, to: QueuePhase) -> Result<QueuePhase, BeltError> {
-        let from = self.phase;
-        if !from.can_transition_to(&to) {
-            return Err(BeltError::InvalidTransition { from, to });
-        }
-        self.phase = to;
-        self.updated_at = Utc::now().to_rfc3339();
-        Ok(from)
-    }
-}
-```
-
-### 테스트 지원
-
-테스트에서 특정 phase의 아이템을 생성하려면 빌더를 사용한다:
-
-```rust
-// 테스트 전용 빌더 (cfg(test) 또는 #[doc(hidden)])
-QueueItem::builder()
-    .work_id("test:1:analyze")
-    .with_phase(QueuePhase::Running)  // 검증 없이 직접 설정
-    .build()
-```
-
-### DB 로드
-
-`belt-infra/db.rs`의 `from_row()`는 `pub(crate)` 접근 가능하므로 DB에서 로드 시 phase 직접 설정이 가능하다.
+- 모든 phase 전이는 전이 이력에 남는다 ([Data Model](./data-model.md) 참조).
+- 한 DB에는 daemon이 하나만 동작한다는 전제다. 처리 소유자 "daemon"은 이 단일 인스턴스를 뜻한다.
 
 ---
 
 ## 전체 상태 전이
 
+```mermaid
+stateDiagram-v2
+    [*] --> Pending: DataSource 수집
+    Pending --> Ready: 자동 전이
+    Pending --> Skipped: skip
+    Ready --> Running: 점유 concurrency 제한
+    Ready --> Done: 이력 기반 사전 판정
+    Ready --> Hitl: spec 충돌 감지
+    Ready --> Skipped: skip
+
+    Running --> Completed: handler 전부 성공
+    Running --> Failed: handler 또는 on_enter 실패
+    Running --> Skipped: 실행 중 취소
+    Running --> Pending: 롤백 shutdown 또는 재시작
+
+    Completed --> Done: evaluate 완료 판정 + on_done 성공
+    Completed --> Failed: on_done 실패
+    Completed --> Hitl: evaluate 사람 필요
+
+    Failed --> Done: 수동 done
+    Failed --> Skipped: skip
+
+    Hitl --> Done: 후처리 done
+    Hitl --> Failed: 후처리 실패
+    Hitl --> Pending: 후처리 retry 또는 replan
+    Hitl --> Skipped: 후처리 skip
+
+    Done --> [*]
+    Skipped --> [*]
 ```
-                            DataSource.collect()
-                                    │
-                                    ▼
-                    ┌───────────────────────────────┐
-                    │           Pending              │
-                    │   (큐 대기, 수집됨)              │
-                    └───────────────┬───────────────┘
-                                    │ 자동 전이
-                                    ▼
-                    ┌───────────────────────────────┐
-                    │            Ready               │
-                    │   (실행 준비 완료)               │
-                    └───────────────┬───────────────┘
-                                    │ 자동 전이 (concurrency 제한)
-                                    ▼
-                    ┌───────────────────────────────┐
-                    │           Running              │
-                    │                                │
-                    │  ① worktree 생성 (or 재사용)    │
-                    │  ② on_enter script             │
-                    │  ③ handlers 순차 실행           │
-                    │     prompt → LLM (worktree)    │
-                    │     script → bash              │
-                    └──────┬────────────┬───────────┘
-                           │            │
-                    전부 성공        handler/on_enter 실패
-                           │            │
-                           ▼            ▼
-          ┌─────────────────┐    ┌─────────────────────────────┐
-          │    Completed     │    │  Stagnation Analyzer (항상 실행)│
-          │                  │    │                               │
-          │  handler 완료    │    │  ① 가중 합성 유사도로         │
-          │  evaluate 대기   │    │    실패 이력 유사도 분석      │
-          │                  │    │  ② 패턴 감지 시              │
-          │  force_trigger   │    │    페르소나 선택 →           │
-          │  ("evaluate")    │    │    고정 directive로 조합      │
-          └────────┬────────┘    │    → lateral_plan 생성        │
-                   │              │                               │
-                   │              │  Escalation (failure_count):  │
-                   │              │  1: retry                    │
-                   │              │     → lateral_plan 주입       │
-                   │              │     → 새 아이템 → Pending     │
-                   │              │     → worktree 보존          │
-                   │              │     → on_fail 실행 안 함      │
-                   │              │                               │
-                   │              │  2: retry_with_comment        │
-                   │              │     → lateral_plan 주입       │
-                   │              │     → on_fail script 실행     │
-                   │              │     → 새 아이템 → Pending     │
-                   │              │     → worktree 보존          │
-                   │              │                               │
-                   │              │  3: hitl                      │
-                   │              │     → lateral 이력 첨부(hitl_notes) │
-                   │              │     → on_fail script 실행     │
-                   │              │     → HITL 이벤트 생성 ───────┐│
-                   │              │     → worktree 보존          ││
-                   │              │                               ││
-                   │              │  terminal: skip 또는 replan   ││
-                   │              │     (hitl timeout 시 적용)     ││
-                   │              │     skip   → Skipped ─────────┼┼──┐
-                   │              │     replan → HITL(replan) ────┤│  │
-                   │              └───────────────────────────────┘│  │
-                   │                                               │  │
-                   │  Evaluator (per-item, Daemon tick)             │  │
-                   │  (LLM이 belt queue done/hitl CLI 호출)     │  │
-                   │                                               │  │
-              ┌────┴────┐                                          │  │
-              │         │                                          │  │
-          완료 판정   사람 필요                                      │  │
-              │         │                                          │  │
-              ▼         ▼                                          │  │
-    ┌──────────┐    ┌──────────────────────────────────────┐       │  │
-    │ on_done  │    │                HITL                   │◄──────┘  │
-    │ script   │    │                                      │          │
-    │ 실행     │    │  사람 대기 (worktree 보존)             │          │
-    └──┬───┬──┘    │                                      │          │
-       │   │       │  응답 경로:                            │          │
-    성공  실패     │    "done"  → on_done → Done           │          │
-       │   │       │    "retry" → 새 아이템 → Pending      │          │
-       ▼   ▼       │    "skip"  → Skipped                 │          │
-  ┌──────┐┌─────┐  │    "replan"→ 스펙 수정 제안           │          │
-  │ Done ││ Fail│  └──────────────────────────────────────┘          │
-  │      ││ ed  │                                                    │
-  │ wt   ││     │  ┌──────────────────────────────────────┐          │
-  │ 정리  ││ wt  │  │              Skipped                 │◄─────────┘
-  │      ││ 보존 │  │                                      │
-  └──────┘│ 로그 │  │  terminal (worktree 정리)             │
-          │ 기록 │  └──────────────────────────────────────┘
-          └─────┘
+
+> 다이어그램의 전이는 허용된 전이의 집합이다. 허용되지 않은 전이 요청은 `invalid_action`으로 거절된다.
+
+### Running 이후의 분기
+
+```mermaid
+flowchart TD
+    R["Running"] --> S{"handler 결과"}
+    S -- "전부 성공" --> C["Completed"]
+    S -- "handler 또는 on_enter 실패" --> A["Stagnation 분석 항상 실행"]
+    A --> F{"failure_count"}
+    F -- "1 retry" --> R1["lateral_plan 주입, 새 아이템 Pending, worktree 보존, on_fail 없음"]
+    F -- "2 retry_with_comment" --> R2["lateral_plan 주입, on_fail 실행, 새 아이템 Pending, worktree 보존"]
+    F -- "3 hitl" --> H["on_fail 실행, lateral 이력 첨부, HITL 요청 생성, worktree 보존"]
+    C --> E{"evaluate per-item"}
+    E -- "완료 판정" --> D["on_done 실행"]
+    E -- "사람 필요" --> H
+    D -- "성공" --> Done["Done, worktree 정리"]
+    D -- "실패" --> Failed["Failed, worktree 보존"]
+    H --> P["사람 응답 후 daemon 후처리"]
+    P -- "done" --> Done
+    P -- "skip" --> Sk["Skipped, worktree 정리"]
+    P -- "retry 또는 replan" --> Pe["Pending"]
 ```
+
+---
+
+## 전이 계약
+
+모든 phase 전이는 하나의 계약을 거친다. 어느 행위자도 phase를 직접 덮어쓰지 않는다.
+
+```mermaid
+flowchart TD
+    Q["전이 요청: 아이템, 기대 phase, 목표 phase, 행위자"] --> G1{"처리 중이고 행위자가 소유자가 아닌가"}
+    G1 -- "예, 잠금 유효" --> B["busy 거절 + 거절 이력"]
+    G1 -- "아니오" --> G2{"Hitl 에서 나가는 요청인가"}
+    G2 -- "예, 후처리가 아님" --> X{"HITL 응답으로 대응되는가"}
+    X -- "예" --> HR["HITL 응답으로 전환: 첫 응답 승리 경합"]
+    X -- "아니오" --> IA["invalid_action 거절"]
+    G2 -- "아니오" --> G3{"현재 phase 가 기대 phase 와 같은가"}
+    G3 -- "아니오" --> CF["conflict: 현재 phase 반환 + 충돌 이력"]
+    G3 -- "예" --> AP["phase 변경 + 전이 이력 기록, 한 트랜잭션: applied"]
+```
+
+| 결과 | 의미 |
+|------|------|
+| `applied` | phase 변경과 전이 이력이 함께 기록되었다 |
+| `busy` | 처리 중인 아이템에 소유자가 아닌 행위자가 요청했다. 처리 종류(handler / 후처리)를 함께 알린다. 거절도 이력에 남는다 |
+| `conflict` | 잠기지 않은 phase(Pending, Ready, Completed, Failed)에서 기대 phase가 이미 달라졌다. 정상 경합의 결과이며 현재 phase를 함께 알린다 |
+
+- `busy`, `conflict`, `invalid_action`은 오류가 아니라 값이다. 호출자는 non-zero 종료와 `--json` reason, TUI 토스트로 확인한다.
+- 동시 전이는 하나만 `applied`이고 나머지는 위 값 중 하나로 끝난다.
+- `conflict`의 예: Ready에서 사람의 skip과 daemon의 점유가 경합한다. Completed에서 evaluator와 사람의 조작이 경합한다.
+- 목표 phase가 허용된 전이 집합 밖이면 거절된다. 허용 집합은 위 상태 전이 다이어그램이다.
+
+---
+
+## 처리 중 잠금
+
+> 처리 중인 아이템은 처리 소유자만 바꾼다. 새 phase나 별도 잠금 값을 두지 않고 기존 상태에서 파생한다.
+
+```mermaid
+stateDiagram-v2
+    Ready --> Running: 점유가 곧 잠금 획득
+    Running --> Completed: 결과 전이가 잠금 해제
+    Running --> Failed: 결과 전이가 잠금 해제
+    Running --> Skipped: 취소가 잠금 해제
+    Running --> Pending: 롤백이 잠금 해제
+    HitlOpen --> HitlResolved: 판정 확정이 잠금 획득
+    HitlResolved --> Done: 결과 전이가 잠금 해제
+    HitlResolved --> Failed: 결과 전이가 잠금 해제
+    HitlResolved --> Skipped: 결과 전이가 잠금 해제
+    HitlResolved --> Pending: 결과 전이가 잠금 해제
+    note right of Running
+        처리 중 handler 실행
+        소유자 daemon
+    end note
+    note right of HitlResolved
+        처리 중 후처리
+        phase는 Hitl 유지
+        소유자 daemon 후처리
+    end note
+```
+
+| 처리 중 | 조건 | 소유자 | 풀리는 시점 |
+|---------|------|--------|-------------|
+| (i) handler | phase가 Running | daemon | Running에서 나가는 결과 전이 (Completed, Failed, Skipped, Pending) |
+| (ii) 후처리 | phase가 Hitl이고 그 HITL 요청이 확정(resolved 또는 expired)됐으나 후처리 미완료 | daemon 후처리 | Hitl에서 나가는 결과 전이 (Done, Failed, Skipped, Pending) |
+
+- **Completed는 잠금이 아니다.** evaluator가 전이 계약으로 전이하는 정당한 행위자이기 때문이다. 평가 중 사람의 조작이 이기면 evaluator의 판정은 `conflict`로 버려진다.
+- **잠금 무효**: 소유자 daemon이 없거나 응답하지 않으면 처리 중 (i) 잠금은 무효다. 무효 판정은 [실행 중 취소](#실행-중-취소) 경로에서만 쓰고, 그 밖의 외부 전이는 여전히 `busy`다.
+
+| 판정 | 기준 |
+|------|------|
+| 부재 | 기록된 daemon 프로세스가 살아 있지 않다. 즉시 무효 |
+| 무응답 | 프로세스는 살아 있지만, 취소 요청으로 깨운 뒤 제한 시간 안에 daemon이 취소 수락을 이력에 남기지 않았다 |
+
+- 무응답 판정이 틀려 daemon이 살아 있었다면, 이후 daemon의 결과 전이는 `conflict`가 되고 daemon은 DB를 따른다 ([Daemon](./daemon.md#db-관찰과-자기-전이-conflict) 참조).
+- crash로 남은 잠금: (i)은 시작 시 Running→Pending 롤백으로, (ii)는 상태 기반 후처리가 재시작 뒤 다시 실행되어 풀린다.
+
+---
+
+## 실행 중 취소
+
+실행 중 아이템 취소는 전이 요청이 아니라 **취소 요청**이다. 처리 중 잠금에서 `busy`로 거절되지 않는 유일한 외부 의도다. 진입점은 `belt queue skip`과 TUI 취소 키다.
+
+### 대상 phase별 의미
+
+| 아이템 상태 | `skip`의 의미 |
+|-------------|---------------|
+| Running | 취소 (아래 두 경로) |
+| Pending, Ready, Failed | 전이 계약으로 바로 Skipped. Ready에서 점유와 경합해 `conflict`면 한 번 다시 판단해 취소 경로로 넘어간다 |
+| Hitl (open) | HITL 응답 skip으로 전환되어 첫 응답 승리 경합에 참여한다 |
+| Hitl (후처리 중) | `busy` |
+
+### 취소 경로
+
+```mermaid
+sequenceDiagram
+    participant U as 사용자 CLI TUI
+    participant DB as SQLite
+    participant D as daemon
+    participant H as handler 프로세스
+
+    Note over U,H: 경로 1 daemon 생존
+    U->>DB: 취소 요청 기록 요청자와 경로 포함
+    U->>D: 즉시 깨움 tick을 기다리지 않음
+    D->>DB: 취소 수락 이력
+    D->>H: 종료
+    D->>DB: Running to Skipped 전이 계약
+    D->>DB: 요청을 canceled 로 닫음
+    DB-->>U: canceled
+
+    Note over U,H: 경로 2 daemon 부재 또는 무응답
+    U->>DB: 취소 요청 기록
+    U->>D: 깨움 시도
+    U->>U: 제한 시간 안에 수락 이력 없음 또는 프로세스 부재 확인
+    U->>DB: Running to Skipped 전이 계약 행위자 cli
+    U->>H: 남은 handler 프로세스 정리
+    U->>DB: 요청을 canceled_directly 로 닫음
+    DB-->>U: canceled_directly
+```
+
+| 결과 | 의미 |
+|------|------|
+| `canceled` | daemon이 handler를 종료하고 Running→Skipped로 바꿨다 |
+| `canceled_directly` | daemon 부재 또는 무응답으로 CLI가 직접 Running→Skipped로 바꾸고 남은 handler를 정리했다 |
+| `too_late` | 처리 전에 이미 Running을 벗어났다. phase는 그 결과를 따른다 |
+| `busy` | HITL 후처리 중이다 |
+
+- 소유자가 살아 있으면 상태는 소유자만 바꾸고 외부는 요청만 남긴다. 소유자가 없을 때만 외부가 바꾼다.
+- 취소 요청과 결과는 아이템 이력에 요청자와 경로(cli / tui)와 함께 남는다. 아이템당 열린 취소 요청은 하나이고 중복 요청은 같은 요청으로 본다.
+- 취소된 실행의 hook(on_done / on_fail / on_escalation)과 escalation은 실행하지 않는다. 시도 이력에는 `skipped`로 남아 failure_count에 영향이 없다. 토큰 사용량은 기록한다.
+- 취소된 아이템의 worktree는 Skipped 규칙(정리)을 따른다.
+- daemon 부재 중 CLI가 Skipped로 만든 아이템은 daemon이 재시작할 때 DB를 따른다.
+- 취소는 channel event `skipped`를 낸다. origin 기본 이벤트에 `skipped`가 없으므로 기본 설정에서는 외부로 나가지 않는다. 상세: [Notification](./notification.md)
+
+---
+
+## Hitl 출구 규칙
+
+> Hitl에서 나가는 전이는 daemon 후처리만 수행한다. 다른 행위자의 요청은 HITL 응답으로 바꾸거나 `invalid_action`으로 거절한다.
+
+```mermaid
+stateDiagram-v2
+    [*] --> HitlOpen: HITL 요청 open
+    HitlOpen --> HitlResolved: 첫 확정 응답 또는 timeout 만료
+    HitlResolved --> Done: 후처리 done 성공
+    HitlResolved --> Failed: on_done 실패 또는 후처리 연속 실패
+    HitlResolved --> Skipped: 후처리 skip
+    HitlResolved --> Pending: 후처리 retry 또는 replan
+    note right of HitlOpen
+        phase는 Hitl
+        queue skip 과 queue done 은 HITL 응답으로 전환
+    end note
+    note right of HitlResolved
+        phase는 Hitl 유지
+        처리 중 후처리
+        외부 전이 요청은 busy
+    end note
+```
+
+| 요청 | 결과 |
+|------|------|
+| `belt queue skip` / `belt queue done` (open HITL) | HITL 응답 skip / done으로 전환. 판정 승리 또는 `already_handled` |
+| 대응되는 HITL 액션이 없는 요청 (예: 이미 Hitl인 아이템에 `belt queue hitl`) | `invalid_action` |
+| HITL 후처리 중 외부 전이 | `busy` |
+
+- **불변식**: open HITL 요청이 있으면 그 아이템의 phase는 Hitl이다. 후처리는 open이 아닌(resolved / expired) 요청에서만 시작되므로 open 요청이 주인 없이 남지 않는다.
+- 응답 직후에도 phase는 Hitl이고 화면에는 "해결됨 · 처리 중"으로 보인다. phase는 후처리의 결과로만 바뀐다. 상세: [Daemon](./daemon.md#hitl-해결-후처리)
 
 ---
 
@@ -163,15 +268,32 @@ QueueItem::builder()
 | Running | 생성 (또는 retry 시 기존 보존분 재사용) |
 | Completed | 유지 (evaluate 대기) |
 | Done | **정리** |
-| HITL | 보존 (사람 확인 후 결정) |
+| Hitl | 보존 (사람 확인 후 결정) |
 | Failed | 보존 (디버깅용) |
-| Skipped | 정리 |
+| Skipped (취소 포함) | 정리 |
 | Retry | 보존 (이전 작업 위에서 재시도) |
-| Graceful shutdown 롤백 (Running→Pending) | **보존** (재시작 후 재사용) |
+| Graceful shutdown 또는 재시작 롤백 (Running→Pending) | **보존** (재사용) |
 | hitl-timeout (HITL 만료) | **정리** |
 | log-cleanup cron | 보존된 worktree 중 TTL 초과분 정리 |
 
-**정리 원칙**: worktree는 **Done 또는 Skipped**가 되어야만 정리한다. HITL 만료 시에도 정리하여 좀비 worktree를 방지한다. Shutdown 롤백 시에는 재시작 후 재사용을 위해 보존한다. 나머지 보존분(Failed 등)은 `log-cleanup` cron이 TTL(기본 7일) 기준으로 주기 정리한다.
+**정리 원칙**: worktree는 **Done 또는 Skipped**가 되어야만 정리한다. HITL 만료 시에도 정리하여 좀비 worktree를 방지한다. 롤백 시에는 재사용을 위해 보존한다. 나머지 보존분(Failed 등)은 `log-cleanup` cron이 TTL(기본 7일) 기준으로 주기 정리한다. 전이 결과가 `conflict`인 실행의 worktree는 DB에 남은 phase의 규칙을 따른다.
+
+---
+
+## DB 로드와 시작 시 복원
+
+```mermaid
+flowchart TD
+    S["daemon 시작"] --> K["이전 daemon 이 남긴 handler 프로세스 종료"]
+    K --> RB["Running 아이템을 Pending 으로 롤백, worktree 보존"]
+    RB --> L["non-terminal 아이템을 DB 에서 복원"]
+    L --> T["tick 시작, 이후 매 tick DB 우선"]
+```
+
+- 시작 시 non-terminal 아이템을 DB에서 복원한다. in-memory 큐가 DB보다 앞서 존재하지 않는다.
+- 롤백 전에 이전 daemon이 남긴 handler 프로세스를 종료한다. 단일 daemon 전제이므로 남은 프로세스는 모두 이전 daemon의 것이다.
+- daemon 부재 중 CLI가 만든 Skipped처럼 DB에 기록된 phase는 그대로 따른다.
+- 수집한 아이템은 즉시 Pending으로 DB에 기록된다.
 
 ---
 
@@ -187,9 +309,9 @@ QueueItem::builder()
 
 > `skip`과 `replan`은 hitl의 응답 경로 또는 hitl timeout 시 `terminal` 설정에 의해 적용된다. 독립적인 escalation level이 아니다. 상세는 [DataSource](./datasource.md)의 Escalation 정책 참조.
 
-failure_count는 append-only history에서 계산한다: `history | filter(state, failed) | count`. on_enter 실패도 handler 실패와 동일하게 failure_count에 포함된다.
+failure_count는 시도 이력(append-only)에서 같은 아이템 계열의 실패 횟수로 계산한다. on_enter 실패도 handler 실패와 동일하게 포함된다.
 
-> 과거 실패 이력이 있는 모든 실패에서 완전 일치·토큰 중복도·압축 유사도의 가중 합성 기준으로 유사도 분석을 수행한다. 패턴이 감지되면 내장 페르소나(HACKER, ARCHITECT 등) 중 하나가 선택되고, 그 페르소나의 고정 directive로 lateral_plan을 구성하여 retry 시 handler prompt에 주입한다. escalation 자체는 기존 failure_count 기반 그대로이되, **패턴이 감지된 retry는 lateral plan으로 강화**된다. 상세: [Stagnation Detection](./stagnation.md)
+> 과거 실패 이력이 있는 모든 실패에서 완전 일치·토큰 중복도·압축 유사도의 가중 합성 기준으로 유사도 분석을 수행한다. 패턴이 감지되면 내장 페르소나 중 하나가 선택되고, 그 페르소나의 고정 directive로 lateral_plan을 구성하여 retry 시 handler prompt에 주입한다. escalation 자체는 failure_count 기반 그대로이되, **패턴이 감지된 retry는 lateral plan으로 강화**된다. 상세: [Stagnation Detection](./stagnation.md)
 
 ---
 
@@ -201,23 +323,15 @@ failure_count는 append-only history에서 계산한다: `history | filter(state
 
 2. **"충분한가?"만 판단** — "이 handler의 결과물이 다음 단계로 넘어가기에 충분한가?"만 본다. 품질 판단(좋은 코드인가?)은 Cron 품질 루프가 담당한다.
 
-3. **state별 구체 기준은 agent-workspace rules에 위임** — `~/.belt/agent-workspace/.claude/rules/classify-policy.md`에 state별 Done 조건을 정의한다. 코어는 rules를 모르고, `belt agent`가 rules를 참조하여 판단한다.
+3. **state별 구체 기준은 agent-workspace rules에 위임** — state별 Done 조건은 agent-workspace의 분류 정책 rules에 정의한다. 코어는 rules를 모르고, `belt agent`가 rules를 참조하여 판단한다.
 
 ### Per-Item 판정
 
-evaluate는 **per-work_id 단위**로 LLM 판정을 실행한다. 각 Completed 아이템에 대해 개별 프롬프트를 발행하고, 해당 아이템의 context를 포함한다.
-
-```
-for item in queue.get(Completed):
-    belt_agent_p(workspace,
-        "아이템 {work_id}의 완료 여부를 판단해줘.
-         belt context {work_id} --json 으로 컨텍스트를 확인하고,
-         belt queue done {work_id} 또는 belt queue hitl {work_id} 를 실행해줘")
-```
+evaluate는 **per-work_id 단위**로 LLM 판정을 실행한다. 각 Completed 아이템에 대해 개별 판정을 발행하고, 해당 아이템의 context를 포함한다. 판정 결과는 `belt queue done` 또는 `belt queue hitl` 호출로 전이 계약에 전달된다.
 
 - 개별 판정 실패 시 해당 아이템만 Completed에 머물고, 다른 아이템 판정에 영향 없다
 - evaluate LLM 호출도 `daemon.max_concurrent` slot을 소비한다 — 별도 batch 제어 없음
-- 기존 `eval_failure_counts`는 이미 per-work_id로 관리됨 (설계 의도 일치)
+- 판정이 `conflict`로 지면 DB phase를 따르고 그 판정 결과는 버린다. 이미 쓴 평가 비용은 버려진다.
 
 ### 실패 원칙
 
@@ -226,7 +340,7 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 | 실패 유형 | 동작 | 상태 |
 |-----------|------|------|
 | evaluate LLM 오류/timeout | Completed 유지, 다음 Daemon tick에서 재시도 | Completed |
-| evaluate 반복 실패 (3회) | HITL로 에스컬레이션 | → HITL |
+| evaluate 반복 실패 (3회) | HITL로 에스컬레이션 | → Hitl |
 | CLI 호출 실패 (`belt queue done/hitl`) | Completed 유지 + 에러 로그, 다음 tick 재시도 | Completed |
 | on_done script 실패 | Failed 상태 (on_fail은 실행하지 않음 — handler 실패가 아니므로) | → Failed |
 
@@ -234,26 +348,54 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 ## 수용 기준
 
-### Phase 전이 캡슐화
+### 상태 소유권과 전이 계약
 
-- [ ] `QueueItem.phase` 필드는 `pub(crate)` 가시성으로, belt-core 외부에서 직접 대입 불가
-- [ ] 모든 phase 변경은 `QueueItem::transit(to)` 메서드를 경유한다
-- [ ] `transit()` 메서드는 내부에서 `can_transition_to()` 검증 + `updated_at` 갱신을 수행한다
-- [ ] 테스트 코드에서도 phase 직접 대입 대신 `transit()` 또는 테스트 헬퍼를 사용한다
+- [ ] 큐 아이템과 phase의 권위는 SQLite 하나이고, daemon의 사본과 다르면 DB를 따른다
+- [ ] 모든 phase 전이는 전이 계약을 거치고, 전이마다 전이 이력이 같은 트랜잭션으로 남는다
+- [ ] 전이 결과는 `applied | busy | conflict` 값이고 DB 에러로 끝나지 않는다
+- [ ] 동시 전이는 하나만 `applied`다
+- [ ] 허용되지 않은 전이 요청은 거절된다
+- [ ] Done, Skipped는 terminal — 이후 전이 불가
+
+### 처리 중 잠금
+
+- [ ] Running 아이템에 대한 외부 전이는 `busy`로 거절되고 phase는 변하지 않으며 거절 이력이 남는다 (`belt queue skip`의 취소 요청은 예외)
+- [ ] 해결된 HITL의 후처리 중에는 외부 전이와 취소가 모두 `busy`다
+- [ ] Completed는 잠금이 아니다. 평가 중 사람의 조작이 이기면 evaluator의 판정은 `conflict`로 버려진다
+- [ ] Ready에서 skip과 점유가 경합하면 하나만 `applied`이고, 점유가 지면 handler가 시작되지 않는다
+- [ ] 잠금 무효 판정(daemon 부재 또는 무응답)은 취소 경로에서만 적용된다
+
+### 실행 중 취소
+
+- [ ] 실행 중 `belt queue skip`은 handler를 종료하고 Skipped로 바꾸며, 그 실행의 hook은 실행하지 않고, 이력에 요청자와 경로가 남는다
+- [ ] daemon이 살아 있으면 tick 간격과 무관하게 취소 처리가 시작된다
+- [ ] daemon 부재 시 CLI가 직접 Skipped로 바꾸고 남은 handler 프로세스를 정리하며, daemon 재시작 후에도 Skipped다
+- [ ] 무응답 판정 뒤 daemon이 늦게 결과를 내도 그 실행의 hook은 실행되지 않는다
+- [ ] handler가 먼저 끝난 경우 `too_late`이고 phase는 handler 결과를 따른다
+- [ ] 결과 값 `canceled | canceled_directly | too_late | busy`가 호출자에게 전달된다
+
+### Hitl 출구
+
+- [ ] open HITL 아이템에 `belt queue skip/done`을 요청하면 HITL 응답으로 경합하고, Hitl에서 직접 빠져나가지 않는다
+- [ ] open HITL 요청이 있는 아이템의 phase는 항상 Hitl이다
+- [ ] 대응되는 HITL 액션이 없는 Hitl 전이 요청은 `invalid_action`이다
+
+### 시작 시 복원
+
+- [ ] 시작 시 non-terminal 아이템을 DB에서 복원한다
+- [ ] Running→Pending 롤백 전에 이전 daemon이 남긴 handler 프로세스를 종료하고 worktree는 보존한다
 
 ### 상태 전이 규칙
 
 - [ ] Pending→Ready 전이는 Daemon tick마다 자동 수행된다
 - [ ] Ready→Running 전이는 workspace.concurrency와 daemon.max_concurrent 모두 만족할 때만 수행된다
 - [ ] queue_dependencies에 미완료(Done이 아닌) 의존이 있으면 Ready→Running 전이가 블로킹된다
-- [ ] `can_transition_to()`가 허용하지 않는 전이를 시도하면 `InvalidTransition` 에러가 반환된다
-- [ ] Done, Skipped는 terminal — 이후 전이 불가
 
 ### Escalation 정책
 
 - [ ] failure_count=1일 때 `retry`가 적용되면 on_fail을 실행하지 않고 새 아이템으로 재시도한다
 - [ ] failure_count=2일 때 `retry_with_comment`가 적용되면 on_fail 실행 후 새 아이템으로 재시도한다
-- [ ] failure_count=3일 때 `hitl`이 적용되면 on_fail 실행 후 HITL 이벤트가 생성된다
+- [ ] failure_count=3일 때 `hitl`이 적용되면 on_fail 실행 후 HITL 요청이 생성된다
 - [ ] on_enter 실패도 failure_count에 포함된다
 - [ ] 모든 실패에서 stagnation 분석이 실행되고, 패턴 감지 시 lateral_plan이 retry에 주입된다
 
@@ -262,15 +404,14 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 - [ ] evaluate는 per-work_id 단위로 LLM 판정을 실행한다
 - [ ] 각 판정에 해당 아이템의 context가 포함된다
 - [ ] 개별 판정 실패 시 해당 아이템만 Completed에 머물고, 다른 아이템에 영향 없다
-- [ ] evaluate LLM 오류 시 아이템은 Completed에 머무르고, 다음 cron tick에서 재시도된다
-- [ ] evaluate 반복 실패(3회)로 HITL 에스컬레이션 시 HitlReason::EvaluateFailure가 기록된다
+- [ ] evaluate 반복 실패(3회)로 HITL 에스컬레이션 시 사유가 `EvaluateFailure`로 기록된다
 - [ ] on_done script 실패 시 Failed 전이되고, on_fail은 실행하지 않는다
 
 ### Worktree 생명주기
 
 - [ ] Running 진입 시 worktree가 생성된다 (retry 시 기존 worktree 재사용)
 - [ ] Done, Skipped 전이 시 worktree가 정리된다
-- [ ] HITL, Failed 전이 시 worktree가 보존된다
+- [ ] Hitl, Failed 전이 시 worktree가 보존된다
 - [ ] log-cleanup cron이 TTL(7일) 초과 보존 worktree를 정리한다
 
 ---
@@ -278,10 +419,11 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 ### 관련 문서
 
 - [DESIGN](../DESIGN.md) — 설계 철학
-- [Daemon](./daemon.md) — 내부 모듈 구조 + 실행 루프
+- [Daemon](./daemon.md) — 실행 루프, 취소 처리, HITL 후처리
+- [Data Model](./data-model.md) — 전이 이력, HITL 요청, 취소 요청
+- [Notification](./notification.md) — 알림과 HITL 응답 수신
 - [Stagnation Detection](./stagnation.md) — 반복 패턴 감지 + lateral thinking
 - [LifecycleHook](./lifecycle-hook.md) — 상태 전이 반응 trait
 - [DataSource](./datasource.md) — 수집/컨텍스트 + escalation 정책
-- [Cron 엔진](./cron-engine.md) — 품질 루프 (gap-detection 등)
+- [Cron 엔진](./cron-engine.md) — 품질 루프, hitl-timeout
 - [실패 복구와 HITL](../flows/04-failure-and-hitl.md) — 실패/HITL 시나리오
-- [Data Model](./data-model.md) — 테이블 스키마, 도메인 enum
