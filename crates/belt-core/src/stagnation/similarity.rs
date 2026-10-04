@@ -562,4 +562,20 @@ mod tests {
         let composite = CompositeSimilarity::new(vec![]);
         assert_eq!(composite.name(), "composite");
     }
+
+    #[test]
+    fn composite_max_score_for_non_identical_inputs_below_spinning_threshold() {
+        // ExactHash contributes 0.0 for any non-identical pair, capping the default preset's
+        // weighted score at 1.0 - 0.5 (ExactHash's weight) = 0.5, even when TokenFingerprint and
+        // NcdJudge both score 1.0. That ceiling sits below the 0.9 threshold SpinningDetector /
+        // OscillationDetector use in belt-daemon, so near-miss (non-identical) repeats are
+        // intentionally never classified as stagnation at the current threshold -- this is a
+        // deliberate boundary, not a gap to close in this change.
+        let composite = CompositeSimilarity::default();
+        let score = composite.score("compile error at line 10", "compile error at line 11");
+        assert!(
+            score < 0.9,
+            "non-identical inputs must stay below the spinning threshold, got {score}"
+        );
+    }
 }

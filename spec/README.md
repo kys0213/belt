@@ -17,7 +17,7 @@
 | [QueuePhase 상태 머신](./concerns/queue-state-machine.md) | 8개 phase 전이, **전이 캡슐화**, worktree 생명주기, on_fail 조건 |
 | [Daemon](./concerns/daemon.md) | **내부 모듈 구조**, 실행 루프, **DB dependency gate**, concurrency, graceful shutdown |
 | [Evaluator](./concerns/evaluator.md) | Progressive Evaluation Pipeline, 완료 아이템 판정 |
-| [Stagnation Detection](./concerns/stagnation.md) | 정체 패턴(SPINNING) 감지, Lateral Thinking 사고 전환 |
+| [Stagnation Detection](./concerns/stagnation.md) | 정체 패턴(SPINNING, OSCILLATION) 감지, Lateral Thinking 사고 전환 |
 | [LifecycleHook](./concerns/lifecycle-hook.md) | 상태 전이 반응 trait, handler/hook 분리, lazy 로딩 |
 | [DataSource](./concerns/datasource.md) | 외부 시스템 추상화 trait + **source_data** + 워크플로우 yaml |
 | [AgentRuntime](./concerns/agent-runtime.md) | LLM 실행 추상화 trait + Registry |

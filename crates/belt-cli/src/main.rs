@@ -4235,6 +4235,39 @@ mod tests {
     }
 
     #[test]
+    fn agent_without_session_subcommand_fails_to_parse() {
+        // `belt agent` requires an `AgentCommands` subcommand (Session, Init,
+        // Rules, ...). Flags belonging to `Session` (--workspace, -p, --json)
+        // are not valid directly under `Agent`.
+        let result =
+            Cli::try_parse_from(["belt", "agent", "--workspace", "x", "-p", "y", "--json"]);
+        assert!(
+            result.is_err(),
+            "expected clap parse error for `belt agent --workspace x -p y --json` \
+             (missing `session` subcommand), got Ok(..)"
+        );
+    }
+
+    #[test]
+    fn agent_session_subcommand_parses_successfully() {
+        let result = Cli::try_parse_from([
+            "belt",
+            "agent",
+            "session",
+            "--workspace",
+            "x",
+            "-p",
+            "y",
+            "--json",
+        ]);
+        assert!(
+            result.is_ok(),
+            "expected `belt agent session --workspace x -p y --json` to parse, got error: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
     fn parse_github_issue_ref_leading_slash() {
         assert_eq!(parse_github_issue_ref("/repo#123"), None);
     }

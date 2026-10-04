@@ -102,7 +102,7 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 
 ### 13. Stagnation Detection + Lateral Thinking — 실패하면 다르게 시도
 
-실패 횟수만으로는 "같은 실수 반복"과 "다른 시도 실패"를 구분할 수 없다. 정체 감지는 동일 출력이 반복되는 패턴(SPINNING)을 감지한다 — 유사도 판정 기준과 임계값은 현재 고정값이며 설정으로 노출되지 않는다. 패턴 감지 시 내장 페르소나(Lateral Thinking)가 접근법을 전환하여 재시도하며, 모든 retry에 lateral plan이 자동 주입되는 것이 기본 동작이다. 상세: [Stagnation Detection](./concerns/stagnation.md)
+실패 횟수만으로는 "같은 실수 반복"과 "다른 시도 실패"를 구분할 수 없다. 정체 감지는 동일 출력이 반복되는 패턴(SPINNING)과 두 출력을 교대로 반복하는 패턴(OSCILLATION)을 감지한다 — 유사도 판정 기준과 임계값은 현재 고정값이며 설정으로 노출되지 않는다. 패턴 감지 시 내장 페르소나(Lateral Thinking)가 접근법을 전환하여 재시도하며, 모든 retry에 lateral plan이 자동 주입되는 것이 기본 동작이다. 상세: [Stagnation Detection](./concerns/stagnation.md)
 
 ### Agent는 대화형 에이전트
 
@@ -245,8 +245,9 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 │  │ concurr. │  │  ④ 실패 시:                                       │ │
 │  │          │  │  ┌─────────────────────────────────────────────┐  │ │
 │  │          │  │  │ 정체 패턴 감지                              │  │ │
-│  │          │  │  │  동일 출력 반복(SPINNING) 여부를             │  │ │
-│  │          │  │  │  해시 완전 일치 기준으로 판정                │  │ │
+│  │          │  │  │  동일 출력 반복(SPINNING) ·                 │  │ │
+│  │          │  │  │  교대 반복(OSCILLATION) 여부를               │  │ │
+│  │          │  │  │  가중 합성 유사도 기준으로 판정              │  │ │
 │  │          │  │  └────────────────┬────────────────────────────┘  │ │
 │  │          │  │                   ▼ 패턴 감지 시                   │ │
 │  │          │  │  ┌─────────────────────────────────────────────┐  │ │
@@ -292,7 +293,7 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 
 ## Stagnation — 정체 감지
 
-정체 감지는 동일 (source_id, state)에서 과거 실패 error와 현재 error를 비교해, 완전 일치 기준(SPINNING)으로 반복 실패 패턴을 판정한다. 새 유사도 알고리즘·패턴 감지 로직은 코어 변경 없이 추가할 수 있는 확장점이다.
+정체 감지는 동일 (source_id, state)에서 과거 실패 error와 현재 error를 비교해, 완전 일치·토큰 중복도·압축 유사도의 가중 합성 기준으로 동일 출력 반복(SPINNING)과 교대 반복(OSCILLATION)을 판정한다. 그 외 패턴 감지·유사도 알고리즘 조합은 코어 변경 없이 추가할 수 있는 확장점이다.
 
 상세: [Stagnation Detection](./concerns/stagnation.md)
 
@@ -305,7 +306,7 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 | Daemon | CPU — 상태 머신 순회 + hook 트리거 + cron 스케줄링 | 0 |
 | Advancer | Pending→Ready→Running 전이, dependency gate (DB), conflict 검출 | 0 |
 | Executor | handler 실행, escalation 결정, hook 트리거 | handler별 |
-| StagnationDetector | 정체 패턴(SPINNING) 감지 | 0 |
+| StagnationDetector | 정체 패턴(SPINNING, OSCILLATION) 감지 | 0 |
 | LateralAnalyzer | 내장 페르소나로 대안 접근법 분석, lateral_plan 생성 | 분석 시 |
 | HitlService | HITL 응답 처리, timeout 만료, terminal action | 0 |
 | Evaluator | Completed → Done/HITL 분류 (per-item, CLI 도구 호출) | 분류 시 |
@@ -330,8 +331,8 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 새 유사도 알고리즘  = SimilarityJudge impl 추가            → 코어 변경 0
 ```
 
-> **예약 필드**: `ItemContext.source_data: serde_json::Value`는 DataSource별 자유 스키마 확장을 위해 예약된 필드다.
-> 현재는 채워지지 않는다(항상 `Null`). 활용 계획은 [source_data와 stagnation 로드맵](../plans/source-data-and-stagnation-roadmap.md) 참조.
+> **자유 스키마 확장점**: `ItemContext.source_data: serde_json::Value`는 DataSource별 자유 스키마 확장을 위한 필드다.
+> 각 DataSource는 원본 응답을 소스 종류별 키(예: GitHub는 `issue`) 아래에 담아 소스 간 데이터가 서로 충돌하지 않게 한다. 활용 계획은 [source_data와 stagnation 로드맵](../plans/source-data-and-stagnation-roadmap.md) 참조.
 
 ---
 
@@ -342,7 +343,7 @@ workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. e
 | [QueuePhase 상태 머신](./concerns/queue-state-machine.md) | 상태 전이, 전이 캡슐화, worktree 생명주기, on_fail 조건 |
 | [Daemon](./concerns/daemon.md) | 내부 모듈 구조, 실행 루프, dependency gate (DB), concurrency, graceful shutdown |
 | [Evaluator](./concerns/evaluator.md) | Progressive Evaluation Pipeline, Stage trait — 완료 아이템 판정 |
-| [Stagnation Detection](./concerns/stagnation.md) | 정체 패턴(SPINNING) 감지, Lateral Thinking 사고 전환 |
+| [Stagnation Detection](./concerns/stagnation.md) | 정체 패턴(SPINNING, OSCILLATION) 감지, Lateral Thinking 사고 전환 |
 | [LifecycleHook](./concerns/lifecycle-hook.md) | 상태 전이 반응 trait, DataSource별 impl, workspace 바인딩, lazy 로딩 |
 | [DataSource](./concerns/datasource.md) | trait, context 스키마 (source_data), 워크플로우 yaml, escalation |
 | [AgentRuntime](./concerns/agent-runtime.md) | LLM 실행 추상화, RuntimeRegistry |

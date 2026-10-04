@@ -4,7 +4,7 @@
 //! a [`Persona`] that suggests a fundamentally different approach,
 //! producing a [`LateralPlan`] that can guide the next agent attempt.
 //!
-//! The analyzer invokes an LLM subprocess (`belt agent -p`) with the
+//! The analyzer invokes an LLM subprocess (`belt agent session -p`) with the
 //! selected persona's embedded prompt template and the failure context,
 //! then parses the response into a structured [`LateralPlan`].
 
@@ -220,7 +220,7 @@ impl LateralAnalyzer {
     /// Given a stagnation detection and failure context, invoke the LLM
     /// subprocess to produce a lateral plan.
     ///
-    /// Uses `belt agent -p` via the provided [`ShellExecutor`].
+    /// Uses `belt agent session -p` via the provided [`ShellExecutor`].
     pub async fn analyze(
         &self,
         executor: &dyn ShellExecutor,
@@ -239,7 +239,7 @@ impl LateralAnalyzer {
 
         // Escape single quotes in the prompt for safe shell embedding.
         let escaped_prompt = prompt.replace('\'', "'\\''");
-        let command = format!("belt agent -p '{escaped_prompt}'");
+        let command = format!("belt agent session -p '{escaped_prompt}'");
 
         let output = executor
             .execute(&command, params.workspace, &HashMap::new())
@@ -535,6 +535,8 @@ mod tests {
     struct MockShell {
         /// The result to return from `execute`.
         result: Mutex<Result<ShellOutput, BeltError>>,
+        /// The last command string passed to `execute`, for argv inspection.
+        last_command: Mutex<Option<String>>,
     }
 
     impl MockShell {
@@ -546,6 +548,7 @@ mod tests {
                     stdout: stdout.to_string(),
                     stderr: String::new(),
                 })),
+                last_command: Mutex::new(None),
             }
         }
 
@@ -557,6 +560,7 @@ mod tests {
                     stdout: String::new(),
                     stderr: stderr.to_string(),
                 })),
+                last_command: Mutex::new(None),
             }
         }
 
@@ -564,7 +568,13 @@ mod tests {
         fn exec_error(message: &str) -> Self {
             Self {
                 result: Mutex::new(Err(BeltError::Runtime(message.to_string()))),
+                last_command: Mutex::new(None),
             }
+        }
+
+        /// Retrieve the last command string passed to `execute`.
+        fn last_command(&self) -> Option<String> {
+            self.last_command.lock().unwrap().clone()
         }
     }
 
@@ -572,10 +582,11 @@ mod tests {
     impl ShellExecutor for MockShell {
         async fn execute(
             &self,
-            _command: &str,
+            command: &str,
             _working_dir: &Path,
             _env_vars: &HashMap<String, String>,
         ) -> Result<ShellOutput, BeltError> {
+            *self.last_command.lock().unwrap() = Some(command.to_string());
             let mut guard = self.result.lock().unwrap();
             std::mem::replace(
                 &mut *guard,
@@ -620,6 +631,34 @@ mod tests {
         assert!(plan.alternative_approach.contains("type alias"));
         assert!(plan.execution_plan.contains("Add type alias"));
         assert!(plan.warnings.contains("confuse"));
+    }
+
+    #[tokio::test]
+    async fn analyze_invokes_agent_session_subcommand() {
+        // `belt agent` requires an `AgentCommands` subcommand (see belt-cli's
+        // `Agent { #[command(subcommand)] command: AgentCommands }`); the `-p`
+        // flag belongs to `AgentCommands::Session`. Without `session`, clap
+        // rejects the invocation as a usage error before any LLM ever runs.
+        let shell = MockShell::success("**Failure Analysis**: root cause found.");
+        let analyzer = LateralAnalyzer::new();
+        let detection = test_detection();
+        let workspace = PathBuf::from("/tmp/test-workspace");
+        let params = AnalyzeParams {
+            detection: &detection,
+            failure_context: "compile error",
+            attempted_personas: &[],
+            workspace: &workspace,
+        };
+
+        analyzer.analyze(&shell, &params).await.unwrap();
+
+        let command = shell
+            .last_command()
+            .expect("execute should have been called");
+        assert!(
+            command.starts_with("belt agent session -p "),
+            "expected subprocess command to invoke 'agent session', got: {command}"
+        );
     }
 
     #[tokio::test]
@@ -748,6 +787,7 @@ mod tests {
                 stdout: String::new(),
                 stderr: "killed by signal".to_string(),
             })),
+            last_command: Mutex::new(None),
         };
         let analyzer = LateralAnalyzer::new();
         let detection = test_detection();

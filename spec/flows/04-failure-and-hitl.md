@@ -11,9 +11,9 @@ handler 또는 hook.on_enter() 실패
     │
     ▼
 Stagnation 분석 (같은 source_id+state에 과거 실패 이력이 있으면 항상 실행):
-  이전 실패 error 메시지 + 이번 error를 완전 일치 기준으로 비교:
+  이전 실패 error 메시지 + 이번 error를 완전 일치·토큰 중복도·압축 유사도의 가중 합성 기준으로 비교:
     │
-    ├── 같은 실패 반복 (SPINNING) — 현재 감지되는 유일한 패턴
+    ├── 같은 실패 반복 (SPINNING) 또는 두 실패를 교대 반복 (OSCILLATION) — 현재 감지되는 패턴
     │   (상세: [Stagnation Detection](../concerns/stagnation.md))
     │
     ├── 패턴 없음 ─────── escalation만 적용
@@ -223,6 +223,7 @@ SIGINT → on_shutdown:
 | 2회 실패 | handler 실패 (failure_count=2) | 새 아이템 Pending | retry_with_comment, on_fail 실행, lateral plan 주입 |
 | 3회 실패 | handler 실패 (failure_count=3) | HITL | hitl, on_fail 실행, lateral report 첨부 |
 | SPINNING 감지 | 동일 error 3회 연속 (유사도 ≥ 0.9, 인접 쌍 일치 2회) | escalation에 따름 | 페르소나 directive가 담긴 lateral plan 주입 |
+| OSCILLATION 감지 | 두 error가 교대로 2회 이상 반복 (유사도 ≥ 0.9) | escalation에 따름 | 페르소나 directive가 담긴 lateral plan 주입 |
 | HITL done 응답 | 사용자 done 선택 | Done | hook.on_done() 트리거, worktree 정리 |
 | HITL retry 응답 | 사용자 retry + 지시 | 새 아이템 Pending | 사용자 지시를 lateral_plan으로 주입, worktree 보존 |
 | HITL skip 응답 | 사용자 skip 선택 | Skipped (terminal) | worktree 정리 |

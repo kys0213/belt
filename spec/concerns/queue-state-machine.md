@@ -94,7 +94,7 @@ QueueItem::builder()
           ┌─────────────────┐    ┌─────────────────────────────┐
           │    Completed     │    │  Stagnation Analyzer (항상 실행)│
           │                  │    │                               │
-          │  handler 완료    │    │  ① 완전 일치 비교로           │
+          │  handler 완료    │    │  ① 가중 합성 유사도로         │
           │  evaluate 대기   │    │    실패 이력 유사도 분석      │
           │                  │    │  ② 패턴 감지 시              │
           │  force_trigger   │    │    페르소나 선택 →           │
@@ -189,7 +189,7 @@ QueueItem::builder()
 
 failure_count는 append-only history에서 계산한다: `history | filter(state, failed) | count`. on_enter 실패도 handler 실패와 동일하게 failure_count에 포함된다.
 
-> 과거 실패 이력이 있는 모든 실패에서 완전 일치 비교 기준으로 유사도 분석을 수행한다. 패턴이 감지되면 내장 페르소나(HACKER, ARCHITECT 등) 중 하나가 선택되고, 그 페르소나의 고정 directive로 lateral_plan을 구성하여 retry 시 handler prompt에 주입한다. escalation 자체는 기존 failure_count 기반 그대로이되, **패턴이 감지된 retry는 lateral plan으로 강화**된다. 상세: [Stagnation Detection](./stagnation.md)
+> 과거 실패 이력이 있는 모든 실패에서 완전 일치·토큰 중복도·압축 유사도의 가중 합성 기준으로 유사도 분석을 수행한다. 패턴이 감지되면 내장 페르소나(HACKER, ARCHITECT 등) 중 하나가 선택되고, 그 페르소나의 고정 directive로 lateral_plan을 구성하여 retry 시 handler prompt에 주입한다. escalation 자체는 기존 failure_count 기반 그대로이되, **패턴이 감지된 retry는 lateral plan으로 강화**된다. 상세: [Stagnation Detection](./stagnation.md)
 
 ---
 

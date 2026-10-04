@@ -313,7 +313,7 @@ impl FromStr for EscalationAction {
 | `NoDrift` | `"no_drift"` | 진행 점수 정체 |
 | `DiminishingReturns` | `"diminishing_returns"` | 개선폭 감소 |
 
-현재 실제로 감지되는 패턴은 SPINNING뿐이다. 상세: [Stagnation Detection](./stagnation.md)
+현재 실제로 감지되는 패턴은 SPINNING·OSCILLATION이다. 상세: [Stagnation Detection](./stagnation.md)
 
 ### Persona
 
@@ -437,7 +437,7 @@ runtime:
 
 `belt context $WORK_ID --json`이 반환하는 구조. script가 정보를 조회하는 유일한 방법.
 
-`ItemContext`에는 `source_data: serde_json::Value` 필드가 있다 — DataSource가 자유 스키마로 채울 수 있는 OCP 확장점이다. 현재는 채워지지 않는다(항상 `Null`, `issue`/`pr` 필드에 데이터가 담긴다). `source_data`가 `Null`이면 JSON 출력에서 해당 키는 생략된다. 상세: [DataSource](./datasource.md)
+`ItemContext`에는 `source_data: serde_json::Value` 필드가 있다 — DataSource가 자유 스키마로 채울 수 있는 OCP 확장점이다. GitHub DataSource는 이슈 조회 원본 응답을 가공 없이 `issue` 키 아래에 담는다(정제된 데이터는 최상위 `issue`/`pr` 필드에 담긴다). 소스 종류별로 키를 나누는 이유는 향후 PR 등 다른 원본 데이터가 추가돼도 서로 충돌하지 않게 하기 위해서다. 이슈 조회에 실패하면 `Null`로 남는다. `source_data`가 `Null`이면 JSON 출력에서 해당 키는 생략된다. 상세: [DataSource](./datasource.md)
 
 ```json
 {
@@ -481,7 +481,16 @@ runtime:
       "created_at": "2026-03-25T10:00:00Z"
     }
   ],
-  "worktree": "/tmp/belt/worktrees/42-implement"
+  "worktree": "/tmp/belt/worktrees/42-implement",
+  "source_data": {
+    "issue": {
+      "title": "...",
+      "body": "...",
+      "labels": [{ "name": "belt:implement" }],
+      "author": { "login": "user" },
+      "state": "OPEN"
+    }
+  }
 }
 ```
 

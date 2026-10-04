@@ -61,7 +61,7 @@ Executor
   │     ├── on_fail()
   │     └── on_escalation()
   │
-  ├── StagnationDetector      실패 시 패턴 탐지 (완전 일치 비교 기준, SPINNING만 감지)
+  ├── StagnationDetector      실패 시 패턴 탐지 (완전 일치·토큰 중복도·압축 유사도 가중 합성 기준, SPINNING·OSCILLATION 감지)
   │
   └── LateralAnalyzer         패턴 감지 시 페르소나 선택 + 고정 directive 조합 (LLM 미호출)
         └── personas/          (include_str! 내장)
@@ -322,7 +322,7 @@ SIGINT → on_shutdown:
 ### Stagnation + Lateral 통합
 
 - [ ] handler/on_enter 실패 시(과거 실패 이력이 있으면) StagnationDetector가 항상 실행된다
-- [ ] 현재는 완전 일치(해시 비교) 기준으로 error 메시지만 검사한다 (SPINNING 패턴만 감지)
+- [ ] 완전 일치·토큰 중복도·압축 유사도의 가중 합성 유사도로 error 메시지를 검사한다 (SPINNING·OSCILLATION 패턴 감지)
 - [ ] 패턴 감지 시 페르소나를 선택하고 고정 directive로 lateral_plan을 구성한다 (LLM 미호출)
 - [ ] lateral_plan이 retry 시 handler prompt에 추가 컨텍스트로 주입된다
 - [ ] hitl 도달 시 모든 lateral 시도 이력이 hitl_notes에 첨부된다
