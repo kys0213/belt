@@ -12,41 +12,53 @@ DataSource가 소유하는 것 (읽기):
   1. 수집 — 어떤 조건에서 아이템을 감지하는가 (collect)
   2. 컨텍스트 — 해당 아이템의 외부 시스템 정보를 어떻게 조회하는가 (get_context)
 
-LifecycleHook이 소유하는 것 (쓰기/반응):
-  3. 상태 반응 — 상태 전이 시 외부 시스템에 어떻게 반영하는가 (on_enter/on_done/on_fail/on_escalation)
+LifecycleHook이 소유하는 것 (출처 상태 쓰기):
+  3. 상태 반영 — 상태 전이 시 출처 시스템의 상태를 어떻게 바꾸는가 (라벨 추가·제거 등)
+
+NotificationChannel이 소유하는 것 (사람과의 소통):
+  4. 알림·HITL 요청 발송, HITL 응답 수신
 
 yaml이 소유하는 것:
-  4. 처리 — 감지된 아이템을 어떻게 처리하는가 (handlers: prompt/script)
-  5. 실패 정책 — 실패 시 어떻게 escalation하는가 (escalation)
+  5. 처리 — 감지된 아이템을 어떻게 처리하는가 (handlers: prompt/script)
+  6. 실패 정책 — 실패 시 어떻게 escalation하는가 (escalation)
 
-코어는 DataSource/LifecycleHook 내부를 모른다. collect() 결과를 큐에 넣고, 상태 전이 시 hook을 트리거할 뿐.
-상세: [LifecycleHook](./lifecycle-hook.md)
+코어는 DataSource/LifecycleHook/NotificationChannel 내부를 모른다. 수집 결과를 큐에 넣고, 상태 전이 시 hook과 channel을 트리거할 뿐.
+상세: [LifecycleHook](./lifecycle-hook.md), [NotificationChannel](./notification.md)
 ```
 
 ---
 
-## trait 정의
+## DataSource의 책임
 
-```rust
-pub trait DataSource: Send + Sync {
-    /// DataSource 이름 (예: "github", "jira")
-    fn name(&self) -> &str;
+DataSource는 수집과 컨텍스트 조회 두 책임만 가진다.
 
-    /// 외부 시스템에서 trigger 조건에 매칭되는 새 아이템 감지
-    async fn collect(&mut self, workspace: &WorkspaceConfig) -> Result<Vec<QueueItem>>;
+| 책임 | 내용 |
+|------|------|
+| 수집 | 외부 시스템에서 trigger 조건에 매칭되는 새 아이템을 감지한다. 수집한 아이템은 즉시 DB에 Pending으로 기록한다 |
+| 컨텍스트 조회 | 아이템의 외부 시스템 컨텍스트를 조회한다. `belt context` CLI가 사용한다 |
 
-    /// 해당 아이템의 외부 시스템 컨텍스트를 조회
-    /// belt context CLI가 내부적으로 호출
-    async fn get_context(&self, item: &QueueItem) -> Result<ItemContext>;
-}
+- 상태 전이 시 출처 상태 반영 → [LifecycleHook](./lifecycle-hook.md)으로 분리
+- 알림·HITL 요청·응답 수신 → [NotificationChannel](./notification.md)로 분리
+- worktree 셋업 → 인프라 레이어가 항상 처리
+- escalation → yaml의 escalation 정책을 코어가 결정, hook과 channel이 반응
+
+### origin channel 짝
+
+각 DataSource에는 출처 시스템에 알림을 보내는 origin channel이 짝으로 대응한다 (GitHub의 경우 이슈 코멘트). 설정이 없으면 알림은 origin channel로만 간다.
+
+```mermaid
+flowchart LR
+    SRC["출처 시스템"] -- "수집" --> DS[DataSource]
+    DS -- "즉시 DB 기록" --> DB[("SQLite")]
+    D[daemon] -- "알림·HITL 요청" --> OC["origin channel"]
+    OC --> SRC
+    SRC -- "사람의 응답 (allowlist)" --> OC
+    OC -- "응답" --> D
 ```
 
-DataSource trait은 collect와 get_context 두 책임만 가진다.
-- on_done/on_fail/on_enter/on_escalation → `LifecycleHook` trait으로 분리. 상세: [LifecycleHook](./lifecycle-hook.md)
-- worktree 셋업 → 인프라 레이어가 항상 처리
-- escalation → yaml의 escalation 정책을 코어가 결정, hook이 반응
+> 출처 시스템에 올라온 HITL 응답을 받는 일은 DataSource가 아니라 origin channel의 책임이다. DataSource는 응답 수신을 위해 바뀌지 않는다. origin channel 구현이 없는 출처는 dashboard only로 동작한다.
 
-`get_context()`가 반환하는 `ItemContext`에는 `source_data: serde_json::Value` 필드가 있다. DataSource가 자신의 고유 데이터를 자유 스키마로 채울 수 있도록 예약된 OCP 확장점이다. GitHub DataSource는 이슈 조회에 성공하면 원본 이슈 응답(제목·본문·라벨·작성자·상태)을 가공 없이 `issue` 키 아래에 담는다 — `issue` 최상위 필드가 사람이 읽기 좋게 정제한 뷰라면, `source_data.issue`는 그 원본이다. 소스 종류별로 키를 나누는 이유는 향후 PR 등 다른 원본 데이터가 추가돼도 서로 충돌하지 않게 하기 위해서다. 이슈 조회가 실패하면 `Null`로 남는다. `source_data`가 `Null`이면 `belt context`의 JSON 출력에서 해당 키 자체가 생략된다. 활용 계획은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
+`get_context()`가 반환하는 `ItemContext`에는 `source_data` 필드가 있다. DataSource가 자신의 고유 데이터를 자유 스키마로 채울 수 있도록 예약된 OCP 확장점이다. GitHub DataSource는 이슈 조회에 성공하면 원본 이슈 응답(제목·본문·라벨·작성자·상태)을 가공 없이 `issue` 키 아래에 담는다 — `issue` 최상위 필드가 사람이 읽기 좋게 정제한 뷰라면, `source_data.issue`는 그 원본이다. 소스 종류별로 키를 나누는 이유는 향후 PR 등 다른 원본 데이터가 추가돼도 서로 충돌하지 않게 하기 위해서다. 이슈 조회가 실패하면 `Null`로 남는다. `source_data`가 `Null`이면 `belt context`의 JSON 출력에서 해당 키 자체가 생략된다. 활용 계획은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
 
 ---
 
@@ -221,11 +233,11 @@ sources:
       terminal: skip          # hitl timeout 시 적용 (skip 또는 replan)
 ```
 
-> **주의**: 위 `on_done` script는 hook 로딩 우선순위상 실제로 실행되지 않는다. github source에는 `GitHubLifecycleHook`이 항상 우선 적용되고(`ScriptLifecycleHook`은 전용 Hook이 없는 source_type에만 폴백으로 쓰인다), `GitHubLifecycleHook`은 yaml script를 실행하지 않고 코드에 고정된 `gh issue comment`/`gh issue edit --add-label` 동작만 수행한다. 라벨 전환·PR 생성을 이 방식으로 하려면 현재는 `LifecycleHook` impl을 직접 확장해야 한다. 상세: [LifecycleHook](./lifecycle-hook.md)
+> **주의**: 위 `on_done` script는 hook 로딩 우선순위상 실제로 실행되지 않는다. github source에는 `GitHubLifecycleHook`이 항상 우선 적용되고(`ScriptLifecycleHook`은 전용 Hook이 없는 source_type에만 폴백으로 쓰인다), `GitHubLifecycleHook`은 yaml script를 실행하지 않고 HITL 라벨 추가·제거만 수행한다(이슈 코멘트는 origin channel이 작성한다). 라벨 전환·PR 생성을 이 방식으로 하려면 현재는 `LifecycleHook` impl을 직접 확장해야 한다. 상세: [LifecycleHook](./lifecycle-hook.md)
 
 ### 향후 확장
 
-DataSource trait을 구현하면 코어 변경 없이 새 외부 시스템을 추가할 수 있다. `source_data`를 통해 코어 타입 변경도 불필요.
+새 DataSource 구현을 추가하면 코어 변경 없이 새 외부 시스템을 연결할 수 있다. `source_data`를 통해 코어 타입 변경도 불필요.
 
 | 시스템 | 상태 표현 | trigger 예시 | source_data |
 |--------|----------|-------------|-------------|
@@ -252,9 +264,9 @@ handler 배열은 Running 상태에서 순차 실행. 하나라도 실패 시 on
 
 ---
 
-## Lifecycle Hook — LifecycleHook trait으로 분리
+## Lifecycle Hook — 출처 상태 반영
 
-on_done/on_fail/on_enter/on_escalation은 `LifecycleHook` trait으로 분리되어 있다. Daemon은 상태 전이 시 hook을 트리거만 하고, 실행 책임은 Hook impl이 가진다.
+on_done/on_fail/on_enter/on_escalation/on_hitl_resolved는 LifecycleHook이 맡는다. Daemon은 상태 전이 시 hook을 트리거만 하고, 실행 책임은 DataSource 유형별 hook 구현이 가진다. 사람 대상 메시지는 hook이 아니라 [NotificationChannel](./notification.md)이 보낸다.
 
 상세: [LifecycleHook](./lifecycle-hook.md)
 
@@ -264,6 +276,7 @@ on_done/on_fail/on_enter/on_escalation은 `LifecycleHook` trait으로 분리되�
 | `on_done` | evaluate가 Done 판정 후 | Failed 상태로 전이 |
 | `on_fail` | handler/on_enter 실패 시 (retry 제외) | — |
 | `on_escalation` | escalation 결정 후 | — |
+| `on_hitl_resolved` | HITL 해결 후처리 중 | — (비치명) |
 
 ---
 
@@ -278,18 +291,18 @@ Escalation level은 **순차 실행 구간**과 **대안 선택 구간**으로 �
 
 ```yaml
 escalation:
-  1: retry                # 같은 state에서 재시도 (hook.on_fail 트리거 안 함)
-  2: retry_with_comment   # hook.on_fail 트리거 + 재시도
-  3: hitl                 # hook.on_fail 트리거 + HITL 이벤트 생성
+  1: retry                # 같은 state에서 재시도 (on_fail 트리거 안 함)
+  2: retry_with_comment   # on_fail 트리거 + 재시도
+  3: hitl                 # on_fail 트리거 + HITL 요청 생성
   terminal: skip          # hitl에서 사람이 결정하지 않으면 (timeout) 적용되는 최종 액션
                           # 선택지: skip (종료) 또는 replan (스펙 수정 제안)
 ```
 
-> **Stagnation과 Escalation의 관계**: escalation은 failure_count 기반으로 결정되고, stagnation은 lateral_plan 주입에 집중한다. 두 관심사는 직교한다 — escalation이 "언제 멈출지"를 결정하고, stagnation이 "다르게 시도할지"를 결정한다. escalation 발생 시 `LifecycleHook.on_escalation()`이 DataSource별 반응을 처리한다. 상세: [LifecycleHook](./lifecycle-hook.md)
+> **Stagnation과 Escalation의 관계**: escalation은 failure_count 기반으로 결정되고, stagnation은 lateral_plan 주입에 집중한다. 두 관심사는 직교한다 — escalation이 "언제 멈출지"를 결정하고, stagnation이 "다르게 시도할지"를 결정한다. escalation 발생 시 LifecycleHook의 `on_escalation`이 출처 상태를 반영하고 channel이 알림을 보낸다. 상세: [LifecycleHook](./lifecycle-hook.md)
 
 ### on_fail 실행 조건
 
-`retry`만 hook.on_fail()을 트리거하지 않는다. 나머지(`retry_with_comment`, `hitl`)는 hook.on_fail() 트리거 후 해당 액션을 수행한다.
+`retry`만 `on_fail`을 트리거하지 않는다. 나머지(`retry_with_comment`, `hitl`)는 `on_fail` 트리거 후 해당 액션을 수행한다.
 
 ```
 1회 실패 → retry           → 조용히 재시도 (worktree 보존)
@@ -314,7 +327,7 @@ retry 시 worktree를 보존하여 이전 작업 위에서 재시도한다. 새 
 ```
 source_id = "github:org/repo#42"
 
-queue_items 테이블:
+큐 아이템 예시:
   work_id              | source_id            | state     | phase
   github:org/repo#42:a | github:org/repo#42   | analyze   | Done
   github:org/repo#42:i | github:org/repo#42   | implement | Running
@@ -328,7 +341,8 @@ queue_items 테이블:
 ### 관련 문서
 
 - [DESIGN](../DESIGN.md) — 전체 아키텍처
-- [LifecycleHook](./lifecycle-hook.md) — 상태 전이 반응 trait
+- [LifecycleHook](./lifecycle-hook.md) — 출처 상태 반영
+- [NotificationChannel](./notification.md) — 알림·HITL 응답 채널
 - [AgentRuntime](./agent-runtime.md) — handler prompt 실행
 - [Stagnation Detection](./stagnation.md) — 실패 패턴 감지
 - [Cron 엔진](./cron-engine.md) — 품질 루프
