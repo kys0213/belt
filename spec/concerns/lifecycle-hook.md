@@ -130,7 +130,7 @@ flowchart TD
 
 > GitHub 이슈 코멘트(시작·실패·escalation·HITL 요청)는 hook이 아니라 GitHub origin channel이 작성한다. 라벨 추가·제거는 hook에 남는다.
 
-> github source에는 `GitHubLifecycleHook`이 항상 우선 적용되고 yaml script를 실행하지 않는다. 라벨 전환이나 PR 생성을 yaml `on_done` script로 하려면 해당 DataSource용 hook 구현을 확장해야 한다.
+> github source에는 `GitHubLifecycleHook`이 항상 우선 적용된다. 이 hook은 PR 생성이나 라벨 전환(`belt:implement` → `belt:review`)을 하지 않는다. 이 작업은 workspace yaml의 `on_done` script에서 구현한다. daemon은 evaluate 성공 후 hook과 무관하게 해당 state의 `on_done` script를 실행한다.
 
 `jira` 등 다른 source는 전용 hook이 없어 `ScriptLifecycleHook` 또는 `NoopLifecycleHook`으로 동작한다. 새 DataSource 유형은 hook 구현을 추가하는 것으로 연결하며 코어를 바꾸지 않는다.
 
@@ -169,6 +169,7 @@ sequenceDiagram
         D->>HK: on_done
         alt 실패
             HK-->>D: 오류
+            D->>HK: on_hitl_resolved (비치명)
             D->>D: Hitl → Failed
             D->>CH: failed
         else 성공
@@ -176,9 +177,15 @@ sequenceDiagram
             D->>D: Hitl → Done
             D->>CH: done
         end
-    else skip / replan
+    else skip
         D->>HK: on_hitl_resolved (비치명)
-        D->>D: Hitl → Skipped 또는 Pending
+        D->>D: Hitl → Skipped
+    else retry / replan
+        D->>HK: on_hitl_resolved (비치명)
+        D->>D: Hitl → Pending
+    else expired (timeout)
+        D->>HK: on_hitl_resolved (비치명)
+        D->>D: Hitl → Skipped 또는 Pending (terminal 설정에 따름)
     end
 ```
 
@@ -202,9 +209,9 @@ flowchart TD
 
 ## 기존 yaml on_done/on_fail/on_enter와의 호환
 
-`ScriptLifecycleHook`은 기존 workspace yaml의 `on_enter`/`on_done`/`on_fail` script를 그대로 실행한다. `handlers`만 필수이고 이 세 필드는 비워도 된다. DataSource별 전용 hook이 있으면 전용 hook이 우선하므로, 그 경우 yaml script는 실행되지 않는다.
+`ScriptLifecycleHook`은 기존 workspace yaml의 `on_enter`/`on_done`/`on_fail` script를 그대로 실행한다. `handlers`만 필수이고 이 세 필드는 비워도 된다. 전용 hook이 있는 DataSource에서도 daemon은 evaluate 성공 후 state의 `on_done` script를 실행한다. PR 생성 같은 출처 작업은 이 script가 맡는다.
 
-GitHub 전용 hook의 코드 상수 기본값(`comment_on_done`, `comment_on_fail`)은 코멘트 작성이 channel로 이동하면서 channel 이벤트 선택([workspace.yaml 스키마](./workspace-schema.md)의 `notifications`)으로 대체된다.
+GitHub 전용 hook의 코멘트 기본값(완료 시 코멘트는 기본 off, 실패 시 기본 on)은 코멘트 작성이 channel로 이동하면서 channel 이벤트 선택([workspace.yaml 스키마](./workspace-schema.md)의 `notifications`)으로 대체된다.
 
 ---
 
@@ -230,7 +237,7 @@ GitHub 전용 hook의 코드 상수 기본값(`comment_on_done`, `comment_on_fai
 - [ ] on_enter/on_done 실패 시 상태 전이에 영향을 준다 (escalation / Failed)
 - [ ] on_fail/on_escalation 실패 시 이력만 기록하고 흐름을 중단하지 않는다
 - [ ] HITL done 후처리에서 on_done이 실패하면 Hitl→Failed로 전이한다
-- [ ] `on_hitl_resolved`는 daemon 후처리에서 호출되고, 실패해도 후처리가 결과 전이까지 진행한다
+- [ ] `on_hitl_resolved`는 daemon 후처리에서 모든 해결 결과(done 성공, done의 on_done 실패, skip, retry, replan, 만료)마다 결과 전이 직전에 호출되고, 실패해도 후처리가 결과 전이까지 진행한다
 - [ ] GitHub는 HITL 해결 후 `belt:needs-human` 라벨을 제거한다 (GitHub 코멘트, CLI, TUI, timeout 어느 경로든 같다)
 - [ ] 내장 hook 구현(GitHubLifecycleHook, NoopLifecycleHook)은 사람 대상 메시지를 보내지 않는다. 사람 대상 메시지는 channel이 보낸다 (사용자 정의 script를 실행하는 ScriptLifecycleHook은 제외)
 - [ ] 시작 코멘트 작성 실패가 handler 실행을 막지 않는다

@@ -104,18 +104,18 @@ HITL 응답은 CLI, TUI, 외부 channel 어디서 오든 같은 경합에 참여
 ### `belt hitl respond`
 
 ```bash
-belt hitl respond <hitl_id|work_id> --action <done|retry|skip|replan> [--notes <text>] [--json]
+belt hitl respond <hitl_id|work_id> --action <done|retry|skip|replan> [--respondent <name>] [--notes <text>] [--json]
 ```
 
 | 결과 | 의미 | exit | `--json` |
 |------|------|------|----------|
 | 판정 승리 | 이 응답이 첫 확정 응답이다. 아이템은 "해결됨 · 처리 중"이 되고 phase는 daemon 후처리 뒤에 바뀐다 | 0 | `{"success":true,...}` |
-| `already_handled` | 먼저 확정된 응답이 있다. 누가·어디서·어떤 액션·언제를 함께 출력한다 | non-zero | `{"success":false,"reason":"already_handled",...}` |
+| `already_handled` | 먼저 확정된 응답이 있다. 응답자(by)·경로(via)·어떤 액션·언제를 함께 출력한다 | non-zero | `{"success":false,"reason":"already_handled",...}` |
 | `not_found` | 대응하는 HITL 요청이 없다 | non-zero | `reason: "not_found"` |
 | `invalid_action` | 허용되지 않는 액션 | non-zero | `reason: "invalid_action"` |
 
 - `work_id`를 주면 그 아이템의 열린 HITL 요청에 응답한다. 같은 아이템이 HITL에 재진입했으면 `hitl_id`로 요청을 특정할 수 있다.
-- CLI 응답에는 allowlist를 적용하지 않는다. 응답자는 이력에 `cli`로 기록된다.
+- CLI 응답에는 allowlist를 적용하지 않는다. 경로(via)는 이력에 `cli`로 기록되고, 응답자(by)는 `--respondent` 값으로 기록된다. 생략하면 OS 사용자 이름이다. 결과와 `already_handled` 출력은 경로와 응답자를 따로 보여준다.
 - daemon이 꺼져 있어도 응답은 확정된다. 후처리는 daemon이 다시 시작된 뒤 수행된다.
 
 ### `belt queue skip`
@@ -148,6 +148,7 @@ flowchart TD
 - 취소된 실행의 hook(on_done/on_fail/on_escalation)과 escalation은 실행되지 않는다. 이력에 요청자와 경로(cli/tui)가 남는다.
 - Ready에서 daemon의 점유와 경합해 `conflict`가 나면 한 번 다시 판단해 Running 취소 경로로 넘어간다.
 - Hitl 아이템은 직접 Skipped로 바뀌지 않는다. HITL에서 나가는 전이는 daemon 후처리만 수행한다.
+- Pending/Ready → Skipped와 Failed → Skipped 전이의 허용 여부는 [QueuePhase 상태 머신](./queue-state-machine.md)의 전이 계약을 따른다.
 
 ### `belt queue done` / `belt queue hitl`
 
@@ -159,6 +160,7 @@ flowchart TD
 | `hitl` | Completed (evaluate가 호출) | Hitl 전이 + HITL 요청 열기 |
 | `hitl` | 처리 중 | `busy` |
 | `hitl` | 이미 Hitl | `invalid_action` |
+| `done` / `hitl` / `skip` | Done · Skipped · Failed 등 전이 간선이 없는 종료 phase (Failed → Skipped skip은 허용) | `invalid_action` |
 
 ### 실패 결과와 exit code
 

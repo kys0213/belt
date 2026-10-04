@@ -58,7 +58,7 @@ flowchart LR
 
 > 출처 시스템에 올라온 HITL 응답을 받는 일은 DataSource가 아니라 origin channel의 책임이다. DataSource는 응답 수신을 위해 바뀌지 않는다. origin channel 구현이 없는 출처는 dashboard only로 동작한다.
 
-`get_context()`가 반환하는 `ItemContext`에는 `source_data` 필드가 있다. DataSource가 자신의 고유 데이터를 자유 스키마로 채울 수 있도록 예약된 OCP 확장점이다. GitHub DataSource는 이슈 조회에 성공하면 원본 이슈 응답(제목·본문·라벨·작성자·상태)을 가공 없이 `issue` 키 아래에 담는다 — `issue` 최상위 필드가 사람이 읽기 좋게 정제한 뷰라면, `source_data.issue`는 그 원본이다. 소스 종류별로 키를 나누는 이유는 향후 PR 등 다른 원본 데이터가 추가돼도 서로 충돌하지 않게 하기 위해서다. 이슈 조회가 실패하면 `Null`로 남는다. `source_data`가 `Null`이면 `belt context`의 JSON 출력에서 해당 키 자체가 생략된다. 활용 계획은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
+`get_context()`가 반환하는 아이템 컨텍스트에는 `source_data` 필드가 있다. DataSource가 자신의 고유 데이터를 자유 스키마로 채울 수 있도록 예약된 OCP 확장점이다. GitHub DataSource는 이슈 조회에 성공하면 원본 이슈 응답(제목·본문·라벨·작성자·상태)을 가공 없이 `issue` 키 아래에 담는다 — `issue` 최상위 필드가 사람이 읽기 좋게 정제한 뷰라면, `source_data.issue`는 그 원본이다. 소스 종류별로 키를 나누는 이유는 향후 PR 등 다른 원본 데이터가 추가돼도 서로 충돌하지 않게 하기 위해서다. 이슈 조회가 실패하면 `Null`로 남는다. `source_data`가 `Null`이면 `belt context`의 JSON 출력에서 해당 키 자체가 생략된다. 활용 계획은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
 
 ---
 
@@ -347,4 +347,4 @@ source_id = "github:org/repo#42"
 - [Stagnation Detection](./stagnation.md) — 실패 패턴 감지
 - [Cron 엔진](./cron-engine.md) — 품질 루프
 - [CLI 레퍼런스](./cli-reference.md) — belt context CLI
-- [Data Model](./data-model.md) — QueueItem/ItemContext 스키마
+- [Data Model](./data-model.md) — QueueItem/아이템 컨텍스트 스키마
