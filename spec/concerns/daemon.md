@@ -218,7 +218,10 @@ flowchart TD
     A -- "skip" --> S1["worktree 정리"]
     S1 --> S2["on_hitl_resolved"]
     S2 --> SKIP["Hitl to Skipped"]
-    A -- "replan" --> P1["replan 아이템을 Hitl 로 생성"]
+    A -- "replan" --> PC{"replan 상한 이내?"}
+    PC -- "초과" --> PF["on_hitl_resolved"]
+    PF --> PFAIL["Hitl to Failed"]
+    PC -- "이내" --> P1["replan 아이템을 Hitl 로 생성"]
     P1 --> P2["on_hitl_resolved"]
     P2 --> PEND
     A -- "expired" --> E1["terminal action 을 위 액션과 같은 방식으로 적용"]

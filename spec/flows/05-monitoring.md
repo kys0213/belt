@@ -147,9 +147,11 @@ Running 아이템을 선택하고 취소 키(`x`)를 누르면 `belt queue skip`
 sequenceDiagram
     actor U as 운영자
     participant T as TUI
+    participant DB as 큐 DB
     participant D as daemon
     U->>T: Running 아이템 선택 후 x
-    T->>D: 취소 요청 기록 + 즉시 깨움
+    T->>DB: 취소 요청 기록
+    T->>D: 즉시 깨움
     T-->>U: 토스트 "취소 요청됨"
     D->>D: handler 종료, Running to Skipped
     T-->>U: 아이템이 Skipped로 표시

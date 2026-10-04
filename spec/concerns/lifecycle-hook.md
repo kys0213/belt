@@ -180,12 +180,15 @@ sequenceDiagram
     else skip
         D->>HK: on_hitl_resolved (비치명)
         D->>D: Hitl → Skipped
-    else retry / replan
+    else retry / replan (상한 이내)
         D->>HK: on_hitl_resolved (비치명)
         D->>D: Hitl → Pending
+    else replan (상한 초과)
+        D->>HK: on_hitl_resolved (비치명)
+        D->>D: Hitl → Failed
     else expired (timeout)
         D->>HK: on_hitl_resolved (비치명)
-        D->>D: Hitl → Skipped (terminal skip) / Pending (terminal replan) / Failed (replan 상한 초과 또는 terminal 해석 불가 시 기본값)
+        D->>D: Hitl → Skipped (terminal skip) / Pending (terminal replan) / Failed (replan 상한 초과 또는 terminal 해석 불가 시 기본값; 사람의 replan 응답도 상한 초과면 Failed)
     end
 ```
 

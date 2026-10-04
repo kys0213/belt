@@ -214,9 +214,9 @@ flowchart TD
     A -- "done" --> D1["on_done 실행"]
     D1 -- "성공" --> DONE["Done, worktree 정리"]
     D1 -- "실패" --> FAIL["Failed, worktree 보존"]
-    A -- "retry" --> RT["사용자 지시를 lateral plan으로 주입, 새 아이템 Pending, worktree 보존"]
+    A -- "retry" --> RT["사용자 지시를 lateral plan으로 주입, Pending으로 돌아가 재시도, worktree 보존"]
     A -- "skip" --> SK["Skipped, worktree 정리"]
-    A -- "replan" --> RP["스펙 수정 제안 (아래 Replan 참조), 이후 Pending"]
+    A -- "replan" --> RP["스펙 수정 제안 (아래 Replan 참조), 상한 이내면 Pending, 초과면 Failed"]
 ```
 
 - done의 on_done이 실패하면 Failed다. 그 밖의 후처리 단계가 실패해도 결과 전이에는 도달하고, dashboard에 경고가 남는다.
@@ -231,7 +231,7 @@ flowchart TD
 ```mermaid
 flowchart TD
     R["replan (사용자 응답 또는 hitl timeout)"] --> C{"replan 횟수 상한 (3회) 이내?"}
-    C -- "초과" --> X["replan 적용 불가: 만료 경로는 Failed (아래 만료 결과 참조)"]
+    C -- "초과" --> X["Failed (사람의 replan 응답과 만료 경로 모두 동일)"]
     C -- "이내" --> S["Agent가 실패 컨텍스트 + lateral report를 분석하여 스펙 수정 제안"]
     S --> U["사용자가 /spec update로 스펙 수정 → 새 이슈 생성 → 파이프라인 재진입"]
 ```
@@ -347,9 +347,10 @@ flowchart TD
 | SPINNING 감지 | 동일 error 3회 연속 (유사도 ≥ 0.9, 인접 쌍 일치 2회) | escalation에 따름 | 페르소나 directive가 담긴 lateral plan 주입 |
 | OSCILLATION 감지 | 두 error가 교대로 2회 이상 반복 (유사도 ≥ 0.9) | escalation에 따름 | 페르소나 directive가 담긴 lateral plan 주입 |
 | HITL done 응답 | 사용자 done 선택 | "해결됨 · 처리 중" 뒤 Done | on_done 성공 후 Done, worktree 정리 |
-| HITL retry 응답 | 사용자 retry + 지시 | 새 아이템 Pending | 사용자 지시를 lateral plan으로 주입, worktree 보존 |
+| HITL retry 응답 | 사용자 retry + 지시 | Pending (같은 아이템) | 사용자 지시를 lateral plan으로 주입, worktree 보존 |
 | HITL skip 응답 | 사용자 skip 선택 | Skipped (terminal) | worktree 정리 |
-| HITL replan 응답 | 사용자 replan 선택 | Pending (replan 처리) | 스펙 수정 제안 |
+| HITL replan 응답 | 사용자 replan 선택 (상한 3회 이내) | Pending (replan 처리) | 스펙 수정 제안 |
+| HITL replan 응답, 상한 초과 | 사용자 replan 선택 (이미 3회 replan) | Failed | 만료 경로와 동일, 정리 |
 | HITL timeout | 24시간 무응답 | terminal 액션 적용 | skip→Skipped, replan→Pending, 상한 초과·해석 불가→Failed |
 | GitHub·CLI 동시 응답 | 두 경로가 거의 동시에 응답 | 먼저 확정된 응답의 결과 | 하나만 승리, 나머지는 `already_handled`, GitHub에는 "이미 처리됨" 회신, DB 에러 없음 |
 | allowlist 밖 응답 | 목록에 없는 응답자가 channel에서 응답 | 변화 없음 | `unauthorized`로 기록, 회신 없음 |

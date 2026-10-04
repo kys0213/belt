@@ -29,7 +29,7 @@ stagnation이 감지      = 실패 패턴을 분석하고, 사고를 전환하�
 | **이슈 작성자** | GitHub에 이슈를 등록하는 개발자/PM | 이슈 등록 + belt 라벨 부착 → Belt가 자동 수집 |
 | **Belt Daemon** | 자율 실행 프로세스 | 수집 → 분류 → 전이 → 실행 → 반영 루프, handler와 HITL 후처리의 단일 실행자 |
 | **LLM Agent** | handler prompt를 실행하는 AI (Claude, Gemini, Codex) | Daemon이 subprocess로 호출, worktree 안에서 실행 |
-| **GitHub** | 이슈/PR 소스 시스템 | 이슈 조회, on_done script가 PR 생성, 코멘트로 HITL 응답 가능 |
+| **GitHub** | 이슈/PR 소스 시스템 | 이슈 조회, on_done script가 PR 생성, 코멘트로 HITL 응답 가능 (respond.allow 설정 시) |
 | **응답자** | HITL 요청에 응답하는 사람 | dashboard, CLI, agent 세션, 설정된 channel(allowlist)에서 응답 |
 | **Cron Engine** | 주기 작업 스케줄러 | evaluate, gap-detection, hitl-timeout 등 내부 주기 실행 |
 | **Reviewer** | PR을 리뷰하는 사람 또는 Bot | changes_requested → DataSource가 감지 → 파이프라인 재진입 |
@@ -117,7 +117,7 @@ Daemon tick은 execute 이후 evaluate 순서로 동작한다. evaluate는 방�
 
 ### 8. 아이템 계보 (Lineage)
 
-같은 외부 엔티티에서 파생된 아이템은 `source_id`로 연결. 모든 이벤트는 append-only history로 축적.
+같은 외부 엔티티에서 파생된 아이템은 `source_id`로 연결. 아이템의 사건은 전이 이력에, 시도 결과는 시도 이력에 append-only로 쌓인다.
 
 ### 9. 환경변수 최소화
 
@@ -159,7 +159,7 @@ handler가 실행 중이거나 HITL 해결 후처리가 진행 중인 아이템�
 stateDiagram-v2
     [*] --> Pending: DataSource 수집
     Pending --> Ready: 자동 전이
-    Ready --> Running: 점유 (dependency gate, conflict gate, concurrency)
+    Ready --> Running: 점유 (dependency gate, spec 충돌 gate, concurrency)
     Ready --> Hitl: spec 충돌 감지
     Ready --> Done: 이력 기반 사전 판정
 
@@ -176,12 +176,14 @@ stateDiagram-v2
     Hitl --> Done: 해결 후처리 done 성공
     Hitl --> Skipped: 해결 후처리 skip
     Hitl --> Pending: 해결 후처리 retry 또는 replan
-    Hitl --> Failed: on_done 실패 또는 후처리 실패
+    Hitl --> Failed: on_done 실패, replan 상한 초과 또는 후처리 실패
 
     Failed --> Skipped: skip
     Done --> [*]
     Skipped --> [*]
 ```
+
+> 위 다이어그램은 큰그림을 위한 요약이다. 허용 전이의 전체 집합은 [QueuePhase 상태 머신](./concerns/queue-state-machine.md)을 따른다.
 
 > Running과 "해결됨 · 처리 중"인 Hitl은 **처리 중** 구간이다. 이 구간의 아이템은 daemon만 바꾸고, 외부 변경 요청은 `busy`로 거절된다(실행 중 취소 제외). 허용 전이의 정의와 worktree 생명주기는 [QueuePhase 상태 머신](./concerns/queue-state-machine.md)이 소유한다.
 
@@ -246,7 +248,7 @@ flowchart LR
 ```mermaid
 flowchart TD
     subgraph DAEMON["Daemon (CPU): 상태 머신 + 언제 어떤 hook을 트리거할지만 안다"]
-        ADV["Advancer: 전이, dependency gate, conflict gate, concurrency"]
+        ADV["Advancer: 전이, dependency gate, spec 충돌 gate, concurrency"]
         EXE["Executor: on_enter, handler 실행, 실패 시 escalation 결정"]
         STG["StagnationDetector + LateralAnalyzer: 패턴 감지, lateral plan"]
         EVA["Evaluator: Completed → Done 또는 HITL"]
@@ -289,7 +291,7 @@ flowchart TD
 | 레이어 | 책임 | 토큰 |
 |--------|------|------|
 | Daemon | CPU — DB 관찰 + handler·HITL 후처리의 단일 실행자 + hook 트리거 + cron 스케줄링 | 0 |
-| Advancer | Pending→Ready→Running 전이, dependency gate, conflict 검출 | 0 |
+| Advancer | Pending→Ready→Running 전이, dependency gate, spec 충돌 검출 | 0 |
 | Executor | handler 실행, escalation 결정, hook 트리거 | handler별 |
 | StagnationDetector | 정체 패턴(SPINNING, OSCILLATION) 감지 | 0 |
 | LateralAnalyzer | 내장 페르소나로 대안 접근법 분석, lateral plan 생성 | 0 |

@@ -63,7 +63,7 @@ stateDiagram-v2
     Failed --> Skipped: skip
 
     Hitl --> Done: 후처리 done
-    Hitl --> Failed: 후처리 실패
+    Hitl --> Failed: 후처리 실패 또는 replan 상한 초과
     Hitl --> Pending: 후처리 retry 또는 replan
     Hitl --> Skipped: 후처리 skip
 
@@ -92,7 +92,8 @@ flowchart TD
     H --> P["사람 응답 후 daemon 후처리"]
     P -- "done" --> Done
     P -- "skip" --> Sk["Skipped, worktree 정리"]
-    P -- "retry 또는 replan" --> Pe["Pending"]
+    P -- "retry 또는 replan (상한 이내)" --> Pe["Pending"]
+    P -- "replan (상한 초과)" --> Fl["Failed"]
 ```
 
 ---
@@ -238,7 +239,7 @@ stateDiagram-v2
     [*] --> HitlOpen: HITL 요청 open
     HitlOpen --> HitlResolved: 첫 확정 응답 또는 timeout 만료
     HitlResolved --> Done: 후처리 done 성공
-    HitlResolved --> Failed: on_done 실패 또는 후처리 연속 실패
+    HitlResolved --> Failed: on_done 실패, replan 상한 초과 또는 후처리 연속 실패
     HitlResolved --> Skipped: 후처리 skip
     HitlResolved --> Pending: 후처리 retry 또는 replan
     note right of HitlOpen
