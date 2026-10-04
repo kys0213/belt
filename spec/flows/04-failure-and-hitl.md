@@ -350,7 +350,7 @@ flowchart TD
 | HITL retry 응답 | 사용자 retry + 지시 | Pending (같은 아이템) | 사용자 지시를 lateral plan으로 주입, worktree 보존 |
 | HITL skip 응답 | 사용자 skip 선택 | Skipped (terminal) | worktree 정리 |
 | HITL replan 응답 | 사용자 replan 선택 (상한 3회 이내) | Pending (replan 처리) | 스펙 수정 제안 |
-| HITL replan 응답, 상한 초과 | 사용자 replan 선택 (이미 3회 replan) | Failed | 만료 경로와 동일, 정리 |
+| HITL replan 응답, 상한 초과 | 사용자 replan 선택 (이미 3회 replan) | Failed | worktree 보존 (Failed 규칙) |
 | HITL timeout | 24시간 무응답 | terminal 액션 적용 | skip→Skipped, replan→Pending, 상한 초과·해석 불가→Failed |
 | GitHub·CLI 동시 응답 | 두 경로가 거의 동시에 응답 | 먼저 확정된 응답의 결과 | 하나만 승리, 나머지는 `already_handled`, GitHub에는 "이미 처리됨" 회신, DB 에러 없음 |
 | allowlist 밖 응답 | 목록에 없는 응답자가 channel에서 응답 | 변화 없음 | `unauthorized`로 기록, 회신 없음 |
