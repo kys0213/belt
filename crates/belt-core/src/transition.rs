@@ -81,8 +81,10 @@ pub enum GuardDecision {
 /// 1. 처리 중이고 행위자가 소유자(daemon)가 아니면 `Busy`
 /// 2. Hitl 출구인데 daemon 후처리가 아니면 HITL 응답으로 대응되는지에 따라
 ///    `ConvertToHitlResponse` 또는 `InvalidAction`
-/// 3. 현재 phase가 기대 phase와 다르면 `Conflict`
-/// 4. 허용된 전이 집합 밖이면 `InvalidAction`
+/// 3. daemon 후처리라도 확정되고 후처리 전인 요청이 없으면(open 요청뿐이거나
+///    요청이 없음) `InvalidAction`. 후처리는 open이 아닌 요청에서만 시작한다.
+/// 4. 현재 phase가 기대 phase와 다르면 `Conflict`
+/// 5. 허용된 전이 집합 밖이면 `InvalidAction`
 pub fn guard(snapshot: &ItemSnapshot, req: &TransitionRequest) -> GuardDecision {
     let current = snapshot.phase;
 
@@ -101,6 +103,10 @@ pub fn guard(snapshot: &ItemSnapshot, req: &TransitionRequest) -> GuardDecision 
                 None => GuardDecision::Reject(TransitionOutcome::InvalidAction { current }),
             };
         }
+        // 확정 요청 없이 Hitl을 벗어나면 open 요청이 주인 없이 남는다.
+        if snapshot.processing != Some(Processing::PostProcessing) {
+            return GuardDecision::Reject(TransitionOutcome::InvalidAction { current });
+        }
     }
 
     if current != req.expected_from {
@@ -115,7 +121,11 @@ pub fn guard(snapshot: &ItemSnapshot, req: &TransitionRequest) -> GuardDecision 
 }
 
 /// Hitl 출구 요청의 목표 phase에 대응되는 HITL 응답. 대응이 없으면 `None`.
-fn hitl_response_for(to: QueuePhase) -> Option<HitlAction> {
+///
+/// [`guard`]의 `ConvertToHitlResponse` 판정과 같은 매핑이다. 전이 요청이
+/// `InvalidAction { current: Hitl }`로 돌아온 호출자(`queue skip`/`queue done`)는
+/// 이 함수로 HITL 응답 액션을 얻어 첫 응답 승리 경합(`resolve_hitl`)으로 넘긴다.
+pub fn hitl_response_for(to: QueuePhase) -> Option<HitlAction> {
     match to {
         QueuePhase::Done => Some(HitlAction::Done),
         QueuePhase::Skipped => Some(HitlAction::Skip),
@@ -240,6 +250,35 @@ mod tests {
                 guard(&snap(Hitl, Some(Processing::PostProcessing)), &r),
                 GuardDecision::Proceed
             );
+        }
+    }
+
+    #[test]
+    fn daemon_post_processing_without_confirmed_request_cannot_leave_hitl() {
+        // Hitl with no confirmed request (an open request or none at all):
+        // leaving would orphan the open request.
+        for (to, action) in [
+            (Done, HitlAction::Done),
+            (Skipped, HitlAction::Skip),
+            (Pending, HitlAction::Retry),
+            (Failed, HitlAction::Replan),
+        ] {
+            let r = req(
+                Hitl,
+                to,
+                Actor::Daemon,
+                TransitionReason::PostProcessing(action),
+            );
+            assert_eq!(guard(&snap(Hitl, None), &r), invalid(Hitl), "to {to:?}");
+        }
+    }
+
+    #[test]
+    fn hitl_response_for_maps_only_done_and_skipped() {
+        assert_eq!(hitl_response_for(Done), Some(HitlAction::Done));
+        assert_eq!(hitl_response_for(Skipped), Some(HitlAction::Skip));
+        for to in [Pending, Ready, Running, Completed, Hitl, Failed] {
+            assert_eq!(hitl_response_for(to), None, "to {to:?}");
         }
     }
 

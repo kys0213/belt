@@ -4,6 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+use crate::escalation::EscalationAction;
 use crate::phase::QueuePhase;
 use crate::queue::HitlRespondAction;
 
@@ -66,6 +67,20 @@ impl fmt::Display for HitlAction {
             HitlAction::Retry => f.write_str("retry"),
             HitlAction::Skip => f.write_str("skip"),
             HitlAction::Replan => f.write_str("replan"),
+        }
+    }
+}
+
+/// timeout 만료 시 terminal action에 대응되는 HITL 응답.
+///
+/// terminal은 `skip`·`replan`만 허용된다. 그 밖의 값이면 `None`이고,
+/// 호출자는 만료를 확정하지 않고 `invalid_action`으로 거절한다.
+pub fn expiry_action(terminal: EscalationAction) -> Option<HitlAction> {
+    match terminal {
+        EscalationAction::Skip => Some(HitlAction::Skip),
+        EscalationAction::Replan => Some(HitlAction::Replan),
+        EscalationAction::Retry | EscalationAction::RetryWithComment | EscalationAction::Hitl => {
+            None
         }
     }
 }
@@ -148,6 +163,25 @@ mod tests {
         );
         let parsed: HitlAction = serde_json::from_str("\"retry\"").unwrap();
         assert_eq!(parsed, HitlAction::Retry);
+    }
+
+    #[test]
+    fn expiry_action_accepts_only_terminal_actions() {
+        assert_eq!(
+            expiry_action(EscalationAction::Skip),
+            Some(HitlAction::Skip)
+        );
+        assert_eq!(
+            expiry_action(EscalationAction::Replan),
+            Some(HitlAction::Replan)
+        );
+        for level in [
+            EscalationAction::Retry,
+            EscalationAction::RetryWithComment,
+            EscalationAction::Hitl,
+        ] {
+            assert_eq!(expiry_action(level), None, "{level:?}");
+        }
     }
 
     #[test]

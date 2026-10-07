@@ -1987,7 +1987,13 @@ impl Database {
     /// A request that leaves Hitl without being a daemon post-processing
     /// transition corresponds to a HITL response. This method does not decide
     /// that race: it reports `InvalidAction { current: Hitl }` and changes
-    /// nothing; the caller answers through [`Database::resolve_hitl`].
+    /// nothing; the caller maps its target phase with
+    /// [`belt_core::transition::hitl_response_for`] and, when that yields an
+    /// action, answers through [`Database::resolve_hitl`].
+    ///
+    /// A daemon post-processing transition leaves Hitl only while a confirmed
+    /// request awaits post-processing; with only an open request it is
+    /// `InvalidAction { current: Hitl }`.
     ///
     /// # Errors
     /// `BeltError::ItemNotFound` for an unknown `work_id`, `BeltError::Database`
@@ -2351,6 +2357,9 @@ impl Database {
     /// phase is untouched: it leaves Hitl only through
     /// [`Database::complete_post_processing`].
     ///
+    /// [`HitlTarget::Item`] addresses only the item's current request (open,
+    /// or confirmed and not yet post-processed); otherwise `NotFound`.
+    ///
     /// # Errors
     /// `BeltError::Database` on I/O failure or an inconsistent stored request.
     pub fn resolve_hitl(
@@ -2377,12 +2386,8 @@ impl Database {
         hitl_id: &HitlId,
         terminal: EscalationAction,
     ) -> Result<RespondOutcome, BeltError> {
-        let action = match terminal {
-            EscalationAction::Skip => HitlAction::Skip,
-            EscalationAction::Replan => HitlAction::Replan,
-            EscalationAction::Retry
-            | EscalationAction::RetryWithComment
-            | EscalationAction::Hitl => return Ok(RespondOutcome::InvalidAction),
+        let Some(action) = belt_core::hitl::expiry_action(terminal) else {
+            return Ok(RespondOutcome::InvalidAction);
         };
         let expiry = HitlResolution {
             action,
@@ -2603,10 +2608,16 @@ fn confirm_open(
     Ok(())
 }
 
+/// The request a target names. An item names only its current request: the
+/// open one, or a confirmed one still awaiting post-processing. Requests
+/// already post-processed belong to the item's past and are not found.
 fn find_hitl(conn: &Connection, target: &HitlTarget) -> Result<Option<HitlRequest>, BeltError> {
     let (filter, key) = match target {
         HitlTarget::Id(id) => ("hitl_id = ?1", id.as_str()),
-        HitlTarget::Item(work_id) => ("work_id = ?1", work_id.as_str()),
+        HitlTarget::Item(work_id) => (
+            "work_id = ?1 AND (status = 'open' OR post_processed_at IS NULL)",
+            work_id.as_str(),
+        ),
     };
     let mut stmt = conn
         .prepare(&format!(
@@ -5275,7 +5286,14 @@ mod tests {
         run_to_running(&db, &first);
         history(&db, &first, "s1", "implement", "failed");
         history(&db, &first, "s1", "implement", "failed");
-        step(&db, &first, QueuePhase::Running, QueuePhase::Hitl);
+        // Replan leaves Hitl only as post-processing of a confirmed request.
+        let hitl_id = opened(&db, &first);
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id),
+            &resolution(HitlAction::Replan, "irene", "cli"),
+            None,
+        )
+        .unwrap();
         assert_eq!(db.failure_count(&first).unwrap(), 2);
 
         let outcome = db
@@ -5958,6 +5976,99 @@ mod tests {
                 processing: Processing::PostProcessing
             }
         );
+    }
+
+    #[test]
+    fn daemon_post_processing_cannot_leave_hitl_while_the_request_is_open() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        for (to, action) in [
+            (QueuePhase::Done, HitlAction::Done),
+            (QueuePhase::Skipped, HitlAction::Skip),
+            (QueuePhase::Pending, HitlAction::Retry),
+            (QueuePhase::Failed, HitlAction::Replan),
+        ] {
+            assert_eq!(
+                db.transition(&post_processing(&id, to, action)).unwrap(),
+                TransitionOutcome::InvalidAction {
+                    current: QueuePhase::Hitl
+                },
+                "to {to:?}"
+            );
+        }
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+        assert_eq!(
+            db.hitl_request(&hitl_id).unwrap().unwrap().status,
+            HitlStatus::Open
+        );
+    }
+
+    #[test]
+    fn cli_skip_on_open_hitl_maps_to_a_response_through_the_core_mapping() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        let skip = request(&id, QueuePhase::Hitl, QueuePhase::Skipped, Actor::Cli);
+
+        let outcome = db.transition(&skip).unwrap();
+        assert_eq!(
+            outcome,
+            TransitionOutcome::InvalidAction {
+                current: QueuePhase::Hitl
+            }
+        );
+        let action = belt_core::transition::hitl_response_for(skip.to)
+            .expect("queue skip on Hitl is a HITL response");
+        assert_eq!(
+            db.resolve_hitl(
+                &HitlTarget::Item(id.clone()),
+                &resolution(action, "irene", "cli"),
+                None
+            )
+            .unwrap(),
+            RespondOutcome::Won { hitl_id }
+        );
+    }
+
+    #[test]
+    fn resolve_hitl_by_item_ignores_requests_already_post_processed() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id.clone()),
+            &resolution(HitlAction::Retry, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+        db.complete_post_processing(
+            &hitl_id,
+            &post_processing(&id, QueuePhase::Pending, HitlAction::Retry),
+        )
+        .unwrap();
+
+        // The item left Hitl; its old request is history, not a target.
+        assert_eq!(
+            db.resolve_hitl(
+                &HitlTarget::Item(id.clone()),
+                &resolution(HitlAction::Done, "bob", "cli"),
+                None
+            )
+            .unwrap(),
+            RespondOutcome::NotFound
+        );
+        // Addressed by id, the old request still reports its winner.
+        assert!(matches!(
+            db.resolve_hitl(
+                &HitlTarget::Id(hitl_id),
+                &resolution(HitlAction::Done, "bob", "cli"),
+                None
+            )
+            .unwrap(),
+            RespondOutcome::AlreadyHandled(_)
+        ));
     }
 
     #[test]
