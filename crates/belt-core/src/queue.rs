@@ -167,6 +167,12 @@ pub struct QueueItem {
     /// Lateral plan (serialized JSON) — stagnation 감지 시 LateralAnalyzer가 생성한 계획.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lateral_plan: Option<String>,
+    /// 파생 원본 — 직전 아이템의 work_id. 파생이 아닌 아이템은 `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<String>,
+    /// 계열의 최초 아이템 work_id. 새 계열의 첫 아이템은 자기 자신이다.
+    #[serde(default)]
+    pub lineage_root: String,
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -177,6 +183,8 @@ impl QueueItem {
     pub fn new(work_id: String, source_id: String, workspace_id: String, state: String) -> Self {
         let now = chrono::Utc::now().to_rfc3339();
         Self {
+            lineage_root: work_id.clone(),
+            derived_from: None,
             work_id,
             source_id,
             workspace_id,
@@ -198,10 +206,16 @@ impl QueueItem {
         }
     }
 
-    /// work_id를 규약에 따라 생성한다.
+    /// `(source_id, state)`에서 처음 만들어지는 아이템의 work_id를 규약에 따라 생성한다.
     /// format: "{source_id}:{state}"
     pub fn make_work_id(source_id: &str, state: &str) -> String {
         format!("{source_id}:{state}")
+    }
+
+    /// 같은 `(source_id, state)`의 두 번째 이후 아이템(파생·재수집)의 work_id.
+    /// format: "{source_id}:{state}:{n}" (`n`은 2부터, 재사용 없음)
+    pub fn make_derived_work_id(source_id: &str, state: &str, n: u32) -> String {
+        format!("{source_id}:{state}:{n}")
     }
 
     /// Read-only accessor for the current phase.
@@ -294,6 +308,8 @@ impl QueueItem {
             .map(|s| s.parse::<EscalationAction>())
             .transpose()?;
         Ok(Self {
+            derived_from: None,
+            lineage_root: row.work_id.clone(),
             work_id: row.work_id.clone(),
             source_id: row.source_id.clone(),
             workspace_id: row.workspace_id.clone(),
@@ -340,6 +356,8 @@ pub mod testing {
     pub fn test_item(source_id: &str, state: &str) -> QueueItem {
         let work_id = QueueItem::make_work_id(source_id, state);
         QueueItem {
+            lineage_root: work_id.clone(),
+            derived_from: None,
             work_id,
             source_id: source_id.to_string(),
             workspace_id: "test-ws".to_string(),
@@ -564,6 +582,47 @@ mod tests {
         assert_eq!(row.replan_count, 3);
         let restored = QueueItem::from_row(&row).unwrap();
         assert_eq!(restored.replan_count, 3);
+    }
+
+    #[test]
+    fn make_derived_work_id_appends_sequence() {
+        assert_eq!(
+            QueueItem::make_derived_work_id("github:org/repo#42", "implement", 2),
+            "github:org/repo#42:implement:2"
+        );
+    }
+
+    #[test]
+    fn new_item_is_its_own_lineage_root_without_origin() {
+        let item = QueueItem::new("w".into(), "s".into(), "ws".into(), "analyze".into());
+        assert_eq!(item.lineage_root, "w");
+        assert_eq!(item.derived_from, None);
+    }
+
+    #[test]
+    fn lineage_fields_json_roundtrip() {
+        let mut item = test_item("s1", "analyze");
+        item.derived_from = Some("s1:analyze".to_string());
+        item.lineage_root = "s1:analyze".to_string();
+        let json = serde_json::to_string(&item).unwrap();
+        let parsed: QueueItem = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.derived_from.as_deref(), Some("s1:analyze"));
+        assert_eq!(parsed.lineage_root, "s1:analyze");
+    }
+
+    #[test]
+    fn derived_from_skipped_in_json_when_none() {
+        let item = test_item("s1", "analyze");
+        let json = serde_json::to_string(&item).unwrap();
+        assert!(!json.contains("derived_from"));
+    }
+
+    #[test]
+    fn from_row_starts_a_lineage_at_the_item_itself() {
+        let item = test_item("s1", "analyze");
+        let restored = QueueItem::from_row(&item.to_row()).unwrap();
+        assert_eq!(restored.lineage_root, item.work_id);
+        assert_eq!(restored.derived_from, None);
     }
 
     #[test]
