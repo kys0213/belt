@@ -199,7 +199,12 @@ impl<'a> Advancer<'a> {
                 }
                 true
             }
-            Ok(TransitionOutcome::Conflict { current }) => {
+            // An `InvalidAction` naming another phase means the row moved on
+            // (a Hitl row refuses every claim this way): follow it like a conflict.
+            Ok(TransitionOutcome::Conflict { current })
+            | Ok(TransitionOutcome::InvalidAction { current })
+                if current != from =>
+            {
                 tracing::info!(
                     work_id = %request.work_id,
                     expected = ?from,
@@ -213,8 +218,9 @@ impl<'a> Advancer<'a> {
                 false
             }
             Ok(
-                outcome
-                @ (TransitionOutcome::Busy { .. } | TransitionOutcome::InvalidAction { .. }),
+                outcome @ (TransitionOutcome::Conflict { .. }
+                | TransitionOutcome::Busy { .. }
+                | TransitionOutcome::InvalidAction { .. }),
             ) => {
                 tracing::error!(work_id = %request.work_id, ?outcome, "claim transition rejected");
                 false

@@ -1055,8 +1055,10 @@ impl Daemon {
 
     /// 실패한 실행을 escalation 결정에 따라 저장소에 반영한다.
     ///
-    /// 순서는 spec의 실패 경로를 따른다: stagnation 탐지 → escalation 결정 →
-    /// 결과 전이 commit → (적용된 경우에만) on_escalation, on_fail, 시도 이력.
+    /// 순서는 spec의 실패 경로를 따른다: stagnation 탐지 → 계열 failure_count로
+    /// escalation 결정 → 결과 전이 commit(retry 계열은 파생) → (적용된 경우에만)
+    /// on_escalation → on_fail script → 시도 이력 → on_fail hook. retry는 on_fail을
+    /// 부르지 않는다. 저장소를 읽지 못하면 아무 전이도 하지 않고 오류로 드러낸다.
     async fn apply_failure(
         &mut self,
         mut item: QueueItem,
@@ -1070,40 +1072,99 @@ impl Daemon {
             self.try_record_token_usage(&item, r);
         }
 
-        // Detect stagnation and generate a lateral plan for retry injection.
-        let lateral_plan = self.detect_stagnation_and_generate_plan(
+        // This run's failure is recorded only after the commit, so it is
+        // counted on top of the lineage's stored failures.
+        let failure_count = match self.db.failure_count(&item.work_id) {
+            Ok(stored) => stored + 1,
+            Err(e) => {
+                return self.discard_unrecorded(item, &ws_name, format!("failure count: {e}"));
+            }
+        };
+
+        // Detect stagnation and generate a lateral plan for the derived item.
+        let lateral_plan =
+            match self.detect_stagnation_and_generate_plan(&item, &error, failure_count) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    return self.discard_unrecorded(
+                        item,
+                        &ws_name,
+                        format!("stagnation history: {e}"),
+                    );
+                }
+            };
+
+        let escalation = self.resolve_escalation(failure_count);
+
+        let hitl_notes = match escalation {
+            EscalationAction::Hitl | EscalationAction::Replan => {
+                match crate::escalation_path::lineage_hitl_notes(
+                    &self.db,
+                    &item,
+                    lateral_plan.as_deref(),
+                ) {
+                    Ok(notes) => notes,
+                    Err(e) => {
+                        return self.discard_unrecorded(
+                            item,
+                            &ws_name,
+                            format!("lineage stagnation history: {e}"),
+                        );
+                    }
+                }
+            }
+            EscalationAction::Retry
+            | EscalationAction::RetryWithComment
+            | EscalationAction::Skip => None,
+        };
+
+        use crate::escalation_path::{Committed, EscalationCommit};
+        let committed = match crate::escalation_path::commit(
+            &self.db,
             &item.work_id,
-            &item.source_id,
-            &item.state,
-            &error,
-        );
-
-        let failure_count = self.count_failures(&item.source_id, &item.state);
-        let escalation = self.resolve_escalation(&item.state, failure_count + 1);
-
-        // Q-10: Mark worktree as preserved for failed items.
-        let was_preserved = item.worktree_preserved;
-        item.mark_worktree_preserved();
-
-        match self.handle_escalation(&mut item, escalation, lateral_plan) {
-            Ok(crate::hitl_service::EscalationCommit::Applied) => {}
-            Ok(crate::hitl_service::EscalationCommit::Conflict { current }) => {
-                item.worktree_preserved = was_preserved;
+            escalation,
+            hitl_notes.clone(),
+        ) {
+            Ok(EscalationCommit::Applied(committed)) => committed,
+            Ok(EscalationCommit::Conflict { current }) => {
                 item.set_phase_unchecked(current);
                 return self.discard_conflicted(item, &ws_name, current);
             }
-            Ok(crate::hitl_service::EscalationCommit::Rejected(refused)) => {
-                item.worktree_preserved = was_preserved;
+            Ok(EscalationCommit::Rejected(refused)) => {
                 return self.discard_unrecorded(
                     item,
                     &ws_name,
                     format!("escalation transition refused: {refused:?}"),
                 );
             }
-            Err(e) => {
-                item.worktree_preserved = was_preserved;
-                return self.discard_unrecorded(item, &ws_name, e.to_string());
+            Err(e) => return self.discard_unrecorded(item, &ws_name, e.to_string()),
+        };
+
+        // Q-10: the worktree outlives a failed run (handed over or preserved).
+        item.mark_worktree_preserved();
+        match committed {
+            Committed::Derived { work_id } => {
+                item.set_phase_unchecked(QueuePhase::Skipped);
+                self.enqueue_derived(&work_id, lateral_plan);
             }
+            Committed::Skipped => item.set_phase_unchecked(QueuePhase::Skipped),
+            Committed::Hitl => {
+                item.set_phase_unchecked(QueuePhase::Hitl);
+                item.hitl_created_at = Some(Utc::now().to_rfc3339());
+                item.hitl_reason = Some(HitlReason::RetryMaxExceeded);
+                item.hitl_notes = hitl_notes;
+                self.queue.push_back(item.clone());
+            }
+        }
+
+        // Hooks react to the committed result; their failure changes nothing.
+        let hook_ctx = self.build_hook_context(&item, worktree.as_ref(), failure_count);
+        let hook = self.resolve_hook(&ws_name);
+        if let Err(e) = hook.on_escalation(&hook_ctx, escalation).await {
+            tracing::warn!(
+                work_id = %item.work_id,
+                "lifecycle hook on_escalation error (ignored): {e}"
+            );
         }
 
         // Q-12: Execute on_fail scripts only when escalation is not a silent retry.
@@ -1134,10 +1195,10 @@ impl Daemon {
         self.record_history(&item, "failed", Some(&error));
         self.record_history_event(&item, "failed", Some(error.clone()));
 
-        // Lifecycle hook: on_fail — log only, do not interrupt flow.
-        let hook_ctx = self.build_hook_context(&item, worktree.as_ref());
-        let fail_hook = self.resolve_hook(&ws_name);
-        if let Err(e) = fail_hook.on_fail(&hook_ctx).await {
+        // Lifecycle hook: on_fail — not for a silent retry, log only on failure.
+        if escalation.should_run_on_fail()
+            && let Err(e) = hook.on_fail(&hook_ctx).await
+        {
             tracing::warn!(
                 work_id = %item.work_id,
                 "lifecycle hook on_fail error (ignored): {e}"
@@ -1198,6 +1259,25 @@ impl Daemon {
         tracing::error!(work_id = %item.work_id, "failed to record execution result: {error}");
         self.tracker.release(ws_name);
         ItemOutcome::StoreError { item, error }
+    }
+
+    /// Queue the item an escalation retry derived, carrying the lateral plan.
+    ///
+    /// The derivation is already committed. If its row cannot be read now,
+    /// the next store observation adds it (without the in-memory lateral
+    /// plan), so the read error is reported but not returned.
+    fn enqueue_derived(&mut self, work_id: &str, lateral_plan: Option<String>) {
+        match self.db.get_item(work_id) {
+            Ok(mut derived) => {
+                derived.lateral_plan = lateral_plan;
+                self.queue.push_back(derived);
+            }
+            Err(e) => tracing::error!(
+                work_id,
+                error = %e,
+                "derived item committed but not readable; the next observation adds it"
+            ),
+        }
     }
 
     // ---------------------------------------------------------------
@@ -1264,11 +1344,26 @@ impl Daemon {
             }
         });
 
-        if let Err(e) = self.worktree_mgr.cleanup(work_id) {
-            tracing::warn!(work_id, error = %e, "worktree cleanup failed on mark_done, continuing");
-        }
+        self.cleanup_owned_worktree(work_id);
 
         Ok(())
+    }
+
+    /// Clean up the worktree a finished (Done) item owns.
+    ///
+    /// The worktree is keyed by its owner: a derived item cleans the worktree
+    /// it was handed. Failures are logged; cleanup never fails the transition.
+    fn cleanup_owned_worktree(&self, work_id: &str) {
+        let key = match self.db.worktree_key(work_id) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::warn!(work_id, error = %e, "worktree owner lookup failed, not cleaned");
+                return;
+            }
+        };
+        if let Err(e) = self.worktree_mgr.cleanup(&key) {
+            tracing::warn!(work_id, worktree = %key, error = %e, "worktree cleanup failed, continuing");
+        }
     }
 
     /// Mark a Completed item as Hitl (human-in-the-loop) with reason and optional notes.
@@ -1518,7 +1613,12 @@ impl Daemon {
         }
         tracing::info!(work_id, source_id = %source_id, "worktree preserved for failed item");
 
-        let attempt = self.count_failures(&source_id, &state) + 1;
+        let attempt = self
+            .history_events
+            .iter()
+            .filter(|h| h.source_id == source_id && h.state == state)
+            .count() as u32
+            + 1;
 
         self.history_events.push(HistoryEvent {
             work_id: work_id.to_string(),
@@ -1532,35 +1632,6 @@ impl Daemon {
         });
 
         Ok(())
-    }
-
-    /// Apply escalation logic based on accumulated failure count.
-    pub fn apply_escalation(&mut self, work_id: &str, source_id: &str, state: &str) {
-        let failure_count = self.count_failures(source_id, state);
-
-        match failure_count {
-            0 => {}
-            1 => {
-                tracing::info!(work_id, source_id, state, "first failure recorded");
-            }
-            2 => {
-                tracing::warn!(work_id, source_id, state, "second failure recorded");
-            }
-            _ => {
-                tracing::error!(
-                    work_id,
-                    source_id,
-                    state,
-                    failure_count,
-                    "escalating to HITL after repeated failures"
-                );
-                let _ = self.mark_hitl(
-                    work_id,
-                    HitlReason::RetryMaxExceeded,
-                    Some("escalation: repeated failures".to_string()),
-                );
-            }
-        }
     }
 
     // ---------------------------------------------------------------
@@ -1613,7 +1684,7 @@ impl Daemon {
     fn settle_on_done(&mut self, item: &QueueItem, succeeded: bool) {
         if succeeded {
             self.record_history(item, "done", None);
-            let _ = self.worktree_mgr.cleanup(&item.work_id);
+            self.cleanup_owned_worktree(&item.work_id);
             self.worktree_mgr.clear_preserved(&item.source_id);
         } else {
             self.record_history(item, "failed", Some("on_done script failed"));
@@ -2342,24 +2413,11 @@ impl Daemon {
         None
     }
 
-    /// Count failures for a given source_id **and** state.
-    pub fn count_failures(&self, source_id: &str, state: &str) -> u32 {
-        let from_entries = self
-            .history
-            .iter()
-            .filter(|h| h.state == state && h.status == belt_core::context::HistoryStatus::Failed)
-            .count() as u32;
-
-        let from_events = self
-            .history_events
-            .iter()
-            .filter(|h| h.source_id == source_id && h.state == state && h.status == "failed")
-            .count() as u32;
-
-        from_entries + from_events
-    }
-
-    fn resolve_escalation(&self, _state: &str, failure_count: u32) -> EscalationAction {
+    /// The escalation action for the `failure_count`-th failure of a lineage.
+    ///
+    /// Past the highest configured level the highest level is reused
+    /// ([`belt_core::escalation::EscalationPolicy::resolve`]).
+    fn resolve_escalation(&self, failure_count: u32) -> EscalationAction {
         let policy = self
             .config
             .sources
@@ -2371,77 +2429,47 @@ impl Daemon {
         policy.resolve(failure_count)
     }
 
-    /// Handle an escalation action for a queue item.
-    ///
-    /// Delegates to [`crate::hitl_service::HitlService`] which encapsulates
-    /// all HITL escalation routing logic and commits the result transition.
-    fn handle_escalation(
-        &mut self,
-        item: &mut QueueItem,
-        action: EscalationAction,
-        lateral_plan: Option<String>,
-    ) -> Result<crate::hitl_service::EscalationCommit, BeltError> {
-        let hook_ctx = self.build_hook_context(item, None);
-        let resolved_hook = self.resolve_hook(&self.config.name);
-        let mut svc = crate::hitl_service::HitlService::new(
-            &mut self.queue,
-            &self.db,
-            &resolved_hook,
-            &self.worktree_mgr,
-        );
-        svc.handle_escalation(item, action, lateral_plan, hook_ctx)
-    }
-
     /// Detect stagnation from failure history and generate a lateral plan directive.
     ///
-    /// Collects error messages from `history_events` for the given source/state,
+    /// Collects the stored failure messages of the item's `(source_id, state)`,
     /// runs them through a `StagnationDetector` (spinning + oscillation detection via
     /// `CompositeSimilarity`), and if a pattern is detected, selects a persona via
     /// `LateralAnalyzer` and builds a directive-based lateral plan string.
+    /// `failure_count` is this failure's position in the lineage.
+    ///
+    /// # Errors
+    /// `BeltError` when the stored history cannot be read. There is no
+    /// in-memory substitute: the store is the only failure history.
     fn detect_stagnation_and_generate_plan(
         &self,
-        work_id: &str,
-        source_id: &str,
-        state: &str,
+        item: &QueueItem,
         current_error: &str,
-    ) -> Option<String> {
+        failure_count: u32,
+    ) -> Result<Option<String>, BeltError> {
+        let (work_id, source_id, state) = (&item.work_id, &item.source_id, &item.state);
+
         // Respect stagnation.enabled configuration flag.
         if !self.config.stagnation.enabled {
-            return None;
+            return Ok(None);
         }
 
         // Respect lateral.enabled configuration flag.
         if !self.config.stagnation.lateral.enabled {
-            return None;
+            return Ok(None);
         }
 
         // Collect recent failure error messages for this source_id + state.
-        // Prefer DB query (R-018); fall back to in-memory history_events when DB
-        // is unavailable or the query fails.
         let errors: Vec<String> = self
             .db
-            .get_history(source_id)
-            .ok()
-            .map(|db_events| {
-                db_events
-                    .into_iter()
-                    .filter(|h| h.state == state && h.status == "failed")
-                    .filter_map(|h| h.error)
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                self.history_events
-                    .iter()
-                    .filter(|h| {
-                        h.source_id == source_id && h.state == state && h.status == "failed"
-                    })
-                    .filter_map(|h| h.error.clone())
-                    .collect()
-            });
+            .get_history(source_id)?
+            .into_iter()
+            .filter(|h| h.state == *state && h.status == "failed")
+            .filter_map(|h| h.error)
+            .collect();
 
         // Need at least one prior failure to detect stagnation.
         if errors.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // Build outputs list: prior errors + current error.
@@ -2479,13 +2507,15 @@ impl Daemon {
             )),
         ]);
 
-        let detection = detector.detect(&outputs)?;
+        let Some(detection) = detector.detect(&outputs) else {
+            return Ok(None);
+        };
 
         // Collect previously attempted personas from lateral_plan history in queue.
         let attempted: Vec<Persona> = self
             .queue
             .iter()
-            .filter(|q| q.source_id == source_id && q.state == state)
+            .filter(|q| q.source_id == *source_id && q.state == *state)
             .filter_map(|q| q.lateral_plan.as_deref())
             .filter_map(|plan| {
                 // Extract persona name from the plan text.
@@ -2504,9 +2534,9 @@ impl Daemon {
             .collect();
 
         let analyzer = LateralAnalyzer::new();
-        let persona = analyzer.select_persona(detection.pattern, &attempted)?;
-
-        let failure_count = self.count_failures(source_id, state) + 1;
+        let Some(persona) = analyzer.select_persona(detection.pattern, &attempted) else {
+            return Ok(None);
+        };
 
         let plan = format!(
             "\n\n## Lateral Plan\n\
@@ -2539,7 +2569,7 @@ impl Daemon {
             "stagnation detected, generated lateral plan"
         );
 
-        Some(plan)
+        Ok(Some(plan))
     }
 
     /// Token usage가 있으면 DB에 기록한다. DB가 없거나 기록 실패 시 경고만 출력.
@@ -2620,8 +2650,12 @@ impl Daemon {
     /// Constructs a minimal `ItemContext` from the item's own fields and
     /// the workspace config.  This avoids calling `DataSource::get_context()`
     /// at every transition point (which would require async I/O).
-    fn build_hook_context(&self, item: &QueueItem, worktree: Option<&PathBuf>) -> HookContext {
-        let failure_count = self.count_failures(&item.source_id, &item.state);
+    fn build_hook_context(
+        &self,
+        item: &QueueItem,
+        worktree: Option<&PathBuf>,
+        failure_count: u32,
+    ) -> HookContext {
         let worktree_path = worktree
             .cloned()
             .unwrap_or_else(|| self.worktree_mgr.path(&item.work_id));
@@ -3611,128 +3645,6 @@ sources:
         // Global limit is 4, so only 4 total should be running
         assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 4);
         assert_eq!(daemon.items_in_phase(QueuePhase::Ready).len(), 2);
-    }
-
-    // ---------------------------------------------------------------
-    // count_failures tests
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn count_failures_returns_zero_with_no_history() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let daemon = setup_daemon(&tmp, source, vec![]);
-
-        assert_eq!(daemon.count_failures("src1", "analyze"), 0);
-    }
-
-    #[test]
-    fn count_failures_includes_history_events() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("src1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Running);
-        daemon.push_item(item);
-
-        daemon
-            .mark_failed("src1:analyze", "first failure".into())
-            .unwrap();
-
-        assert_eq!(daemon.count_failures("src1", "analyze"), 1);
-    }
-
-    #[test]
-    fn count_failures_is_source_and_state_specific() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item1 = test_item("src1", "analyze");
-        item1.set_phase_unchecked(QueuePhase::Running);
-        daemon.push_item(item1);
-
-        daemon
-            .mark_failed("src1:analyze", "failure".into())
-            .unwrap();
-
-        // Different source_id → 0 failures
-        assert_eq!(daemon.count_failures("src2", "analyze"), 0);
-        // Different state → 0 failures
-        assert_eq!(daemon.count_failures("src1", "implement"), 0);
-        // Correct source_id + state → 1 failure
-        assert_eq!(daemon.count_failures("src1", "analyze"), 1);
-    }
-
-    #[test]
-    fn count_failures_accumulates_across_multiple_failures() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        // Record failures via mark_failed using distinct work_ids so each
-        // call finds a fresh Running item (work_id is unique per attempt).
-        for i in 0..3u32 {
-            let mut item = test_item("src1", "analyze");
-            item.work_id = format!("src1:analyze-attempt-{i}");
-            item.set_phase_unchecked(QueuePhase::Running);
-            daemon.push_item(item);
-            daemon
-                .mark_failed(
-                    &format!("src1:analyze-attempt-{i}"),
-                    "repeated failure".into(),
-                )
-                .unwrap();
-        }
-
-        // count_failures filters by source_id + state, not work_id.
-        assert_eq!(daemon.count_failures("src1", "analyze"), 3);
-    }
-
-    // ---------------------------------------------------------------
-    // apply_escalation tests
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn apply_escalation_first_failure_logs_info() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        // No failures recorded yet → count_failures = 0 → no action taken.
-        daemon.apply_escalation("work-1", "src1", "analyze");
-        // No HITL item should be in queue.
-        assert_eq!(daemon.items_in_phase(QueuePhase::Hitl).len(), 0);
-    }
-
-    #[test]
-    fn apply_escalation_after_three_failures_routes_to_hitl() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        // Record 3 failures via mark_failed using distinct work_ids so
-        // each call finds a fresh Running item.
-        for i in 0..3u32 {
-            let mut item = test_item("src1", "analyze");
-            item.work_id = format!("src1:analyze-attempt-{i}");
-            item.set_phase_unchecked(QueuePhase::Running);
-            daemon.push_item(item);
-            daemon
-                .mark_failed(&format!("src1:analyze-attempt-{i}"), "failure".into())
-                .unwrap();
-        }
-
-        // Push a Completed item so mark_hitl (called by apply_escalation) can succeed.
-        let mut item = test_item("src1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Completed);
-        daemon.push_item(item);
-
-        // With 3 recorded failures, apply_escalation sees failure_count >= 3 → HITL.
-        daemon.apply_escalation("src1:analyze", "src1", "analyze");
-
-        assert_eq!(daemon.items_in_phase(QueuePhase::Hitl).len(), 1);
     }
 
     // ---------------------------------------------------------------
@@ -5649,14 +5561,22 @@ sources:
 
     // --- detect_stagnation_and_generate_plan tests ---
 
+    /// Run stagnation detection for a `src:1`/`implement` item named `work_id`.
+    fn stagnation_plan(daemon: &Daemon, work_id: &str, error: &str) -> Option<String> {
+        let mut item = test_item("src:1", "implement");
+        item.work_id = work_id.to_string();
+        daemon
+            .detect_stagnation_and_generate_plan(&item, error, 1)
+            .unwrap()
+    }
+
     #[test]
     fn detect_stagnation_no_prior_failures_returns_none() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let daemon = setup_daemon(&tmp, source, vec![0]);
 
-        let result =
-            daemon.detect_stagnation_and_generate_plan("w:1", "src:1", "implement", "error");
+        let result = stagnation_plan(&daemon, "w:1", "error");
         assert!(result.is_none());
     }
 
@@ -5671,12 +5591,7 @@ sources:
         daemon.record_history_event(&item, "failed", Some("compile error".to_string()));
 
         // Only 2 outputs (1 prior + 1 current), need min_consecutive=2 spinning pairs.
-        let result = daemon.detect_stagnation_and_generate_plan(
-            "w:1",
-            "src:1",
-            "implement",
-            "compile error",
-        );
+        let result = stagnation_plan(&daemon, "w:1", "compile error");
         assert!(result.is_none());
     }
 
@@ -5692,12 +5607,7 @@ sources:
             daemon.record_history_event(&item, "failed", Some("compile error X".to_string()));
         }
 
-        let result = daemon.detect_stagnation_and_generate_plan(
-            "w:1",
-            "src:1",
-            "implement",
-            "compile error X",
-        );
+        let result = stagnation_plan(&daemon, "w:1", "compile error X");
         assert!(
             result.is_some(),
             "expected lateral plan for spinning pattern"
@@ -5720,8 +5630,7 @@ sources:
         daemon.record_history_event(&item, "failed", Some("error B".to_string()));
         daemon.record_history_event(&item, "failed", Some("error C".to_string()));
 
-        let result =
-            daemon.detect_stagnation_and_generate_plan("w:1", "src:1", "implement", "error D");
+        let result = stagnation_plan(&daemon, "w:1", "error D");
         assert!(result.is_none());
     }
 
@@ -5736,12 +5645,7 @@ sources:
             daemon.record_history_event(&item, "failed", Some("compile error X".to_string()));
         }
 
-        let result = daemon.detect_stagnation_and_generate_plan(
-            &item.work_id,
-            "src:1",
-            "implement",
-            "compile error X",
-        );
+        let result = stagnation_plan(&daemon, &item.work_id, "compile error X");
         assert!(result.is_some(), "expected stagnation detection");
 
         // Verify the stagnation event was recorded in transition_events.
@@ -5783,8 +5687,7 @@ sources:
             daemon.record_history_event(&item, "failed", Some(err.to_string()));
         }
 
-        let result =
-            daemon.detect_stagnation_and_generate_plan(&item.work_id, "src:1", "implement", err);
+        let result = stagnation_plan(&daemon, &item.work_id, err);
         assert!(result.is_some(), "expected spinning detection");
 
         let events = daemon.db.list_transition_events(&item.work_id).unwrap();
@@ -5826,8 +5729,7 @@ sources:
         daemon.record_history_event(&item, "failed", Some("fix B".to_string()));
         daemon.record_history_event(&item, "failed", Some("fix A".to_string()));
 
-        let result =
-            daemon.detect_stagnation_and_generate_plan("w:1", "src:1", "implement", "fix B");
+        let result = stagnation_plan(&daemon, "w:1", "fix B");
         assert!(
             result.is_some(),
             "expected oscillation pattern to be detected"
@@ -5854,12 +5756,7 @@ sources:
             daemon.record_history_event(&item, "failed", Some("compile error X".to_string()));
         }
 
-        let result = daemon.detect_stagnation_and_generate_plan(
-            "w:1",
-            "src:1",
-            "implement",
-            "compile error X",
-        );
+        let result = stagnation_plan(&daemon, "w:1", "compile error X");
         assert!(
             result.is_none(),
             "stagnation detection should be skipped when disabled"
@@ -5894,12 +5791,7 @@ sources:
             daemon.record_history_event(&item, "failed", Some("compile error X".to_string()));
         }
 
-        let result = daemon.detect_stagnation_and_generate_plan(
-            "w:1",
-            "src:1",
-            "implement",
-            "compile error X",
-        );
+        let result = stagnation_plan(&daemon, "w:1", "compile error X");
         assert!(
             result.is_none(),
             "lateral plan generation should be skipped when lateral.enabled is false"
@@ -5934,12 +5826,7 @@ sources:
         // Clear in-memory history to prove detection uses DB.
         daemon.history_events.clear();
 
-        let result = daemon.detect_stagnation_and_generate_plan(
-            &item.work_id,
-            "src:1",
-            "implement",
-            "compile error X",
-        );
+        let result = stagnation_plan(&daemon, &item.work_id, "compile error X");
         assert!(
             result.is_some(),
             "stagnation should be detected from DB history even when in-memory is empty"
@@ -6044,153 +5931,27 @@ sources:
         );
     }
 
-    // --- handle_escalation with lateral_plan tests ---
+    // --- derived item queueing ---
 
     #[test]
-    fn handle_escalation_retry_stores_lateral_plan() {
+    fn enqueue_derived_carries_the_lateral_plan() {
         let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![0]);
-
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Running);
-        Daemon::ensure_row(&daemon.db, &item);
+        let mut daemon = setup_daemon(&tmp, MockDataSource::new("github"), vec![]);
+        let work_id = running_daemon_item(&mut daemon);
+        let crate::escalation_path::EscalationCommit::Applied(
+            crate::escalation_path::Committed::Derived { work_id: derived },
+        ) = crate::escalation_path::commit(&daemon.db, &work_id, EscalationAction::Retry, None)
+            .unwrap()
+        else {
+            panic!("expected a derived item");
+        };
         let plan = Some("\n\n## Lateral Plan\ntest plan".to_string());
 
-        daemon
-            .handle_escalation(&mut item, EscalationAction::Retry, plan.clone())
-            .unwrap();
+        daemon.enqueue_derived(&derived, plan.clone());
 
-        let retry = daemon.queue.back().expect("should have retry item");
-        assert_eq!(retry.phase(), QueuePhase::Pending);
-        assert_eq!(retry.lateral_plan, plan);
-    }
-
-    #[test]
-    fn handle_escalation_retry_without_plan_clears_lateral_plan() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![0]);
-
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Running);
-        Daemon::ensure_row(&daemon.db, &item);
-        item.lateral_plan = Some("old plan".to_string());
-
-        daemon
-            .handle_escalation(&mut item, EscalationAction::Retry, None)
-            .unwrap();
-
-        let retry = daemon.queue.back().expect("should have retry item");
-        assert!(retry.lateral_plan.is_none());
-    }
-
-    #[test]
-    fn handle_escalation_hitl_does_not_store_lateral_plan() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![0]);
-
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Running);
-        Daemon::ensure_row(&daemon.db, &item);
-        let plan = Some("some plan".to_string());
-
-        daemon
-            .handle_escalation(&mut item, EscalationAction::Hitl, plan)
-            .unwrap();
-
-        let hitl = daemon.queue.back().expect("should have hitl item");
-        assert_eq!(hitl.phase(), QueuePhase::Hitl);
-        // HITL items retain original lateral_plan (from the cloned item), not the new plan.
-    }
-
-    #[test]
-    fn handle_escalation_hitl_attaches_lateral_notes_from_plan() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![0]);
-
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Running);
-        Daemon::ensure_row(&daemon.db, &item);
-        let plan = Some("try a different algorithm".to_string());
-
-        daemon
-            .handle_escalation(&mut item, EscalationAction::Hitl, plan)
-            .unwrap();
-
-        let hitl = daemon.queue.back().expect("should have hitl item");
-        assert_eq!(hitl.phase(), QueuePhase::Hitl);
-        let notes = hitl.hitl_notes.as_ref().expect("hitl_notes should be set");
-        assert!(notes.contains("## Lateral Thinking History"));
-        assert!(notes.contains("try a different algorithm"));
-        assert!(notes.contains("Stagnation events: 0"));
-    }
-
-    #[test]
-    fn handle_escalation_hitl_no_notes_without_plan_or_events() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![0]);
-
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Running);
-        Daemon::ensure_row(&daemon.db, &item);
-
-        daemon
-            .handle_escalation(&mut item, EscalationAction::Hitl, None)
-            .unwrap();
-
-        let hitl = daemon.queue.back().expect("should have hitl item");
-        assert_eq!(hitl.phase(), QueuePhase::Hitl);
-        assert!(hitl.hitl_notes.is_none());
-    }
-
-    #[test]
-    fn handle_escalation_hitl_includes_stagnation_events_from_db() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![0]);
-
-        // Insert a stagnation event for the work_id.
-        let ev = TransitionEvent {
-            id: "ev-stag-1".to_string(),
-            work_id: "src:1:implement".to_string(),
-            source_id: "src:1".to_string(),
-            event_type: "stagnation".to_string(),
-            phase: None,
-            from_phase: None,
-            detail: Some(
-                serde_json::json!({
-                    "pattern_type": "spinning",
-                    "confidence": 0.95,
-                    "reason": "repeated identical errors",
-                    "recommended_persona": "contrarian",
-                    "failure_count": 3
-                })
-                .to_string(),
-            ),
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
-        daemon.db.insert_transition_event(&ev).unwrap();
-
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Running);
-        Daemon::ensure_row(&daemon.db, &item);
-        let plan = Some("use contrarian approach".to_string());
-
-        daemon
-            .handle_escalation(&mut item, EscalationAction::Hitl, plan)
-            .unwrap();
-
-        let hitl = daemon.queue.back().expect("should have hitl item");
-        let notes = hitl.hitl_notes.as_ref().expect("hitl_notes should be set");
-        assert!(notes.contains("## Lateral Thinking History"));
-        assert!(notes.contains("use contrarian approach"));
-        assert!(notes.contains("Stagnation events: 1"));
-        assert!(notes.contains("Pattern: spinning (confidence: 0.95)"));
-        assert!(notes.contains("Persona: contrarian"));
+        let queued = daemon.get_item(&derived).expect("derived item is queued");
+        assert_eq!(queued.phase(), QueuePhase::Pending);
+        assert_eq!(queued.lateral_plan, plan);
     }
 
     // ---------------------------------------------------------------
@@ -6369,53 +6130,41 @@ sources:
         }
 
         #[tokio::test]
-        async fn on_fail_called_on_execution_failure() {
+        async fn failures_call_on_escalation_and_on_fail_except_for_silent_retry() {
             let tmp = TempDir::new().unwrap();
             let hook = Arc::new(RecordingHook::new());
             // exit code 1 = handler prompt failure (on_enter has no actions for implement)
-            let mut daemon =
-                setup_daemon_with_hook(&tmp, vec![1], Arc::clone(&hook) as Arc<dyn LifecycleHook>);
+            let mut daemon = setup_daemon_with_hook(
+                &tmp,
+                vec![1, 1],
+                Arc::clone(&hook) as Arc<dyn LifecycleHook>,
+            );
 
             let mut item = test_item("s1", "implement");
             item.set_phase_unchecked(QueuePhase::Running);
             item.updated_at = Utc::now().to_rfc3339();
             daemon.push_item(item);
 
+            // First failure: silent retry.
             let outcomes = daemon.execute_running().await;
-
-            assert_eq!(outcomes.len(), 1);
             assert!(
-                matches!(outcomes[0], ItemOutcome::Failed { .. }),
+                matches!(
+                    outcomes[0],
+                    ItemOutcome::Failed {
+                        escalation: EscalationAction::Retry,
+                        ..
+                    }
+                ),
                 "handler should fail with exit code 1"
             );
-            assert!(
-                hook.on_fail_count.load(Ordering::SeqCst) >= 1,
-                "on_fail should be called on execution failure"
-            );
-        }
+            assert_eq!(hook.on_escalation_count.load(Ordering::SeqCst), 1);
+            assert_eq!(hook.on_fail_count.load(Ordering::SeqCst), 0);
 
-        #[tokio::test]
-        async fn on_escalation_called_on_handle_escalation() {
-            let tmp = TempDir::new().unwrap();
-            let hook = Arc::new(RecordingHook::new());
-            let mut daemon =
-                setup_daemon_with_hook(&tmp, vec![0], Arc::clone(&hook) as Arc<dyn LifecycleHook>);
-
-            let mut item = test_item("s1", "implement");
-            item.set_phase_unchecked(QueuePhase::Running);
-            Daemon::ensure_row(&daemon.db, &item);
-
-            daemon
-                .handle_escalation(&mut item, EscalationAction::Hitl, None)
-                .unwrap();
-
-            // Allow the spawned task to complete.
-            tokio::task::yield_now().await;
-
-            assert!(
-                hook.on_escalation_count.load(Ordering::SeqCst) >= 1,
-                "on_escalation should be called on escalation"
-            );
+            // Second failure of the lineage: retry_with_comment runs on_fail.
+            daemon.advance();
+            daemon.execute_running().await;
+            assert_eq!(hook.on_escalation_count.load(Ordering::SeqCst), 2);
+            assert_eq!(hook.on_fail_count.load(Ordering::SeqCst), 1);
         }
 
         #[test]

@@ -1068,9 +1068,20 @@ impl CronHandler for DailyReportJob {
 /// Scans terminal-phase items (Done, Skipped) and stalled items with
 /// preserved worktrees (Hitl, Failed), checking their `updated_at`
 /// timestamp. Worktrees older than the TTL are removed.
+///
+/// A worktree is judged by its owner ([`Database::worktree_holder`]): an
+/// item whose worktree was handed to a derived item leaves it alone.
+/// Transition history and HITL records are never removed.
 pub struct LogCleanupJob {
     db: Arc<Database>,
     worktree_mgr: Arc<dyn WorktreeManager>,
+}
+
+impl LogCleanupJob {
+    /// Create a log-cleanup job over the store and the worktree manager.
+    pub fn new(db: Arc<Database>, worktree_mgr: Arc<dyn WorktreeManager>) -> Self {
+        Self { db, worktree_mgr }
+    }
 }
 
 impl CronHandler for LogCleanupJob {
@@ -1093,22 +1104,31 @@ impl CronHandler for LogCleanupJob {
             .chain(failed_items.iter());
 
         for item in candidates {
+            // Only the worktree's owner decides its fate: an item that handed
+            // its worktree over by escalation retry no longer owns it.
+            let key = self.db.worktree_key(&item.work_id)?;
+            if self.db.worktree_holder(&key)? != item.work_id {
+                continue;
+            }
+
             let updated = DateTime::parse_from_rfc3339(&item.updated_at)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or(ctx.now);
 
-            if updated < threshold && self.worktree_mgr.exists(&item.work_id) {
-                match self.worktree_mgr.cleanup(&item.work_id) {
+            if updated < threshold && self.worktree_mgr.exists(&key) {
+                match self.worktree_mgr.cleanup(&key) {
                     Ok(()) => {
                         cleaned_count += 1;
                         tracing::info!(
                             work_id = %item.work_id,
+                            worktree = %key,
                             "cleaned up stale worktree"
                         );
                     }
                     Err(e) => {
                         tracing::warn!(
                             work_id = %item.work_id,
+                            worktree = %key,
                             error = %e,
                             "failed to cleanup stale worktree"
                         );

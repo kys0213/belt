@@ -96,6 +96,27 @@ fn advance_multiple_items_records_events_per_item() {
     }
 }
 
+/// A claim refused as `InvalidAction` names the stored phase; the copy follows it.
+///
+/// A stored Hitl row refuses any claim that is not post-processing, so the
+/// copy that still says Pending must become Hitl and not be retried.
+#[test]
+fn claim_refused_as_invalid_action_follows_the_stored_phase() {
+    let (db, db_opt) = setup_db();
+    let item = test_item("src-1", "analyze");
+    insert_item_to_db(&db, &item);
+    db.update_phase(&item.work_id, QueuePhase::Hitl).unwrap();
+
+    let mut queue = make_queue(vec![item]);
+    let mut tracker = ConcurrencyTracker::new(4);
+
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
+    let advanced = advancer.run();
+
+    assert_eq!(advanced, 0);
+    assert_eq!(queue[0].phase(), QueuePhase::Hitl);
+}
+
 // ---------------------------------------------------------------------------
 // Queue dependency gate: queue_dependencies blocks Ready -> Running
 // ---------------------------------------------------------------------------

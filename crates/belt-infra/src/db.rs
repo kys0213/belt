@@ -2260,6 +2260,55 @@ impl Database {
         }
     }
 
+    /// The key of the worktree `work_id` works in.
+    ///
+    /// An item handed a worktree by escalation retry works in the worktree
+    /// of the item it was first created for (its `worktree_owner`); any
+    /// other item works in its own, keyed by its `work_id`.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`.
+    pub fn worktree_key(&self, work_id: &str) -> Result<String, BeltError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COALESCE(worktree_owner, work_id) FROM queue_items WHERE work_id = ?1",
+            params![work_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_err)?
+        .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))
+    }
+
+    /// The `work_id` of the item that currently owns the worktree keyed `key`.
+    ///
+    /// The owner is the most recently created item the worktree was handed
+    /// to; a worktree never handed over is owned by the item `key` names.
+    /// Only the owner's phase decides whether the worktree may be cleaned up.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn worktree_holder(&self, key: &str) -> Result<String, BeltError> {
+        let conn = self.lock_conn()?;
+        let handed: Option<String> = conn
+            .query_row(
+                &format!(
+                    "SELECT work_id FROM queue_items WHERE worktree_owner = ?1
+                     ORDER BY (SELECT MAX(t.seq) FROM transition_log t
+                               WHERE t.work_id = queue_items.work_id AND t.kind = '{kind}')
+                              DESC NULLS LAST,
+                              created_at DESC, rowid DESC
+                     LIMIT 1",
+                    kind = transition_kind::ITEM_CREATED
+                ),
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        Ok(handed.unwrap_or_else(|| key.to_string()))
+    }
+
     fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, BeltError> {
         self.conn
             .lock()
@@ -5311,6 +5360,46 @@ mod tests {
         assert_eq!(owner(&second).as_deref(), Some(first.as_str()));
         assert_eq!(owner(&third).as_deref(), Some(first.as_str()));
         assert_eq!(db.failure_count(&first).unwrap(), 1);
+    }
+
+    #[test]
+    fn worktree_key_and_holder_follow_the_handover() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        assert_eq!(db.worktree_key(&first).unwrap(), first);
+        assert_eq!(db.worktree_holder(&first).unwrap(), first);
+
+        run_to_running(&db, &first);
+        let DeriveOutcome::Derived { work_id: second } = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+        assert_eq!(db.worktree_key(&second).unwrap(), first);
+        assert_eq!(db.worktree_holder(&first).unwrap(), second);
+
+        run_to_running(&db, &second);
+        let DeriveOutcome::Derived { work_id: third } = db
+            .derive(&derive_request(
+                &second,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+        assert_eq!(db.worktree_key(&third).unwrap(), first);
+        assert_eq!(db.worktree_holder(&first).unwrap(), third);
+        assert!(matches!(
+            db.worktree_key("missing"),
+            Err(BeltError::ItemNotFound(_))
+        ));
     }
 
     #[test]

@@ -85,17 +85,11 @@ async fn first_failure_escalation_is_retry() {
         other => panic!("expected Failed, got {other:?}"),
     }
 
-    // Retry should enqueue a new Pending item.
+    // Retry continues in a derived Pending item.
     assert_eq!(daemon.items_in_phase(QueuePhase::Pending).len(), 1);
 }
 
-/// Second failure escalates beyond Retry.
-///
-/// The daemon counts failures from both history and history_events, so
-/// each execution failure records entries in both stores. This means the
-/// effective failure count grows faster than the number of execute calls.
-/// After one prior failure, the second execute sees an accumulated count
-/// that resolves to Hitl (the highest configured escalation level).
+/// Second failure of the lineage escalates to RetryWithComment.
 #[tokio::test]
 async fn second_failure_escalation_beyond_retry() {
     let tmp = TempDir::new().unwrap();
@@ -105,7 +99,7 @@ async fn second_failure_escalation_beyond_retry() {
     // Two consecutive failures.
     let mut daemon = setup_daemon(&tmp, source, vec![1, 1]);
 
-    // First failure -> Retry (count_failures=0, resolve(1)=Retry).
+    // First failure -> Retry (failure_count=1).
     daemon.collect().await.unwrap();
     daemon.advance();
     let outcomes = daemon.execute_running().await;
@@ -116,26 +110,20 @@ async fn second_failure_escalation_beyond_retry() {
         other => panic!("expected Failed with Retry, got {other:?}"),
     }
 
-    // The retry item is now in Pending. Advance and execute again.
+    // The derived item is now in Pending. Advance and execute again.
     daemon.advance();
     let outcomes = daemon.execute_running().await;
 
-    // Second failure: accumulated count from both history + history_events
-    // results in an escalation beyond Retry.
     match &outcomes[0] {
         ItemOutcome::Failed { escalation, .. } => {
-            assert!(
-                escalation.should_run_on_fail(),
-                "second failure escalation should run on_fail (got {escalation:?})"
-            );
+            assert_eq!(*escalation, EscalationAction::RetryWithComment);
         }
         other => panic!("expected Failed, got {other:?}"),
     }
 }
 
-/// Repeated failures eventually escalate to HITL.
+/// The third failure of the lineage escalates to HITL.
 ///
-/// After enough failures, the escalation policy routes to Hitl.
 /// The item should end up in the Hitl phase with RetryMaxExceeded reason.
 #[tokio::test]
 async fn repeated_failures_escalate_to_hitl() {
@@ -143,16 +131,16 @@ async fn repeated_failures_escalate_to_hitl() {
     let mut source = MockDataSource::new("github");
     source.add_item(test_item("github:org/repo#1", "analyze"));
 
-    // Two consecutive failures are enough to reach Hitl escalation
-    // (count_failures counts both history + history_events per failure).
-    let mut daemon = setup_daemon(&tmp, source, vec![1, 1]);
+    let mut daemon = setup_daemon(&tmp, source, vec![1, 1, 1]);
 
-    // First failure -> Retry.
+    // First failure -> Retry, second -> RetryWithComment.
     daemon.collect().await.unwrap();
     daemon.advance();
     daemon.execute_running().await;
+    daemon.advance();
+    daemon.execute_running().await;
 
-    // Second failure -> Hitl (accumulated failure count >= 3).
+    // Third failure -> Hitl.
     daemon.advance();
     let outcomes = daemon.execute_running().await;
 
@@ -464,19 +452,28 @@ fn escalation_on_fail_policy() {
     assert!(EscalationAction::Skip.should_run_on_fail());
     assert!(EscalationAction::Replan.should_run_on_fail());
 }
-
 // ---------------------------------------------------------------------------
-// DB-owned escalation results (retry / skip / hitl)
+// DB-owned escalation results: derivation, lineage failure count, hooks
 // ---------------------------------------------------------------------------
 
 mod store_results {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
 
+    use async_trait::async_trait;
     use belt_core::escalation::EscalationPolicy;
     use belt_core::hitl::HitlId;
     use belt_core::hitl::HitlStatus;
+    use belt_core::lifecycle::{HookContext, LifecycleHook};
+    use belt_core::transition::{Actor, TransitionReason, TransitionRequest};
+    use belt_daemon::cron::{CronContext, CronHandler, LogCleanupJob};
+    use belt_infra::db::{DeriveKind, DeriveOutcome, DeriveRequest, NewItem};
+    use belt_infra::worktree::WorktreeManager;
 
     use super::*;
+
+    const ORIGIN: &str = "github:org/repo#1:analyze";
 
     /// `(from, to, reason)` of every phase entry, oldest first.
     fn phase_enters(daemon: &Daemon, work_id: &str) -> Vec<(String, String, String)> {
@@ -500,52 +497,345 @@ mod store_results {
         (from.to_string(), to.to_string(), reason.to_string())
     }
 
-    fn failing_daemon(tmp: &TempDir, exit_codes: Vec<i32>, config: WorkspaceConfig) -> Daemon {
+    fn derived(n: u32) -> String {
+        format!("{ORIGIN}:{n}")
+    }
+
+    fn daemon_over(
+        tmp: &TempDir,
+        exit_codes: Vec<i32>,
+        config: WorkspaceConfig,
+        db: Database,
+        with_item: bool,
+    ) -> Daemon {
         let mut source = MockDataSource::new("github");
-        source.add_item(test_item("github:org/repo#1", "analyze"));
+        if with_item {
+            source.add_item(test_item("github:org/repo#1", "analyze"));
+        }
         let mut registry = RuntimeRegistry::new("mock".to_string());
         registry.register(Arc::new(MockRuntime::new("mock", exit_codes)));
         Daemon::new(
             config,
             vec![Box::new(source)],
             Arc::new(registry),
-            Box::new(MockWorktreeManager::new(tmp.path().to_path_buf())),
+            Box::new(MockWorktreeManager::new(tmp.path().join("worktrees"))),
             4,
-            Database::open_in_memory().unwrap(),
+            db,
         )
     }
 
+    fn failing_daemon(tmp: &TempDir, exit_codes: Vec<i32>, config: WorkspaceConfig) -> Daemon {
+        daemon_over(
+            tmp,
+            exit_codes,
+            config,
+            Database::open_in_memory().unwrap(),
+            true,
+        )
+    }
+
+    /// Hook that records each call together with the stored phase at call time.
+    struct RecordingHook {
+        db: Arc<Database>,
+        calls: Mutex<Vec<String>>,
+        worktrees: Mutex<Vec<(String, PathBuf)>>,
+        /// When set, on_enter moves the stored row to Skipped behind the
+        /// daemon's back, so the result transition conflicts.
+        skip_on_enter: bool,
+    }
+
+    impl RecordingHook {
+        fn new(db: Arc<Database>) -> Arc<Self> {
+            Self::build(db, false)
+        }
+
+        fn skipping_on_enter(db: Arc<Database>) -> Arc<Self> {
+            Self::build(db, true)
+        }
+
+        fn build(db: Arc<Database>, skip_on_enter: bool) -> Arc<Self> {
+            Arc::new(Self {
+                db,
+                calls: Mutex::new(Vec::new()),
+                worktrees: Mutex::new(Vec::new()),
+                skip_on_enter,
+            })
+        }
+
+        fn stored_phase(&self, work_id: &str) -> String {
+            self.db
+                .get_item(work_id)
+                .unwrap()
+                .phase()
+                .as_str()
+                .to_string()
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+
+        fn worktree_of(&self, work_id: &str) -> PathBuf {
+            self.worktrees
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(w, _)| w == work_id)
+                .map(|(_, p)| p.clone())
+                .unwrap_or_else(|| panic!("{work_id} never entered Running"))
+        }
+    }
+
+    #[async_trait]
+    impl LifecycleHook for RecordingHook {
+        async fn on_enter(&self, ctx: &HookContext) -> anyhow::Result<()> {
+            self.worktrees
+                .lock()
+                .unwrap()
+                .push((ctx.work_id.clone(), ctx.worktree.clone()));
+            if self.skip_on_enter {
+                self.db.update_phase(&ctx.work_id, QueuePhase::Skipped)?;
+            }
+            Ok(())
+        }
+
+        async fn on_done(&self, _ctx: &HookContext) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn on_fail(&self, ctx: &HookContext) -> anyhow::Result<()> {
+            let phase = self.stored_phase(&ctx.work_id);
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("on_fail {} {phase}", ctx.work_id));
+            Ok(())
+        }
+
+        async fn on_escalation(
+            &self,
+            ctx: &HookContext,
+            action: EscalationAction,
+        ) -> anyhow::Result<()> {
+            let phase = self.stored_phase(&ctx.work_id);
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("on_escalation {} {action} {phase}", ctx.work_id));
+            Ok(())
+        }
+    }
+
+    async fn run_once(daemon: &mut Daemon) -> ItemOutcome {
+        daemon.advance();
+        let mut outcomes = daemon.execute_running().await;
+        assert_eq!(outcomes.len(), 1, "exactly one item runs per step");
+        outcomes.remove(0)
+    }
+
+    fn escalation_of(outcome: &ItemOutcome) -> EscalationAction {
+        match outcome {
+            ItemOutcome::Failed { escalation, .. } => *escalation,
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
-    async fn retry_moves_the_same_row_back_to_pending() {
+    async fn retry_ends_the_origin_and_derives_a_pending_item() {
         let tmp = TempDir::new().unwrap();
-        let mut daemon = failing_daemon(&tmp, vec![1], test_workspace_config());
+        let daemon = failing_daemon(&tmp, vec![1, 0], test_workspace_config());
+        let hook = RecordingHook::new(Arc::clone(daemon.database()));
+        let mut daemon = daemon.with_hook(hook.clone());
 
         daemon.collect().await.unwrap();
-        daemon.advance();
-        daemon.execute_running().await;
+        let outcome = run_once(&mut daemon).await;
+        assert_eq!(escalation_of(&outcome), EscalationAction::Retry);
 
-        let work_id = daemon.queue_items()[0].work_id.clone();
         assert_eq!(
-            phase_enters(&daemon, &work_id),
+            phase_enters(&daemon, ORIGIN),
             vec![
                 enter("pending", "ready", "advance"),
                 enter("ready", "running", "advance"),
-                enter("running", "pending", "escalation:retry"),
+                enter("running", "skipped", "derived"),
             ],
-            "a failed run is one Running -> Pending entry, no Failed phase"
+            "the origin ends as Skipped (derived), it is not reused"
         );
-        let stored = daemon.db().get_item(&work_id).unwrap();
-        assert_eq!(stored.phase(), QueuePhase::Pending);
-        assert_eq!(daemon.queue_items().len(), 1);
-        assert_eq!(daemon.queue_items()[0].phase(), stored.phase());
-
-        // The retry is claimed again from the same row.
-        daemon.advance();
+        let next = daemon.db().get_item(&derived(2)).unwrap();
+        assert_eq!(next.phase(), QueuePhase::Pending);
+        assert_eq!(next.derived_from.as_deref(), Some(ORIGIN));
+        assert_eq!(next.lineage_root, ORIGIN);
+        assert!(daemon.get_item(ORIGIN).is_none());
         assert_eq!(
-            daemon.db().get_item(&work_id).unwrap().phase(),
-            QueuePhase::Running
+            daemon.get_item(&derived(2)).map(|i| i.phase()),
+            Some(QueuePhase::Pending)
         );
-        assert_eq!(daemon.queue_items()[0].phase(), QueuePhase::Running);
+
+        // The derived item runs in the worktree handed over from the origin.
+        run_once(&mut daemon).await;
+        assert_eq!(hook.worktree_of(&derived(2)), hook.worktree_of(ORIGIN));
+    }
+
+    #[tokio::test]
+    async fn on_escalation_runs_after_the_result_is_committed() {
+        let tmp = TempDir::new().unwrap();
+        let daemon = failing_daemon(&tmp, vec![1, 1, 1], test_workspace_config());
+        let hook = RecordingHook::new(Arc::clone(daemon.database()));
+        let mut daemon = daemon.with_hook(hook.clone());
+
+        daemon.collect().await.unwrap();
+        run_once(&mut daemon).await;
+        run_once(&mut daemon).await;
+        run_once(&mut daemon).await;
+
+        assert_eq!(
+            hook.calls(),
+            vec![
+                // retry: no on_fail
+                format!("on_escalation {ORIGIN} retry skipped"),
+                format!("on_escalation {} retry_with_comment skipped", derived(2)),
+                format!("on_fail {} skipped", derived(2)),
+                format!("on_escalation {} hitl hitl", derived(3)),
+                format!("on_fail {} hitl", derived(3)),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_result_transition_calls_no_hook() {
+        let tmp = TempDir::new().unwrap();
+        let daemon = failing_daemon(&tmp, vec![1], test_workspace_config());
+        let hook = RecordingHook::skipping_on_enter(Arc::clone(daemon.database()));
+        let mut daemon = daemon.with_hook(hook.clone());
+
+        daemon.collect().await.unwrap();
+        let outcome = run_once(&mut daemon).await;
+
+        assert!(
+            matches!(
+                outcome,
+                ItemOutcome::Conflicted {
+                    current: QueuePhase::Skipped,
+                    ..
+                }
+            ),
+            "got {outcome:?}"
+        );
+        assert!(hook.calls().is_empty(), "no hook after a conflict");
+        assert!(matches!(
+            daemon.db().get_item(&derived(2)),
+            Err(belt_core::error::BeltError::ItemNotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn lineage_failures_climb_the_ladder_to_one_open_hitl_request() {
+        let tmp = TempDir::new().unwrap();
+        let mut daemon = failing_daemon(&tmp, vec![1, 1, 1], test_workspace_config());
+
+        daemon.collect().await.unwrap();
+        let ladder: Vec<EscalationAction> = [
+            run_once(&mut daemon).await,
+            run_once(&mut daemon).await,
+            run_once(&mut daemon).await,
+        ]
+        .iter()
+        .map(escalation_of)
+        .collect();
+        assert_eq!(
+            ladder,
+            vec![
+                EscalationAction::Retry,
+                EscalationAction::RetryWithComment,
+                EscalationAction::Hitl,
+            ]
+        );
+
+        for done in [ORIGIN.to_string(), derived(2)] {
+            assert_eq!(
+                daemon.db().get_item(&done).unwrap().phase(),
+                QueuePhase::Skipped
+            );
+        }
+        let last = derived(3);
+        assert_eq!(
+            daemon.db().get_item(&last).unwrap().phase(),
+            QueuePhase::Hitl
+        );
+        assert_eq!(daemon.db().failure_count(&last).unwrap(), 3);
+
+        let hitl_entries: Vec<_> = [ORIGIN.to_string(), derived(2), last.clone()]
+            .iter()
+            .flat_map(|w| daemon.db().transitions_of(w).unwrap())
+            .filter(|e| e.to_phase.as_deref() == Some("hitl"))
+            .collect();
+        assert_eq!(hitl_entries.len(), 1, "one Hitl entry in the lineage");
+        let request = daemon
+            .db()
+            .hitl_request(&HitlId::new(format!("hitl-{}", hitl_entries[0].seq)))
+            .unwrap()
+            .expect("the request is opened with the transition");
+        assert_eq!(request.status, HitlStatus::Open);
+        assert_eq!(request.work_id, last);
+        assert_eq!(request.reason, Some(HitlReason::RetryMaxExceeded));
+        assert_eq!(daemon.items_in_phase(QueuePhase::Hitl).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failure_count_survives_a_restart() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("belt.db");
+        let path = path.to_str().unwrap();
+
+        {
+            let mut daemon = daemon_over(
+                &tmp,
+                vec![1],
+                test_workspace_config(),
+                Database::open(path).unwrap(),
+                true,
+            );
+            daemon.collect().await.unwrap();
+            let outcome = run_once(&mut daemon).await;
+            assert_eq!(escalation_of(&outcome), EscalationAction::Retry);
+        }
+
+        let mut daemon = daemon_over(
+            &tmp,
+            vec![1],
+            test_workspace_config(),
+            Database::open(path).unwrap(),
+            false,
+        );
+        daemon.restore_from_store().unwrap();
+        let outcome = run_once(&mut daemon).await;
+        assert_eq!(
+            escalation_of(&outcome),
+            EscalationAction::RetryWithComment,
+            "the second failure of the lineage is level 2 after a restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn failures_past_the_highest_level_reuse_it() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_workspace_config();
+        config.sources.get_mut("github").unwrap().escalation =
+            EscalationPolicy::new(BTreeMap::from([
+                (1, EscalationAction::Retry),
+                (2, EscalationAction::RetryWithComment),
+            ]));
+        let mut daemon = failing_daemon(&tmp, vec![1, 1, 1], config);
+
+        daemon.collect().await.unwrap();
+        run_once(&mut daemon).await;
+        run_once(&mut daemon).await;
+        let outcome = run_once(&mut daemon).await;
+
+        assert_eq!(escalation_of(&outcome), EscalationAction::RetryWithComment);
+        assert_eq!(
+            daemon.db().get_item(&derived(4)).unwrap().phase(),
+            QueuePhase::Pending
+        );
     }
 
     #[tokio::test]
@@ -557,73 +847,136 @@ mod store_results {
         let mut daemon = failing_daemon(&tmp, vec![1], config);
 
         daemon.collect().await.unwrap();
-        daemon.advance();
-        let work_id = daemon.queue_items()[0].work_id.clone();
-        let outcomes = daemon.execute_running().await;
+        let outcome = run_once(&mut daemon).await;
 
-        assert!(matches!(
-            outcomes[0],
-            ItemOutcome::Failed {
-                escalation: EscalationAction::Skip,
-                ..
-            }
-        ));
+        assert_eq!(escalation_of(&outcome), EscalationAction::Skip);
         assert_eq!(
-            phase_enters(&daemon, &work_id),
+            phase_enters(&daemon, ORIGIN),
             vec![
                 enter("pending", "ready", "advance"),
                 enter("ready", "running", "advance"),
                 enter("running", "skipped", "escalation:skip"),
             ]
         );
-        assert_eq!(
-            daemon.db().get_item(&work_id).unwrap().phase(),
-            QueuePhase::Skipped
-        );
+        assert!(matches!(
+            daemon.db().get_item(&derived(2)),
+            Err(belt_core::error::BeltError::ItemNotFound(_))
+        ));
     }
 
     #[tokio::test]
-    async fn hitl_escalation_enters_hitl_and_opens_a_request() {
+    async fn unreadable_failure_history_surfaces_instead_of_falling_back() {
         let tmp = TempDir::new().unwrap();
-        let mut daemon = failing_daemon(&tmp, vec![1, 1], test_workspace_config());
+        let path = tmp.path().join("belt.db");
+        let path = path.to_str().unwrap();
+        let mut daemon = daemon_over(
+            &tmp,
+            vec![1, 1],
+            test_workspace_config(),
+            Database::open(path).unwrap(),
+            true,
+        );
 
         daemon.collect().await.unwrap();
-        daemon.advance();
-        daemon.execute_running().await;
-        daemon.advance();
-        let work_id = daemon.queue_items()[0].work_id.clone();
-        daemon.execute_running().await;
+        run_once(&mut daemon).await;
 
-        assert_eq!(
-            phase_enters(&daemon, &work_id),
-            vec![
-                enter("pending", "ready", "advance"),
-                enter("ready", "running", "advance"),
-                enter("running", "pending", "escalation:retry"),
-                enter("pending", "ready", "advance"),
-                enter("ready", "running", "advance"),
-                enter("running", "hitl", "escalation:hitl"),
-            ]
-        );
-        let stored = daemon.db().get_item(&work_id).unwrap();
-        assert_eq!(stored.phase(), QueuePhase::Hitl);
-        assert_eq!(daemon.items_in_phase(QueuePhase::Hitl).len(), 1);
-
-        let entering = daemon
-            .db()
-            .transitions_of(&work_id)
-            .unwrap()
-            .into_iter()
-            .rev()
-            .find(|e| e.to_phase.as_deref() == Some("hitl"))
+        // Corrupt the stored attempt history the stagnation check reads.
+        let raw = rusqlite::Connection::open(path).unwrap();
+        raw.execute("UPDATE history SET attempt = 'not-a-number'", [])
             .unwrap();
-        let request = daemon
-            .db()
-            .hitl_request(&HitlId::new(format!("hitl-{}", entering.seq)))
-            .unwrap()
-            .expect("exactly one open request is created with the transition");
-        assert_eq!(request.status, HitlStatus::Open);
-        assert_eq!(request.work_id, work_id);
-        assert_eq!(request.reason, Some(HitlReason::RetryMaxExceeded));
+        drop(raw);
+
+        let outcome = run_once(&mut daemon).await;
+        assert!(
+            matches!(outcome, ItemOutcome::StoreError { .. }),
+            "got {outcome:?}"
+        );
+        assert_eq!(
+            daemon.db().get_item(&derived(2)).unwrap().phase(),
+            QueuePhase::Running,
+            "no escalation is committed on a store read error"
+        );
+        assert!(matches!(
+            daemon.db().get_item(&derived(3)),
+            Err(belt_core::error::BeltError::ItemNotFound(_))
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // log-cleanup follows the worktree owner
+    // -----------------------------------------------------------------------
+
+    fn claim(db: &Database, work_id: &str, from: QueuePhase, to: QueuePhase) {
+        db.transition(&TransitionRequest {
+            work_id: work_id.to_string(),
+            expected_from: from,
+            to,
+            actor: Actor::Daemon,
+            reason: TransitionReason::Advance,
+            detail: None,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn log_cleanup_keeps_a_handed_over_worktree_until_its_owner_finishes() {
+        let tmp = TempDir::new().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let worktrees: Arc<dyn WorktreeManager> =
+            Arc::new(MockWorktreeManager::new(tmp.path().to_path_buf()));
+
+        db.insert_collected(&NewItem {
+            source_id: "github:org/repo#1".to_string(),
+            workspace_id: "test-ws".to_string(),
+            state: "analyze".to_string(),
+            title: None,
+            actor: Actor::Daemon,
+        })
+        .unwrap();
+        claim(&db, ORIGIN, QueuePhase::Pending, QueuePhase::Ready);
+        claim(&db, ORIGIN, QueuePhase::Ready, QueuePhase::Running);
+        worktrees.create_or_reuse(ORIGIN).unwrap();
+        let outcome = db
+            .derive(&DeriveRequest {
+                work_id: ORIGIN.to_string(),
+                expected_from: QueuePhase::Running,
+                kind: DeriveKind::EscalationRetry,
+                actor: Actor::Daemon,
+                reason: TransitionReason::Derived,
+                detail: None,
+            })
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DeriveOutcome::Derived {
+                work_id: derived(2)
+            }
+        );
+
+        let job = LogCleanupJob::new(Arc::clone(&db), Arc::clone(&worktrees));
+        let past_ttl = CronContext {
+            now: chrono::Utc::now() + chrono::Duration::days(30),
+        };
+
+        job.execute(&past_ttl).unwrap();
+        assert!(
+            worktrees.exists(ORIGIN),
+            "the Skipped origin no longer owns the handed-over worktree"
+        );
+
+        db.transition(&TransitionRequest {
+            work_id: derived(2),
+            expected_from: QueuePhase::Pending,
+            to: QueuePhase::Skipped,
+            actor: Actor::Cli,
+            reason: TransitionReason::Manual,
+            detail: None,
+        })
+        .unwrap();
+        job.execute(&past_ttl).unwrap();
+        assert!(
+            !worktrees.exists(ORIGIN),
+            "the worktree goes once its owner is finished"
+        );
     }
 }
