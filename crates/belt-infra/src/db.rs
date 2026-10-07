@@ -1805,6 +1805,9 @@ pub mod transition_kind {
     pub const TRANSITION_REJECTED: &str = "transition_rejected";
     /// A transition found a phase other than the expected one.
     pub const TRANSITION_CONFLICT: &str = "transition_conflict";
+    /// A HITL response was refused; `reason` is `already_handled` or
+    /// `unauthorized`. The phase columns are empty: no transition happened.
+    pub const HITL_RESPONSE_REJECTED: &str = "hitl_response_rejected";
 }
 
 /// One row of the append-only `transition_log`.
@@ -1946,6 +1949,8 @@ pub enum CompleteOutcome {
 }
 
 /// `resolution.by` / `resolution.via` recorded when a request expires.
+const REJECT_ALREADY_HANDLED: &str = "already_handled";
+const REJECT_UNAUTHORIZED: &str = "unauthorized";
 const EXPIRY_BY: &str = "system";
 const EXPIRY_VIA: &str = "timeout";
 
@@ -2443,6 +2448,67 @@ impl Database {
         self.write_tx(|tx| confirm_in_tx(tx, target, resolution, notes))
     }
 
+    /// Record a response of `by` through `via` that was refused as
+    /// unauthorized, in the `transition_log`. The request is left untouched.
+    ///
+    /// Returns `false` when `target` names no request (nothing to attribute
+    /// the rejection to).
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn record_unauthorized_response(
+        &self,
+        target: &HitlTarget,
+        by: &str,
+        via: &str,
+    ) -> Result<bool, BeltError> {
+        self.write_tx(|tx| {
+            let Some(request) = find_hitl(tx, target)? else {
+                return Ok(false);
+            };
+            append_rejection(tx, &request, REJECT_UNAUTHORIZED, by, via, None)?;
+            Ok(true)
+        })
+    }
+
+    /// Every open request, oldest first.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn open_hitl_requests(&self) -> Result<Vec<HitlRequest>, BeltError> {
+        let conn = self.lock_conn()?;
+        read_open_requests(&conn)
+    }
+
+    /// Claim the `on_hitl_opened` notification of every open request that
+    /// has not been claimed yet, and return those requests.
+    ///
+    /// The claim is stored before the hook runs, so each request is handed
+    /// out exactly once: a failing hook is not retried, and a request that
+    /// was confirmed before it was observed is never handed out.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn claim_opened_hooks(&self) -> Result<Vec<HitlRequest>, BeltError> {
+        self.write_tx(|tx| {
+            let now = Utc::now().to_rfc3339();
+            let mut claimed = Vec::new();
+            for request in read_open_requests(tx)? {
+                let changed = tx
+                    .execute(
+                        "UPDATE hitl_requests SET opened_hook_done_at = ?1
+                         WHERE hitl_id = ?2 AND status = 'open' AND opened_hook_done_at IS NULL",
+                        params![now, request.hitl_id.as_str()],
+                    )
+                    .map_err(sql_err)?;
+                if changed == 1 {
+                    claimed.push(request);
+                }
+            }
+            Ok(claimed)
+        })
+    }
+
     /// Expire an open request by timeout, applying `terminal`.
     ///
     /// Races with [`Database::resolve_hitl`] on the same open-state
@@ -2628,9 +2694,65 @@ fn confirm_in_tx(
             })
         }
         HitlStatus::Resolved | HitlStatus::Expired => {
-            Ok(RespondOutcome::AlreadyHandled(stored_resolution(&current)?))
+            let winner = stored_resolution(&current)?;
+            append_rejection(
+                tx,
+                &current,
+                REJECT_ALREADY_HANDLED,
+                &resolution.by,
+                &resolution.via,
+                Some(resolution.action),
+            )?;
+            Ok(RespondOutcome::AlreadyHandled(winner))
         }
     }
+}
+
+/// Record a response of `by` through `via` refused against `request` in the
+/// `transition_log`, inside the caller's transaction. `action` is `None`
+/// when the response was refused before its action was read.
+fn append_rejection(
+    tx: &Transaction<'_>,
+    request: &HitlRequest,
+    reason: &str,
+    by: &str,
+    via: &str,
+    action: Option<HitlAction>,
+) -> Result<(), BeltError> {
+    let source_id: String = tx
+        .query_row(
+            "SELECT source_id FROM queue_items WHERE work_id = ?1",
+            params![request.work_id],
+            |r| r.get(0),
+        )
+        .map_err(sql_err)?;
+    let detail = serde_json::json!({
+        "hitl_id": request.hitl_id.as_str(),
+        "by": by,
+        "via": via,
+        "action": action.map(|a| a.to_string()),
+        "winner": request.resolution.as_ref().map(|w| serde_json::json!({
+            "by": w.by,
+            "via": w.via,
+            "action": w.action.to_string(),
+            "at": w.at,
+        })),
+    })
+    .to_string();
+    append_log(
+        tx,
+        &LogRecord {
+            work_id: &request.work_id,
+            source_id: &source_id,
+            kind: transition_kind::HITL_RESPONSE_REJECTED,
+            from_phase: None,
+            to_phase: None,
+            actor: via,
+            reason: Some(reason),
+            detail: Some(&detail),
+        },
+    )?;
+    Ok(())
 }
 
 /// Open -> `status` compare-and-set recording the winning resolution.
@@ -2702,6 +2824,20 @@ fn find_hitl(conn: &Connection, target: &HitlTarget) -> Result<Option<HitlReques
         .map_err(sql_err)?
         .map(row_to_hitl_request)
         .transpose()
+}
+
+fn read_open_requests(conn: &Connection) -> Result<Vec<HitlRequest>, BeltError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {HITL_COLUMNS} FROM hitl_requests WHERE status = 'open' ORDER BY rowid"
+        ))
+        .map_err(sql_err)?;
+    let mut rows = stmt.query([]).map_err(sql_err)?;
+    let mut open = Vec::new();
+    while let Some(row) = rows.next().map_err(sql_err)? {
+        open.push(row_to_hitl_request(row)?);
+    }
+    Ok(open)
 }
 
 /// The recorded winner of a confirmed request.
