@@ -39,6 +39,7 @@ use crate::evaluator::Evaluator;
 use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
 use crate::hitl::{HitlExpiry, HitlService};
 use crate::hook_cache::DynamicHookLoader;
+use crate::notify::{ChannelSend, DeliveryResult, Notifier, PollResult};
 use crate::post_processing::OnDoneRun;
 
 /// Safely transition a [`QueueItem`] to a new phase.
@@ -119,6 +120,9 @@ pub struct Daemon {
     handler_tasks: HashMap<tokio::task::Id, String>,
     /// Stops handler process groups (cancel, shutdown, leftovers at start).
     killer: Arc<dyn ProcessKiller>,
+    /// Progress notifications, HITL request delivery and external responses.
+    /// `None` runs the daemon without any channel (dashboard only).
+    notifier: Option<Notifier>,
 }
 
 #[derive(Debug)]
@@ -245,7 +249,17 @@ impl Daemon {
             in_flight: Arc::new(InFlight::default()),
             handler_tasks: HashMap::new(),
             killer: Arc::from(belt_infra::platform::default_process_killer()),
+            notifier: None,
         }
+    }
+
+    /// Set the notifier the tick drives (steps 4 to 6 of the tick order).
+    ///
+    /// The notifier is built once at start from the workspace's
+    /// `notifications` section, so a changed section applies after a restart.
+    pub fn with_notifier(mut self, notifier: Notifier) -> Self {
+        self.notifier = Some(notifier);
+        self
     }
 
     /// Register the built-in jobs, seed per-workspace jobs and load custom jobs.
@@ -2418,6 +2432,7 @@ impl Daemon {
             tracing::info!("post-processed {post_processed} HITL requests");
         }
         self.observe_hitl_opened().await?;
+        self.run_notifications().await;
 
         // Ended handlers free their concurrency slots before the claim.
         let ended = self.reap_finished().await;
@@ -2918,6 +2933,14 @@ impl Daemon {
     pub async fn observe_hitl_opened(&mut self) -> Result<usize> {
         let claimed = self.hitl.claim_opened()?;
         for request in &claimed {
+            if let Some(notifier) = &self.notifier
+                && let Err(e) = notifier.register_deliveries(&request.hitl_id)
+            {
+                tracing::error!(
+                    hitl_id = %request.hitl_id,
+                    "HITL request delivery not registered: {e}"
+                );
+            }
             let item = match self.db.get_item(&request.work_id) {
                 Ok(item) => item,
                 Err(e) => {
@@ -2944,6 +2967,85 @@ impl Daemon {
             }
         }
         Ok(claimed.len())
+    }
+
+    /// Deliver due HITL requests, poll the channels for responses and
+    /// announce progress (tick steps 4 to 6).
+    ///
+    /// Notification is best-effort: a store error is logged and never stops
+    /// the tick, and every result value is traced. Delivery and notification
+    /// failures are also recorded in the store by the notifier.
+    async fn run_notifications(&mut self) {
+        let Some(notifier) = self.notifier.as_mut() else {
+            return;
+        };
+
+        match notifier.deliver_due().await {
+            Ok(reports) => {
+                for report in reports {
+                    match report.result {
+                        DeliveryResult::Sent => tracing::info!(
+                            hitl_id = %report.hitl_id,
+                            channel = %report.channel,
+                            "HITL request delivered"
+                        ),
+                        DeliveryResult::Retrying { attempts } => tracing::warn!(
+                            hitl_id = %report.hitl_id,
+                            channel = %report.channel,
+                            attempts,
+                            "HITL request delivery failed, retrying next tick"
+                        ),
+                        DeliveryResult::GaveUp { attempts } => tracing::error!(
+                            hitl_id = %report.hitl_id,
+                            channel = %report.channel,
+                            attempts,
+                            "HITL request delivery given up"
+                        ),
+                    }
+                }
+            }
+            Err(e) => tracing::error!("HITL request delivery not run: {e}"),
+        }
+
+        match notifier.poll_responses().await {
+            Ok(reports) => {
+                for report in reports {
+                    match report.result {
+                        PollResult::Failed { error } => tracing::warn!(
+                            channel = %report.channel,
+                            %error,
+                            "channel polling failed, polling again next tick"
+                        ),
+                        PollResult::Polled(responses) => {
+                            for response in responses {
+                                tracing::info!(
+                                    channel = %report.channel,
+                                    external_id = %response.external_id,
+                                    respondent = %response.respondent,
+                                    outcome = ?response.outcome,
+                                    reply = ?response.reply,
+                                    "external response processed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::error!("channel polling not run: {e}"),
+        }
+
+        match notifier.notify_progress().await {
+            Ok(notices) => {
+                let failed = notices
+                    .iter()
+                    .filter(|n| matches!(n.result, ChannelSend::Failed { .. }))
+                    .count();
+                if !notices.is_empty() {
+                    tracing::debug!(sent = notices.len() - failed, failed, "progress announced");
+                }
+            }
+            Err(e) => tracing::error!("progress notification not run: {e}"),
+        }
     }
 
     /// Apply every confirmed HITL request of this workspace (tick step 3):
