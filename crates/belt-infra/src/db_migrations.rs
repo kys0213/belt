@@ -3,6 +3,8 @@
 //! The schema version lives in `PRAGMA user_version`. A database that predates
 //! versioning reports `0`; if it already holds tables it is treated as v1.
 
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -33,10 +35,13 @@ pub(crate) fn migrate(conn: &mut Connection, db_path: Option<&Path>) -> Result<(
     }
     if found < CURRENT_VERSION {
         // An empty database (v0) has nothing to lose, so only v1+ is backed up.
-        if found >= 1
-            && let Some(path) = db_path
-        {
-            backup(conn, path, found)?;
+        if found >= 1 {
+            // A migration that is certain to fail must not leave a backup behind
+            // on every start.
+            v2_data::precheck(conn)?;
+            if let Some(path) = db_path {
+                backup(conn, path, found)?;
+            }
         }
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -83,19 +88,52 @@ fn detect_version(conn: &Connection) -> Result<u32, BeltError> {
 
 /// Copy the database to `{path}.bak-v{version}` (or `.bak-v{version}.{n}` when
 /// that name is taken). An existing backup is never overwritten.
+///
+/// The name is claimed atomically by creating an empty file with
+/// `create_new`, so processes starting at the same time never pick the same
+/// name. `VACUUM INTO` accepts an existing empty file as its target.
 fn backup(conn: &Connection, path: &Path, version: u32) -> Result<(), BeltError> {
     let base = format!("{}.bak-v{version}", path.display());
-    let target = std::iter::once(PathBuf::from(&base))
-        .chain((2..).map(|n| PathBuf::from(format!("{base}.{n}"))))
-        .find(|candidate| !candidate.exists())
-        .expect("an unbounded candidate sequence always has a free name");
-    let target_str = target.to_str().ok_or_else(|| {
-        BeltError::Database(format!("backup path is not UTF-8: {}", target.display()))
-    })?;
-    // VACUUM INTO reads through the connection, so pages still in a WAL file are included.
-    conn.execute("VACUUM INTO ?1", params![target_str])
-        .map_err(|e| BeltError::Database(format!("backup to {target_str} failed: {e}")))?;
-    tracing::info!(backup = %target_str, from_version = version, "database backed up before migration");
+    let candidates = std::iter::once(PathBuf::from(&base))
+        .chain((2..).map(|n| PathBuf::from(format!("{base}.{n}"))));
+    for target in candidates {
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&target)
+        {
+            Ok(_) => return fill_backup(conn, &target, version),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(BeltError::Database(format!(
+                    "cannot create backup file {}: {e}",
+                    target.display()
+                )));
+            }
+        }
+    }
+    unreachable!("an unbounded candidate sequence always has a free name")
+}
+
+/// `VACUUM INTO` the claimed empty file; on failure the empty claim is removed.
+fn fill_backup(conn: &Connection, target: &Path, version: u32) -> Result<(), BeltError> {
+    let vacuum = target
+        .to_str()
+        .ok_or_else(|| {
+            BeltError::Database(format!("backup path is not UTF-8: {}", target.display()))
+        })
+        .and_then(|target_str| {
+            // VACUUM INTO reads through the connection, so pages still in a WAL file are included.
+            conn.execute("VACUUM INTO ?1", params![target_str])
+                .map_err(|e| BeltError::Database(format!("backup to {target_str} failed: {e}")))
+        });
+    if let Err(e) = vacuum {
+        if let Err(remove) = std::fs::remove_file(target) {
+            tracing::warn!(backup = %target.display(), error = %remove, "could not remove the unfinished backup file");
+        }
+        return Err(e);
+    }
+    tracing::info!(backup = %target.display(), from_version = version, "database backed up before migration");
     Ok(())
 }
 
@@ -105,9 +143,88 @@ fn db_err(e: rusqlite::Error) -> BeltError {
 
 /// The v1 schema: every table as it existed before versioning was introduced.
 ///
-/// Frozen. A legacy database may already hold any subset of these tables.
+/// Frozen. A legacy database may already hold any subset of these tables,
+/// and a table created by an older release may lack later v1 columns
+/// (v0.1.0 through v0.1.6 have no `queue_items.previous_worktree_path`).
+/// `CREATE TABLE IF NOT EXISTS` does not add those, so they are added here.
 fn apply_v1(conn: &Connection) -> Result<(), BeltError> {
-    conn.execute_batch(V1_SCHEMA).map_err(db_err)
+    conn.execute_batch(V1_SCHEMA).map_err(db_err)?;
+    add_missing_v1_columns(conn)
+}
+
+/// A column as `pragma_table_info` describes it.
+struct ColumnDef {
+    name: String,
+    decl_type: String,
+    not_null: bool,
+    default: Option<String>,
+    primary_key: bool,
+}
+
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<ColumnDef>, BeltError> {
+    let mut stmt = conn
+        .prepare("SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_info(?1)")
+        .map_err(db_err)?;
+    stmt.query_map(params![table], |r| {
+        Ok(ColumnDef {
+            name: r.get(0)?,
+            decl_type: r.get(1)?,
+            not_null: r.get(2)?,
+            default: r.get(3)?,
+            primary_key: r.get::<_, i64>(4)? > 0,
+        })
+    })
+    .map_err(db_err)?
+    .collect::<Result<_, _>>()
+    .map_err(db_err)
+}
+
+/// Add every v1 column a v1 table lacks, with its v1 type, nullability and
+/// default. The v1 definitions are read from [`V1_SCHEMA`] applied to a
+/// scratch in-memory database, so they cannot drift from the frozen schema.
+fn add_missing_v1_columns(conn: &Connection) -> Result<(), BeltError> {
+    let reference = Connection::open_in_memory().map_err(db_err)?;
+    reference.execute_batch(V1_SCHEMA).map_err(db_err)?;
+    let tables: Vec<String> = {
+        let mut stmt = reference
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .map_err(db_err)?;
+        stmt.query_map([], |r| r.get(0))
+            .map_err(db_err)?
+            .collect::<Result<_, _>>()
+            .map_err(db_err)?
+    };
+    for table in tables {
+        let present: Vec<String> = table_columns(conn, &table)?
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        for column in table_columns(&reference, &table)? {
+            if present.contains(&column.name) {
+                continue;
+            }
+            if column.primary_key {
+                return Err(BeltError::Database(format!(
+                    "migration v1: table {table} lacks its primary key column {}",
+                    column.name
+                )));
+            }
+            let mut ddl = format!(
+                "ALTER TABLE {table} ADD COLUMN {} {}",
+                column.name, column.decl_type
+            );
+            if column.not_null {
+                ddl.push_str(" NOT NULL");
+            }
+            if let Some(default) = &column.default {
+                ddl.push_str(&format!(" DEFAULT {default}"));
+            }
+            conn.execute_batch(&ddl)
+                .map_err(|e| BeltError::Database(format!("migration v1: `{ddl}` failed: {e}")))?;
+            tracing::info!(table = %table, column = %column.name, "added missing v1 column");
+        }
+    }
+    Ok(())
 }
 
 /// v2: SQLite owns queue state. Adds lineage and handler columns, the
@@ -122,7 +239,7 @@ fn apply_v2(tx: &Transaction<'_>) -> Result<(), BeltError> {
 /// v1 binaries wrote; they must not follow later changes to core enums.
 mod v2_data {
     use chrono::Utc;
-    use rusqlite::{Transaction, params};
+    use rusqlite::{Connection, Transaction, params};
 
     use belt_core::error::BeltError;
 
@@ -175,9 +292,25 @@ mod v2_data {
         open_requests_for_hitl_items(tx)
     }
 
+    /// Read-only check, run before the backup, for data the conversion is
+    /// certain to reject. [`convert`] repeats it under the write lock.
+    pub(super) fn precheck(conn: &Connection) -> Result<(), BeltError> {
+        let has_queue: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'queue_items')",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(db_err)?;
+        if has_queue {
+            reject_unknown_values(conn)?;
+        }
+        Ok(())
+    }
+
     /// Fail Fast on values no v1 binary wrote: they cannot be mapped safely.
-    fn reject_unknown_values(tx: &Transaction<'_>) -> Result<(), BeltError> {
-        let mut stmt = tx
+    fn reject_unknown_values(conn: &Connection) -> Result<(), BeltError> {
+        let mut stmt = conn
             .prepare("SELECT work_id, phase, hitl_reason FROM queue_items ORDER BY work_id")
             .map_err(db_err)?;
         let rows = stmt
@@ -469,6 +602,10 @@ const V2_SCHEMA: &str = "
         legacy_event_id TEXT
     );
     CREATE INDEX idx_transition_log_work_id ON transition_log (work_id);
+    -- Work-id issuance reads every id a (source_id, state) series ever had under the write lock.
+    CREATE INDEX idx_transition_log_source ON transition_log (source_id, work_id);
+    CREATE INDEX idx_queue_items_lineage_root ON queue_items (lineage_root);
+    CREATE INDEX idx_history_work_id ON history (work_id);
 
     CREATE TABLE hitl_requests (
         hitl_id                  TEXT PRIMARY KEY,
@@ -1207,6 +1344,193 @@ mod tests {
             .expect("migration must fail");
         assert!(err.to_string().contains("paused"), "error: {err}");
         assert_eq!(user_version(&raw(&path)), 0);
+    }
+
+    fn backups_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.contains(".bak-"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn migration_that_is_certain_to_fail_leaves_no_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = legacy_db(dir.path());
+        insert_legacy(
+            &raw(&path),
+            &LegacyItem {
+                work_id: "weird",
+                phase: "paused",
+                reason: None,
+                notes: None,
+                terminal: None,
+            },
+        );
+
+        for _ in 0..2 {
+            assert!(Database::open(path.to_str().unwrap()).is_err());
+        }
+        assert_eq!(backups_in(dir.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn concurrent_first_opens_of_a_legacy_database_all_succeed() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = legacy_db(dir.path());
+        let path_str = path.to_str().unwrap().to_string();
+        let barrier = Arc::new(Barrier::new(4));
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let path = path_str.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Database::open(&path).map(drop)
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().expect("every concurrent open succeeds");
+        }
+
+        let conn = raw(&path);
+        assert_eq!(user_version(&conn), CURRENT_VERSION);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM hitl_requests"),
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM queue_items WHERE phase = 'hitl'"
+            )
+        );
+        // Every backup is a complete, readable database.
+        let backups = backups_in(dir.path());
+        assert!(!backups.is_empty());
+        for name in backups {
+            let backup = raw(&dir.path().join(&name));
+            assert_eq!(
+                count(&backup, "SELECT COUNT(*) FROM queue_items"),
+                LEGACY_ITEMS.len() as i64,
+                "{name}"
+            );
+        }
+    }
+
+    /// `queue_items` as created by v0.1.0 through v0.1.6, before
+    /// `previous_worktree_path` existed (`git show v0.1.0:crates/belt-infra/src/db.rs`).
+    const V0_1_0_QUEUE_ITEMS: &str = "
+        CREATE TABLE queue_items (
+            work_id          TEXT PRIMARY KEY,
+            source_id        TEXT NOT NULL,
+            workspace_id     TEXT NOT NULL,
+            state            TEXT NOT NULL,
+            phase            TEXT NOT NULL,
+            title            TEXT,
+            created_at       TEXT NOT NULL,
+            updated_at       TEXT NOT NULL,
+            hitl_created_at  TEXT,
+            hitl_respondent  TEXT,
+            hitl_notes       TEXT,
+            hitl_reason          TEXT,
+            hitl_timeout_at      TEXT,
+            hitl_terminal_action TEXT,
+            replan_count         INTEGER NOT NULL DEFAULT 0,
+            worktree_preserved   INTEGER NOT NULL DEFAULT 0
+        );
+    ";
+
+    #[test]
+    fn database_from_a_release_without_previous_worktree_path_is_migrated_and_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        {
+            let conn = raw(&path);
+            conn.execute_batch(V0_1_0_QUEUE_ITEMS).unwrap();
+            // The remaining v1 tables had their final shape already.
+            conn.execute_batch(super::V1_SCHEMA).unwrap();
+            assert!(!column_exists(
+                &conn,
+                "queue_items",
+                "previous_worktree_path"
+            ));
+            for item in LEGACY_ITEMS {
+                insert_legacy(&conn, item);
+            }
+        }
+
+        let db = open(&path);
+
+        let items = db.list_items(None, None).unwrap();
+        assert_eq!(items.len(), LEGACY_ITEMS.len());
+        for item in &items {
+            assert_eq!(item.previous_worktree_path, None);
+            assert_eq!(db.get_item(&item.work_id).unwrap().work_id, item.work_id);
+        }
+        let conn = raw(&path);
+        assert_eq!(user_version(&conn), CURRENT_VERSION);
+        let (notnull, default): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT \"notnull\", dflt_value FROM pragma_table_info('queue_items')
+                 WHERE name = 'previous_worktree_path'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((notnull, default), (0, None));
+    }
+
+    #[test]
+    fn missing_v1_column_keeps_its_v1_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        {
+            let conn = raw(&path);
+            conn.execute_batch(
+                "CREATE TABLE cron_jobs (name TEXT PRIMARY KEY, schedule TEXT NOT NULL, created_at TEXT NOT NULL);
+                 INSERT INTO cron_jobs VALUES ('job', '* * * * *', '2026-01-01T00:00:00Z');",
+            )
+            .unwrap();
+        }
+
+        drop(open(&path));
+
+        let conn = raw(&path);
+        let (script, enabled, updated_at): (String, i64, String) = conn
+            .query_row(
+                "SELECT script, enabled, updated_at FROM cron_jobs WHERE name = 'job'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((script.as_str(), enabled, updated_at.as_str()), ("", 1, ""));
+    }
+
+    #[test]
+    fn v2_indexes_cover_lineage_and_series_lookups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        drop(open(&path));
+
+        let conn = raw(&path);
+        for (table, index) in [
+            ("transition_log", "idx_transition_log_source"),
+            ("queue_items", "idx_queue_items_lineage_root"),
+            ("history", "idx_history_work_id"),
+        ] {
+            let found: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 AND name = ?2",
+                    params![table, index],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(found, 1, "missing index {index} on {table}");
+        }
     }
 
     #[test]
