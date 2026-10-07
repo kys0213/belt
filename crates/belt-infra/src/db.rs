@@ -2111,6 +2111,16 @@ impl Database {
             derived.lineage_root = origin.item.lineage_root.clone();
             insert_queue_row(tx, &derived)?;
 
+            // Replan leaves Hitl as post-processing of a confirmed request;
+            // completing it here keeps it out of `pending_post_processing`.
+            tx.execute(
+                "UPDATE hitl_requests SET post_processed_at = ?1
+                 WHERE work_id = ?2 AND status IN ('resolved', 'expired')
+                   AND post_processed_at IS NULL",
+                params![Utc::now().to_rfc3339(), origin.item.work_id],
+            )
+            .map_err(sql_err)?;
+
             match req.kind {
                 DeriveKind::EscalationRetry => {
                     let owner = origin
@@ -2158,7 +2168,7 @@ impl Database {
     /// # Errors
     /// `BeltError::ItemNotFound` for an unknown `work_id`.
     /// `BeltError::Database` on I/O failure or a history status that maps to
-    /// no attempt status (`failed`, `reset`, `running`, `done`/`success`,
+    /// no attempt status (`failed`, `reset`, `running`, `completed`/`done`/`success`,
     /// `skipped`, `hitl`).
     pub fn failure_count(&self, work_id: &str) -> Result<u32, BeltError> {
         let conn = self.lock_conn()?;
@@ -2219,6 +2229,10 @@ impl Database {
 
     /// The most recently created item of the lineage `work_id` belongs to.
     ///
+    /// Creation order is the `item_created` log sequence, which survives row
+    /// re-insertion and `VACUUM`; legacy items without an `item_created` row
+    /// sort oldest and fall back to `created_at`.
+    ///
     /// # Errors
     /// `BeltError::ItemNotFound` for an unknown `work_id`.
     pub fn latest_in_lineage(&self, work_id: &str) -> Result<QueueItem, BeltError> {
@@ -2227,7 +2241,12 @@ impl Database {
             .prepare(&format!(
                 "SELECT {QUEUE_ITEM_COLUMNS} FROM queue_items
                  WHERE lineage_root = (SELECT lineage_root FROM queue_items WHERE work_id = ?1)
-                 ORDER BY rowid DESC LIMIT 1"
+                 ORDER BY (SELECT MAX(t.seq) FROM transition_log t
+                           WHERE t.work_id = queue_items.work_id AND t.kind = '{kind}')
+                          DESC NULLS LAST,
+                          created_at DESC, rowid DESC
+                 LIMIT 1",
+                kind = transition_kind::ITEM_CREATED
             ))
             .map_err(sql_err)?;
         let mut rows = stmt.query(params![work_id]).map_err(sql_err)?;
@@ -2984,7 +3003,7 @@ fn attempt_status(status: &str) -> Result<AttemptStatus, BeltError> {
         "failed" => Ok(AttemptStatus::Failed),
         HISTORY_STATUS_RESET => Ok(AttemptStatus::Reset),
         "running" => Ok(AttemptStatus::Running),
-        "done" | "success" => Ok(AttemptStatus::Done),
+        "completed" | "done" | "success" => Ok(AttemptStatus::Done),
         "skipped" => Ok(AttemptStatus::Skipped),
         "hitl" => Ok(AttemptStatus::Hitl),
         other => Err(BeltError::Database(format!(
@@ -5092,6 +5111,16 @@ mod tests {
                 .count();
             assert_eq!((applied, conflicts), (1, 1), "round {round}: {outcomes:?}");
         }
+
+        let seqs: Vec<u64> = setup
+            .transitions_since(0)
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        let unique: std::collections::BTreeSet<_> = seqs.iter().collect();
+        assert_eq!(unique.len(), seqs.len(), "duplicate transition_log seq");
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
@@ -5450,6 +5479,157 @@ mod tests {
             db.record_reset("nope"),
             Err(BeltError::ItemNotFound(_))
         ));
+    }
+
+    #[test]
+    fn failure_count_treats_legacy_completed_history_as_a_non_failure() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "implement"));
+        history(&db, &id, "s1", "implement", "completed");
+        history(&db, &id, "s1", "implement", "failed");
+        history(&db, &id, "s1", "implement", "completed");
+        assert_eq!(db.failure_count(&id).unwrap(), 1);
+    }
+
+    #[test]
+    fn latest_in_lineage_follows_creation_order_not_rowid() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+        let second = match db.derive(&derive_request(
+            &first,
+            QueuePhase::Running,
+            DeriveKind::EscalationRetry,
+        )) {
+            Ok(DeriveOutcome::Derived { work_id }) => work_id,
+            other => panic!("expected Derived, got {other:?}"),
+        };
+        // Re-insert the newest row so that it gets the lowest rowid.
+        {
+            let conn = db.conn.lock().unwrap();
+            let rowid: i64 = conn
+                .query_row("SELECT MIN(rowid) FROM queue_items", [], |r| r.get(0))
+                .unwrap();
+            conn.execute(
+                "UPDATE queue_items SET rowid = ?1 WHERE work_id = ?2",
+                params![rowid - 1, second],
+            )
+            .unwrap();
+        }
+        assert_eq!(db.latest_in_lineage(&first).unwrap().work_id, second);
+    }
+
+    #[test]
+    fn derive_replan_marks_the_confirmed_request_post_processed() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+        let hitl_id = opened(&db, &first);
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id.clone()),
+            &resolution(HitlAction::Replan, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.pending_post_processing().unwrap().len(), 1);
+
+        let outcome = db
+            .derive(&DeriveRequest {
+                reason: TransitionReason::PostProcessing(HitlAction::Replan),
+                ..derive_request(&first, QueuePhase::Hitl, DeriveKind::Replan)
+            })
+            .unwrap();
+
+        assert!(
+            matches!(outcome, DeriveOutcome::Derived { .. }),
+            "{outcome:?}"
+        );
+        assert!(db.pending_post_processing().unwrap().is_empty());
+        let stored = db.hitl_request(&hitl_id).unwrap().unwrap();
+        assert!(stored.post_processed_at.is_some());
+    }
+
+    #[test]
+    fn derive_from_running_has_no_hitl_request_to_mark() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+        let outcome = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap();
+        assert!(matches!(outcome, DeriveOutcome::Derived { .. }));
+        let conn = db.conn.lock().unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM hitl_requests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn concurrent_collection_of_one_series_inserts_once_and_reports_duplicate_once() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        let path = path.to_str().unwrap().to_string();
+        let _migrated = Database::open(&path).unwrap();
+
+        for round in 0..10 {
+            let source = format!("s{round}");
+            let barrier = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let (path, source, barrier) =
+                        (path.clone(), source.clone(), Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        let db = Database::open(&path).unwrap();
+                        barrier.wait();
+                        db.insert_collected(&new_item(&source, "implement"))
+                    })
+                })
+                .collect();
+            let outcomes: Vec<_> = handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap()
+                        .expect("no database error under contention")
+                })
+                .collect();
+            let inserted = outcomes
+                .iter()
+                .filter(|o| matches!(o, CollectOutcome::Inserted { .. }))
+                .count();
+            let duplicates = outcomes
+                .iter()
+                .filter(|o| matches!(o, CollectOutcome::Duplicate))
+                .count();
+            assert_eq!(
+                (inserted, duplicates),
+                (1, 1),
+                "round {round}: {outcomes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_database_connection_uses_wal_and_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        assert!(timeout > 0, "busy_timeout = {timeout}");
     }
 
     #[test]
