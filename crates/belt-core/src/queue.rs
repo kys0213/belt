@@ -259,6 +259,8 @@ pub struct QueueItemRow {
     pub previous_worktree_path: Option<String>,
     pub replan_count: u32,
     pub lateral_plan: Option<String>,
+    pub derived_from: Option<String>,
+    pub lineage_root: String,
 }
 
 impl QueueItem {
@@ -282,6 +284,8 @@ impl QueueItem {
             previous_worktree_path: self.previous_worktree_path.clone(),
             replan_count: self.replan_count,
             lateral_plan: self.lateral_plan.clone(),
+            derived_from: self.derived_from.clone(),
+            lineage_root: self.lineage_root.clone(),
         }
     }
 
@@ -308,8 +312,8 @@ impl QueueItem {
             .map(|s| s.parse::<EscalationAction>())
             .transpose()?;
         Ok(Self {
-            derived_from: None,
-            lineage_root: row.work_id.clone(),
+            derived_from: row.derived_from.clone(),
+            lineage_root: row.lineage_root.clone(),
             work_id: row.work_id.clone(),
             source_id: row.source_id.clone(),
             workspace_id: row.workspace_id.clone(),
@@ -623,6 +627,21 @@ mod tests {
         let restored = QueueItem::from_row(&item.to_row()).unwrap();
         assert_eq!(restored.lineage_root, item.work_id);
         assert_eq!(restored.derived_from, None);
+    }
+
+    #[test]
+    fn row_roundtrip_keeps_lineage_of_derived_item() {
+        let mut item = test_item("s1", "analyze");
+        item.work_id = QueueItem::make_derived_work_id("s1", "analyze", 2);
+        item.derived_from = Some("s1:analyze".to_string());
+        item.lineage_root = "s1:analyze".to_string();
+
+        let row = item.to_row();
+        assert_eq!(row.derived_from.as_deref(), Some("s1:analyze"));
+        assert_eq!(row.lineage_root, "s1:analyze");
+        let restored = QueueItem::from_row(&row).unwrap();
+        assert_eq!(restored.derived_from.as_deref(), Some("s1:analyze"));
+        assert_eq!(restored.lineage_root, "s1:analyze");
     }
 
     #[test]

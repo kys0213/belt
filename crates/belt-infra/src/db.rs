@@ -4,6 +4,7 @@
 //! cron jobs, and token usage — all backed by a single SQLite database.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
@@ -15,6 +16,8 @@ use belt_core::escalation::EscalationAction;
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::runtime::TokenUsage;
+
+use crate::db_migrations;
 
 /// An immutable history event recording an attempt on a work item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -180,7 +183,7 @@ pub struct RuntimeStats {
 /// Column list shared by all `queue_items` SELECT and INSERT statements.
 ///
 /// Keeping this in one place avoids drift when columns are added or reordered.
-const QUEUE_ITEM_COLUMNS: &str = "work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action, replan_count, worktree_preserved, previous_worktree_path";
+const QUEUE_ITEM_COLUMNS: &str = "work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action, replan_count, worktree_preserved, previous_worktree_path, derived_from, lineage_root";
 
 /// Shorthand for extracting a column value and mapping the error to `BeltError::Database`.
 fn col<T: rusqlite::types::FromSql>(row: &rusqlite::Row<'_>, idx: usize) -> Result<T, BeltError> {
@@ -196,134 +199,35 @@ pub struct Database {
 }
 
 impl Database {
-    /// Open (or create) a database at the given path and initialize the schema.
+    /// Open (or create) a database at the given path and migrate it to the
+    /// current schema version.
+    ///
+    /// A database created by an older binary is backed up next to `path`
+    /// (`{path}.bak-v{old}`) before it is migrated. Migration is forward-only:
+    /// a migrated database cannot be opened by an older binary.
     ///
     /// # Errors
-    /// Returns `BeltError::Database` if the connection or schema creation fails.
+    /// Returns `BeltError::Database` if the connection fails, the database was
+    /// written by a newer binary, or the migration fails (it is rolled back).
     pub fn open(path: &str) -> Result<Self, BeltError> {
-        let conn = Connection::open(path).map_err(|e| BeltError::Database(e.to_string()))?;
-        let db = Self {
+        let mut conn = Connection::open(path).map_err(|e| BeltError::Database(e.to_string()))?;
+        db_migrations::migrate(&mut conn, Some(Path::new(path)))?;
+        Ok(Self {
             conn: Mutex::new(conn),
-        };
-        db.init()?;
-        Ok(db)
+        })
     }
 
-    /// Open an in-memory database — useful for testing.
+    /// Open an in-memory database at the current schema version — useful for testing.
     ///
     /// # Errors
     /// Returns `BeltError::Database` if schema creation fails.
     pub fn open_in_memory() -> Result<Self, BeltError> {
-        let conn = Connection::open_in_memory().map_err(|e| BeltError::Database(e.to_string()))?;
-        let db = Self {
+        let mut conn =
+            Connection::open_in_memory().map_err(|e| BeltError::Database(e.to_string()))?;
+        db_migrations::migrate(&mut conn, None)?;
+        Ok(Self {
             conn: Mutex::new(conn),
-        };
-        db.init()?;
-        Ok(db)
-    }
-
-    /// Create all tables if they do not already exist.
-    fn init(&self) -> Result<(), BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS queue_items (
-                work_id          TEXT PRIMARY KEY,
-                source_id        TEXT NOT NULL,
-                workspace_id     TEXT NOT NULL,
-                state            TEXT NOT NULL,
-                phase            TEXT NOT NULL,
-                title            TEXT,
-                created_at       TEXT NOT NULL,
-                updated_at       TEXT NOT NULL,
-                hitl_created_at  TEXT,
-                hitl_respondent  TEXT,
-                hitl_notes       TEXT,
-                hitl_reason          TEXT,
-                hitl_timeout_at      TEXT,
-                hitl_terminal_action TEXT,
-                replan_count         INTEGER NOT NULL DEFAULT 0,
-                worktree_preserved   INTEGER NOT NULL DEFAULT 0,
-                previous_worktree_path TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS history (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                work_id    TEXT NOT NULL,
-                source_id  TEXT NOT NULL,
-                state      TEXT NOT NULL,
-                status     TEXT NOT NULL,
-                attempt    INTEGER NOT NULL,
-                summary    TEXT,
-                error      TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS workspaces (
-                name        TEXT PRIMARY KEY,
-                config_path TEXT NOT NULL,
-                created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS cron_jobs (
-                name        TEXT PRIMARY KEY,
-                schedule    TEXT NOT NULL,
-                script      TEXT NOT NULL DEFAULT '',
-                workspace   TEXT,
-                enabled     INTEGER NOT NULL DEFAULT 1,
-                last_run_at TEXT,
-                created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL DEFAULT ''
-            );
-
-            CREATE TABLE IF NOT EXISTS knowledge_base (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                workspace  TEXT NOT NULL,
-                source_ref TEXT NOT NULL,
-                category   TEXT NOT NULL,
-                content    TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS token_usage (
-                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-                work_id            TEXT NOT NULL,
-                workspace          TEXT NOT NULL,
-                runtime            TEXT NOT NULL,
-                model              TEXT NOT NULL,
-                input_tokens       INTEGER NOT NULL,
-                output_tokens      INTEGER NOT NULL,
-                cache_read_tokens  INTEGER,
-                cache_write_tokens INTEGER,
-                duration_ms        INTEGER,
-                created_at         TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS transition_events (
-                id         TEXT PRIMARY KEY,
-                work_id    TEXT NOT NULL,
-                source_id  TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                phase      TEXT,
-                from_phase TEXT,
-                detail     TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS queue_dependencies (
-                work_id    TEXT NOT NULL,
-                depends_on TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (work_id, depends_on)
-            );
-            ",
-        )
-        .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(())
+        })
     }
 
     // ---- Queue CRUD --------------------------------------------------------
@@ -339,7 +243,7 @@ impl Database {
             .map_err(|e| BeltError::Database(e.to_string()))?;
         conn.execute(
             &format!(
-                "INSERT INTO queue_items ({QUEUE_ITEM_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
+                "INSERT INTO queue_items ({QUEUE_ITEM_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"
             ),
             params![
                 item.work_id,
@@ -359,6 +263,8 @@ impl Database {
                 item.replan_count,
                 item.worktree_preserved,
                 item.previous_worktree_path,
+                item.derived_from,
+                item.lineage_root,
             ],
         )
         .map_err(|e| BeltError::Database(e.to_string()))?;
@@ -1975,7 +1881,8 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
     item.replan_count = row.get::<_, u32>(14).unwrap_or(0);
     item.worktree_preserved = col(row, 15)?;
     item.previous_worktree_path = col(row, 16)?;
-    item.lateral_plan = col(row, 17).unwrap_or(None);
+    item.derived_from = col(row, 17)?;
+    item.lineage_root = col(row, 18)?;
     Ok(item)
 }
 
@@ -3344,12 +3251,14 @@ mod tests {
     #[test]
     fn queue_item_columns_count_matches_schema() {
         let col_count = QUEUE_ITEM_COLUMNS.split(',').count();
-        // The queue_items table has exactly 17 columns:
+        // QueueItem maps 19 queue_items columns:
         // work_id, source_id, workspace_id, state, phase, title,
         // created_at, updated_at, hitl_created_at, hitl_respondent,
         // hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action,
-        // replan_count, worktree_preserved, previous_worktree_path
-        assert_eq!(col_count, 17);
+        // replan_count, worktree_preserved, previous_worktree_path,
+        // derived_from, lineage_root.
+        // handler_pid and worktree_owner are not part of QueueItem.
+        assert_eq!(col_count, 19);
     }
 
     #[test]
@@ -3380,6 +3289,8 @@ mod tests {
             "replan_count",
             "worktree_preserved",
             "previous_worktree_path",
+            "derived_from",
+            "lineage_root",
         ];
         let columns: Vec<&str> = QUEUE_ITEM_COLUMNS.split(',').map(|s| s.trim()).collect();
         for col_name in &expected {

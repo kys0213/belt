@@ -1,5 +1,6 @@
 pub mod cipher;
 pub mod db;
+mod db_migrations;
 pub mod hooks;
 pub mod ipc;
 pub mod onboarding;
