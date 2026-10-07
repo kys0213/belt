@@ -19,12 +19,14 @@ Belt의 모든 상태는 SQLite 단일 파일(`~/.belt/belt.db`)에 저장된다
 | 취소 요청 | 실행 중 아이템의 취소 의도와 결과 | 아이템당 열린 요청 하나 |
 | handler 프로세스 식별 정보 | Running 아이템의 handler 프로세스 정리용 | Running 동안만 유효 |
 | 아이템 의존 | 아이템 간 실행 순서 제약 | 순환 거부 |
-| 스펙 / 스펙 연결 | 스펙 정의와 외부 리소스 연결 | — |
+| 자연어 제안 | HITL 응답에서 LLM이 만든 제안과 응답자의 확인 대기 | HITL 요청·응답자당 pending 하나, HITL 확정 시 종결 |
 | 워크스페이스 / cron job | 등록 정보 | — |
 | 토큰 사용량 | LLM 호출 비용 | append-only |
 | 지식 베이스 | PR에서 추출한 지식 | — |
 
-> 큐 아이템은 하나의 워크플로우 상태(analyze, implement 등)에 대응하며, 식별자는 `{source_id}:{state}` 형태의 `work_id`다. 같은 외부 엔티티(`source_id`)를 공유하는 아이템들은 서로 연결된다.
+> 큐 아이템은 하나의 워크플로우 상태(analyze, implement 등)에 대응하며, 식별자는 `work_id`다. `(source_id, state)`에서 처음 만들어지는 아이템의 `work_id`는 `{source_id}:{state}`이고, 같은 `(source_id, state)`에서 그 뒤에 만들어지는 아이템은 파생이든 재수집이든 `{source_id}:{state}:{n}`이다. `n`은 `(source_id, state)` 단위로 2부터 1씩 단조 증가하고 `work_id`는 재사용되지 않는다. 같은 외부 엔티티(`source_id`)를 공유하는 아이템들은 서로 연결된다.
+>
+> escalation retry와 replan은 원 아이템을 다시 쓰지 않고 새 `work_id`의 **파생 아이템**을 만든다. 파생 아이템은 직전 아이템의 `work_id`를 **파생 원본**으로 기록하고, 같은 최초 아이템에서 이어진 아이템들을 **계열**이라 부른다. 재수집된 아이템은 파생 원본이 없는 새 계열의 첫 아이템이다. 상세: [파생 아이템과 계열](./queue-state-machine.md#파생-아이템과-계열)
 
 ---
 
@@ -49,8 +51,8 @@ Belt의 모든 상태는 SQLite 단일 파일(`~/.belt/belt.db`)에 저장된다
 
 - **append-only**다. 쓰기만 하고 수정하지 않는다.
 - phase 전이는 **phase 변경과 같은 트랜잭션**에서 기록된다. phase는 바뀌었는데 이력이 없거나 그 반대인 상태가 없다.
-- **전역 단조 증가 순서**를 가진다. log-cleanup 등으로 기록이 삭제되어도 순서 번호는 재사용되지 않는다. 진행 알림 같은 소비자는 이 순서를 따라 읽는다.
-- 새 아이템을 처음부터 Hitl로 만드는 경우에도 생성 사건이 기록된다 (이전 phase 없음).
+- **전역 단조 증가 순서**를 가진다. 전이 이력은 log-cleanup 대상이 아니다. 순서 번호는 재사용되지 않는다. 진행 알림 같은 소비자는 이 순서를 따라 읽는다.
+- 파생 아이템 생성도 생성 사건(파생 원본 포함)으로 기록된다 (이전 phase 없음).
 - 누가 했는지(actor)를 남긴다: daemon, cli, tui, cron, 외부 channel 이름.
 - 전이가 아닌 사건도 종류(kind)로 남긴다.
 
@@ -64,14 +66,15 @@ Belt의 모든 상태는 SQLite 단일 파일(`~/.belt/belt.db`)에 저장된다
 | `hitl_resolved` | HITL 요청 확정 (응답 또는 만료) |
 | `hitl_response_rejected` | 거절된 HITL 응답 (`already_handled`, `unauthorized` 등) |
 | `notification_failed` | 진행 알림 또는 거절 회신 발송 실패 |
-| `cancel_requested` / `cancel_accepted` / `cancel_closed` | 취소 요청 접수, daemon의 수락, 결과 종결 |
+| `cancel_requested` / `cancel_accepted` / `cancel_closed` | 취소 요청 접수, daemon의 수락, 결과 종결 (CLI의 `accepted` 반환 포함) |
 | `post_processing_error` | HITL 후처리의 비치명 단계 실패 |
 | `post_processing_failed` | 후처리 결과 전이가 연속 실패해 Hitl→Failed로 탈출 |
 
 ### 시도 이력 계약
 
 - append-only이고 읽기 전용으로 조회한다.
-- `failure_count`는 같은 아이템 계열의 실패 기록 수다. on_enter 실패도 포함한다.
+- `failure_count`는 계열의 시도 이력에서 마지막 **리셋 지점** 이후의 실패 수다. 리셋 지점은 HITL retry 확정과 replan 파생이다. 리셋 뒤 다음 실패는 escalation 1단계(retry)부터 다시 적용된다. on_enter 실패도 포함한다.
+- 파생된 원 아이템의 실행은 `failed`로 남고 계열의 failure_count에 포함된다.
 - stagnation 분석은 같은 `source_id`의 이전 실패 에러 메시지를 입력으로 쓴다. 상세: [Stagnation Detection](./stagnation.md)
 - 취소된 실행은 `skipped`로 기록되어 failure_count에 영향이 없다.
 - 전이 `conflict`로 버려진 실행은 기록하지 않는다 (failure_count 왜곡 방지). 이미 쓴 토큰 사용량은 기록한다.
@@ -84,7 +87,7 @@ Belt의 모든 상태는 SQLite 단일 파일(`~/.belt/belt.db`)에 저장된다
 | Done | `done` | 완료 |
 | Hitl | `hitl` | 사람 대기 |
 | Failed | `failed` | 실패 |
-| Skipped | `skipped` | 건너뜀, 취소 포함 |
+| Skipped | `skipped` | 건너뜀, 취소·파생됨 포함 |
 
 ---
 
@@ -108,13 +111,12 @@ stateDiagram-v2
 | resolved / expired, 후처리 미완료 | Hitl 유지 | 예 (후처리) |
 | 후처리 완료 | 결과 전이로 Done / Failed / Skipped / Pending | 해제 |
 
-- **열기 계약** (한 트랜잭션): 모든 HITL 진입은 아래 둘 중 하나다.
-  - 기존 아이템: 전이 계약(X→Hitl) + 요청 open
-  - 새 아이템을 Hitl로 생성: 아이템 생성 + 생성 이력 + 요청 open (replan, spec 완료 경로)
+- **열기 계약** (한 트랜잭션): 모든 HITL 진입은 기존 아이템의 전이 계약(X→Hitl)과 요청 open으로 이루어진다.
 - **확정 계약**: 요청은 open일 때만 확정(resolved)되거나 만료(expired)된다. 동시 응답과 timeout은 하나만 이기고 나머지는 `already_handled`로 끝난다. DB 에러로 끝나지 않는다.
 - 확정 정보: 응답 액션, 응답자, 응답 경로(직접 / 자연어 확정), 시각, 메모. 만료 시각과 만료 시 terminal action도 요청에 속한다.
 - 후처리 완료 시각은 crash-safe 후처리 계약의 일부다. 결과 전이와 완료 표시는 한 트랜잭션이다.
-- **불변식**: open 요청이 있으면 그 아이템의 phase는 Hitl이다.
+- 요청에는 열림 반영(`on_hitl_opened`) 완료 여부가 속한다. 상세: [LifecycleHook](./lifecycle-hook.md)
+- **불변식**: open 요청이 있으면 그 아이템의 phase는 Hitl이다. 아이템당 open 요청은 최대 하나이고, `hitl_id`는 전역 고유다.
 
 HITL 사유(`HitlReason`)는 생성 경로를 구분한다.
 
@@ -124,9 +126,6 @@ HITL 사유(`HitlReason`)는 생성 경로를 구분한다.
 | `retry_max_exceeded` | 재시도 횟수 초과 |
 | `timeout` | 실행 타임아웃 |
 | `manual_escalation` | 사용자 수동 요청 |
-| `spec_conflict` | 스펙 파일 겹침 |
-| `spec_completion_review` | 스펙 완료 최종 확인 |
-| `spec_modification_proposed` | Agent 수정 제안 |
 | `stagnation_detected` | 반복 패턴 감지 + lateral thinking |
 
 ### HITL 요청 전달 기록
@@ -141,6 +140,23 @@ HITL 요청 알림이 channel별로 어디까지 전달됐는지의 기록이다
 
 - `(channel, external_response_id)`는 유일하다. 같은 외부 응답은 재시작 후에도 한 번만 처리된다.
 - 승자의 응답을 다시 polling해도 거절로 처리되지 않는다.
+- daemon이 꺼진 동안 외부 channel에 온 응답은 재시작 후 polling이 소급 수신한다. 그 사이 다른 경로가 확정했으면 `already_handled`다.
+
+### 자연어 제안
+
+자연어 응답에서 LLM이 만든 제안과 응답자의 확인 대기 상태를 DB에 기록한다. 상세: [Notification](./notification.md)
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending: LLM 제안 기록
+    pending --> confirmed: 응답자 확인 후 HITL 판정 시도
+    pending --> superseded: 같은 응답자의 새 제안 또는 HITL 확정
+    confirmed --> [*]
+    superseded --> [*]
+```
+
+- HITL 요청·응답자마다 pending 제안은 하나다. 같은 응답자의 새 자연어 응답은 이전 제안을 대체한다.
+- HITL이 확정되면 pending 제안은 종결된다. 종결 뒤 온 확인은 승자 정보를 포함한 `already_handled`로 회신한다.
 
 ---
 
@@ -152,7 +168,8 @@ HITL 요청 알림이 channel별로 어디까지 전달됐는지의 기록이다
 stateDiagram-v2
     [*] --> Requested: 요청자가 기록
     Requested --> Accepted: daemon 수락
-    Accepted --> canceled: handler 종료 후 Running to Skipped
+    Accepted --> canceled: handler 종료 후 Running to Skipped, 재시작 시 종결 포함
+    Requested --> canceled: 재시작 시 Running이면 종결
     Requested --> canceled_directly: daemon 부재 또는 무응답, CLI 직접 전이
     Requested --> too_late: 이미 Running을 벗어남
     Accepted --> too_late: 이미 Running을 벗어남
@@ -164,6 +181,7 @@ stateDiagram-v2
 - 아이템당 **열린 요청은 하나**다. 중복 요청은 같은 요청으로 본다.
 - 요청자(respondent)와 경로(cli / tui), 요청 시각, 결과를 남긴다.
 - 결과는 `canceled`, `canceled_directly`, `too_late` 중 하나이고 dashboard에 노출된다.
+- CLI가 받는 `accepted`(수락됨, 종결 대기)는 요청 상태가 아니라 CLI 반환값이다. 최종 결과는 `belt queue show`로 확인한다.
 
 ## handler 프로세스 식별 정보
 
@@ -175,34 +193,28 @@ stateDiagram-v2
 
 ## 아이템 의존
 
-`depends_on` 아이템이 Done이 아니면 해당 아이템은 Ready→Running 점유가 블로킹된다. 확인은 **DB 조회 기반**이라 재시작 후에도 정확하다. 순환과 자기 의존은 등록 시점에 거부한다. 상세: [Daemon](./daemon.md#dependency-gate)
+`depends_on` 아이템이 Done이 아니면 해당 아이템은 Ready→Running 점유가 블로킹된다. 확인은 **DB 조회 기반**이라 재시작 후에도 정확하다. 순환과 자기 의존은 등록 시점에 거부한다. 선행 아이템이 파생되면 그 계열의 최신 아이템 phase로 판정한다. 상세: [Daemon](./daemon.md#dependency-gate)
 
 ---
 
 ## 도메인 어휘
 
-### 스펙 상태
+### Escalation 레벨 값
 
-| 상태 | 설명 |
-|------|------|
-| `draft` | 초기 상태 |
-| `active` | 활성 (이슈 생성/처리 진행) |
-| `paused` | 일시 중단 |
-| `completing` | 모든 이슈 Done + gap 없음, HITL 대기 |
-| `completed` | 최종 완료 |
-| `archived` | 소프트 삭제 |
-
-### Escalation 액션
-
-| 액션 | on_fail 트리거 | 설명 |
+| 값 | on_fail 트리거 | 설명 |
 |------|:--------------:|------|
-| `retry` | 아니오 | 조용한 재시도 |
+| `retry` | 아니오 | 조용한 재시도. 원 아이템 Skipped(파생됨) + 파생 아이템 Pending |
 | `retry_with_comment` | 예 | on_fail + 재시도 |
 | `hitl` | 예 | on_fail + HITL 생성 |
-| `skip` | 예 | on_fail + Skipped |
-| `replan` | 예 | on_fail + HITL(replan) |
 
-모든 액션에서 `on_escalation(action)`이 트리거되고, `on_fail`은 `retry`를 제외하고 추가로 트리거된다. HITL 요청의 terminal action은 이 중 허용된 값만 가진다. 유효하지 않은 값은 거부된다.
+### Escalation terminal 값
+
+| 값 | 결과 |
+|------|------|
+| `skip` | Hitl→Skipped |
+| `replan` | 원 아이템 Skipped + 파생 아이템 Pending. 계열 replan 3회 초과 시 Failed |
+
+레벨 값은 `retry`·`retry_with_comment`·`hitl`만, terminal은 `skip`·`replan`만 허용한다. 그 밖의 값은 workspace 설정 로드 시 거부한다. 모든 값에서 `on_escalation(action)`이 트리거되고, `on_fail`은 `retry`를 제외하고 추가로 트리거된다.
 
 ### Stagnation 패턴과 페르소나
 
@@ -254,13 +266,12 @@ on_done:
 | `issue`, `pr` | 정제된 이슈·PR 정보 (PR은 리뷰 포함) |
 | `history` | 같은 source의 시도 기록 |
 | `worktree` | worktree 경로 |
+| `derived_from` | 파생 원본 work_id (파생 아이템만, 없으면 생략) |
 | `source_data` | DataSource가 채우는 자유 스키마 확장점 |
 
 - `source_data`는 소스 원본 응답을 가공 없이 담는다. GitHub은 이슈 원본을 `issue` 키 아래에 둔다. 소스 종류별로 키를 나눠 다른 원본이 추가돼도 충돌하지 않는다.
 - `issue.number`, `source.url`, `history[].status` 같은 하위 필드의 상세는 [DataSource](./datasource.md#github-context-스키마)가 단일 출처다.
 - 이슈 조회에 실패하면 `source_data`는 비고, 비어 있으면 JSON 출력에서 키가 생략된다. 상세: [DataSource](./datasource.md)
-
-> `source_data` 도입의 단계적 마이그레이션 구상은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md)에 기록되어 있다.
 
 ---
 
@@ -275,7 +286,6 @@ on_done:
 ```mermaid
 erDiagram
     WORKSPACE ||--o{ QUEUE_ITEM : owns
-    WORKSPACE ||--o{ SPEC : owns
     WORKSPACE ||--o{ CRON_JOB : scopes
     QUEUE_ITEM ||--o{ TRANSITION_EVENT : records
     QUEUE_ITEM ||--o{ ATTEMPT : records
@@ -283,8 +293,9 @@ erDiagram
     QUEUE_ITEM ||--o{ CANCEL_REQUEST : receives
     QUEUE_ITEM ||--o{ TOKEN_USAGE : consumes
     QUEUE_ITEM ||--o{ DEPENDENCY : depends
+    QUEUE_ITEM ||--o{ QUEUE_ITEM : derives
     HITL_REQUEST ||--o{ DELIVERY : delivered_by
-    SPEC ||--o{ SPEC_LINK : links
+    HITL_REQUEST ||--o{ PROPOSAL : receives
 ```
 
 ---
@@ -294,7 +305,10 @@ erDiagram
 ### 전이 이력
 
 - [ ] 모든 phase 전이는 같은 트랜잭션으로 전이 이력에 남는다
-- [ ] 전이 이력의 순서는 전역 단조 증가이고, 기록이 삭제되어도 재사용되지 않는다
+- [ ] 전이 이력의 순서는 전역 단조 증가이고 재사용되지 않는다
+- [ ] 파생 아이템은 새 work_id와 파생 원본을 가진다
+- [ ] 같은 `(source_id, state)`의 work_id 순번은 단조 증가하고 재사용되지 않으며, 재수집 아이템은 파생 원본이 없다
+- [ ] 전이 이력·HITL 요청·응답 기록·중복 제거 키·취소 요청·제안은 log-cleanup으로 지워지지 않는다
 - [ ] `busy` 거절, `conflict`, 취소 요청·수락·종결, 후처리 오류가 이력 종류로 남는다
 - [ ] 시도 이력은 failure_count와 stagnation 입력으로만 쓰이고 phase 권위가 아니다
 
@@ -304,6 +318,7 @@ erDiagram
 - [ ] 동시 응답과 timeout 중 하나만 확정되고 나머지는 `already_handled`다
 - [ ] 결과 전이와 후처리 완료 표시는 한 트랜잭션이다
 - [ ] open 요청이 있는 아이템의 phase는 항상 Hitl이다
+- [ ] 아이템당 open HITL 요청은 최대 하나다
 - [ ] 같은 외부 응답은 재시작 후에도 한 번만 처리된다
 
 ### 취소 요청

@@ -91,10 +91,12 @@ notifications:
 
 | 필드 | 타입 | 기본값 | 필수 | 설명 | 상세 |
 |------|------|--------|------|------|------|
-| `{N}` | EscalationAction | — | ✅ | N회 실패 시 액션 | [DataSource](./datasource.md) |
-| `terminal` | EscalationAction | — | ✅ | HITL timeout 시 액션 | [DataSource](./datasource.md) |
+| `{N}` | `retry` \| `retry_with_comment` \| `hitl` | — | ✅ | N회 실패 시 액션 | [DataSource](./datasource.md) |
+| `terminal` | `skip` \| `replan` | — | ✅ | HITL timeout 시 액션 | [DataSource](./datasource.md) |
 
-EscalationAction: `retry` | `retry_with_comment` | `hitl` | `skip` | `replan`
+- 레벨 값: `retry` | `retry_with_comment` | `hitl`
+- terminal 값: `skip` | `replan`
+- 그 밖의 값은 workspace 설정 로드 시 거부한다.
 
 ### runtime
 
@@ -153,6 +155,7 @@ notifications:
 
 Event: `started` | `done` | `failed` | `skipped` | `hitl_requested`
 
+- `notifications` 설정 변경은 daemon 재시작 시 반영된다. hook 선택 설정은 다음 트리거에 반영된다.
 - Dashboard는 이 설정과 무관하게 항상 켜져 있고 응답할 수 있다.
 - 확인 요청·`already_handled` 같은 회신은 이벤트 필터와 무관하게 응답을 보낸 channel로 간다.
 - `hitl_resolved`는 내부 이벤트라 선택할 수 없다.
