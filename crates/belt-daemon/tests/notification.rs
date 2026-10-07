@@ -1112,3 +1112,112 @@ async fn confirmation_without_a_proposal_is_answered() {
         HitlStatus::Open
     );
 }
+
+// ---- correlation through the real GitHub channel ---------------------------
+
+/// A `gh` double: every command answers with the same stdout.
+struct FixedGh {
+    stdout: String,
+}
+
+#[async_trait]
+impl belt_core::platform::ShellExecutor for FixedGh {
+    async fn execute(
+        &self,
+        _command: &str,
+        _working_dir: &std::path::Path,
+        _env_vars: &std::collections::HashMap<String, String>,
+    ) -> Result<belt_core::platform::ShellOutput, belt_core::error::BeltError> {
+        Ok(belt_core::platform::ShellOutput {
+            exit_code: Some(0),
+            stdout: self.stdout.clone(),
+            stderr: String::new(),
+        })
+    }
+}
+
+fn github_comment(n: u32, login: &str, body: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("IC_{n}"),
+        "url": format!("https://github.com/org/repo/issues/1#issuecomment-{n}"),
+        "author": {"login": login},
+        "body": body,
+        "createdAt": "2099-01-01T00:00:00Z",
+        "includesCreatedEdit": false,
+    })
+}
+
+#[tokio::test]
+async fn response_without_id_reaches_the_new_open_request_not_the_confirmed_one() {
+    let db = db();
+    // h-1 was confirmed and is still in the late-response window; h-2 is a
+    // newer open request of another state of the same issue.
+    let (_, old) = open_hitl(&db, "1");
+    cli_responds(&db, &old, HitlAction::Retry);
+    let second = match db
+        .insert_collected(&NewItem {
+            source_id: "github:org/repo#1".to_string(),
+            workspace_id: "ws".to_string(),
+            state: "implement".to_string(),
+            title: None,
+            actor: Actor::Daemon,
+        })
+        .unwrap()
+    {
+        CollectOutcome::Inserted { work_id } => work_id,
+        other => panic!("expected a new item, got {other:?}"),
+    };
+    move_item(&db, &second, QueuePhase::Pending, QueuePhase::Ready);
+    move_item(&db, &second, QueuePhase::Ready, QueuePhase::Running);
+    let new = match HitlService::new(db.clone())
+        .open(&OpenHitlRequest {
+            work_id: second.clone(),
+            expected_from: QueuePhase::Running,
+            reason: HitlReason::EvaluateFailure,
+            notes: None,
+            actor: Actor::Daemon,
+            transition_reason: TransitionReason::Escalation(EscalationAction::Hitl),
+            timeout_at: None,
+            terminal_action: None,
+        })
+        .unwrap()
+    {
+        OpenHitlOutcome::Opened { hitl_id, .. } => hitl_id,
+        other => panic!("expected Opened, got {other:?}"),
+    };
+
+    let comments = serde_json::json!({ "comments": [
+        github_comment(1, "alice", "/belt done"),
+        github_comment(2, "alice", &format!("/belt done {old}")),
+    ]})
+    .to_string();
+    let channel = belt_infra::channels::github::GitHubOriginChannel::new(
+        belt_infra::channels::github::GitHubChannelConfig::new("org/repo"),
+        Arc::new(FixedGh { stdout: comments }),
+    );
+    let notifier = Notifier::new(
+        db.clone(),
+        config(ALLOW_ALICE),
+        vec![Arc::new(channel) as Arc<dyn NotificationChannel>],
+        NlInterpreter::new(ScriptedRuntime::new(&[]), PathBuf::from(".")),
+    )
+    .unwrap();
+
+    let reports = poll(&notifier).await;
+    assert!(
+        matches!(&reports[0].outcome, ResponseOutcome::Won { hitl_id, action: HitlAction::Done, .. } if hitl_id == &new),
+        "{:?}",
+        reports[0].outcome
+    );
+    // The explicit id of the confirmed request is answered `already_handled`.
+    assert!(
+        matches!(&reports[1].outcome, ResponseOutcome::AlreadyHandled { hitl_id, .. } if hitl_id == &old),
+        "{:?}",
+        reports[1].outcome
+    );
+    assert!(reports[1].reply.is_some());
+    assert_eq!(
+        db.hitl_request(&new).unwrap().unwrap().status,
+        HitlStatus::Resolved
+    );
+}
