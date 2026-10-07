@@ -398,7 +398,7 @@ mod store_judgement {
     }
 
     #[tokio::test]
-    async fn judgement_is_discarded_when_a_human_moved_the_item_first() {
+    async fn no_judgement_is_applied_when_a_human_moved_the_item_first() {
         let tmp = TempDir::new().unwrap();
         let mut daemon = single_item_daemon(&tmp, vec![0, 0]);
 
@@ -429,12 +429,8 @@ mod store_judgement {
             QueuePhase::Failed,
             "the stored phase wins"
         );
-        let log = daemon.db().transitions_of(work_id).unwrap();
-        assert!(
-            log.iter()
-                .any(|e| e.kind == "transition_conflict" && e.actor == "daemon"),
-            "daemon conflict must be logged: {log:?}"
-        );
+        // The tick observes the human's move first, so no judgement is even
+        // attempted (a mid-tick race would instead log a daemon conflict).
         assert!(
             !phase_enters(&daemon, work_id)
                 .iter()

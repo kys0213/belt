@@ -493,14 +493,14 @@ async fn start_daemon(
         max_concurrent,
         std::process::id()
     );
-    daemon.run(tick_interval_secs).await;
+    let result = daemon.run(tick_interval_secs).await;
 
-    // Clean up PID file on graceful shutdown.
+    // Clean up PID file on graceful shutdown and on a failed start.
     if let Err(e) = std::fs::remove_file(&pid_path) {
         tracing::warn!("failed to remove PID file: {e}");
     }
 
-    Ok(())
+    result.map_err(|e| anyhow::anyhow!("daemon failed to start: {e}"))
 }
 
 #[derive(Subcommand)]

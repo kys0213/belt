@@ -221,7 +221,7 @@ async fn unknown_state_skips_item() {
     );
 }
 
-/// Collect deduplicates items by work_id.
+/// Collect deduplicates through the store, not by the source's work_id.
 #[tokio::test]
 async fn collect_deduplicates_by_work_id() {
     let tmp = TempDir::new().unwrap();
@@ -232,8 +232,8 @@ async fn collect_deduplicates_by_work_id() {
     let mut daemon = setup_daemon(&tmp, source, vec![]);
 
     let collected = daemon.collect().await.unwrap();
-    // DataSource returns 2 items but daemon deduplicates by work_id.
-    assert_eq!(collected, 2, "DataSource reports 2 items collected");
+    // The source offers 2 items; the store accepts only the first.
+    assert_eq!(collected, 1, "only the inserted item is counted");
     assert_eq!(
         daemon.queue_items().len(),
         1,
@@ -913,5 +913,356 @@ mod results {
             daemon.db().get_item(&work_id).unwrap().phase(),
             QueuePhase::Skipped
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Store-owned collection, restart restore and tick observation
+// ---------------------------------------------------------------------------
+
+mod store_owned {
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+    use belt_core::context::ItemContext;
+    use belt_core::queue::QueueItem;
+    use belt_core::source::DataSource;
+    use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
+
+    use super::*;
+
+    /// A source whose pending items can be refilled between collects.
+    #[derive(Clone, Default)]
+    struct SharedSource {
+        items: Arc<Mutex<Vec<QueueItem>>>,
+    }
+
+    impl SharedSource {
+        fn offer(&self, source_id: &str, state: &str) {
+            self.items.lock().unwrap().push(test_item(source_id, state));
+        }
+    }
+
+    #[async_trait]
+    impl DataSource for SharedSource {
+        fn name(&self) -> &str {
+            "github"
+        }
+
+        async fn collect(&mut self, _ws: &WorkspaceConfig) -> anyhow::Result<Vec<QueueItem>> {
+            Ok(std::mem::take(&mut *self.items.lock().unwrap()))
+        }
+
+        async fn get_context(&self, item: &QueueItem) -> anyhow::Result<ItemContext> {
+            Ok(MockDataSource::default_context(item))
+        }
+    }
+
+    fn daemon_over(tmp: &TempDir, source: SharedSource, db: Database) -> Daemon {
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(MockRuntime::new("mock", vec![0, 0, 0, 0])));
+        Daemon::new(
+            test_workspace_config(),
+            vec![Box::new(source)],
+            Arc::new(registry),
+            Box::new(MockWorktreeManager::new(tmp.path().to_path_buf())),
+            4,
+            db,
+        )
+    }
+
+    fn db_path(tmp: &TempDir) -> String {
+        tmp.path().join("belt.db").to_str().unwrap().to_string()
+    }
+
+    fn move_item(db: &Database, work_id: &str, from: QueuePhase, to: QueuePhase, actor: Actor) {
+        let outcome = db
+            .transition(&TransitionRequest {
+                work_id: work_id.to_string(),
+                expected_from: from,
+                to,
+                actor,
+                reason: TransitionReason::Manual,
+                detail: None,
+            })
+            .unwrap();
+        assert!(
+            matches!(outcome, TransitionOutcome::Applied { .. }),
+            "{work_id} {from:?}->{to:?}: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_dedupes_by_store_while_an_item_is_open() {
+        let tmp = TempDir::new().unwrap();
+        let source = SharedSource::default();
+        let mut daemon = daemon_over(&tmp, source.clone(), Database::open_in_memory().unwrap());
+
+        source.offer("github:org/repo#1", "analyze");
+        source.offer("github:org/repo#1", "analyze");
+        assert_eq!(daemon.collect().await.unwrap(), 1);
+
+        source.offer("github:org/repo#1", "analyze");
+        assert_eq!(
+            daemon.collect().await.unwrap(),
+            0,
+            "open item blocks recollect"
+        );
+
+        assert_eq!(daemon.queue_items().len(), 1);
+        assert_eq!(daemon.database().list_items(None, None).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_item_blocks_recollect_until_skipped_then_a_new_lineage_is_issued() {
+        let tmp = TempDir::new().unwrap();
+        let source = SharedSource::default();
+        let mut daemon = daemon_over(&tmp, source.clone(), Database::open_in_memory().unwrap());
+        let id = "github:org/repo#1:analyze";
+
+        source.offer("github:org/repo#1", "analyze");
+        daemon.collect().await.unwrap();
+        let db = Arc::clone(daemon.database());
+        move_item(
+            &db,
+            id,
+            QueuePhase::Pending,
+            QueuePhase::Ready,
+            Actor::Daemon,
+        );
+        move_item(
+            &db,
+            id,
+            QueuePhase::Ready,
+            QueuePhase::Running,
+            Actor::Daemon,
+        );
+        move_item(
+            &db,
+            id,
+            QueuePhase::Running,
+            QueuePhase::Failed,
+            Actor::Daemon,
+        );
+
+        source.offer("github:org/repo#1", "analyze");
+        assert_eq!(daemon.collect().await.unwrap(), 0, "Failed still blocks");
+
+        move_item(&db, id, QueuePhase::Failed, QueuePhase::Skipped, Actor::Cli);
+        source.offer("github:org/repo#1", "analyze");
+        assert_eq!(daemon.collect().await.unwrap(), 1);
+
+        let fresh = daemon.get_item("github:org/repo#1:analyze:2").unwrap();
+        assert_eq!(fresh.phase(), QueuePhase::Pending);
+        assert_eq!(
+            db.get_item("github:org/repo#1:analyze:2").unwrap().phase(),
+            QueuePhase::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn new_daemon_rolls_back_running_and_restores_open_items() {
+        let tmp = TempDir::new().unwrap();
+        let path = db_path(&tmp);
+        let running_id = "github:org/repo#1:analyze";
+        let pending_id = "github:org/repo#2:analyze";
+        let skipped_id = "github:org/repo#3:analyze";
+
+        {
+            let source = SharedSource::default();
+            let mut a = daemon_over(&tmp, source.clone(), Database::open(&path).unwrap());
+            for n in 1..=3 {
+                source.offer(&format!("github:org/repo#{n}"), "analyze");
+            }
+            a.collect().await.unwrap();
+            let db = Arc::clone(a.database());
+            move_item(
+                &db,
+                skipped_id,
+                QueuePhase::Pending,
+                QueuePhase::Skipped,
+                Actor::Cli,
+            );
+            move_item(
+                &db,
+                running_id,
+                QueuePhase::Pending,
+                QueuePhase::Ready,
+                Actor::Daemon,
+            );
+            move_item(
+                &db,
+                running_id,
+                QueuePhase::Ready,
+                QueuePhase::Running,
+                Actor::Daemon,
+            );
+        }
+
+        let mut b = daemon_over(
+            &tmp,
+            SharedSource::default(),
+            Database::open(&path).unwrap(),
+        );
+        assert_eq!(b.queue_items().len(), 0, "nothing is loaded before restore");
+        b.restore_from_store().unwrap();
+
+        assert_eq!(b.queue_items().len(), 2, "Skipped is not restored");
+        assert_eq!(b.get_item(running_id).unwrap().phase(), QueuePhase::Pending);
+        assert_eq!(b.get_item(pending_id).unwrap().phase(), QueuePhase::Pending);
+        assert!(b.get_item(skipped_id).is_none());
+        assert_eq!(
+            b.database().get_item(running_id).unwrap().phase(),
+            QueuePhase::Pending
+        );
+
+        let log = b.database().transitions_of(running_id).unwrap();
+        let rollback = log.last().unwrap();
+        assert_eq!(rollback.from_phase.as_deref(), Some("running"));
+        assert_eq!(rollback.to_phase.as_deref(), Some("pending"));
+        assert_eq!(rollback.reason.as_deref(), Some("rollback"));
+        assert_eq!(rollback.actor, "daemon");
+
+        // The restored copy keeps working: a tick advances it.
+        b.tick().await.unwrap();
+        assert_ne!(
+            b.database().get_item(running_id).unwrap().phase(),
+            QueuePhase::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_drops_items_another_connection_skipped() {
+        let tmp = TempDir::new().unwrap();
+        let path = db_path(&tmp);
+        let source = SharedSource::default();
+        let mut daemon = daemon_over(&tmp, source.clone(), Database::open(&path).unwrap());
+        let id = "github:org/repo#1:analyze";
+
+        source.offer("github:org/repo#1", "analyze");
+        daemon.collect().await.unwrap();
+        daemon.restore_from_store().unwrap();
+        assert!(daemon.get_item(id).is_some());
+
+        let cli = Database::open(&path).unwrap();
+        move_item(
+            &cli,
+            id,
+            QueuePhase::Pending,
+            QueuePhase::Skipped,
+            Actor::Cli,
+        );
+
+        daemon.tick().await.unwrap();
+        assert!(daemon.get_item(id).is_none(), "skipped item left the copy");
+        assert_eq!(cli.get_item(id).unwrap().phase(), QueuePhase::Skipped);
+    }
+
+    #[tokio::test]
+    async fn tick_follows_phase_changed_by_another_connection() {
+        let tmp = TempDir::new().unwrap();
+        let path = db_path(&tmp);
+        let source = SharedSource::default();
+        let mut daemon = daemon_over(&tmp, source.clone(), Database::open(&path).unwrap());
+        let id = "github:org/repo#1:analyze";
+
+        source.offer("github:org/repo#1", "analyze");
+        daemon.collect().await.unwrap();
+        daemon.restore_from_store().unwrap();
+        daemon.request_shutdown(); // observe only: no advance
+
+        let cli = Database::open(&path).unwrap();
+        move_item(&cli, id, QueuePhase::Pending, QueuePhase::Ready, Actor::Cli);
+
+        daemon.tick().await.unwrap();
+        assert_eq!(daemon.get_item(id).unwrap().phase(), QueuePhase::Ready);
+    }
+
+    #[tokio::test]
+    async fn memory_only_hitl_exit_does_not_overwrite_the_store() {
+        let tmp = TempDir::new().unwrap();
+        let path = db_path(&tmp);
+        let source = SharedSource::default();
+        let mut daemon = daemon_over(&tmp, source.clone(), Database::open(&path).unwrap());
+        let id = "github:org/repo#1:analyze";
+
+        source.offer("github:org/repo#1", "analyze");
+        daemon.collect().await.unwrap();
+        let db = Arc::clone(daemon.database());
+        move_item(
+            &db,
+            id,
+            QueuePhase::Pending,
+            QueuePhase::Ready,
+            Actor::Daemon,
+        );
+        move_item(
+            &db,
+            id,
+            QueuePhase::Ready,
+            QueuePhase::Running,
+            Actor::Daemon,
+        );
+        move_item(
+            &db,
+            id,
+            QueuePhase::Running,
+            QueuePhase::Completed,
+            Actor::Daemon,
+        );
+        let outcome = db
+            .open_hitl(&belt_infra::db::OpenHitlRequest {
+                work_id: id.to_string(),
+                expected_from: QueuePhase::Completed,
+                reason: belt_core::queue::HitlReason::EvaluateFailure,
+                notes: None,
+                actor: Actor::Daemon,
+                transition_reason: TransitionReason::Advance,
+                timeout_at: None,
+                terminal_action: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            belt_infra::db::OpenHitlOutcome::Opened { .. }
+        ));
+        daemon.restore_from_store().unwrap();
+        let before = db.transitions_of(id).unwrap().len();
+
+        // Leaving Hitl is memory-only until the HITL contract owns it (P5).
+        daemon.retry_from_hitl(id).unwrap();
+        assert_eq!(daemon.get_item(id).unwrap().phase(), QueuePhase::Pending);
+
+        daemon.tick().await.unwrap();
+        daemon.tick().await.unwrap();
+
+        assert_eq!(
+            db.get_item(id).unwrap().phase(),
+            QueuePhase::Hitl,
+            "store wins"
+        );
+        assert_eq!(daemon.get_item(id).unwrap().phase(), QueuePhase::Hitl);
+        assert_eq!(
+            db.transitions_of(id).unwrap().len(),
+            before,
+            "no store writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_fails_when_the_store_cannot_be_read() {
+        let tmp = TempDir::new().unwrap();
+        let path = db_path(&tmp);
+        let db = Database::open(&path).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("DROP TABLE queue_items;")
+            .unwrap();
+
+        let mut daemon = daemon_over(&tmp, SharedSource::default(), db);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), daemon.run(3600))
+            .await
+            .expect("run must fail at start, not loop");
+        assert!(result.is_err());
     }
 }

@@ -21,7 +21,9 @@ use belt_core::stagnation::{
 };
 use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
 use belt_core::workspace::{StateConfig, WorkspaceConfig};
-use belt_infra::db::{Database, OpenHitlOutcome, OpenHitlRequest, TransitionEvent};
+use belt_infra::db::{
+    CollectOutcome, Database, NewItem, OpenHitlOutcome, OpenHitlRequest, TransitionEvent,
+};
 use belt_infra::worktree::WorktreeManager;
 
 use crate::concurrency::ConcurrencyTracker;
@@ -73,6 +75,8 @@ pub struct Daemon {
     queue: VecDeque<QueueItem>,
     history: Vec<HistoryEntry>,
     db: Arc<Database>,
+    /// Highest transition-log sequence the in-memory copy has been matched to.
+    store_cursor: u64,
     /// History events with full lineage information for failure tracking.
     history_events: Vec<HistoryEvent>,
     evaluator: Evaluator,
@@ -183,6 +187,7 @@ impl Daemon {
             queue: VecDeque::new(),
             history: Vec::new(),
             db,
+            store_cursor: 0,
             history_events: Vec::new(),
             evaluator,
             cron_engine: Some(cron),
@@ -423,40 +428,181 @@ impl Daemon {
     // ---------------------------------------------------------------
 
     /// Collect new items from all DataSources and add them to the Pending queue.
+    ///
+    /// The store issues `work_id` and decides duplicates ([`Database::insert_collected`]):
+    /// an item whose `(source_id, state)` still has an open item is dropped.
+    /// Returns the number of items the store accepted.
     pub async fn collect(&mut self) -> Result<usize> {
-        let mut total = 0;
+        let mut inserted = 0;
         for source in &mut self.sources {
             let items = source.collect(&self.config).await?;
-            total += items.len();
-            for mut item in items {
-                if !self.queue.iter().any(|q| q.work_id == item.work_id) {
-                    // Restore previous_worktree_path from DB if the item was
-                    // previously rolled back with a preserved worktree.
-                    if let Ok(db_item) = self.db.get_item(&item.work_id)
-                        && let Some(path) = db_item.previous_worktree_path.as_deref()
-                    {
-                        if std::path::Path::new(path).exists() {
-                            item.previous_worktree_path = db_item.previous_worktree_path.clone();
-                            item.worktree_preserved = db_item.worktree_preserved;
-                            tracing::info!(
-                                work_id = %item.work_id,
-                                path,
-                                "restored previous_worktree_path from DB"
-                            );
-                        } else {
-                            tracing::debug!(
-                                work_id = %item.work_id,
-                                path,
-                                "previous_worktree_path from DB no longer exists, skipping"
-                            );
-                        }
+            for item in items {
+                let outcome = self.db.insert_collected(&NewItem {
+                    source_id: item.source_id.clone(),
+                    workspace_id: self.config.name.clone(),
+                    state: item.state.clone(),
+                    title: item.title.clone(),
+                    actor: Actor::Daemon,
+                })?;
+                match outcome {
+                    CollectOutcome::Inserted { work_id } => {
+                        self.queue.push_back(self.db.get_item(&work_id)?);
+                        inserted += 1;
                     }
-                    Self::ensure_row(&self.db, &item);
-                    self.queue.push_back(item);
+                    CollectOutcome::Duplicate => {
+                        tracing::debug!(
+                            source_id = %item.source_id,
+                            state = %item.state,
+                            "collect skipped: an open item exists"
+                        );
+                    }
                 }
             }
         }
-        Ok(total)
+        Ok(inserted)
+    }
+
+    // ---------------------------------------------------------------
+    // Store restore and observation
+    // ---------------------------------------------------------------
+
+    /// Restore the in-memory queue from the store at daemon start.
+    ///
+    /// 1. Running items left by a previous daemon go back to Pending (reason
+    ///    `rollback`; the worktree stays preserved). Closing open cancel
+    ///    requests belongs to the cancel flow and is not done here.
+    /// 2. The observation cursor moves to the end of the log, so later ticks
+    ///    only see changes made after the restore.
+    /// 3. This workspace's non-terminal items are loaded, oldest first.
+    ///
+    /// Assumes one daemon per database: every Running row belongs to a dead daemon.
+    pub fn restore_from_store(&mut self) -> Result<usize> {
+        for item in self.db.list_items(Some(QueuePhase::Running), None)? {
+            let outcome = self.db.transition(&TransitionRequest {
+                work_id: item.work_id.clone(),
+                expected_from: QueuePhase::Running,
+                to: QueuePhase::Pending,
+                actor: Actor::Daemon,
+                reason: TransitionReason::Rollback,
+                detail: Some("daemon restart: rolled back to Pending".to_string()),
+            })?;
+            match outcome {
+                TransitionOutcome::Applied { .. } => {}
+                // Someone else moved it between the listing and the rollback.
+                TransitionOutcome::Conflict { .. } => {}
+                TransitionOutcome::Busy { .. } | TransitionOutcome::InvalidAction { .. } => {
+                    anyhow::bail!(
+                        "restart rollback of {} was refused: {outcome:?}",
+                        item.work_id
+                    )
+                }
+            }
+        }
+
+        self.store_cursor = self
+            .db
+            .transitions_since(0)?
+            .last()
+            .map_or(0, |entry| entry.seq);
+
+        let mut restored = Vec::new();
+        for phase in [
+            QueuePhase::Pending,
+            QueuePhase::Ready,
+            QueuePhase::Completed,
+            QueuePhase::Hitl,
+            QueuePhase::Failed,
+        ] {
+            restored.extend(self.db.list_items(Some(phase), Some(&self.config.name))?);
+        }
+        restored.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+        self.queue.clear();
+        let count = restored.len();
+        self.queue.extend(restored);
+        Ok(count)
+    }
+
+    /// Match the in-memory copy to the store (tick step 1).
+    ///
+    /// Reads the transition log past the cursor and, for every item it names
+    /// in this workspace, lets the stored row win over a differing copy: a
+    /// copy whose row is Done or Skipped leaves the queue, a copy in another
+    /// phase is replaced by the row, and an open row without a copy is added.
+    /// Running rows without a Running copy are not adopted: only this daemon
+    /// claims, so such a row has no handler behind it.
+    fn observe_store(&mut self) -> Result<()> {
+        let entries = self.db.transitions_since(self.store_cursor)?;
+        if let Some(last) = entries.last() {
+            self.store_cursor = last.seq;
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        for entry in &entries {
+            if !seen.insert(entry.work_id.clone()) {
+                continue;
+            }
+            let row = match self.db.get_item(&entry.work_id) {
+                Ok(row) => row,
+                Err(BeltError::ItemNotFound(_)) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if row.workspace_id != self.config.name {
+                continue;
+            }
+            self.follow_row(row);
+        }
+
+        // The memory-only Hitl exits ([`Daemon::mark_skipped`],
+        // [`Daemon::retry_from_hitl`], [`Daemon::respond_hitl`]) write no log
+        // entry, so the cursor cannot see them. Re-checking the open Hitl rows
+        // lets the store win until the HITL contract owns those exits.
+        for row in self
+            .db
+            .list_items(Some(QueuePhase::Hitl), Some(&self.config.name))?
+        {
+            self.follow_row(row);
+        }
+        Ok(())
+    }
+
+    fn follow_row(&mut self, row: QueueItem) {
+        let ws_name = self.config.name.clone();
+        let Some(idx) = self.queue.iter().position(|i| i.work_id == row.work_id) else {
+            match row.phase() {
+                QueuePhase::Pending
+                | QueuePhase::Ready
+                | QueuePhase::Completed
+                | QueuePhase::Hitl
+                | QueuePhase::Failed => self.queue.push_back(row),
+                QueuePhase::Running => {
+                    tracing::warn!(work_id = %row.work_id, "stored Running item has no handler; not adopted");
+                }
+                QueuePhase::Done | QueuePhase::Skipped => {}
+            }
+            return;
+        };
+
+        let copy_phase = self.queue[idx].phase();
+        if copy_phase == row.phase() {
+            return;
+        }
+        if copy_phase == QueuePhase::Running {
+            self.tracker.release(&ws_name);
+        }
+        match row.phase() {
+            QueuePhase::Done | QueuePhase::Skipped => {
+                self.queue.remove(idx);
+            }
+            QueuePhase::Running => {
+                tracing::warn!(work_id = %row.work_id, "stored Running item has no handler; copy kept");
+            }
+            QueuePhase::Pending
+            | QueuePhase::Ready
+            | QueuePhase::Completed
+            | QueuePhase::Hitl
+            | QueuePhase::Failed => self.queue[idx] = row,
+        }
     }
 
     // ---------------------------------------------------------------
@@ -1145,6 +1291,8 @@ impl Daemon {
     ///
     /// Applied to the in-memory item only: leaving Hitl belongs to the HITL
     /// contract, which the store enforces for the daemon only as post-processing.
+    /// Until that flow owns this exit the store keeps Hitl and wins: the next
+    /// tick's observation replaces this copy with the stored Hitl row.
     pub fn mark_skipped(&mut self, work_id: &str) -> Result<(), BeltError> {
         let item = self
             .queue
@@ -1159,6 +1307,8 @@ impl Daemon {
     ///
     /// Applied to the in-memory item only: leaving Hitl belongs to the HITL
     /// contract, which the store enforces for the daemon only as post-processing.
+    /// Until that flow owns this exit the store keeps Hitl and wins: the next
+    /// tick's observation replaces this copy with the stored Hitl row.
     pub fn retry_from_hitl(&mut self, work_id: &str) -> Result<(), BeltError> {
         let item = self
             .queue
@@ -1175,7 +1325,8 @@ impl Daemon {
     /// Respond to a HITL item with a user action.
     ///
     /// Applied to the in-memory queue only; the store-side HITL response flow
-    /// replaces this path.
+    /// replaces this path. Until then the store keeps Hitl and wins over the
+    /// copy (see [`Daemon::retry_from_hitl`]).
     ///
     /// Applies the given [`HitlRespondAction`] and records the respondent.
     ///
@@ -1787,11 +1938,13 @@ impl Daemon {
         self.tracker.release_evaluate();
     }
 
-    /// Daemon tick: collect -> advance -> execute -> evaluate.
+    /// Daemon tick: observe store -> collect -> advance -> execute -> evaluate.
     ///
     /// shutdown이 요청되면 collect/advance를 건너뛰고 실행 중인
     /// 아이템의 완료 처리만 수행한다.
     pub async fn tick(&mut self) -> Result<()> {
+        self.observe_store()?;
+
         if !self.shutdown_requested {
             let collected = self.collect().await?;
             if collected > 0 {
@@ -1850,7 +2003,14 @@ impl Daemon {
     /// 2. Running 아이템 완료를 최대 30초 대기 (`drain_with_timeout`).
     /// 3. timeout 초과 시 Running -> Pending 롤백 (worktree 보존).
     /// 4. drain 중 두 번째 SIGINT 시 즉시 종료 (Running -> Failed 강제 전이).
-    pub async fn run(&mut self, tick_interval_secs: u64) {
+    ///
+    /// # Errors
+    /// Returns an error, before the loop starts, when the store cannot be
+    /// read to restore the queue.
+    pub async fn run(&mut self, tick_interval_secs: u64) -> Result<()> {
+        let restored = self.restore_from_store()?;
+        tracing::info!("restored {restored} items from the store");
+
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs));
         tracing::info!("belt daemon started (tick={}s)", tick_interval_secs);
 
@@ -1861,6 +2021,7 @@ impl Daemon {
             .await;
 
         tracing::info!("belt daemon stopped");
+        Ok(())
     }
 
     /// Handle a cron-trigger notification by performing a full sync of custom
@@ -2066,8 +2227,6 @@ impl Daemon {
                 // Persist the worktree path so it survives daemon restart.
                 item.previous_worktree_path = wt_path_str;
 
-                // Items collected from DataSource may not yet exist in the DB.
-                Self::ensure_row(&self.db, item);
                 match Self::commit_transition(
                     &self.db,
                     item,
@@ -2567,7 +2726,12 @@ impl Daemon {
         &self.history_events
     }
 
-    /// Push an item onto the queue.
+    /// Push a pre-built item onto the queue (test seam; production items enter
+    /// through [`Daemon::collect`] and [`Daemon::restore_from_store`]).
+    ///
+    /// A new Pending item is created through the collection contract, so the
+    /// store must issue the same `work_id` the item carries. An item at any
+    /// other phase has no collection path; its row is written as given.
     pub fn push_item(&mut self, item: QueueItem) {
         Self::ensure_row(&self.db, &item);
         self.queue.push_back(item);
@@ -2577,14 +2741,28 @@ impl Daemon {
     fn ensure_row(db: &Database, item: &QueueItem) {
         match db.get_item(&item.work_id) {
             Ok(_) => {}
-            Err(belt_core::error::BeltError::ItemNotFound(_)) => {
-                if let Err(e) = db.insert_item(item) {
-                    tracing::error!(work_id = %item.work_id, "failed to persist queue item: {e}");
+            Err(BeltError::ItemNotFound(_)) if item.phase() == QueuePhase::Pending => {
+                let outcome = db.insert_collected(&NewItem {
+                    source_id: item.source_id.clone(),
+                    workspace_id: item.workspace_id.clone(),
+                    state: item.state.clone(),
+                    title: item.title.clone(),
+                    actor: Actor::Daemon,
+                });
+                match outcome {
+                    Ok(CollectOutcome::Inserted { work_id }) if work_id == item.work_id => {}
+                    other => panic!(
+                        "push_item({}) was not accepted as a new collected item: {other:?}",
+                        item.work_id
+                    ),
                 }
             }
-            Err(e) => {
-                tracing::error!(work_id = %item.work_id, "failed to look up queue item: {e}");
+            Err(BeltError::ItemNotFound(_)) => {
+                if let Err(e) = db.insert_item(item) {
+                    panic!("push_item({}) could not persist the row: {e}", item.work_id);
+                }
             }
+            Err(e) => panic!("push_item({}) could not read the store: {e}", item.work_id),
         }
     }
 
@@ -3633,10 +3811,10 @@ sources:
             Database::open_in_memory().unwrap(),
         );
 
-        // Both sources report the same work_id; collect() should report 2 total
-        // (1 from each source) but only enqueue 1 unique item.
+        // Both sources offer the same (source_id, state); the store accepts
+        // the first and rejects the second as a duplicate.
         let total_reported = daemon.collect().await.unwrap();
-        assert_eq!(total_reported, 2);
+        assert_eq!(total_reported, 1);
         assert_eq!(daemon.queue_items().len(), 1);
     }
 
@@ -4164,9 +4342,9 @@ sources:
         daemon.push_item(test_item("github:org/repo#1", "analyze"));
         assert_eq!(daemon.queue_items().len(), 1);
 
-        // collect() should report 1 collected but not add a duplicate.
+        // The store already has an open item, so nothing is collected.
         let collected = daemon.collect().await.unwrap();
-        assert_eq!(collected, 1);
+        assert_eq!(collected, 0);
         assert_eq!(daemon.queue_items().len(), 1);
     }
 
@@ -4935,10 +5113,9 @@ sources:
     // ---------------------------------------------------------------
 
     #[test]
-    fn rollback_inserts_item_into_db_when_not_present() {
-        // Items collected from DataSource live in-memory only.
-        // rollback_running_to_pending must insert the item into the DB
-        // before updating its worktree state so the path survives restart.
+    fn rollback_persists_worktree_state_to_db() {
+        // rollback_running_to_pending must store the preserved worktree path
+        // so it survives a daemon restart.
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
@@ -4949,18 +5126,15 @@ sources:
 
         let mut item = test_item("github:org/repo#99", "analyze");
         item.set_phase_unchecked(QueuePhase::Running);
-        daemon.queue.push_back(item);
-
-        // Item is NOT in the DB yet (only in-memory queue).
-        assert!(daemon.db.get_item("github:org/repo#99:analyze").is_err());
+        daemon.push_item(item);
 
         daemon.rollback_running_to_pending();
 
-        // After rollback, item should exist in DB with previous_worktree_path.
+        // After rollback, the stored item carries previous_worktree_path.
         let db_item = daemon
             .db
             .get_item("github:org/repo#99:analyze")
-            .expect("item should be inserted into DB during rollback");
+            .expect("item row exists");
         assert_eq!(db_item.phase(), QueuePhase::Pending);
         assert!(db_item.worktree_preserved);
         assert_eq!(
