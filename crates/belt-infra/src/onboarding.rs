@@ -37,8 +37,6 @@ const WORKSPACE_CRON_SEEDS: &[(&str, &str)] = &[
     ("hitl_timeout", "*/5 * * * *"),
     ("daily_report", "0 6 * * *"),
     ("log_cleanup", "0 0 * * *"),
-    ("evaluate", "0 */6 * * *"),
-    ("gap_detection", "0 */12 * * *"),
     ("knowledge_extraction", "0 0 * * *"),
 ];
 
@@ -218,7 +216,7 @@ sources:
         let result = onboard_workspace(&db, tmp.path(), belt_home.path()).unwrap();
         assert_eq!(result.workspace_name, "test-project");
         assert_eq!(result.source_count, 2);
-        assert_eq!(result.cron_jobs_seeded, 6);
+        assert_eq!(result.cron_jobs_seeded, 4);
         assert!(result.created);
 
         // Verify workspace is in DB
@@ -227,13 +225,13 @@ sources:
 
         // Verify cron jobs are in DB
         let jobs = db.list_cron_jobs().unwrap();
-        assert_eq!(jobs.len(), 6);
+        assert_eq!(jobs.len(), 4);
         let job_names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
         assert!(job_names.contains(&"test-project:hitl_timeout"));
         assert!(job_names.contains(&"test-project:daily_report"));
         assert!(job_names.contains(&"test-project:log_cleanup"));
-        assert!(job_names.contains(&"test-project:evaluate"));
-        assert!(job_names.contains(&"test-project:gap_detection"));
+        assert!(!job_names.contains(&"test-project:evaluate"));
+        assert!(!job_names.contains(&"test-project:gap_detection"));
         assert!(job_names.contains(&"test-project:knowledge_extraction"));
 
         // All jobs should be scoped to the workspace
@@ -252,7 +250,7 @@ sources:
         // First onboard
         let result1 = onboard_workspace(&db, tmp.path(), belt_home.path()).unwrap();
         assert!(result1.created);
-        assert_eq!(result1.cron_jobs_seeded, 6);
+        assert_eq!(result1.cron_jobs_seeded, 4);
 
         // Second onboard should update, not create
         let result2 = onboard_workspace(&db, tmp.path(), belt_home.path()).unwrap();
@@ -261,7 +259,7 @@ sources:
 
         // Still only 6 cron jobs total
         let jobs = db.list_cron_jobs().unwrap();
-        assert_eq!(jobs.len(), 6);
+        assert_eq!(jobs.len(), 4);
     }
 
     #[test]
@@ -299,7 +297,7 @@ sources:
         onboard_workspace(&db, tmp_b.path(), belt_home.path()).unwrap();
 
         let jobs = db.list_cron_jobs().unwrap();
-        assert_eq!(jobs.len(), 12); // 6 per workspace
+        assert_eq!(jobs.len(), 8); // 4 per workspace
 
         let job_names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
         assert!(job_names.contains(&"project-a:hitl_timeout"));
@@ -365,7 +363,7 @@ sources:
         assert_eq!(result.source_count, 0);
         assert!(result.created);
         // Cron jobs are still seeded regardless of source count.
-        assert_eq!(result.cron_jobs_seeded, 6);
+        assert_eq!(result.cron_jobs_seeded, 4);
     }
 
     #[test]
@@ -396,11 +394,8 @@ sources:
         );
         assert_eq!(job_map.get("test-project:daily_report"), Some(&"0 6 * * *"));
         assert_eq!(job_map.get("test-project:log_cleanup"), Some(&"0 0 * * *"));
-        assert_eq!(job_map.get("test-project:evaluate"), Some(&"0 */6 * * *"));
-        assert_eq!(
-            job_map.get("test-project:gap_detection"),
-            Some(&"0 */12 * * *")
-        );
+        assert_eq!(job_map.get("test-project:evaluate"), None);
+        assert_eq!(job_map.get("test-project:gap_detection"), None);
         assert_eq!(
             job_map.get("test-project:knowledge_extraction"),
             Some(&"0 0 * * *")
@@ -420,7 +415,7 @@ sources:
 
         assert!(!result3.created);
         assert_eq!(result3.cron_jobs_seeded, 0);
-        assert_eq!(db.list_cron_jobs().unwrap().len(), 6);
+        assert_eq!(db.list_cron_jobs().unwrap().len(), 4);
     }
 
     #[test]

@@ -15,7 +15,6 @@ use belt_core::escalation::EscalationAction;
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::runtime::TokenUsage;
-use belt_core::spec::{Spec, SpecLink, SpecStatus};
 
 /// An immutable history event recording an attempt on a work item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -302,30 +301,6 @@ impl Database {
                 cache_write_tokens INTEGER,
                 duration_ms        INTEGER,
                 created_at         TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS specs (
-                id                TEXT PRIMARY KEY,
-                workspace_id      TEXT NOT NULL,
-                name              TEXT NOT NULL,
-                status            TEXT NOT NULL,
-                content           TEXT NOT NULL,
-                priority          INTEGER,
-                labels            TEXT,
-                depends_on        TEXT,
-                entry_point       TEXT,
-                decomposed_issues TEXT,
-                test_commands     TEXT,
-                created_at        TEXT NOT NULL,
-                updated_at        TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS spec_links (
-                id         TEXT PRIMARY KEY,
-                spec_id    TEXT NOT NULL,
-                target     TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE(spec_id, target)
             );
 
             CREATE TABLE IF NOT EXISTS transition_events (
@@ -1144,260 +1119,6 @@ impl Database {
         Ok(())
     }
 
-    // ---- Specs -------------------------------------------------------------
-
-    /// Insert a new spec.
-    ///
-    /// # Errors
-    /// Returns `BeltError::Database` on constraint violation or I/O error.
-    pub fn insert_spec(&self, spec: &Spec) -> Result<(), BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        conn.execute(
-            "INSERT INTO specs (id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, test_commands, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                spec.id,
-                spec.workspace_id,
-                spec.name,
-                spec.status.as_str(),
-                spec.content,
-                spec.priority,
-                spec.labels,
-                spec.depends_on,
-                spec.entry_point,
-                spec.decomposed_issues,
-                spec.test_commands,
-                spec.created_at,
-                spec.updated_at,
-            ],
-        )
-        .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Retrieve a single spec by ID.
-    ///
-    /// # Errors
-    /// Returns `BeltError::SpecNotFound` if no row matches.
-    pub fn get_spec(&self, id: &str) -> Result<Spec, BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        conn.query_row(
-            "SELECT id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, test_commands, created_at, updated_at
-                 FROM specs WHERE id = ?1",
-            params![id],
-            |row| Ok(row_to_spec(row)),
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => BeltError::SpecNotFound(id.to_string()),
-            other => BeltError::Database(other.to_string()),
-        })?
-    }
-
-    /// List all specs, optionally filtered by workspace and/or status.
-    ///
-    /// By default, archived specs are excluded unless explicitly requested
-    /// via `status = Some(SpecStatus::Archived)`.
-    pub fn list_specs(
-        &self,
-        workspace: Option<&str>,
-        status: Option<SpecStatus>,
-    ) -> Result<Vec<Spec>, BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let mut sql = String::from(
-            "SELECT id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, test_commands, created_at, updated_at FROM specs WHERE 1=1",
-        );
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(ws) = workspace {
-            sql.push_str(" AND workspace_id = ?");
-            param_values.push(Box::new(ws.to_string()));
-        }
-        if let Some(s) = status {
-            sql.push_str(" AND status = ?");
-            param_values.push(Box::new(s.as_str().to_string()));
-        } else {
-            // Exclude archived specs by default
-            sql.push_str(" AND status != ?");
-            param_values.push(Box::new(SpecStatus::Archived.as_str().to_string()));
-        }
-
-        sql.push_str(" ORDER BY created_at ASC");
-
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-
-        let specs = stmt
-            .query_map(params_ref.as_slice(), |row| Ok(row_to_spec(row)))
-            .map_err(|e| BeltError::Database(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-
-        specs.into_iter().collect::<Result<Vec<_>, _>>()
-    }
-
-    /// Update a spec's name, content, priority, labels, and depends_on.
-    ///
-    /// # Errors
-    /// Returns `BeltError::SpecNotFound` if no spec matches the given ID.
-    pub fn update_spec(&self, spec: &Spec) -> Result<(), BeltError> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "UPDATE specs SET name = ?1, content = ?2, priority = ?3, labels = ?4, depends_on = ?5, entry_point = ?6, decomposed_issues = ?7, test_commands = ?8, updated_at = ?9 WHERE id = ?10",
-                params![
-                    spec.name,
-                    spec.content,
-                    spec.priority,
-                    spec.labels,
-                    spec.depends_on,
-                    spec.entry_point,
-                    spec.decomposed_issues,
-                    spec.test_commands,
-                    now,
-                    spec.id,
-                ],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        if rows == 0 {
-            return Err(BeltError::SpecNotFound(spec.id.clone()));
-        }
-        Ok(())
-    }
-
-    /// Update the status of a spec.
-    ///
-    /// This method does NOT validate state machine transitions; the caller
-    /// is responsible for checking `SpecStatus::can_transition_to` before
-    /// calling this.
-    ///
-    /// # Errors
-    /// Returns `BeltError::SpecNotFound` if no spec matches the given ID.
-    pub fn update_spec_status(&self, id: &str, status: SpecStatus) -> Result<(), BeltError> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "UPDATE specs SET status = ?1, updated_at = ?2 WHERE id = ?3",
-                params![status.as_str(), now, id],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        if rows == 0 {
-            return Err(BeltError::SpecNotFound(id.to_string()));
-        }
-        Ok(())
-    }
-
-    /// Soft-delete a spec by transitioning it to Archived status.
-    ///
-    /// # Errors
-    /// Returns `BeltError::SpecNotFound` if no spec matches the given ID.
-    pub fn remove_spec(&self, id: &str) -> Result<(), BeltError> {
-        self.update_spec_status(id, SpecStatus::Archived)
-    }
-
-    // ---- Spec Links ---------------------------------------------------------
-
-    /// Insert a new spec link (association between a spec and an external resource).
-    ///
-    /// # Errors
-    /// Returns `BeltError::Database` on constraint violation.
-    pub fn insert_spec_link(&self, link: &SpecLink) -> Result<(), BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        conn.execute(
-            "INSERT INTO spec_links (id, spec_id, target, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![link.id, link.spec_id, link.target, link.created_at],
-        )
-        .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(())
-    }
-
-    /// List all links for a given spec.
-    pub fn list_spec_links(&self, spec_id: &str) -> Result<Vec<SpecLink>, BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, spec_id, target, created_at FROM spec_links WHERE spec_id = ?1 ORDER BY created_at ASC",
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let links = stmt
-            .query_map(params![spec_id], |row| {
-                Ok(SpecLink {
-                    id: row.get(0)?,
-                    spec_id: row.get(1)?,
-                    target: row.get(2)?,
-                    created_at: row.get(3)?,
-                })
-            })
-            .map_err(|e| BeltError::Database(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(links)
-    }
-
-    /// Remove a spec link by spec_id and target.
-    ///
-    /// # Errors
-    /// Returns `BeltError::Database` with a descriptive message if no matching link exists.
-    pub fn remove_spec_link(&self, spec_id: &str, target: &str) -> Result<(), BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "DELETE FROM spec_links WHERE spec_id = ?1 AND target = ?2",
-                params![spec_id, target],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        if rows == 0 {
-            return Err(BeltError::Database(format!(
-                "no link found for spec '{spec_id}' with target '{target}'"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Remove all links for a spec (used when removing a spec).
-    pub fn remove_all_spec_links(&self, spec_id: &str) -> Result<usize, BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "DELETE FROM spec_links WHERE spec_id = ?1",
-                params![spec_id],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(rows)
-    }
-
     // ---- Knowledge Base ----------------------------------------------------
 
     /// Insert a new knowledge entry extracted from a merged PR.
@@ -2214,39 +1935,6 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>, BeltError> {
         .map_err(|_| BeltError::Database(format!("invalid datetime: {s}")))
 }
 
-/// Parse a database status string back into a `SpecStatus`.
-///
-/// # Errors
-/// Returns `BeltError::Database` for unrecognised status values.
-fn str_to_spec_status(s: &str) -> Result<SpecStatus, BeltError> {
-    s.parse::<SpecStatus>()
-        .map_err(|_| BeltError::Database(format!("unknown spec status: {s}")))
-}
-
-/// Extract a `Spec` from a rusqlite `Row`.
-///
-/// Column order must match:
-/// `id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, test_commands, created_at, updated_at`
-fn row_to_spec(row: &rusqlite::Row<'_>) -> Result<Spec, BeltError> {
-    let status_str: String = col(row, 3)?;
-
-    Ok(Spec {
-        id: col(row, 0)?,
-        workspace_id: col(row, 1)?,
-        name: col(row, 2)?,
-        status: str_to_spec_status(&status_str)?,
-        content: col(row, 4)?,
-        priority: col(row, 5)?,
-        labels: col(row, 6)?,
-        depends_on: col(row, 7)?,
-        entry_point: col(row, 8)?,
-        decomposed_issues: col(row, 9)?,
-        test_commands: col(row, 10)?,
-        created_at: col(row, 11)?,
-        updated_at: col(row, 12)?,
-    })
-}
-
 /// Extract a `QueueItem` from a rusqlite `Row`.
 ///
 /// Column order must match [`QUEUE_ITEM_COLUMNS`].
@@ -3047,264 +2735,52 @@ mod tests {
         assert_send_sync::<Database>();
     }
 
-    // ---- Specs -------------------------------------------------------------
+    // ---- Legacy spec tables ------------------------------------------------
 
-    fn sample_spec() -> Spec {
-        Spec::new(
-            "spec-1".to_string(),
-            "ws-1".to_string(),
-            "Test Spec".to_string(),
-            "Some content".to_string(),
+    fn table_exists(db: &Database, name: &str) -> bool {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |row| row.get::<_, i64>(0),
         )
+        .unwrap()
+            > 0
     }
 
     #[test]
-    fn insert_and_get_spec() {
+    fn new_database_has_no_spec_tables() {
         let db = test_db();
-        let spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        let fetched = db.get_spec(&spec.id).unwrap();
-        assert_eq!(fetched.id, spec.id);
-        assert_eq!(fetched.name, "Test Spec");
-        assert_eq!(fetched.status, SpecStatus::Draft);
-        assert_eq!(fetched.content, "Some content");
+        assert!(!table_exists(&db, "specs"));
+        assert!(!table_exists(&db, "spec_links"));
     }
 
     #[test]
-    fn get_spec_not_found() {
-        let db = test_db();
-        let err = db.get_spec("nonexistent").unwrap_err();
-        assert!(matches!(err, BeltError::SpecNotFound(_)));
-    }
-
-    #[test]
-    fn list_specs_no_filter() {
-        let db = test_db();
-        db.insert_spec(&sample_spec()).unwrap();
-
-        let specs = db.list_specs(None, None).unwrap();
-        assert_eq!(specs.len(), 1);
-    }
-
-    #[test]
-    fn list_specs_filter_by_workspace() {
-        let db = test_db();
-        db.insert_spec(&sample_spec()).unwrap();
-
-        let specs = db.list_specs(Some("ws-1"), None).unwrap();
-        assert_eq!(specs.len(), 1);
-
-        let specs = db.list_specs(Some("other"), None).unwrap();
-        assert!(specs.is_empty());
-    }
-
-    #[test]
-    fn list_specs_filter_by_status() {
-        let db = test_db();
-        db.insert_spec(&sample_spec()).unwrap();
-
-        let specs = db.list_specs(None, Some(SpecStatus::Draft)).unwrap();
-        assert_eq!(specs.len(), 1);
-
-        let specs = db.list_specs(None, Some(SpecStatus::Active)).unwrap();
-        assert!(specs.is_empty());
-    }
-
-    #[test]
-    fn update_spec_fields() {
-        let db = test_db();
-        let mut spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        spec.name = "Updated Name".to_string();
-        spec.content = "Updated content".to_string();
-        spec.priority = Some(1);
-        spec.labels = Some("urgent".to_string());
-        db.update_spec(&spec).unwrap();
-
-        let fetched = db.get_spec(&spec.id).unwrap();
-        assert_eq!(fetched.name, "Updated Name");
-        assert_eq!(fetched.content, "Updated content");
-        assert_eq!(fetched.priority, Some(1));
-        assert_eq!(fetched.labels.as_deref(), Some("urgent"));
-    }
-
-    #[test]
-    fn update_spec_not_found() {
-        let db = test_db();
-        let spec = sample_spec();
-        let err = db.update_spec(&spec).unwrap_err();
-        assert!(matches!(err, BeltError::SpecNotFound(_)));
-    }
-
-    #[test]
-    fn update_spec_status() {
-        let db = test_db();
-        let spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        db.update_spec_status(&spec.id, SpecStatus::Active).unwrap();
-        let fetched = db.get_spec(&spec.id).unwrap();
-        assert_eq!(fetched.status, SpecStatus::Active);
-    }
-
-    #[test]
-    fn update_spec_status_not_found() {
-        let db = test_db();
-        let err = db
-            .update_spec_status("nonexistent", SpecStatus::Active)
-            .unwrap_err();
-        assert!(matches!(err, BeltError::SpecNotFound(_)));
-    }
-
-    #[test]
-    fn remove_spec() {
-        let db = test_db();
-        let spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        db.remove_spec(&spec.id).unwrap();
-        // Soft delete: spec still exists but is archived
-        let fetched = db.get_spec(&spec.id).unwrap();
-        assert_eq!(fetched.status, SpecStatus::Archived);
-        // Archived specs are excluded from default listing
-        let listed = db.list_specs(None, None).unwrap();
-        assert!(listed.is_empty());
-        // But can be listed explicitly
-        let archived = db.list_specs(None, Some(SpecStatus::Archived)).unwrap();
-        assert_eq!(archived.len(), 1);
-    }
-
-    #[test]
-    fn remove_spec_not_found() {
-        let db = test_db();
-        let err = db.remove_spec("nonexistent").unwrap_err();
-        assert!(matches!(err, BeltError::SpecNotFound(_)));
-    }
-
-    #[test]
-    fn spec_with_optional_fields() {
-        let db = test_db();
-        let mut spec = sample_spec();
-        spec.priority = Some(5);
-        spec.labels = Some("bug,feature".to_string());
-        spec.depends_on = Some("spec-0".to_string());
-        db.insert_spec(&spec).unwrap();
-
-        let fetched = db.get_spec(&spec.id).unwrap();
-        assert_eq!(fetched.priority, Some(5));
-        assert_eq!(fetched.labels.as_deref(), Some("bug,feature"));
-        assert_eq!(fetched.depends_on.as_deref(), Some("spec-0"));
-    }
-
-    #[test]
-    fn spec_status_roundtrip() {
-        let statuses = [
-            SpecStatus::Draft,
-            SpecStatus::Active,
-            SpecStatus::Paused,
-            SpecStatus::Completed,
-        ];
-        for s in statuses {
-            assert_eq!(str_to_spec_status(s.as_str()).unwrap(), s);
-        }
-    }
-
-    // ---- Spec links -----------------------------------------------------------
-
-    #[test]
-    fn insert_and_list_spec_links() {
-        let db = test_db();
-        let spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        let link = SpecLink::new(
-            "link-1".to_string(),
-            spec.id.clone(),
-            "https://example.com".to_string(),
-        );
-        db.insert_spec_link(&link).unwrap();
-
-        let links = db.list_spec_links(&spec.id).unwrap();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].target, "https://example.com");
-    }
-
-    #[test]
-    fn remove_spec_link() {
-        let db = test_db();
-        let spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        let link = SpecLink::new(
-            "link-1".to_string(),
-            spec.id.clone(),
-            "https://example.com".to_string(),
-        );
-        db.insert_spec_link(&link).unwrap();
-        db.remove_spec_link(&spec.id, "https://example.com")
+    fn existing_database_with_spec_tables_opens_and_keeps_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let path = path.to_str().unwrap();
+        {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE specs (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                 CREATE TABLE spec_links (id TEXT PRIMARY KEY, spec_id TEXT NOT NULL);
+                 INSERT INTO specs (id, name) VALUES ('s1', 'legacy');",
+            )
             .unwrap();
+        }
 
-        let links = db.list_spec_links(&spec.id).unwrap();
-        assert!(links.is_empty());
-    }
-
-    #[test]
-    fn remove_spec_link_not_found() {
-        let db = test_db();
-        let err = db
-            .remove_spec_link("nonexistent", "https://example.com")
-            .unwrap_err();
-        assert!(matches!(err, BeltError::Database(_)));
-    }
-
-    #[test]
-    fn remove_all_spec_links() {
-        let db = test_db();
-        let spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        let link1 = SpecLink::new(
-            "link-1".to_string(),
-            spec.id.clone(),
-            "https://example.com".to_string(),
-        );
-        let link2 = SpecLink::new(
-            "link-2".to_string(),
-            spec.id.clone(),
-            "https://other.com".to_string(),
-        );
-        db.insert_spec_link(&link1).unwrap();
-        db.insert_spec_link(&link2).unwrap();
-
-        let removed = db.remove_all_spec_links(&spec.id).unwrap();
-        assert_eq!(removed, 2);
-
-        let links = db.list_spec_links(&spec.id).unwrap();
-        assert!(links.is_empty());
-    }
-
-    #[test]
-    fn duplicate_spec_link_rejected() {
-        let db = test_db();
-        let spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        let link = SpecLink::new(
-            "link-1".to_string(),
-            spec.id.clone(),
-            "https://example.com".to_string(),
-        );
-        db.insert_spec_link(&link).unwrap();
-
-        let link2 = SpecLink::new(
-            "link-2".to_string(),
-            spec.id.clone(),
-            "https://example.com".to_string(),
-        );
-        let err = db.insert_spec_link(&link2).unwrap_err();
-        assert!(matches!(err, BeltError::Database(_)));
+        let db = Database::open(path).unwrap();
+        assert!(table_exists(&db, "specs"));
+        assert!(table_exists(&db, "spec_links"));
+        db.insert_item(&sample_item()).unwrap();
+        let count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM specs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     // ---- HITL metadata --------------------------------------------------------

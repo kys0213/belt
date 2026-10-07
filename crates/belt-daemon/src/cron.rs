@@ -376,6 +376,9 @@ impl CronEngine {
         let custom_db_jobs: Vec<&belt_infra::db::CronJob> = db_jobs
             .iter()
             .filter(|j| {
+                if is_legacy_cron_job_name(&j.name) {
+                    return false;
+                }
                 if global_builtin_names.contains(&j.name.as_str()) {
                     return false;
                 }
@@ -2009,6 +2012,18 @@ impl CronHandler for CustomScriptJob {
     }
 }
 
+/// Cron job names that earlier versions seeded into the DB but that are no
+/// longer cron jobs (evaluate is a daemon tick stage; gap detection was removed).
+/// Rows with these names stay in the DB and are never loaded as custom jobs.
+const LEGACY_CRON_JOB_NAMES: [&str; 2] = ["evaluate", "gap_detection"];
+
+/// Whether `name` is a legacy job name, bare or workspace-scoped (`ws:evaluate`).
+fn is_legacy_cron_job_name(name: &str) -> bool {
+    LEGACY_CRON_JOB_NAMES
+        .iter()
+        .any(|legacy| name == *legacy || name.ends_with(&format!(":{legacy}")))
+}
+
 /// Load user-defined cron jobs from the database and register them with the engine.
 ///
 /// Reads all cron jobs from the `cron_jobs` table, skips any whose name matches
@@ -2037,6 +2052,9 @@ pub fn load_custom_jobs(engine: &mut CronEngine, db: &Arc<Database>) {
     ];
 
     for job in jobs {
+        if is_legacy_cron_job_name(&job.name) {
+            continue;
+        }
         // Skip global built-in jobs (they are registered separately).
         if global_builtin_names.contains(&job.name.as_str()) {
             continue;
@@ -3512,6 +3530,41 @@ mod tests {
         load_custom_jobs(&mut engine, &db);
 
         // Workspace-scoped builtin names should be skipped.
+        assert_eq!(engine.job_count(), 0);
+    }
+
+    #[test]
+    fn load_custom_jobs_skips_legacy_evaluate_and_gap_detection_rows() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        db.add_cron_job("ws:evaluate", "0 */6 * * *", "", Some("ws"))
+            .unwrap();
+        db.add_cron_job("ws:gap_detection", "0 */12 * * *", "", Some("ws"))
+            .unwrap();
+        db.add_cron_job("evaluate", "0 */6 * * *", "", None)
+            .unwrap();
+        db.add_cron_job("my_custom_job", "*/10 * * * *", "/usr/bin/custom.sh", None)
+            .unwrap();
+
+        let mut engine = CronEngine::new();
+        load_custom_jobs(&mut engine, &db);
+
+        assert_eq!(engine.job_count(), 1);
+        assert_eq!(engine.jobs[0].name, "my_custom_job");
+        // Legacy rows are preserved in the DB.
+        assert_eq!(db.list_cron_jobs().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn sync_custom_jobs_skips_legacy_evaluate_and_gap_detection_rows() {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        db.add_cron_job("ws:evaluate", "0 */6 * * *", "", Some("ws"))
+            .unwrap();
+        db.add_cron_job("ws:gap_detection", "0 */12 * * *", "", Some("ws"))
+            .unwrap();
+
+        let mut engine = CronEngine::new();
+        engine.sync_custom_jobs_from_db(&db);
+
         assert_eq!(engine.job_count(), 0);
     }
 

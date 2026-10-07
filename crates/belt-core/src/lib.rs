@@ -1,7 +1,6 @@
 pub mod action;
 pub mod cipher;
 pub mod context;
-pub mod dependency;
 pub mod error;
 pub mod escalation;
 pub mod evaluation;
@@ -11,8 +10,6 @@ pub mod platform;
 pub mod queue;
 pub mod runtime;
 pub mod source;
-pub mod spec;
 pub mod stagnation;
 pub mod state_machine;
-pub mod test_runner;
 pub mod workspace;
