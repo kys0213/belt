@@ -220,14 +220,18 @@ enum AgentCommands {
 
 #[derive(Subcommand)]
 enum HitlCommands {
-    /// Respond to a HITL item.
+    /// Respond to a HITL request (the item's current request, or one by id).
     Respond {
         /// Queue item work_id.
-        item_id: String,
+        #[arg(required_unless_present = "hitl_id", conflicts_with = "hitl_id")]
+        item_id: Option<String>,
+        /// Address one specific (for example past) request instead of an item.
+        #[arg(long)]
+        hitl_id: Option<String>,
         /// Action to take: done, retry, skip, replan.
         #[arg(long)]
         action: String,
-        /// Respondent name.
+        /// Respondent name (defaults to the OS user).
         #[arg(long)]
         respondent: Option<String>,
         /// Additional notes.
@@ -273,8 +277,8 @@ enum HitlTimeoutCommands {
         /// Timeout duration in seconds.
         #[arg(long)]
         duration: u64,
-        /// Terminal action when timeout fires: skip, failed, replan.
-        #[arg(long)]
+        /// Terminal action when timeout fires.
+        #[arg(long, value_parser = ["skip", "replan"])]
         action: Option<String>,
         /// Output as JSON.
         #[arg(long)]
@@ -1037,9 +1041,35 @@ enum ManualOutcome {
     /// The request left Hitl, so it joined the HITL response race instead.
     HitlResponse {
         action: belt_core::hitl::HitlAction,
+        /// Respondent the response was recorded for.
+        by: String,
         outcome: belt_core::hitl::RespondOutcome,
     },
     Refused(belt_core::transition::TransitionOutcome),
+}
+
+/// The respondent recorded for CLI responses: the OS user, else `cli`.
+fn cli_respondent() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "cli".to_string())
+}
+
+/// Answer a HITL request as the CLI. Local users are trusted, so no
+/// allowlist applies.
+fn respond_as_cli(
+    hitl: &belt_daemon::hitl::HitlService,
+    target: belt_infra::db::HitlTarget,
+    action: belt_core::hitl::HitlAction,
+    by: String,
+    notes: Option<String>,
+) -> anyhow::Result<belt_core::hitl::RespondOutcome> {
+    Ok(hitl.respond(&belt_daemon::hitl::HitlResponse {
+        target,
+        action,
+        by,
+        via: "cli".to_string(),
+        path: belt_core::hitl::ConfirmPath::Direct,
+        notes,
+    })?)
 }
 
 /// Request `item -> to` as the CLI.
@@ -1050,30 +1080,31 @@ enum ManualOutcome {
 /// An item whose request is already confirmed is processing, so it goes to
 /// `transition` and is refused as `busy`.
 fn request_manual_transition(
-    db: &Database,
+    hitl: &belt_daemon::hitl::HitlService,
     item: &belt_core::queue::QueueItem,
     to: QueuePhase,
     detail: Option<String>,
 ) -> anyhow::Result<ManualOutcome> {
     use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
 
+    let db = hitl.database();
     if item.phase() == QueuePhase::Hitl
         && let Some(action) = belt_core::transition::hitl_response_for(to)
         && processing_of_item(db, item)?.is_none()
     {
-        let resolution = belt_core::hitl::HitlResolution {
+        let by = cli_respondent();
+        let outcome = respond_as_cli(
+            hitl,
+            belt_infra::db::HitlTarget::Item(item.work_id.clone()),
             action,
-            by: std::env::var("USER").unwrap_or_else(|_| "cli".to_string()),
-            via: "cli".to_string(),
-            at: chrono::Utc::now().to_rfc3339(),
-            path: belt_core::hitl::ConfirmPath::Direct,
-        };
-        let outcome = db.resolve_hitl(
-            &belt_infra::db::HitlTarget::Item(item.work_id.clone()),
-            &resolution,
+            by.clone(),
             None,
         )?;
-        return Ok(ManualOutcome::HitlResponse { action, outcome });
+        return Ok(ManualOutcome::HitlResponse {
+            action,
+            by,
+            outcome,
+        });
     }
 
     let outcome = db.transition(&TransitionRequest {
@@ -1136,13 +1167,24 @@ fn emit_manual_outcome(
         ManualOutcome::Refused(refused) => {
             emit_refusal(work_id, json, Refusal::from_transition(refused))
         }
-        ManualOutcome::HitlResponse { action, outcome } => match outcome {
+        ManualOutcome::HitlResponse {
+            action,
+            by,
+            outcome,
+        } => match outcome {
             RespondOutcome::Won { hitl_id } => emit_success(
                 work_id,
                 json,
                 "hitl_response",
-                serde_json::json!({ "action": action.to_string(), "hitl_id": hitl_id.as_str() }),
-                format!("Recorded HITL response '{action}' for {work_id}; the daemon applies it."),
+                serde_json::json!({
+                    "action": action.to_string(),
+                    "hitl_id": hitl_id.as_str(),
+                    "by": by,
+                    "via": "cli",
+                }),
+                format!(
+                    "Recorded HITL response '{action}' by {by} via cli for {work_id}; the daemon applies it."
+                ),
             ),
             RespondOutcome::AlreadyHandled(r) => {
                 emit_refusal(work_id, json, already_handled_refusal(&r))
@@ -1186,7 +1228,8 @@ fn cleanup_worktree(mgr: &GitWorktreeManager, work_id: &str, command: &str) {
 /// A Completed item whose scripts fail goes to Failed. Any other phase is
 /// decided by the transition contract without running scripts.
 async fn cmd_queue_done(work_id: &str, json: bool) -> anyhow::Result<i32> {
-    let db = open_db()?;
+    let db = Arc::new(open_db()?);
+    let hitl = belt_daemon::hitl::HitlService::new(Arc::clone(&db));
     let Some(item) = find_item(&db, work_id)? else {
         return emit_refusal(work_id, json, Refusal::not_found());
     };
@@ -1246,7 +1289,7 @@ async fn cmd_queue_done(work_id: &str, json: bool) -> anyhow::Result<i32> {
         }
     }
 
-    let outcome = request_manual_transition(&db, &item, target, detail)?;
+    let outcome = request_manual_transition(&hitl, &item, target, detail)?;
     if matches!(outcome, ManualOutcome::Applied) && target == QueuePhase::Done {
         cleanup_worktree(&worktree_mgr, work_id, "queue done");
     }
@@ -1312,11 +1355,12 @@ fn cmd_queue_hitl(work_id: &str, reason: Option<&str>, json: bool) -> anyhow::Re
 ///
 /// A Running item is refused as `busy` until execution cancel exists.
 fn cmd_queue_skip(work_id: &str, json: bool) -> anyhow::Result<i32> {
-    let db = open_db()?;
+    let db = Arc::new(open_db()?);
+    let hitl = belt_daemon::hitl::HitlService::new(Arc::clone(&db));
     let Some(item) = find_item(&db, work_id)? else {
         return emit_refusal(work_id, json, Refusal::not_found());
     };
-    let outcome = request_manual_transition(&db, &item, QueuePhase::Skipped, None)?;
+    let outcome = request_manual_transition(&hitl, &item, QueuePhase::Skipped, None)?;
     if matches!(outcome, ManualOutcome::Applied) {
         cleanup_worktree(&worktree_manager()?, work_id, "queue skip");
     }
@@ -1809,9 +1853,175 @@ fn recommended_action(
     }
 }
 
-/// `belt hitl show` -- show HITL item details.
-fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Result<()> {
+/// The request an item is currently held by: its open request, else a
+/// confirmed one the daemon has not post-processed yet.
+fn current_request_of(
+    db: &Database,
+    work_id: &str,
+) -> anyhow::Result<Option<belt_infra::db::HitlRequest>> {
+    if let Some(open) = open_request_of(db, work_id)? {
+        return Ok(Some(open));
+    }
+    Ok(db
+        .pending_post_processing()?
+        .into_iter()
+        .find(|r| r.work_id == work_id))
+}
+
+/// The open request of an item (at most one per item).
+fn open_request_of(
+    db: &Database,
+    work_id: &str,
+) -> anyhow::Result<Option<belt_infra::db::HitlRequest>> {
+    Ok(db
+        .open_hitl_requests()?
+        .into_iter()
+        .find(|r| r.work_id == work_id))
+}
+
+/// Where a request is in its life: open, confirmed and waiting for the
+/// daemon, or fully processed.
+fn processing_label(request: &belt_infra::db::HitlRequest) -> &'static str {
+    use belt_core::hitl::HitlStatus;
+    match (request.status, &request.post_processed_at) {
+        (HitlStatus::Open, _) => "open",
+        (HitlStatus::Resolved | HitlStatus::Expired, None) => "awaiting_post_processing",
+        (HitlStatus::Resolved | HitlStatus::Expired, Some(_)) => "post_processed",
+    }
+}
+
+fn hitl_request_json(request: &belt_infra::db::HitlRequest) -> serde_json::Value {
+    serde_json::json!({
+        "hitl_id": request.hitl_id.as_str(),
+        "work_id": request.work_id,
+        "status": request.status,
+        "processing": processing_label(request),
+        "reason": request.reason.map(|r| r.to_string()),
+        "notes": request.notes,
+        "opened_at": request.opened_at,
+        "timeout_at": request.timeout_at,
+        "terminal_action": request.terminal_action.map(|a| a.to_string()),
+        "resolution": request.resolution,
+        "resolution_notes": request.resolution_notes,
+        "post_processed_at": request.post_processed_at,
+    })
+}
+
+/// `belt hitl respond` -- answer a HITL request through the shared contract.
+fn cmd_hitl_respond(
+    item_id: Option<String>,
+    hitl_id: Option<String>,
+    action: &str,
+    respondent: Option<String>,
+    notes: Option<String>,
+    json: bool,
+) -> anyhow::Result<i32> {
+    use belt_infra::db::HitlTarget;
+
+    let db = Arc::new(open_db()?);
+    let hitl = belt_daemon::hitl::HitlService::new(Arc::clone(&db));
+
+    let (target, work_id) = match (item_id, hitl_id) {
+        (Some(work_id), None) => (HitlTarget::Item(work_id.clone()), work_id),
+        (None, Some(id)) => {
+            let id = belt_core::hitl::HitlId::new(id);
+            let Some(request) = db.hitl_request(&id)? else {
+                return emit_refusal(id.as_str(), json, Refusal::not_found());
+            };
+            (HitlTarget::Id(id), request.work_id)
+        }
+        (Some(_), Some(_)) | (None, None) => {
+            anyhow::bail!("give either a work_id or --hitl-id")
+        }
+    };
+
+    let action: belt_core::queue::HitlRespondAction = match action.parse() {
+        Ok(action) => action,
+        Err(e) => {
+            return emit_refusal(
+                &work_id,
+                json,
+                Refusal::new("invalid_action", serde_json::json!({}), e),
+            );
+        }
+    };
+    let action = belt_core::hitl::HitlAction::from(action);
+    let by = respondent.unwrap_or_else(cli_respondent);
+    let outcome = respond_as_cli(&hitl, target, action, by.clone(), notes)?;
+    emit_manual_outcome(
+        &work_id,
+        json,
+        QueuePhase::Hitl,
+        ManualOutcome::HitlResponse {
+            action,
+            by,
+            outcome,
+        },
+        serde_json::json!({}),
+        String::new(),
+    )
+}
+
+/// `belt hitl list` -- open HITL requests.
+fn cmd_hitl_list(workspace: Option<&str>, format: &str) -> anyhow::Result<()> {
     let db = open_db()?;
+    let mut rows = Vec::new();
+    for request in db.open_hitl_requests()? {
+        let item = db.get_item(&request.work_id)?;
+        if workspace.is_some_and(|w| w != item.workspace_id) {
+            continue;
+        }
+        rows.push((request, item));
+    }
+
+    if format == "json" {
+        let values: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(request, item)| {
+                let mut value = hitl_request_json(request);
+                merge_json(
+                    &mut value,
+                    serde_json::json!({
+                        "workspace_id": item.workspace_id,
+                        "state": item.state,
+                        "title": item.title,
+                    }),
+                );
+                value
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&values)?);
+    } else if rows.is_empty() {
+        println!("No items awaiting human review.");
+    } else {
+        println!(
+            "{:<40} {:<20} {:<12} {:<24} TITLE",
+            "WORK_ID", "WORKSPACE", "STATE", "REASON"
+        );
+        println!("{}", "-".repeat(104));
+        for (request, item) in &rows {
+            let reason = request
+                .reason
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "{:<40} {:<20} {:<12} {:<24} {}",
+                item.work_id,
+                item.workspace_id,
+                item.state,
+                reason,
+                item.title.as_deref().unwrap_or("-"),
+            );
+        }
+        println!("\n{} item(s) awaiting review.", rows.len());
+    }
+    Ok(())
+}
+
+/// `belt hitl show` -- show the HITL request an item is held by.
+fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Result<i32> {
+    let db = Arc::new(open_db()?);
+    let hitl = belt_daemon::hitl::HitlService::new(Arc::clone(&db));
     let item = db.get_item(item_id)?;
 
     if item.phase() != QueuePhase::Hitl {
@@ -1821,25 +2031,25 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
             item.phase()
         );
     }
+    let Some(request) = current_request_of(&db, item_id)? else {
+        anyhow::bail!("item '{item_id}' has no HITL request");
+    };
 
-    let (rec_action, rec_explanation) = recommended_action(item.hitl_reason.as_ref());
+    let (rec_action, rec_explanation) = recommended_action(request.reason.as_ref());
 
     match format {
         "json" => {
-            // Build an enriched JSON output that includes the recommended action.
             let mut value = serde_json::to_value(&item)?;
-            if let serde_json::Value::Object(ref mut map) = value {
-                let mut rec = serde_json::Map::new();
-                rec.insert(
-                    "action".to_string(),
-                    serde_json::Value::String(rec_action.to_string()),
-                );
-                rec.insert(
-                    "explanation".to_string(),
-                    serde_json::Value::String(rec_explanation.to_string()),
-                );
-                map.insert("recommended".to_string(), serde_json::Value::Object(rec));
-            }
+            merge_json(
+                &mut value,
+                serde_json::json!({
+                    "hitl_request": hitl_request_json(&request),
+                    "recommended": {
+                        "action": rec_action,
+                        "explanation": rec_explanation,
+                    },
+                }),
+            );
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
         _ => {
@@ -1853,23 +2063,29 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
             }
             println!("Created:      {}", item.created_at);
             println!("Updated:      {}", item.updated_at);
-            if let Some(hitl_at) = &item.hitl_created_at {
-                println!("HITL Since:   {hitl_at}");
-            }
-            if let Some(reason) = &item.hitl_reason {
+            println!("HITL ID:      {}", request.hitl_id);
+            println!("Request:      {}", processing_label(&request));
+            println!("HITL Since:   {}", request.opened_at);
+            if let Some(reason) = &request.reason {
                 println!("HITL Reason:  {reason}");
             }
-            if let Some(respondent) = &item.hitl_respondent {
-                println!("Respondent:   {respondent}");
-            }
-            if let Some(notes) = &item.hitl_notes {
+            if let Some(notes) = &request.notes {
                 println!("Notes:        {notes}");
             }
-            if let Some(timeout_at) = &item.hitl_timeout_at {
+            if let Some(timeout_at) = &request.timeout_at {
                 println!("Timeout At:   {timeout_at}");
             }
-            if let Some(action) = &item.hitl_terminal_action {
+            if let Some(action) = &request.terminal_action {
                 println!("Timeout Act:  {action}");
+            }
+            if let Some(r) = &request.resolution {
+                println!(
+                    "Resolved:     {} by {} via {} at {} ({:?})",
+                    r.action, r.by, r.via, r.at, r.path
+                );
+            }
+            if let Some(notes) = &request.resolution_notes {
+                println!("Resp. Notes:  {notes}");
             }
             println!();
             println!("Recommended:  {rec_action}");
@@ -1877,114 +2093,54 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
         }
     }
 
-    if interactive {
-        println!();
-        println!("Available actions: done, retry, skip, replan");
-        print!("Enter action [{}]: ", rec_action);
-        // Flush stdout so the prompt appears before reading.
-        use std::io::Write;
-        std::io::stdout().flush()?;
-
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim();
-
-        // Use the recommended action as default when the user presses Enter.
-        let chosen = if input.is_empty() { rec_action } else { input };
-
-        let action: belt_core::queue::HitlRespondAction =
-            chosen.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-
-        print!("Notes (optional): ");
-        std::io::stdout().flush()?;
-        let mut notes_input = String::new();
-        std::io::stdin().read_line(&mut notes_input)?;
-        let notes = notes_input.trim();
-        let notes = if notes.is_empty() {
-            None
-        } else {
-            Some(notes.to_string())
-        };
-
-        // Apply the response action.
-        match action {
-            belt_core::queue::HitlRespondAction::Replan => {
-                let max_replan = 3u32;
-                let new_count = item.replan_count + 1;
-                if new_count > max_replan {
-                    db.update_phase(item_id, QueuePhase::Failed)?;
-                    println!(
-                        "Item '{}' replan limit exceeded ({}/{}), transitioned to failed.",
-                        item_id, new_count, max_replan
-                    );
-                } else {
-                    db.update_phase(item_id, QueuePhase::Pending)?;
-                    let failure_reason = item.hitl_notes.as_deref().unwrap_or("unknown failure");
-                    let replan_work_id = format!("{item_id}:replan-{new_count}");
-                    let mut replan_item = belt_core::queue::QueueItem::new(
-                        replan_work_id.clone(),
-                        item.source_id.clone(),
-                        item.workspace_id.clone(),
-                        item.state.clone(),
-                    );
-                    replan_item.set_phase_unchecked(QueuePhase::Hitl);
-                    replan_item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
-                    replan_item.hitl_reason =
-                        Some(belt_core::queue::HitlReason::SpecModificationProposed);
-                    replan_item.hitl_notes = Some(format!(
-                        "Claw replan delegation (attempt {new_count}): {failure_reason}"
-                    ));
-                    replan_item.title =
-                        Some(format!("spec-modification-proposed (replan #{new_count})"));
-                    replan_item.replan_count = new_count;
-                    if let Some(n) = &notes {
-                        replan_item.hitl_notes = Some(n.clone());
-                    }
-                    db.insert_item(&replan_item)?;
-                    println!(
-                        "Item '{}' rolled back to pending (replan {}/{}). \
-                         Created HITL item '{}' for spec modification review.",
-                        item_id, new_count, max_replan, replan_work_id
-                    );
-                }
-            }
-            _ => {
-                let target_phase = match action {
-                    belt_core::queue::HitlRespondAction::Done => QueuePhase::Done,
-                    belt_core::queue::HitlRespondAction::Retry => QueuePhase::Pending,
-                    belt_core::queue::HitlRespondAction::Skip => QueuePhase::Skipped,
-                    belt_core::queue::HitlRespondAction::Replan => unreachable!(),
-                };
-                db.update_phase(item_id, target_phase)?;
-
-                // Cleanup worktree on Done/Skipped (matches daemon pattern).
-                if matches!(target_phase, QueuePhase::Done | QueuePhase::Skipped)
-                    && let Ok(home) = belt_home()
-                {
-                    let wt_base = home.join("worktrees");
-                    let repo_path = std::path::PathBuf::from(".");
-                    let wt_mgr = GitWorktreeManager::new(wt_base, repo_path);
-                    if let Err(e) = wt_mgr.cleanup(item_id) {
-                        tracing::warn!(
-                            work_id = item_id,
-                            error = %e,
-                            "worktree cleanup failed on hitl respond, continuing"
-                        );
-                    }
-                }
-
-                if let Some(n) = &notes {
-                    println!("Notes recorded: {n}");
-                }
-                println!(
-                    "Item '{}' transitioned from hitl to {} (action: {}).",
-                    item_id, target_phase, action
-                );
-            }
-        }
+    if !interactive {
+        return Ok(0);
     }
 
-    Ok(())
+    println!();
+    println!("Available actions: done, retry, skip, replan");
+    print!("Enter action [{}]: ", rec_action);
+    // Flush stdout so the prompt appears before reading.
+    use std::io::Write;
+    std::io::stdout().flush()?;
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+
+    // Use the recommended action as default when the user presses Enter.
+    let chosen = if input.is_empty() { rec_action } else { input };
+    let action: belt_core::queue::HitlRespondAction =
+        chosen.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+
+    print!("Notes (optional): ");
+    std::io::stdout().flush()?;
+    let mut notes_input = String::new();
+    std::io::stdin().read_line(&mut notes_input)?;
+    let notes = notes_input.trim();
+    let notes = (!notes.is_empty()).then(|| notes.to_string());
+
+    let action = belt_core::hitl::HitlAction::from(action);
+    let by = cli_respondent();
+    let outcome = respond_as_cli(
+        &hitl,
+        belt_infra::db::HitlTarget::Id(request.hitl_id.clone()),
+        action,
+        by.clone(),
+        notes,
+    )?;
+    emit_manual_outcome(
+        item_id,
+        false,
+        QueuePhase::Hitl,
+        ManualOutcome::HitlResponse {
+            action,
+            by,
+            outcome,
+        },
+        serde_json::json!({}),
+        String::new(),
+    )
 }
 
 /// `belt hitl timeout set|ls` -- manage HITL timeouts.
@@ -1995,96 +2151,64 @@ fn cmd_hitl_timeout(command: HitlTimeoutCommands) -> anyhow::Result<()> {
             item_id,
             duration,
             action,
-            json,
+            json: _,
         } => {
-            // Validate that the item exists and is in HITL phase.
-            let item = db.get_item(&item_id)?;
-            if item.phase() != QueuePhase::Hitl {
-                anyhow::bail!(
-                    "item '{}' is in phase '{}', expected 'hitl'",
-                    item_id,
-                    item.phase()
-                );
-            }
-
-            // Validate terminal action if provided by parsing via EscalationAction.
-            let parsed_action = action
-                .as_deref()
-                .map(|a| {
-                    a.parse::<belt_core::escalation::EscalationAction>()
-                        .map_err(|e| anyhow::anyhow!("{e}"))
-                })
-                .transpose()?;
-
-            // Compute absolute timeout timestamp.
-            let timeout_at =
-                (chrono::Utc::now() + chrono::Duration::seconds(duration as i64)).to_rfc3339();
-
-            db.set_hitl_timeout(&item_id, &timeout_at, parsed_action.as_ref())?;
-
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": true,
-                        "work_id": item_id,
-                        "timeout_at": timeout_at,
-                        "duration_secs": duration,
-                        "action": action.as_deref().unwrap_or("skip")
-                    }))?
-                );
-            } else {
-                println!("Timeout set for item '{item_id}':");
-                println!("  expires at: {timeout_at}");
-                println!("  duration:   {} seconds", duration);
-                if let Some(a) = &action {
-                    println!("  action:     {a}");
-                } else {
-                    println!("  action:     skip (default)");
-                }
-            }
+            let Some(request) = open_request_of(&db, &item_id)? else {
+                anyhow::bail!("item '{item_id}' has no open HITL request");
+            };
+            // The deadline and terminal action belong on `request`, which the
+            // store cannot update yet; the legacy `queue_items` columns are not
+            // a substitute because nothing reads them any more.
+            anyhow::bail!(
+                "setting a timeout on HITL request {} (duration {duration}s, action {}) is not supported yet",
+                request.hitl_id,
+                action.as_deref().unwrap_or("workspace default"),
+            )
         }
         HitlTimeoutCommands::Ls { json } => {
-            let items = db.list_hitl_items_with_timeout()?;
+            let mut rows = Vec::new();
+            for request in db.open_hitl_requests()? {
+                if request.timeout_at.is_none() {
+                    continue;
+                }
+                let item = db.get_item(&request.work_id)?;
+                rows.push((request, item));
+            }
             if json {
-                let entries: Vec<serde_json::Value> = items
+                let entries: Vec<serde_json::Value> = rows
                     .iter()
-                    .map(|item| {
+                    .map(|(request, item)| {
                         serde_json::json!({
-                            "work_id": item.work_id,
-                            "timeout_at": item.hitl_timeout_at,
-                            "action": item.hitl_terminal_action.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "skip".to_string()),
+                            "work_id": request.work_id,
+                            "hitl_id": request.hitl_id.as_str(),
+                            "timeout_at": request.timeout_at,
+                            "action": request.terminal_action.map(|a| a.to_string()),
                             "workspace": item.workspace_id,
                         })
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&entries)?);
-            } else if items.is_empty() {
+            } else if rows.is_empty() {
                 println!("No HITL items with active timeouts.");
             } else {
                 println!(
                     "{:<40} {:<28} {:<10} {:<20}",
                     "WORK_ID", "TIMEOUT_AT", "ACTION", "WORKSPACE"
                 );
-                for item in &items {
-                    let timeout_at = item.hitl_timeout_at.as_deref().unwrap_or("-");
-                    let action_str;
-                    let action = match &item.hitl_terminal_action {
-                        Some(a) => {
-                            action_str = a.to_string();
-                            action_str.as_str()
-                        }
-                        None => "skip",
-                    };
+                for (request, item) in &rows {
+                    let action = request
+                        .terminal_action
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "-".to_string());
                     println!(
                         "{:<40} {:<28} {:<10} {:<20}",
-                        truncate(&item.work_id, 40),
-                        timeout_at,
+                        truncate(&request.work_id, 40),
+                        request.timeout_at.as_deref().unwrap_or("-"),
                         action,
                         &item.workspace_id,
                     );
                 }
-                println!("\n{} item(s) with timeout", items.len());
+                println!("\n{} item(s) with timeout", rows.len());
             }
         }
     }
@@ -2777,185 +2901,31 @@ async fn main() -> anyhow::Result<()> {
         Commands::Hitl { command } => match command {
             HitlCommands::Respond {
                 item_id,
+                hitl_id,
                 action,
                 respondent,
                 notes,
                 json: json_output,
             } => {
-                let action: belt_core::queue::HitlRespondAction =
-                    action.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-                tracing::info!(
+                exit_if_refused(cmd_hitl_respond(
                     item_id,
-                    %action,
-                    ?respondent,
-                    ?notes,
-                    "responding to HITL item"
-                );
-                let db = open_db()?;
-                // Verify the item exists and is in HITL phase.
-                let item = db.get_item(&item_id)?;
-                if item.phase() != QueuePhase::Hitl {
-                    anyhow::bail!(
-                        "item '{}' is in phase '{}', not 'hitl'",
-                        item_id,
-                        item.phase()
-                    );
-                }
-                match action {
-                    belt_core::queue::HitlRespondAction::Replan => {
-                        let max_replan = 3u32;
-                        let new_count = item.replan_count + 1;
-                        if new_count > max_replan {
-                            db.update_phase(&item_id, QueuePhase::Failed)?;
-                            if json_output {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&serde_json::json!({
-                                        "success": true,
-                                        "work_id": item_id,
-                                        "action": "replan",
-                                        "phase": "failed",
-                                        "reason": "replan limit exceeded"
-                                    }))?
-                                );
-                            } else {
-                                println!(
-                                    "Item '{}' replan limit exceeded ({}/{}), transitioned to failed.",
-                                    item_id, new_count, max_replan
-                                );
-                            }
-                        } else {
-                            // Roll back original item to Pending.
-                            db.update_phase(&item_id, QueuePhase::Pending)?;
-                            // Create a spec-modification-proposed HITL item.
-                            let failure_reason =
-                                item.hitl_notes.as_deref().unwrap_or("unknown failure");
-                            let replan_work_id = format!("{item_id}:replan-{new_count}");
-                            let mut replan_item = belt_core::queue::QueueItem::new(
-                                replan_work_id.clone(),
-                                item.source_id.clone(),
-                                item.workspace_id.clone(),
-                                item.state.clone(),
-                            );
-                            replan_item.set_phase_unchecked(QueuePhase::Hitl);
-                            replan_item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
-                            replan_item.hitl_reason =
-                                Some(belt_core::queue::HitlReason::SpecModificationProposed);
-                            replan_item.hitl_notes = Some(format!(
-                                "Claw replan delegation (attempt {new_count}): {failure_reason}"
-                            ));
-                            replan_item.title =
-                                Some(format!("spec-modification-proposed (replan #{new_count})"));
-                            replan_item.replan_count = new_count;
-                            db.insert_item(&replan_item)?;
-                            if json_output {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&serde_json::json!({
-                                        "success": true,
-                                        "work_id": item_id,
-                                        "action": "replan",
-                                        "phase": "pending",
-                                        "replan_count": new_count,
-                                        "replan_work_id": replan_work_id
-                                    }))?
-                                );
-                            } else {
-                                println!(
-                                    "Item '{}' rolled back to pending (replan {}/{}). \
-                                     Created HITL item '{}' for spec modification review.",
-                                    item_id, new_count, max_replan, replan_work_id
-                                );
-                            }
-                        }
-                    }
-                    _ => {
-                        let target_phase = match action {
-                            belt_core::queue::HitlRespondAction::Done => QueuePhase::Done,
-                            belt_core::queue::HitlRespondAction::Retry => QueuePhase::Pending,
-                            belt_core::queue::HitlRespondAction::Skip => QueuePhase::Skipped,
-                            belt_core::queue::HitlRespondAction::Replan => unreachable!(),
-                        };
-                        db.update_phase(&item_id, target_phase)?;
-
-                        // Cleanup worktree on Done/Skipped (matches daemon pattern).
-                        if matches!(target_phase, QueuePhase::Done | QueuePhase::Skipped)
-                            && let Ok(home) = belt_home()
-                        {
-                            let wt_base = home.join("worktrees");
-                            let repo_path = std::path::PathBuf::from(".");
-                            let wt_mgr = GitWorktreeManager::new(wt_base, repo_path);
-                            if let Err(e) = wt_mgr.cleanup(&item_id) {
-                                tracing::warn!(
-                                    work_id = %item_id,
-                                    error = %e,
-                                    "worktree cleanup failed on hitl respond, continuing"
-                                );
-                            }
-                        }
-
-                        if json_output {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&serde_json::json!({
-                                    "success": true,
-                                    "work_id": item_id,
-                                    "action": action.to_string(),
-                                    "phase": target_phase.as_str()
-                                }))?
-                            );
-                        } else {
-                            println!(
-                                "Item '{}' transitioned from hitl to {} (action: {}).",
-                                item_id, target_phase, action
-                            );
-                        }
-                    }
-                }
+                    hitl_id,
+                    &action,
+                    respondent,
+                    notes,
+                    json_output,
+                )?);
             }
             HitlCommands::List { workspace, format } => {
                 tracing::info!(?workspace, "listing HITL items...");
-                let db = open_db()?;
-                let items = db.list_items(Some(QueuePhase::Hitl), workspace.as_deref())?;
-                match format.as_str() {
-                    "json" => {
-                        println!("{}", serde_json::to_string_pretty(&items)?);
-                    }
-                    _ => {
-                        if items.is_empty() {
-                            println!("No items awaiting human review.");
-                        } else {
-                            println!(
-                                "{:<40} {:<20} {:<12} {:<24} TITLE",
-                                "WORK_ID", "WORKSPACE", "STATE", "REASON"
-                            );
-                            println!("{}", "-".repeat(104));
-                            for item in &items {
-                                let reason = item
-                                    .hitl_reason
-                                    .as_ref()
-                                    .map(|r| r.to_string())
-                                    .unwrap_or_else(|| "-".to_string());
-                                println!(
-                                    "{:<40} {:<20} {:<12} {:<24} {}",
-                                    item.work_id,
-                                    item.workspace_id,
-                                    item.state,
-                                    reason,
-                                    item.title.as_deref().unwrap_or("-"),
-                                );
-                            }
-                            println!("\n{} item(s) awaiting review.", items.len());
-                        }
-                    }
-                }
+                cmd_hitl_list(workspace.as_deref(), &format)?;
             }
             HitlCommands::Show {
                 item_id,
                 format,
                 interactive,
             } => {
-                cmd_hitl_show(&item_id, &format, interactive)?;
+                exit_if_refused(cmd_hitl_show(&item_id, &format, interactive)?);
             }
             HitlCommands::Timeout { command } => {
                 cmd_hitl_timeout(command)?;
@@ -3045,6 +3015,7 @@ mod tests {
             QueuePhase::Done,
             ManualOutcome::HitlResponse {
                 action: HitlAction::Done,
+                by: "carol".to_string(),
                 outcome: RespondOutcome::AlreadyHandled(resolution),
             },
             serde_json::json!({}),

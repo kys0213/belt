@@ -212,182 +212,341 @@ fn context_json_exposes_derived_from_only_for_derived_items() {
 }
 
 // ---------------------------------------------------------------------------
-// hitl respond: EscalationAction / HitlRespondAction parsing
+// hitl respond / list / show / timeout: HITL requests are the only source
 // ---------------------------------------------------------------------------
 
-#[test]
-fn hitl_respond_valid_action_done() {
-    let (tmp, db) = setup_belt_home();
-    insert_hitl_item(&db, "hitl-1");
-
-    let output = run_belt(
-        tmp.path(),
-        &["hitl", "respond", "hitl-1", "--action", "done"],
-    );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "expected success for valid action 'done', stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        stdout.contains("done"),
-        "stdout should mention action: {stdout}"
-    );
-
-    // Verify phase changed to Done.
-    let updated = db.get_item("hitl-1").expect("item should exist");
-    assert_eq!(updated.phase(), QueuePhase::Done);
+/// Seed a Completed item and open a request the way the daemon does:
+/// reason, notes, deadline and terminal action all live on the request.
+fn open_daemon_style_hitl(db: &Database) -> (String, String) {
+    let id = seed_item(db, "daemon", QueuePhase::Completed);
+    let opened = db
+        .open_hitl(&OpenHitlRequest {
+            work_id: id.clone(),
+            expected_from: QueuePhase::Completed,
+            reason: belt_core::queue::HitlReason::RetryMaxExceeded,
+            notes: Some("needs a human look".to_string()),
+            actor: Actor::Daemon,
+            transition_reason: TransitionReason::Manual,
+            timeout_at: Some("2099-01-01T00:00:00+00:00".to_string()),
+            terminal_action: Some(belt_core::escalation::EscalationAction::Replan),
+        })
+        .expect("open hitl");
+    let OpenHitlOutcome::Opened { hitl_id, .. } = opened else {
+        panic!("expected an opened request, got {opened:?}");
+    };
+    (id, hitl_id.as_str().to_string())
 }
 
 #[test]
-fn hitl_respond_valid_action_retry() {
+fn hitl_respond_wins_and_holds_the_item_in_hitl() {
     let (tmp, db) = setup_belt_home();
-    insert_hitl_item(&db, "hitl-2");
+    let id = seed_item(&db, "1", QueuePhase::Hitl);
 
-    let output = run_belt(
+    let out = run_belt(
         tmp.path(),
-        &["hitl", "respond", "hitl-2", "--action", "retry"],
+        &[
+            "hitl",
+            "respond",
+            &id,
+            "--action",
+            "done",
+            "--respondent",
+            "irene",
+            "--json",
+        ],
     );
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    assert!(out.status.success(), "{out:?}");
+    let v = stdout_json(&out);
+    assert_eq!(v["success"], true);
+    assert_eq!(v["action"], "done");
+    assert_eq!(v["by"], "irene");
+    assert_eq!(v["via"], "cli");
 
-    let updated = db.get_item("hitl-2").expect("item should exist");
-    assert_eq!(updated.phase(), QueuePhase::Pending);
+    // Confirmed, not applied: the item leaves Hitl only by daemon post-processing.
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+    assert_eq!(db.pending_post_processing().unwrap().len(), 1);
 }
 
 #[test]
-fn hitl_respond_valid_action_skip() {
+fn hitl_respond_by_hitl_id_wins() {
     let (tmp, db) = setup_belt_home();
-    insert_hitl_item(&db, "hitl-3");
+    let (id, hitl_id) = open_daemon_style_hitl(&db);
 
-    let output = run_belt(
+    let out = run_belt(
         tmp.path(),
-        &["hitl", "respond", "hitl-3", "--action", "skip"],
+        &[
+            "hitl",
+            "respond",
+            "--hitl-id",
+            &hitl_id,
+            "--action",
+            "skip",
+            "--json",
+        ],
     );
-    assert!(
-        output.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let updated = db.get_item("hitl-3").expect("item should exist");
-    assert_eq!(updated.phase(), QueuePhase::Skipped);
+    assert!(out.status.success(), "{out:?}");
+    let v = stdout_json(&out);
+    assert_eq!(v["hitl_id"], hitl_id.as_str());
+    assert_eq!(v["work_id"], id.as_str());
+    assert_eq!(db.pending_post_processing().unwrap().len(), 1);
 }
 
 #[test]
-fn hitl_respond_invalid_action_rejected() {
+fn hitl_respond_after_confirmation_is_already_handled_and_recorded() {
     let (tmp, db) = setup_belt_home();
-    insert_hitl_item(&db, "hitl-4");
-
-    let output = run_belt(
+    let id = seed_item(&db, "1", QueuePhase::Hitl);
+    let first = run_belt(
         tmp.path(),
-        &["hitl", "respond", "hitl-4", "--action", "invalid_action"],
+        &[
+            "hitl",
+            "respond",
+            &id,
+            "--action",
+            "skip",
+            "--respondent",
+            "alice",
+        ],
     );
+    assert!(first.status.success(), "{first:?}");
+
+    let second = run_belt(
+        tmp.path(),
+        &[
+            "hitl",
+            "respond",
+            &id,
+            "--action",
+            "done",
+            "--respondent",
+            "bob",
+            "--json",
+        ],
+    );
+    assert_eq!(second.status.code(), Some(EXIT_REFUSED));
+    let v = stdout_json(&second);
+    assert_eq!(v["success"], false);
+    assert_eq!(v["reason"], "already_handled");
+    assert_eq!(v["by"], "alice");
+    assert_eq!(v["via"], "cli");
+    assert_eq!(v["action"], "skip");
+    assert!(v["at"].is_string());
+
+    let log = db.transitions_of(&id).unwrap();
     assert!(
-        !output.status.success(),
-        "expected failure for invalid action"
+        log.iter()
+            .any(|e| e.kind == belt_infra::db::transition_kind::HITL_RESPONSE_REJECTED),
+        "rejection must be in the history: {log:?}"
     );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("invalid") || stderr.contains("HITL respond action"),
-        "stderr should mention invalid action: {stderr}"
-    );
+    assert_eq!(db.pending_post_processing().unwrap().len(), 1);
 }
 
 #[test]
-fn hitl_respond_non_hitl_item_rejected() {
-    // Responding to an item that is NOT in HITL phase should fail.
+fn hitl_respond_unknown_targets_are_not_found() {
     let (tmp, db) = setup_belt_home();
+    // An item without any request is not a HITL target either.
+    let pending = seed_item(&db, "1", QueuePhase::Pending);
 
-    let item = QueueItem::new(
-        "hitl-5".to_string(),
-        "source-5".to_string(),
-        "ws-test".to_string(),
-        "implement".to_string(),
-    );
-    // Item is in Pending phase (not HITL).
-    db.insert_item(&item).expect("insert item");
-
-    let output = run_belt(
-        tmp.path(),
-        &["hitl", "respond", "hitl-5", "--action", "done"],
-    );
-    assert!(
-        !output.status.success(),
-        "expected failure for non-HITL item"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("not 'hitl'") || stderr.contains("pending"),
-        "stderr should mention phase mismatch: {stderr}"
-    );
+    for args in [
+        vec![
+            "hitl",
+            "respond",
+            "no-such-item",
+            "--action",
+            "done",
+            "--json",
+        ],
+        vec![
+            "hitl",
+            "respond",
+            pending.as_str(),
+            "--action",
+            "done",
+            "--json",
+        ],
+        vec![
+            "hitl",
+            "respond",
+            "--hitl-id",
+            "no-such-hitl",
+            "--action",
+            "done",
+            "--json",
+        ],
+    ] {
+        let out = run_belt(tmp.path(), &args);
+        assert_eq!(out.status.code(), Some(EXIT_REFUSED), "{args:?}");
+        assert_eq!(stdout_json(&out)["reason"], "not_found", "{args:?}");
+    }
 }
 
 #[test]
-fn hitl_timeout_set_valid_escalation_action() {
-    // `belt hitl timeout set` parses the --action via EscalationAction::from_str.
+fn hitl_respond_unknown_action_is_invalid_action() {
     let (tmp, db) = setup_belt_home();
-    insert_hitl_item(&db, "hitl-t1");
+    let id = seed_item(&db, "1", QueuePhase::Hitl);
 
-    let output = run_belt(
+    let out = run_belt(
+        tmp.path(),
+        &["hitl", "respond", &id, "--action", "bogus", "--json"],
+    );
+    assert_eq!(out.status.code(), Some(EXIT_REFUSED));
+    assert_eq!(stdout_json(&out)["reason"], "invalid_action");
+    assert!(db.pending_post_processing().unwrap().is_empty());
+}
+
+#[test]
+fn hitl_list_and_show_read_the_request_a_daemon_opened() {
+    let (tmp, db) = setup_belt_home();
+    let (id, hitl_id) = open_daemon_style_hitl(&db);
+
+    let list = run_belt(tmp.path(), &["hitl", "list", "--format", "json"]);
+    assert!(list.status.success(), "{list:?}");
+    let rows = stdout_json(&list);
+    let row = &rows.as_array().expect("array")[0];
+    assert_eq!(row["work_id"], id.as_str());
+    assert_eq!(row["hitl_id"], hitl_id.as_str());
+    assert_eq!(row["reason"], "retry_max_exceeded");
+    assert_eq!(row["notes"], "needs a human look");
+    assert_eq!(row["timeout_at"], "2099-01-01T00:00:00+00:00");
+    assert_eq!(row["terminal_action"], "replan");
+
+    let text = run_belt(tmp.path(), &["hitl", "list"]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        text.contains(&id) && text.contains("retry_max_exceeded"),
+        "{text}"
+    );
+
+    let show = run_belt(tmp.path(), &["hitl", "show", &id, "--format", "json"]);
+    assert!(show.status.success(), "{show:?}");
+    let v = stdout_json(&show);
+    assert_eq!(v["hitl_request"]["hitl_id"], hitl_id.as_str());
+    assert_eq!(v["hitl_request"]["status"], "open");
+    assert_eq!(v["hitl_request"]["reason"], "retry_max_exceeded");
+    assert_eq!(v["hitl_request"]["notes"], "needs a human look");
+    assert_eq!(v["hitl_request"]["timeout_at"], "2099-01-01T00:00:00+00:00");
+    assert_eq!(v["hitl_request"]["terminal_action"], "replan");
+    assert_eq!(v["recommended"]["action"], "skip");
+}
+
+#[test]
+fn hitl_show_reports_the_confirmed_response() {
+    let (tmp, db) = setup_belt_home();
+    let (id, _) = open_daemon_style_hitl(&db);
+    assert!(
+        run_belt(
+            tmp.path(),
+            &[
+                "hitl",
+                "respond",
+                &id,
+                "--action",
+                "retry",
+                "--respondent",
+                "irene"
+            ],
+        )
+        .status
+        .success()
+    );
+
+    let show = run_belt(tmp.path(), &["hitl", "show", &id, "--format", "json"]);
+    let v = stdout_json(&show);
+    assert_eq!(v["hitl_request"]["status"], "resolved");
+    assert_eq!(v["hitl_request"]["processing"], "awaiting_post_processing");
+    assert_eq!(v["hitl_request"]["resolution"]["action"], "retry");
+    assert_eq!(v["hitl_request"]["resolution"]["by"], "irene");
+    assert_eq!(v["hitl_request"]["resolution"]["via"], "cli");
+}
+
+#[test]
+fn hitl_timeout_set_rejects_terminal_actions_other_than_skip_and_replan() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Hitl);
+
+    for action in ["failed", "retry", "hitl", "retry_with_comment", "nope"] {
+        let out = run_belt(
+            tmp.path(),
+            &[
+                "hitl",
+                "timeout",
+                "set",
+                &id,
+                "--duration",
+                "3600",
+                "--action",
+                action,
+            ],
+        );
+        assert!(!out.status.success(), "{action} must be refused");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("invalid value"), "{action}: {stderr}");
+    }
+}
+
+#[test]
+fn hitl_timeout_set_with_allowed_action_reports_storage_unsupported() {
+    // Storing a request's deadline needs a store API that does not exist yet;
+    // the command must refuse loudly instead of writing the legacy columns.
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Hitl);
+
+    for action in ["skip", "replan"] {
+        let out = run_belt(
+            tmp.path(),
+            &[
+                "hitl",
+                "timeout",
+                "set",
+                &id,
+                "--duration",
+                "3600",
+                "--action",
+                action,
+            ],
+        );
+        assert!(!out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("not supported"), "{stderr}");
+    }
+}
+
+#[test]
+fn hitl_timeout_set_without_open_request_is_not_found() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Pending);
+
+    let out = run_belt(
         tmp.path(),
         &[
             "hitl",
             "timeout",
             "set",
-            "hitl-t1",
+            &id,
             "--duration",
-            "3600",
+            "60",
             "--action",
             "skip",
         ],
     );
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "expected success for valid escalation action 'skip', stderr: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        stdout.contains("skip"),
-        "stdout should mention action: {stdout}"
-    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("no open HITL request"), "{stderr}");
 }
 
 #[test]
-fn hitl_timeout_set_invalid_escalation_action() {
-    // Invalid escalation action strings should be rejected.
+fn hitl_timeout_ls_lists_open_requests_with_a_deadline() {
     let (tmp, db) = setup_belt_home();
-    insert_hitl_item(&db, "hitl-t2");
+    let (id, _) = open_daemon_style_hitl(&db);
+    seed_item(&db, "no-deadline", QueuePhase::Hitl);
 
-    let output = run_belt(
-        tmp.path(),
-        &[
-            "hitl",
-            "timeout",
-            "set",
-            "hitl-t2",
-            "--duration",
-            "3600",
-            "--action",
-            "not_a_real_action",
-        ],
-    );
-    assert!(
-        !output.status.success(),
-        "expected failure for invalid escalation action"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("invalid escalation action") || stderr.contains("not_a_real_action"),
-        "stderr should mention invalid action: {stderr}"
-    );
+    let out = run_belt(tmp.path(), &["hitl", "timeout", "ls", "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    let v = stdout_json(&out);
+    let rows = v.as_array().expect("array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["work_id"], id.as_str());
+    assert_eq!(rows[0]["action"], "replan");
 }
-
 // ---------------------------------------------------------------------------
 // cron trigger: last_run_at reset
 // ---------------------------------------------------------------------------
