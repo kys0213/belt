@@ -284,7 +284,14 @@ impl<'a> Advancer<'a> {
 
         let dep_work_ids = match db.list_queue_dependencies(work_id) {
             Ok(deps) => deps,
-            Err(_) => return true,
+            Err(err) => {
+                tracing::error!(
+                    work_id = %work_id,
+                    error = %err,
+                    "dependency list lookup failed; keeping gate closed"
+                );
+                return false;
+            }
         };
 
         if dep_work_ids.is_empty() {
@@ -310,13 +317,15 @@ impl<'a> Advancer<'a> {
                     // Not in DB — orphan dependency, gate open.
                 }
                 Err(err) => {
-                    // DB error — gate open for stability (safe default).
-                    tracing::warn!(
+                    // Store error — the dependency state is unknown, so the gate
+                    // stays closed (fail-closed).
+                    tracing::error!(
                         work_id = %work_id,
                         dependency = %dep_id,
                         error = %err,
-                        "DB lookup failed for dependency; keeping gate open"
+                        "DB lookup failed for dependency; keeping gate closed"
                     );
+                    return false;
                 }
             }
         }
@@ -515,5 +524,40 @@ mod tests {
         let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
 
         assert!(advancer.check_queue_dependency_gate("my-work-id"));
+    }
+
+    #[test]
+    fn dependency_gate_closes_on_store_error() {
+        // A store failure (not ItemNotFound) leaves the dependency state
+        // unknown, so the gate must stay closed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        let path = path.to_str().unwrap();
+        let db = Arc::new(Database::open(path).expect("file DB"));
+
+        let mut dep_item = test_item("dep-src", "analyze");
+        dep_item.work_id = "dep-work-id".to_string();
+        db.insert_item(&dep_item).unwrap();
+        db.update_phase("dep-work-id", QueuePhase::Ready).unwrap();
+        db.update_phase("dep-work-id", QueuePhase::Running).unwrap();
+        db.update_phase("dep-work-id", QueuePhase::Done).unwrap();
+
+        let mut item = test_item("my-src", "implement");
+        item.work_id = "my-work-id".to_string();
+        db.insert_item(&item).unwrap();
+        db.add_queue_dependency("my-work-id", "dep-work-id")
+            .unwrap();
+
+        // Break the lineage lookup through a second connection.
+        let other = rusqlite::Connection::open(path).unwrap();
+        other.execute_batch("DROP TABLE transition_log").unwrap();
+
+        let mut queue = make_queue(vec![item]);
+        let mut tracker = ConcurrencyTracker::new(4);
+        let db_opt: Option<Arc<Database>> = Some(Arc::clone(&db));
+
+        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
+
+        assert!(!advancer.check_queue_dependency_gate("my-work-id"));
     }
 }
