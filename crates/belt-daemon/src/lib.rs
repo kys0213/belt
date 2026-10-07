@@ -9,7 +9,7 @@ pub mod cancel;
 pub mod concurrency;
 pub mod cron;
 pub mod daemon;
-mod escalation_path;
+pub mod escalation_path;
 pub mod evaluation_stages;
 pub mod evaluator;
 pub mod executor;

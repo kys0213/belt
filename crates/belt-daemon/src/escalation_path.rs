@@ -25,6 +25,23 @@ use crate::hitl::{HitlExpiry, HitlService};
 /// Phase an escalated execution leaves: escalation decides the fate of a failed run.
 const ESCALATION_FROM: QueuePhase = QueuePhase::Running;
 
+/// `detail` of the derive transition that continues a failed run by `action`
+/// (`Retry` or `RetryWithComment`). The progress notifier reads it back with
+/// [`retry_action_of`].
+pub fn retry_detail(action: EscalationAction) -> String {
+    format!("{RETRY_DETAIL_PREFIX}{action}")
+}
+
+/// The retry escalation a derive `detail` written by [`retry_detail`] names.
+pub fn retry_action_of(detail: Option<&str>) -> Option<EscalationAction> {
+    detail?
+        .strip_prefix(RETRY_DETAIL_PREFIX)?
+        .parse::<EscalationAction>()
+        .ok()
+}
+
+const RETRY_DETAIL_PREFIX: &str = "escalation: ";
+
 /// Result of committing an escalation decision to the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EscalationCommit {
@@ -72,7 +89,7 @@ pub(crate) fn commit(
                 kind: DeriveKind::EscalationRetry,
                 actor: Actor::Daemon,
                 reason: TransitionReason::Derived,
-                detail: Some(format!("escalation: {action}")),
+                detail: Some(retry_detail(action)),
             })?;
             match outcome {
                 DeriveOutcome::Derived { work_id } => {
@@ -306,6 +323,35 @@ mod tests {
         assert_eq!(derived.phase(), QueuePhase::Pending);
         assert_eq!(derived.derived_from.as_deref(), Some(first.as_str()));
         assert_eq!(db.worktree_key(&work_id).unwrap(), first);
+    }
+
+    #[test]
+    fn committed_retry_names_its_action_in_the_origin_skip_row() {
+        for action in [EscalationAction::Retry, EscalationAction::RetryWithComment] {
+            let db = Arc::new(Database::open_in_memory().unwrap());
+            let first = collect(&db);
+            run(&db, &first);
+            commit_on(&db, &first, action, None).unwrap();
+
+            let skipped = db
+                .transitions_of(&first)
+                .unwrap()
+                .into_iter()
+                .find(|e| e.to_phase.as_deref() == Some("skipped"))
+                .expect("origin skip row");
+            assert_eq!(retry_action_of(skipped.detail.as_deref()), Some(action));
+        }
+    }
+
+    #[test]
+    fn retry_action_of_ignores_other_details() {
+        assert_eq!(retry_action_of(None), None);
+        assert_eq!(retry_action_of(Some("derived")), None);
+        assert_eq!(retry_action_of(Some("escalation: nonsense")), None);
+        assert_eq!(
+            retry_action_of(Some(&retry_detail(EscalationAction::Retry))),
+            Some(EscalationAction::Retry)
+        );
     }
 
     #[test]

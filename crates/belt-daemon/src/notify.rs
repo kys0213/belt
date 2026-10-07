@@ -30,6 +30,7 @@ use belt_core::notification::{
     NotificationChannel, NotificationsConfig, NotifyOutcome, ORIGIN_CHANNEL, OutboundMessage,
     PollTarget, route,
 };
+use belt_core::phase::QueuePhase;
 use belt_core::runtime::{AgentRuntime, RuntimeRequest, StructuredOutputConfig};
 use belt_core::transition::Actor;
 use belt_infra::db::{
@@ -39,6 +40,7 @@ use belt_infra::db::{
 };
 use chrono::{Duration, Utc};
 
+use crate::escalation_path::retry_action_of;
 use crate::hitl::{HitlResponse, HitlService};
 
 /// How long a confirmed request keeps being polled, so a response that
@@ -333,7 +335,13 @@ fn strip_code_fence(text: &str) -> &str {
 /// the same transaction, is in the same batch) is not `skipped`; it is
 /// `failed` only for `retry_with_comment`, the escalation that runs `on_fail`.
 /// Entering Hitl by an escalation that runs `on_fail` is `failed`.
-fn progress_events(batch: &[TransitionLogEntry]) -> Vec<(&TransitionLogEntry, ChannelEvent)> {
+///
+/// # Errors
+/// A phase-enter row without a readable `to_phase`: the log is inconsistent
+/// and nothing is announced from it.
+fn progress_events(
+    batch: &[TransitionLogEntry],
+) -> Result<Vec<(&TransitionLogEntry, ChannelEvent)>, BeltError> {
     let derived_origins: HashSet<&str> = batch
         .iter()
         .filter(|e| {
@@ -341,25 +349,45 @@ fn progress_events(batch: &[TransitionLogEntry]) -> Vec<(&TransitionLogEntry, Ch
         })
         .filter_map(|e| e.detail.as_deref())
         .collect();
-    let commented_retry = format!("escalation: {}", EscalationAction::RetryWithComment);
-    batch
+    let mut events = Vec::new();
+    for entry in batch
         .iter()
         .filter(|e| e.kind == transition_kind::PHASE_ENTER)
-        .filter_map(|e| {
-            let event = match e.to_phase.as_deref()? {
-                "running" => ChannelEvent::Started,
-                "done" => ChannelEvent::Done,
-                "failed" => ChannelEvent::Failed,
-                "skipped" if !derived_origins.contains(e.work_id.as_str()) => ChannelEvent::Skipped,
-                "skipped" if e.detail.as_deref() == Some(commented_retry.as_str()) => {
-                    ChannelEvent::Failed
-                }
-                "hitl" if escalation_runs_on_fail(e.reason.as_deref()) => ChannelEvent::Failed,
-                _ => return None,
-            };
-            Some((e, event))
-        })
-        .collect()
+    {
+        let phase = entry
+            .to_phase
+            .as_deref()
+            .ok_or_else(|| {
+                BeltError::Database(format!(
+                    "phase_enter row {} of {} has no to_phase",
+                    entry.seq, entry.work_id
+                ))
+            })?
+            .parse::<QueuePhase>()
+            .map_err(|e| {
+                BeltError::Database(format!(
+                    "phase_enter row {} of {}: {e}",
+                    entry.seq, entry.work_id
+                ))
+            })?;
+        let event = match phase {
+            QueuePhase::Running => Some(ChannelEvent::Started),
+            QueuePhase::Done => Some(ChannelEvent::Done),
+            QueuePhase::Failed => Some(ChannelEvent::Failed),
+            QueuePhase::Skipped if !derived_origins.contains(entry.work_id.as_str()) => {
+                Some(ChannelEvent::Skipped)
+            }
+            QueuePhase::Skipped => (retry_action_of(entry.detail.as_deref())
+                == Some(EscalationAction::RetryWithComment))
+            .then_some(ChannelEvent::Failed),
+            QueuePhase::Hitl => {
+                escalation_runs_on_fail(entry.reason.as_deref()).then_some(ChannelEvent::Failed)
+            }
+            QueuePhase::Pending | QueuePhase::Ready | QueuePhase::Completed => None,
+        };
+        events.extend(event.map(|event| (entry, event)));
+    }
+    Ok(events)
 }
 
 fn escalation_runs_on_fail(reason: Option<&str>) -> bool {
@@ -641,7 +669,7 @@ impl Notifier {
     pub async fn notify_progress(&mut self) -> Result<Vec<ProgressNotice>, BeltError> {
         let batch = self.db.transitions_since(self.cursor)?;
         let mut notices = Vec::new();
-        for (entry, event) in progress_events(&batch) {
+        for (entry, event) in progress_events(&batch)? {
             for name in route(event, &self.config) {
                 let result = match self.channels.get(&name) {
                     None => {
@@ -1030,4 +1058,65 @@ fn already_handled(
         },
         Some((request.clone(), text)),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enter(seq: u64, to_phase: Option<&str>) -> TransitionLogEntry {
+        TransitionLogEntry {
+            seq,
+            work_id: "w1".to_string(),
+            source_id: "s".to_string(),
+            kind: transition_kind::PHASE_ENTER.to_string(),
+            from_phase: None,
+            to_phase: to_phase.map(str::to_string),
+            actor: "daemon".to_string(),
+            reason: None,
+            detail: None,
+            created_at: "2026-10-07T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn phase_enter_rows_map_to_events_by_parsed_phase() {
+        let batch = [
+            enter(1, Some("running")),
+            enter(2, Some("completed")),
+            enter(3, Some("done")),
+            enter(4, Some("failed")),
+            enter(5, Some("skipped")),
+        ];
+        let events: Vec<ChannelEvent> = progress_events(&batch)
+            .unwrap()
+            .into_iter()
+            .map(|(_, e)| e)
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                ChannelEvent::Started,
+                ChannelEvent::Done,
+                ChannelEvent::Failed,
+                ChannelEvent::Skipped
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_or_missing_phase_is_an_error_not_a_silent_skip() {
+        let unknown = progress_events(&[enter(1, Some("exploded"))]).unwrap_err();
+        assert!(unknown.to_string().contains("exploded"), "{unknown}");
+        let missing = progress_events(&[enter(2, None)]).unwrap_err();
+        assert!(missing.to_string().contains("no to_phase"), "{missing}");
+    }
+
+    #[test]
+    fn echoed_text_is_one_line_cut_at_the_limit() {
+        assert_eq!(one_line("  first \nsecond", 10), "first");
+        assert_eq!(one_line("\n\n  ", 10), "");
+        assert_eq!(one_line("abcdef", 6), "abcdef");
+        assert_eq!(one_line("abcdefg", 6), "abcde…");
+    }
 }

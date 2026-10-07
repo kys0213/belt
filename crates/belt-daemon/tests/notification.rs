@@ -18,6 +18,7 @@ use belt_core::phase::QueuePhase;
 use belt_core::queue::HitlReason;
 use belt_core::runtime::{AgentRuntime, RuntimeCapabilities, RuntimeRequest, RuntimeResponse};
 use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
+use belt_daemon::escalation_path::retry_detail;
 use belt_daemon::hitl::{HitlResponse, HitlService};
 use belt_daemon::notify::{
     ChannelSend, DeliveryResult, MAX_ECHOED_TEXT_CHARS, NlInterpreter, Notifier, PollResult,
@@ -356,7 +357,7 @@ fn derive_retry(db: &Database, work_id: &str, action: EscalationAction) -> Strin
             kind: DeriveKind::EscalationRetry,
             actor: Actor::Daemon,
             reason: TransitionReason::Derived,
-            detail: Some(format!("escalation: {action}")),
+            detail: Some(retry_detail(action)),
         })
         .unwrap()
     {
