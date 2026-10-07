@@ -183,8 +183,11 @@ async fn repeated_failures_escalate_to_hitl() {
         1,
         "item should be in Hitl after repeated failures"
     );
+    let requests = daemon.db().open_hitl_requests().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].work_id, hitl[0].work_id);
     assert_eq!(
-        hitl[0].hitl_reason,
+        requests[0].reason,
         Some(HitlReason::RetryMaxExceeded),
         "HITL reason should be RetryMaxExceeded"
     );

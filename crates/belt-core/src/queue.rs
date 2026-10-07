@@ -4,7 +4,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::BeltError;
-use crate::escalation::EscalationAction;
 use crate::phase::QueuePhase;
 
 /// HITL 생성 경로 — 어떤 원인으로 HITL에 진입했는지 기록한다.
@@ -81,24 +80,6 @@ pub struct QueueItem {
     pub created_at: String,
     /// 마지막 업데이트 시각 (RFC3339)
     pub updated_at: String,
-    /// HITL 진입 시각 (RFC3339). HITL phase 진입 시 설정된다.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hitl_created_at: Option<String>,
-    /// HITL 응답자 (e.g. 사용자 이름).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hitl_respondent: Option<String>,
-    /// HITL 관련 메모 (사유, 응답 내용 등).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hitl_notes: Option<String>,
-    /// HITL 생성 경로.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hitl_reason: Option<HitlReason>,
-    /// HITL timeout 만료 시각 (RFC3339). `belt hitl timeout` 으로 설정된다.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hitl_timeout_at: Option<String>,
-    /// HITL timeout 만료 시 적용할 terminal action.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hitl_terminal_action: Option<EscalationAction>,
     /// Worktree가 보존되었는지 여부.
     ///
     /// HITL 또는 Failed 전이 시 `true`로 설정되어 worktree가
@@ -143,12 +124,6 @@ impl QueueItem {
             title: None,
             created_at: now.clone(),
             updated_at: now,
-            hitl_created_at: None,
-            hitl_respondent: None,
-            hitl_notes: None,
-            hitl_reason: None,
-            hitl_timeout_at: None,
-            hitl_terminal_action: None,
             worktree_preserved: false,
             previous_worktree_path: None,
             replan_count: 0,
@@ -199,12 +174,6 @@ pub struct QueueItemRow {
     pub title: Option<String>,
     pub created_at: String,
     pub updated_at: String,
-    pub hitl_created_at: Option<String>,
-    pub hitl_respondent: Option<String>,
-    pub hitl_notes: Option<String>,
-    pub hitl_reason: Option<String>,
-    pub hitl_timeout_at: Option<String>,
-    pub hitl_terminal_action: Option<String>,
     pub worktree_preserved: bool,
     pub previous_worktree_path: Option<String>,
     pub replan_count: u32,
@@ -224,12 +193,6 @@ impl QueueItem {
             title: self.title.clone(),
             created_at: self.created_at.clone(),
             updated_at: self.updated_at.clone(),
-            hitl_created_at: self.hitl_created_at.clone(),
-            hitl_respondent: self.hitl_respondent.clone(),
-            hitl_notes: self.hitl_notes.clone(),
-            hitl_reason: self.hitl_reason.map(|r| r.to_string()),
-            hitl_timeout_at: self.hitl_timeout_at.clone(),
-            hitl_terminal_action: self.hitl_terminal_action.map(|a| a.to_string()),
             worktree_preserved: self.worktree_preserved,
             previous_worktree_path: self.previous_worktree_path.clone(),
             replan_count: self.replan_count,
@@ -241,23 +204,6 @@ impl QueueItem {
 
     pub fn from_row(row: &QueueItemRow) -> Result<Self, String> {
         let phase: QueuePhase = row.phase.parse()?;
-        let hitl_reason = row
-            .hitl_reason
-            .as_deref()
-            .map(|s| match s {
-                "evaluate_failure" => Ok(HitlReason::EvaluateFailure),
-                "retry_max_exceeded" => Ok(HitlReason::RetryMaxExceeded),
-                "timeout" => Ok(HitlReason::Timeout),
-                "manual_escalation" => Ok(HitlReason::ManualEscalation),
-                "stagnation_detected" => Ok(HitlReason::StagnationDetected),
-                other => Err(format!("invalid hitl_reason: {other}")),
-            })
-            .transpose()?;
-        let hitl_terminal_action = row
-            .hitl_terminal_action
-            .as_deref()
-            .map(|s| s.parse::<EscalationAction>())
-            .transpose()?;
         Ok(Self {
             derived_from: row.derived_from.clone(),
             lineage_root: row.lineage_root.clone(),
@@ -269,12 +215,6 @@ impl QueueItem {
             title: row.title.clone(),
             created_at: row.created_at.clone(),
             updated_at: row.updated_at.clone(),
-            hitl_created_at: row.hitl_created_at.clone(),
-            hitl_respondent: row.hitl_respondent.clone(),
-            hitl_notes: row.hitl_notes.clone(),
-            hitl_reason,
-            hitl_timeout_at: row.hitl_timeout_at.clone(),
-            hitl_terminal_action,
             worktree_preserved: row.worktree_preserved,
             previous_worktree_path: row.previous_worktree_path.clone(),
             replan_count: row.replan_count,
@@ -317,12 +257,6 @@ pub mod testing {
             title: Some(format!("Test item: {state}")),
             created_at: "2026-03-22T00:00:00Z".to_string(),
             updated_at: "2026-03-22T00:00:00Z".to_string(),
-            hitl_created_at: None,
-            hitl_respondent: None,
-            hitl_notes: None,
-            hitl_reason: None,
-            hitl_timeout_at: None,
-            hitl_terminal_action: None,
             worktree_preserved: false,
             previous_worktree_path: None,
             replan_count: 0,
@@ -381,22 +315,6 @@ mod tests {
     }
 
     #[test]
-    fn hitl_metadata_json_roundtrip() {
-        let mut item = test_item("github:org/repo#42", "analyze");
-        item.hitl_created_at = Some("2026-03-24T00:00:00Z".to_string());
-        item.hitl_respondent = Some("irene".to_string());
-        item.hitl_notes = Some("needs manual review".to_string());
-        item.hitl_reason = Some(HitlReason::RetryMaxExceeded);
-
-        let json = serde_json::to_string(&item).unwrap();
-        let parsed: QueueItem = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.hitl_created_at, item.hitl_created_at);
-        assert_eq!(parsed.hitl_respondent, item.hitl_respondent);
-        assert_eq!(parsed.hitl_notes, item.hitl_notes);
-        assert_eq!(parsed.hitl_reason, item.hitl_reason);
-    }
-
-    #[test]
     fn hitl_reason_vocabulary_matches_spec() {
         let reasons = [
             (HitlReason::EvaluateFailure, "evaluate_failure"),
@@ -411,10 +329,8 @@ mod tests {
                 serde_json::to_string(&reason).unwrap(),
                 format!("\"{name}\"")
             );
-            let mut item = test_item("s1", "analyze");
-            item.hitl_reason = Some(reason);
-            let restored = QueueItem::from_row(&item.to_row()).unwrap();
-            assert_eq!(restored.hitl_reason, Some(reason));
+            let parsed: HitlReason = serde_json::from_str(&format!("\"{name}\"")).unwrap();
+            assert_eq!(parsed, reason);
         }
     }
 

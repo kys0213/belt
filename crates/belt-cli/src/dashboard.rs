@@ -4563,14 +4563,12 @@ mod tests {
         let db = make_db();
         let hitl_id = open_hitl_item(&db, "src1", Some("needs review"));
         let request = db.hitl_request(&hitl_id).unwrap().unwrap();
-        let mut item = QueueItem::new(
+        let item = QueueItem::new(
             request.work_id.clone(),
             "src1".to_string(),
             "ws1".to_string(),
             "analyze".to_string(),
         );
-        // Legacy columns must not be shown.
-        item.hitl_notes = Some("legacy notes".to_string());
 
         let lines = build_detail_lines_with_history(
             &request.work_id,
@@ -4584,18 +4582,16 @@ mod tests {
         assert!(text.contains("Entered:"));
         assert!(text.contains("evaluate_failure"));
         assert!(text.contains("needs review"));
-        assert!(!text.contains("legacy notes"));
     }
 
     #[test]
     fn build_detail_lines_hides_hitl_section_without_request() {
-        let mut item = QueueItem::new(
+        let item = QueueItem::new(
             "w1".to_string(),
             "src1".to_string(),
             "ws1".to_string(),
             "analyze".to_string(),
         );
-        item.hitl_notes = Some("legacy notes".to_string());
         let lines = build_detail_lines("w1", Some(&item), &[]);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
         assert!(!text.contains("HITL Details:"));

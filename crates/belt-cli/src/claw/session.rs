@@ -161,21 +161,19 @@ fn collect_status_from_db(db: &belt_infra::db::Database) -> Option<StatusSummary
     let events = db.list_recent_transition_events(5).ok()?;
     let recent_events = events.into_iter().map(into_recent_event).collect();
 
-    let hitl_items = db
-        .list_items(Some(belt_core::phase::QueuePhase::Hitl), None)
-        .ok()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|item| HitlItemSummary {
+    let mut hitl_items = Vec::new();
+    for request in db.open_hitl_requests().ok()? {
+        let item = db.get_item(&request.work_id).ok()?;
+        hitl_items.push(HitlItemSummary {
             work_id: item.work_id,
             workspace: item.workspace_id,
-            reason: item
-                .hitl_reason
+            reason: request
+                .reason
                 .map(|r| r.to_string())
                 .unwrap_or_else(|| "other".to_string()),
             title: item.title,
-        })
-        .collect();
+        });
+    }
 
     Some(StatusSummary {
         total_items,
@@ -934,6 +932,33 @@ mod tests {
         assert!(summary.hitl_items.is_empty());
     }
 
+    /// Opens a HITL request on a Running item.
+    fn open_hitl_request(
+        db: &belt_infra::db::Database,
+        work_id: &str,
+        reason: belt_core::queue::HitlReason,
+    ) {
+        use belt_core::phase::QueuePhase;
+        use belt_core::transition::{Actor, TransitionReason};
+        use belt_infra::db::{OpenHitlOutcome, OpenHitlRequest};
+
+        let outcome = db
+            .open_hitl(&OpenHitlRequest {
+                work_id: work_id.to_string(),
+                expected_from: QueuePhase::Running,
+                reason,
+                notes: None,
+                actor: Actor::Daemon,
+                transition_reason: TransitionReason::Escalation(
+                    belt_core::escalation::EscalationAction::Hitl,
+                ),
+                timeout_at: None,
+                terminal_action: None,
+            })
+            .unwrap();
+        assert!(matches!(outcome, OpenHitlOutcome::Opened { .. }));
+    }
+
     #[test]
     fn collect_status_from_populated_db() {
         use belt_core::phase::QueuePhase;
@@ -956,9 +981,9 @@ mod tests {
             "ws1".to_string(),
             "implement".to_string(),
         );
-        item2.hitl_reason = Some(belt_core::queue::HitlReason::EvaluateFailure);
+        item2.set_phase_unchecked(QueuePhase::Running);
         db.insert_item(&item2).unwrap();
-        db.update_phase("w2", QueuePhase::Hitl).unwrap();
+        open_hitl_request(&db, "w2", belt_core::queue::HitlReason::EvaluateFailure);
 
         let summary = collect_status_from_db(&db).unwrap();
         assert_eq!(summary.total_items, 2);
@@ -1114,9 +1139,9 @@ mod tests {
             "implement".to_string(),
         );
         item.title = Some("My HITL task".to_string());
-        item.hitl_reason = Some(belt_core::queue::HitlReason::Timeout);
+        item.set_phase_unchecked(QueuePhase::Running);
         db.insert_item(&item).unwrap();
-        db.update_phase("w-hitl", QueuePhase::Hitl).unwrap();
+        open_hitl_request(&db, "w-hitl", belt_core::queue::HitlReason::Timeout);
 
         let summary = collect_status_from_db(&db).unwrap();
         assert_eq!(summary.hitl_items.len(), 1);

@@ -1177,9 +1177,6 @@ impl Daemon {
             Committed::Skipped => item.set_phase_unchecked(QueuePhase::Skipped),
             Committed::Hitl => {
                 item.set_phase_unchecked(QueuePhase::Hitl);
-                item.hitl_created_at = Some(Utc::now().to_rfc3339());
-                item.hitl_reason = Some(HitlReason::RetryMaxExceeded);
-                item.hitl_notes = hitl_notes;
                 self.queue.push_back(item.clone());
             }
         }
@@ -1446,9 +1443,6 @@ impl Daemon {
         match outcome {
             OpenHitlOutcome::Opened { .. } => {
                 transit(item, QueuePhase::Hitl)?;
-                item.hitl_created_at = Some(Utc::now().to_rfc3339());
-                item.hitl_reason = Some(reason);
-                item.hitl_notes = notes;
                 Ok(())
             }
             OpenHitlOutcome::Rejected(refused) => {
@@ -1633,9 +1627,6 @@ impl Daemon {
                     );
                 }
                 let now = Utc::now().to_rfc3339();
-                item.hitl_created_at = Some(now.clone());
-                item.hitl_reason = Some(HitlReason::EvaluateFailure);
-                item.hitl_notes = Some(notes.clone());
                 self.history.push(HistoryEntry {
                     source_id: item.source_id.clone(),
                     work_id: item.work_id.clone(),
@@ -5063,12 +5054,11 @@ sources:
 
         let item = daemon.get_item("s1:analyze").unwrap();
         assert_eq!(item.phase(), QueuePhase::Hitl);
-        assert_eq!(item.hitl_reason, Some(HitlReason::EvaluateFailure));
-        assert_eq!(item.hitl_notes.as_deref(), Some("partial result"));
-        assert!(
-            item.hitl_created_at.is_some(),
-            "hitl_created_at should be set"
-        );
+        let requests = daemon.db().open_hitl_requests().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].work_id, "s1:analyze");
+        assert_eq!(requests[0].reason, Some(HitlReason::EvaluateFailure));
+        assert_eq!(requests[0].notes.as_deref(), Some("partial result"));
     }
 
     #[test]
@@ -5089,8 +5079,10 @@ sources:
 
         let item = daemon.get_item("s1:analyze").unwrap();
         assert_eq!(item.phase(), QueuePhase::Hitl);
-        assert_eq!(item.hitl_reason, Some(HitlReason::Timeout));
-        assert!(item.hitl_notes.is_none());
+        let requests = daemon.db().open_hitl_requests().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].reason, Some(HitlReason::Timeout));
+        assert!(requests[0].notes.is_none());
     }
 
     // ---------------------------------------------------------------

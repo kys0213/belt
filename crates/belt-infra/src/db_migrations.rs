@@ -682,7 +682,6 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use belt_core::phase::QueuePhase;
-    use belt_core::queue::HitlReason;
     use rusqlite::{Connection, params};
 
     use super::{CURRENT_VERSION, apply_v1};
@@ -1252,11 +1251,10 @@ mod tests {
         assert_eq!(items.len(), LEGACY_ITEMS.len());
         let conflict = db.get_item("hitl-conflict").unwrap();
         assert_eq!(conflict.phase(), QueuePhase::Hitl);
-        assert_eq!(conflict.hitl_reason, Some(HitlReason::ManualEscalation));
         assert_eq!(conflict.lineage_root, "hitl-conflict");
         assert_eq!(conflict.derived_from, None);
         let retry = db.get_item("hitl-retry").unwrap();
-        assert_eq!(retry.hitl_terminal_action, None);
+        assert_eq!(retry.phase(), QueuePhase::Hitl);
     }
 
     // ---- idempotency, failure, version guard --------------------------------

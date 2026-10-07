@@ -69,6 +69,17 @@ fn daemon_over(tmp: &TempDir, on_done: &str, db: Database) -> Daemon {
     )
 }
 
+/// Sets the lineage's replan count the way earlier derivations leave it.
+fn seed_replan_count(db_path: &str, work_id: &str, count: u32) {
+    rusqlite::Connection::open(db_path)
+        .unwrap()
+        .execute(
+            "UPDATE queue_items SET replan_count = ?1 WHERE work_id = ?2",
+            rusqlite::params![count, work_id],
+        )
+        .unwrap();
+}
+
 fn daemon(tmp: &TempDir, on_done: &str) -> Daemon {
     daemon_over(tmp, on_done, Database::open_in_memory().unwrap())
 }
@@ -469,11 +480,14 @@ async fn replan_within_the_limit_derives_a_pending_item_with_the_failure_context
 #[tokio::test]
 async fn replan_after_three_lineage_replans_ends_failed_and_keeps_the_worktree() {
     let tmp = TempDir::new().unwrap();
-    let (mut daemon, hook) = with_hook(daemon(&tmp, "echo done"), false);
+    let path = tmp.path().join("belt.db");
+    let path = path.to_str().unwrap();
+    let (mut daemon, hook) = with_hook(
+        daemon_over(&tmp, "echo done", Database::open(path).unwrap()),
+        false,
+    );
     let (work_id, hitl_id) = hitl_item(&mut daemon, None);
-    for _ in 0..REPLAN_LIMIT {
-        daemon.db().increment_replan_count(&work_id).unwrap();
-    }
+    seed_replan_count(path, &work_id, REPLAN_LIMIT);
     respond(daemon.hitl(), &hitl_id, HitlAction::Replan, None);
 
     daemon.run_post_processing().await.unwrap();
@@ -572,11 +586,11 @@ async fn expired_with_terminal_replan_derives_like_a_replan_response() {
 #[tokio::test]
 async fn expired_with_terminal_replan_over_the_limit_ends_failed() {
     let tmp = TempDir::new().unwrap();
-    let mut daemon = daemon(&tmp, "echo done");
+    let path = tmp.path().join("belt.db");
+    let path = path.to_str().unwrap();
+    let mut daemon = daemon_over(&tmp, "echo done", Database::open(path).unwrap());
     let (work_id, hitl_id) = hitl_item(&mut daemon, Some(EscalationAction::Replan));
-    for _ in 0..REPLAN_LIMIT {
-        daemon.db().increment_replan_count(&work_id).unwrap();
-    }
+    seed_replan_count(path, &work_id, REPLAN_LIMIT);
     daemon
         .hitl()
         .expire(&hitl_id, EscalationAction::Replan)

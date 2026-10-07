@@ -191,7 +191,7 @@ pub struct RuntimeStats {
 /// Column list shared by all `queue_items` SELECT and INSERT statements.
 ///
 /// Keeping this in one place avoids drift when columns are added or reordered.
-const QUEUE_ITEM_COLUMNS: &str = "work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action, replan_count, worktree_preserved, previous_worktree_path, derived_from, lineage_root";
+const QUEUE_ITEM_COLUMNS: &str = "work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, replan_count, worktree_preserved, previous_worktree_path, derived_from, lineage_root";
 
 /// Shorthand for extracting a column value and mapping the error to `BeltError::Database`.
 fn col<T: rusqlite::types::FromSql>(row: &rusqlite::Row<'_>, idx: usize) -> Result<T, BeltError> {
@@ -311,178 +311,6 @@ impl Database {
             return Err(BeltError::ItemNotFound(work_id.to_string()));
         }
         Ok(())
-    }
-
-    /// Escalate an item to HITL phase with metadata.
-    ///
-    /// Sets `phase` to `Hitl`, records `hitl_created_at`, `hitl_reason`, and
-    /// `hitl_notes`, and refreshes `updated_at`.
-    ///
-    /// # Errors
-    /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
-    pub fn escalate_to_hitl(
-        &self,
-        work_id: &str,
-        reason: &str,
-        notes: &str,
-    ) -> Result<(), BeltError> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "UPDATE queue_items SET phase = 'hitl', updated_at = ?1, hitl_created_at = ?2, hitl_reason = ?3, hitl_notes = ?4 WHERE work_id = ?5",
-                params![now, now, reason, notes, work_id],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        if rows == 0 {
-            return Err(BeltError::ItemNotFound(work_id.to_string()));
-        }
-        Ok(())
-    }
-
-    /// Increment the `replan_count` for a queue item.
-    ///
-    /// Used by `EvaluateJob` to track per-item evaluate failure counts.
-    /// Also refreshes `updated_at`.
-    ///
-    /// # Errors
-    /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
-    pub fn increment_replan_count(&self, work_id: &str) -> Result<u32, BeltError> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "UPDATE queue_items SET replan_count = replan_count + 1, updated_at = ?1 WHERE work_id = ?2",
-                params![now, work_id],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        if rows == 0 {
-            return Err(BeltError::ItemNotFound(work_id.to_string()));
-        }
-        // Return updated count.
-        let count: u32 = conn
-            .query_row(
-                "SELECT replan_count FROM queue_items WHERE work_id = ?1",
-                params![work_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(count)
-    }
-
-    /// Update HITL metadata when responding to a HITL item.
-    ///
-    /// Sets `hitl_respondent`, `hitl_notes`, phase, and refreshes `updated_at`.
-    ///
-    /// Scheduled to be replaced by the HITL request API, where the first
-    /// response wins and the item leaves Hitl only through daemon
-    /// post-processing. This method decides nothing about who wins.
-    ///
-    /// # Errors
-    /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
-    pub fn respond_hitl(
-        &self,
-        work_id: &str,
-        phase: QueuePhase,
-        respondent: Option<&str>,
-        notes: Option<&str>,
-    ) -> Result<(), BeltError> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "UPDATE queue_items SET phase = ?1, updated_at = ?2, hitl_respondent = ?3, hitl_notes = COALESCE(?4, hitl_notes) WHERE work_id = ?5",
-                params![phase_to_str(phase), now, respondent, notes, work_id],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        if rows == 0 {
-            return Err(BeltError::ItemNotFound(work_id.to_string()));
-        }
-        Ok(())
-    }
-
-    /// List queue items in HITL phase that have exceeded the timeout threshold.
-    ///
-    /// Returns work_ids of HITL items where `hitl_created_at` is older than
-    /// `timeout_hours` from now.
-    pub fn list_expired_hitl_items(&self, timeout_hours: u64) -> Result<Vec<String>, BeltError> {
-        let cutoff = (Utc::now() - chrono::Duration::hours(timeout_hours as i64)).to_rfc3339();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT work_id FROM queue_items WHERE phase = 'hitl' AND hitl_created_at IS NOT NULL AND hitl_created_at < ?1",
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let work_ids = stmt
-            .query_map(params![cutoff], |row| row.get::<_, String>(0))
-            .map_err(|e| BeltError::Database(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(work_ids)
-    }
-
-    /// Set HITL timeout on a queue item.
-    ///
-    /// Stores `hitl_timeout_at` (the absolute expiry time) and an optional
-    /// `terminal_action` (skip/failed/replan) to apply when the timeout fires.
-    ///
-    /// # Errors
-    /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
-    pub fn set_hitl_timeout(
-        &self,
-        work_id: &str,
-        timeout_at: &str,
-        terminal_action: Option<&EscalationAction>,
-    ) -> Result<(), BeltError> {
-        let now = Utc::now().to_rfc3339();
-        let action_str = terminal_action.map(|a| a.to_string());
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "UPDATE queue_items SET hitl_timeout_at = ?1, hitl_terminal_action = ?2, updated_at = ?3 WHERE work_id = ?4",
-                params![timeout_at, action_str, now, work_id],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        if rows == 0 {
-            return Err(BeltError::ItemNotFound(work_id.to_string()));
-        }
-        Ok(())
-    }
-
-    /// List HITL items that have a timeout set and are pending expiry.
-    ///
-    /// Returns items where `hitl_timeout_at` is set and the item is still in HITL phase.
-    pub fn list_hitl_items_with_timeout(&self) -> Result<Vec<QueueItem>, BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let mut stmt = conn
-            .prepare(
-                &format!("SELECT {QUEUE_ITEM_COLUMNS} FROM queue_items WHERE phase = 'hitl' AND hitl_timeout_at IS NOT NULL"),
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let items = stmt
-            .query_map([], |row| Ok(row_to_queue_item(row)))
-            .map_err(|e| BeltError::Database(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        items.into_iter().collect::<Result<Vec<_>, _>>()
     }
 
     /// Retrieve a single queue item by `work_id`.
@@ -2999,7 +2827,7 @@ fn read_stored_item(tx: &Transaction<'_>, work_id: &str) -> Result<StoredItem, B
         return Err(BeltError::ItemNotFound(work_id.to_string()));
     };
     let item = row_to_queue_item(row)?;
-    let worktree_owner = col(row, 19)?;
+    let worktree_owner = col(row, 13)?;
     let processing = processing_of(tx, &item)?;
     let snapshot = ItemSnapshot {
         phase: item.phase(),
@@ -3194,7 +3022,7 @@ fn insert_queue_row(conn: &Connection, item: &QueueItem) -> Result<(), BeltError
     }
     conn.execute(
         &format!(
-            "INSERT INTO queue_items ({QUEUE_ITEM_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"
+            "INSERT INTO queue_items ({QUEUE_ITEM_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
         ),
         params![
             item.work_id,
@@ -3205,12 +3033,6 @@ fn insert_queue_row(conn: &Connection, item: &QueueItem) -> Result<(), BeltError
             item.title,
             item.created_at,
             item.updated_at,
-            item.hitl_created_at,
-            item.hitl_respondent,
-            item.hitl_notes,
-            item.hitl_reason.map(|r| r.to_string()),
-            item.hitl_timeout_at,
-            item.hitl_terminal_action.map(|a| a.to_string()),
             item.replan_count,
             item.worktree_preserved,
             item.previous_worktree_path,
@@ -3347,31 +3169,16 @@ fn parse_hitl_reason(s: &str) -> Result<HitlReason, BeltError> {
 /// Column order must match [`QUEUE_ITEM_COLUMNS`].
 fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
     let phase_str: String = col(row, 4)?;
-    let hitl_reason_str: Option<String> = col(row, 11)?;
-    let hitl_reason = hitl_reason_str
-        .as_deref()
-        .map(parse_hitl_reason)
-        .transpose()?;
-
     let mut item = QueueItem::new(col(row, 0)?, col(row, 1)?, col(row, 2)?, col(row, 3)?);
     item.set_phase_unchecked(str_to_phase(&phase_str)?);
     item.title = col(row, 5)?;
     item.created_at = col(row, 6)?;
     item.updated_at = col(row, 7)?;
-    item.hitl_created_at = col(row, 8)?;
-    item.hitl_respondent = col(row, 9)?;
-    item.hitl_notes = col(row, 10)?;
-    item.hitl_reason = hitl_reason;
-    item.hitl_timeout_at = col(row, 12)?;
-    item.hitl_terminal_action = col::<Option<String>>(row, 13)?
-        .as_deref()
-        .map(|s| s.parse::<EscalationAction>().map_err(BeltError::Database))
-        .transpose()?;
-    item.replan_count = row.get::<_, u32>(14).unwrap_or(0);
-    item.worktree_preserved = col(row, 15)?;
-    item.previous_worktree_path = col(row, 16)?;
-    item.derived_from = col(row, 17)?;
-    item.lineage_root = col(row, 18)?;
+    item.replan_count = col(row, 8)?;
+    item.worktree_preserved = col(row, 9)?;
+    item.previous_worktree_path = col(row, 10)?;
+    item.derived_from = col(row, 11)?;
+    item.lineage_root = col(row, 12)?;
     Ok(item)
 }
 
@@ -3430,53 +3237,6 @@ mod tests {
         let err = db
             .update_phase("nonexistent", QueuePhase::Ready)
             .unwrap_err();
-        assert!(matches!(err, BeltError::ItemNotFound(_)));
-    }
-
-    #[test]
-    fn escalate_to_hitl_sets_metadata() {
-        let db = test_db();
-        let item = sample_item();
-        db.insert_item(&item).unwrap();
-
-        db.escalate_to_hitl(&item.work_id, "evaluate_failure", "failed 3 times")
-            .unwrap();
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.phase(), QueuePhase::Hitl);
-        assert!(fetched.hitl_created_at.is_some());
-        assert_eq!(fetched.hitl_notes.as_deref(), Some("failed 3 times"));
-    }
-
-    #[test]
-    fn escalate_to_hitl_not_found() {
-        let db = test_db();
-        let err = db
-            .escalate_to_hitl("nonexistent", "evaluate_failure", "error")
-            .unwrap_err();
-        assert!(matches!(err, BeltError::ItemNotFound(_)));
-    }
-
-    #[test]
-    fn increment_replan_count_returns_new_value() {
-        let db = test_db();
-        let item = sample_item();
-        db.insert_item(&item).unwrap();
-
-        let count = db.increment_replan_count(&item.work_id).unwrap();
-        assert_eq!(count, 1);
-
-        let count = db.increment_replan_count(&item.work_id).unwrap();
-        assert_eq!(count, 2);
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.replan_count, 2);
-    }
-
-    #[test]
-    fn increment_replan_count_not_found() {
-        let db = test_db();
-        let err = db.increment_replan_count("nonexistent").unwrap_err();
         assert!(matches!(err, BeltError::ItemNotFound(_)));
     }
 
@@ -4179,124 +3939,6 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    // ---- HITL metadata --------------------------------------------------------
-
-    #[test]
-    fn insert_and_get_item_with_hitl_metadata() {
-        let db = test_db();
-        let mut item = sample_item();
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_created_at = Some(Utc::now().to_rfc3339());
-        item.hitl_reason = Some(belt_core::queue::HitlReason::RetryMaxExceeded);
-        item.hitl_notes = Some("max retries".to_string());
-        db.insert_item(&item).unwrap();
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.phase(), QueuePhase::Hitl);
-        assert!(fetched.hitl_created_at.is_some());
-        assert_eq!(
-            fetched.hitl_reason,
-            Some(belt_core::queue::HitlReason::RetryMaxExceeded)
-        );
-        assert_eq!(fetched.hitl_notes.as_deref(), Some("max retries"));
-    }
-
-    #[test]
-    fn respond_hitl_updates_metadata() {
-        let db = test_db();
-        let mut item = sample_item();
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_created_at = Some(Utc::now().to_rfc3339());
-        db.insert_item(&item).unwrap();
-
-        db.respond_hitl(
-            &item.work_id,
-            QueuePhase::Done,
-            Some("irene"),
-            Some("looks good"),
-        )
-        .unwrap();
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.phase(), QueuePhase::Done);
-        assert_eq!(fetched.hitl_respondent.as_deref(), Some("irene"));
-        assert_eq!(fetched.hitl_notes.as_deref(), Some("looks good"));
-    }
-
-    #[test]
-    fn list_expired_hitl_items_returns_old_items() {
-        let db = test_db();
-        // Item with hitl_created_at 25 hours ago
-        let mut old_item = sample_item();
-        old_item.set_phase_unchecked(QueuePhase::Hitl);
-        old_item.hitl_created_at = Some((Utc::now() - chrono::Duration::hours(25)).to_rfc3339());
-        db.insert_item(&old_item).unwrap();
-        db.update_phase(&old_item.work_id, QueuePhase::Hitl)
-            .unwrap();
-
-        // Item with hitl_created_at 1 hour ago (not expired)
-        let mut new_item = sample_item();
-        new_item.work_id = "gh:org/repo#2:implement".to_string();
-        new_item.set_phase_unchecked(QueuePhase::Hitl);
-        new_item.hitl_created_at = Some((Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
-        db.insert_item(&new_item).unwrap();
-        db.update_phase(&new_item.work_id, QueuePhase::Hitl)
-            .unwrap();
-
-        let expired = db.list_expired_hitl_items(24).unwrap();
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0], old_item.work_id);
-    }
-
-    #[test]
-    fn set_hitl_timeout_updates_item() {
-        let db = test_db();
-        let mut item = sample_item();
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        db.insert_item(&item).unwrap();
-
-        let timeout_at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
-        db.set_hitl_timeout(&item.work_id, &timeout_at, Some(&EscalationAction::Skip))
-            .unwrap();
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(
-            fetched.hitl_timeout_at.as_deref(),
-            Some(timeout_at.as_str())
-        );
-        assert_eq!(fetched.hitl_terminal_action, Some(EscalationAction::Skip));
-    }
-
-    #[test]
-    fn set_hitl_timeout_not_found() {
-        let db = test_db();
-        let result = db.set_hitl_timeout("nonexistent", "2026-01-01T00:00:00Z", None);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn list_hitl_items_with_timeout_returns_matching() {
-        let db = test_db();
-
-        // Item with timeout set.
-        let mut item1 = sample_item();
-        item1.work_id = "w-timeout".to_string();
-        item1.set_phase_unchecked(QueuePhase::Hitl);
-        item1.hitl_timeout_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
-        item1.hitl_terminal_action = Some(EscalationAction::Skip);
-        db.insert_item(&item1).unwrap();
-
-        // Item without timeout.
-        let mut item2 = sample_item();
-        item2.work_id = "w-no-timeout".to_string();
-        item2.set_phase_unchecked(QueuePhase::Hitl);
-        db.insert_item(&item2).unwrap();
-
-        let items = db.list_hitl_items_with_timeout().unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].work_id, "w-timeout");
-    }
-
     // ---- Transition Events tests -------------------------------------------
 
     #[test]
@@ -4740,14 +4382,10 @@ mod tests {
     #[test]
     fn queue_item_columns_count_matches_schema() {
         let col_count = QUEUE_ITEM_COLUMNS.split(',').count();
-        // QueueItem maps 19 queue_items columns:
-        // work_id, source_id, workspace_id, state, phase, title,
-        // created_at, updated_at, hitl_created_at, hitl_respondent,
-        // hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action,
-        // replan_count, worktree_preserved, previous_worktree_path,
-        // derived_from, lineage_root.
-        // handler_pid and worktree_owner are not part of QueueItem.
-        assert_eq!(col_count, 19);
+        // QueueItem maps 13 queue_items columns. The legacy hitl_* columns
+        // stay in the schema but are neither read nor written; handler_pid
+        // and worktree_owner are not part of QueueItem either.
+        assert_eq!(col_count, 13);
     }
 
     #[test]
@@ -4769,12 +4407,6 @@ mod tests {
             "title",
             "created_at",
             "updated_at",
-            "hitl_created_at",
-            "hitl_respondent",
-            "hitl_notes",
-            "hitl_reason",
-            "hitl_timeout_at",
-            "hitl_terminal_action",
             "replan_count",
             "worktree_preserved",
             "previous_worktree_path",
@@ -4789,57 +4421,6 @@ mod tests {
             );
         }
         assert_eq!(columns.len(), expected.len());
-    }
-
-    // ---- respond_hitl additional tests -------------------------------------
-
-    #[test]
-    fn respond_hitl_not_found() {
-        let db = test_db();
-        let err = db
-            .respond_hitl("nonexistent", QueuePhase::Done, Some("irene"), None)
-            .unwrap_err();
-        assert!(matches!(err, BeltError::ItemNotFound(_)));
-    }
-
-    #[test]
-    fn respond_hitl_with_none_respondent_and_notes() {
-        let db = test_db();
-        let mut item = sample_item();
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_created_at = Some(Utc::now().to_rfc3339());
-        item.hitl_notes = Some("original notes".to_string());
-        db.insert_item(&item).unwrap();
-
-        db.respond_hitl(&item.work_id, QueuePhase::Pending, None, None)
-            .unwrap();
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.phase(), QueuePhase::Pending);
-        assert!(fetched.hitl_respondent.is_none());
-        // When notes is NULL, COALESCE preserves original notes
-        assert_eq!(fetched.hitl_notes.as_deref(), Some("original notes"));
-    }
-
-    #[test]
-    fn respond_hitl_overwrites_notes_when_provided() {
-        let db = test_db();
-        let mut item = sample_item();
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_created_at = Some(Utc::now().to_rfc3339());
-        item.hitl_notes = Some("old notes".to_string());
-        db.insert_item(&item).unwrap();
-
-        db.respond_hitl(
-            &item.work_id,
-            QueuePhase::Done,
-            Some("bob"),
-            Some("new notes"),
-        )
-        .unwrap();
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.hitl_notes.as_deref(), Some("new notes"));
     }
 
     // ---- toggle_cron_job tests ---------------------------------------------
@@ -4948,27 +4529,6 @@ mod tests {
         let db = test_db();
         let err = db.update_cron_last_run("nonexistent").unwrap_err();
         assert!(matches!(err, BeltError::ItemNotFound(_)));
-    }
-
-    // ---- set_hitl_timeout additional tests ----------------------------------
-
-    #[test]
-    fn set_hitl_timeout_with_no_terminal_action() {
-        let db = test_db();
-        let mut item = sample_item();
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        db.insert_item(&item).unwrap();
-
-        let timeout_at = (Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
-        db.set_hitl_timeout(&item.work_id, &timeout_at, None)
-            .unwrap();
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(
-            fetched.hitl_timeout_at.as_deref(),
-            Some(timeout_at.as_str())
-        );
-        assert!(fetched.hitl_terminal_action.is_none());
     }
 
     // ---- list_cron_jobs tests -----------------------------------------------
@@ -5640,11 +5200,23 @@ mod tests {
         assert_eq!(owner, None);
     }
 
+    /// Seeds the lineage's replan count the way earlier derivations leave it.
+    fn seed_replan_count(db: &Database, work_id: &str, count: u32) {
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE queue_items SET replan_count = ?1 WHERE work_id = ?2",
+                params![count, work_id],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn derive_inherits_replan_count() {
         let db = test_db();
         let first = inserted_id(collect(&db, "s1", "implement"));
-        db.increment_replan_count(&first).unwrap();
+        seed_replan_count(&db, &first, 1);
         run_to_running(&db, &first);
 
         let DeriveOutcome::Derived { work_id } = db
@@ -5664,7 +5236,7 @@ mod tests {
     fn derive_replan_counts_one_more_lineage_replan() {
         let db = test_db();
         let first = inserted_id(collect(&db, "s1", "implement"));
-        db.increment_replan_count(&first).unwrap();
+        seed_replan_count(&db, &first, 1);
         run_to_running(&db, &first);
         let hitl_id = opened(&db, &first);
         db.resolve_hitl(

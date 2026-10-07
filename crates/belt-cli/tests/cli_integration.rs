@@ -56,10 +56,26 @@ fn insert_hitl_item(db: &Database, work_id: &str) {
         "ws-test".to_string(),
         "implement".to_string(),
     );
-    item.set_phase_unchecked(QueuePhase::Hitl);
-    item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
-    item.hitl_reason = Some(belt_core::queue::HitlReason::EvaluateFailure);
+    item.set_phase_unchecked(QueuePhase::Running);
     db.insert_item(&item).expect("failed to insert HITL item");
+    let outcome = db
+        .open_hitl(&belt_infra::db::OpenHitlRequest {
+            work_id: work_id.to_string(),
+            expected_from: QueuePhase::Running,
+            reason: belt_core::queue::HitlReason::EvaluateFailure,
+            notes: None,
+            actor: belt_core::transition::Actor::Daemon,
+            transition_reason: belt_core::transition::TransitionReason::Escalation(
+                belt_core::escalation::EscalationAction::Hitl,
+            ),
+            timeout_at: None,
+            terminal_action: None,
+        })
+        .expect("failed to open HITL request");
+    assert!(matches!(
+        outcome,
+        belt_infra::db::OpenHitlOutcome::Opened { .. }
+    ));
 }
 
 // ---------------------------------------------------------------------------

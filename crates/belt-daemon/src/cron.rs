@@ -783,18 +783,22 @@ impl DailyReportJob {
             })
             .collect();
 
-        // HITL-waiting items.
-        let hitl_items = self.db.list_items(Some(QueuePhase::Hitl), None)?;
-        let hitl_waiting: Vec<DailyReportHitlItem> = hitl_items
-            .iter()
-            .map(|item| DailyReportHitlItem {
-                work_id: item.work_id.clone(),
-                source_id: item.source_id.clone(),
-                title: item.title.clone(),
-                hitl_created_at: item.hitl_created_at.clone(),
-                hitl_notes: item.hitl_notes.clone(),
+        // Items waiting for a human answer: one entry per open HITL request.
+        let hitl_waiting = self
+            .db
+            .open_hitl_requests()?
+            .into_iter()
+            .map(|request| {
+                let item = self.db.get_item(&request.work_id)?;
+                Ok(DailyReportHitlItem {
+                    work_id: item.work_id,
+                    source_id: item.source_id,
+                    title: item.title,
+                    hitl_created_at: Some(request.opened_at),
+                    hitl_notes: request.notes,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, belt_core::error::BeltError>>()?;
 
         // Token usage stats (last 24 hours).
         let runtime_stats = self.db.get_runtime_stats()?;
@@ -2487,9 +2491,26 @@ mod tests {
 
         let mut hitl1 =
             belt_core::queue::QueueItem::new("h1".into(), "s4".into(), "ws".into(), "st".into());
-        hitl1.set_phase_unchecked(QueuePhase::Hitl);
-        hitl1.hitl_notes = Some("needs review".into());
+        hitl1.set_phase_unchecked(QueuePhase::Running);
         db.insert_item(&hitl1).unwrap();
+        let opened = db
+            .open_hitl(&belt_infra::db::OpenHitlRequest {
+                work_id: "h1".into(),
+                expected_from: QueuePhase::Running,
+                reason: belt_core::queue::HitlReason::EvaluateFailure,
+                notes: Some("needs review".into()),
+                actor: belt_core::transition::Actor::Daemon,
+                transition_reason: belt_core::transition::TransitionReason::Escalation(
+                    belt_core::escalation::EscalationAction::Hitl,
+                ),
+                timeout_at: None,
+                terminal_action: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            opened,
+            belt_infra::db::OpenHitlOutcome::Opened { .. }
+        ));
 
         let job = DailyReportJob::new(Arc::clone(&db), None);
         let ctx = CronContext { now: Utc::now() };
@@ -2503,6 +2524,12 @@ mod tests {
         assert_eq!(report.recent_failures[0].work_id, "f1");
         assert_eq!(report.hitl_waiting.len(), 1);
         assert_eq!(report.hitl_waiting[0].work_id, "h1");
+        assert_eq!(report.hitl_waiting[0].source_id, "s4");
+        assert_eq!(
+            report.hitl_waiting[0].hitl_notes.as_deref(),
+            Some("needs review")
+        );
+        assert!(report.hitl_waiting[0].hitl_created_at.is_some());
     }
 
     #[test]
@@ -3230,59 +3257,6 @@ mod tests {
         let (extracted, skipped) = job.scan_merged_prs(&ctx).unwrap();
         assert_eq!(extracted, 0);
         assert_eq!(skipped, 0);
-    }
-
-    // ---- EvaluateJob sentinel logging and workspace grouping ----------------
-
-    #[test]
-    fn evaluate_job_replan_count_increment() {
-        let db = Arc::new(Database::open_in_memory().unwrap());
-
-        let mut item = belt_core::queue::QueueItem::new(
-            "eval-replan".into(),
-            "src-replan".into(),
-            "ws".into(),
-            "implement".into(),
-        );
-        item.set_phase_unchecked(QueuePhase::Completed);
-        db.insert_item(&item).unwrap();
-
-        let count1 = db.increment_replan_count("eval-replan").unwrap();
-        assert_eq!(count1, 1);
-        let count2 = db.increment_replan_count("eval-replan").unwrap();
-        assert_eq!(count2, 2);
-        let count3 = db.increment_replan_count("eval-replan").unwrap();
-        assert_eq!(count3, 3);
-
-        assert!(count3 >= crate::evaluator::DEFAULT_MAX_EVAL_FAILURES);
-    }
-
-    #[test]
-    fn evaluate_job_hitl_escalation_at_threshold() {
-        let db = Arc::new(Database::open_in_memory().unwrap());
-
-        let mut item = belt_core::queue::QueueItem::new(
-            "eval-hitl".into(),
-            "src-hitl".into(),
-            "ws".into(),
-            "implement".into(),
-        );
-        item.set_phase_unchecked(QueuePhase::Completed);
-        db.insert_item(&item).unwrap();
-
-        for _ in 0..crate::evaluator::DEFAULT_MAX_EVAL_FAILURES {
-            db.increment_replan_count("eval-hitl").unwrap();
-        }
-
-        let result = db.escalate_to_hitl("eval-hitl", "evaluate_failure", "test escalation");
-        assert!(result.is_ok());
-
-        let updated = db.get_item("eval-hitl").unwrap();
-        assert_eq!(updated.phase(), QueuePhase::Hitl);
-        assert_eq!(
-            updated.hitl_reason,
-            Some(belt_core::queue::HitlReason::EvaluateFailure)
-        );
     }
 
     // ---- CronSchedule::parse_expression boundary/edge cases ----------------
