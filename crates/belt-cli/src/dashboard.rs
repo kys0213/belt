@@ -9,9 +9,9 @@
 //! - **PerWorkspace** (`w`): items filtered by a selected workspace
 //! - **Board** (`b`): kanban-style board with columns per queue phase
 //! - **DataSource** (`n`): real-time DataSource connection status panel
-//! - **Scripts** (`x`): script execution statistics with success/fail rates
+//! - **Scripts** (`t`): script execution statistics with success/fail rates
 //!
-//! Tab switching: `d/w/b/n/x` to jump, or `Tab`/`Shift+Tab` to cycle.
+//! Tab switching: `d/w/b/n/t` to jump, or `Tab`/`Shift+Tab` to cycle.
 //! Item selection with arrow keys and item detail overlay (Enter).
 //! Help overlay (`h`) showing all available key bindings.
 //! Scroll positions are preserved per tab.
@@ -34,9 +34,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 
+use belt_core::hitl::{ConfirmPath, HitlAction, HitlStatus, RespondOutcome};
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
-use belt_infra::db::{Database, HistoryEvent, ScriptExecStats, TransitionEvent};
+use belt_daemon::hitl::{HitlResponse, HitlService};
+use belt_infra::db::{
+    Database, HistoryEvent, HitlRequest, HitlTarget, ScriptExecStats, TransitionEvent,
+};
 use belt_infra::workspace_loader::load_workspace_config;
 
 /// Connection status of a DataSource (internal dashboard representation).
@@ -196,6 +200,8 @@ enum OverlayMode {
     Hitl {
         /// Selected index in the HITL items list.
         selected: usize,
+        /// Retry instruction being typed (`r`); `None` outside input mode.
+        retry_input: Option<String>,
     },
 }
 
@@ -280,6 +286,8 @@ struct DashboardState {
     per_ws_kanban_row: usize,
     /// Status filter for PerWorkspace tab.
     status_filter: StatusFilter,
+    /// Result of the last HITL response, shown in the HITL overlay.
+    toast: Option<String>,
 }
 
 impl DashboardState {
@@ -308,6 +316,7 @@ impl DashboardState {
             per_ws_kanban_col: 0,
             per_ws_kanban_row: 0,
             status_filter: StatusFilter::All,
+            toast: None,
         }
     }
 
@@ -344,7 +353,8 @@ pub fn run(db: Arc<Database>) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &db);
+    let service = HitlService::new(db);
+    let result = run_loop(&mut terminal, &service);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -355,8 +365,13 @@ pub fn run(db: Arc<Database>) -> anyhow::Result<()> {
 
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    db: &Database,
+    service: &HitlService,
 ) -> anyhow::Result<()> {
+    let db = service.database();
+    let responder = HitlResponder {
+        service,
+        by: tui_respondent(),
+    };
     let mut state = DashboardState::new();
 
     loop {
@@ -561,8 +576,17 @@ fn run_loop(
                 OverlayMode::ItemDetail(work_id) => {
                     render_item_detail_overlay(frame, db, work_id);
                 }
-                OverlayMode::Hitl { selected } => {
-                    render_hitl_overlay(frame, db, *selected);
+                OverlayMode::Hitl {
+                    selected,
+                    retry_input,
+                } => {
+                    render_hitl_overlay(
+                        frame,
+                        db,
+                        *selected,
+                        retry_input.as_deref(),
+                        state.toast.as_deref(),
+                    );
                 }
             }
         })?;
@@ -572,73 +596,29 @@ fn run_loop(
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            // Handle overlay-specific keys.
-            match &state.overlay {
-                OverlayMode::Help => {
-                    // Help overlay: close on any key.
-                    state.overlay = OverlayMode::None;
-                    continue;
-                }
-                OverlayMode::ItemDetail(_) => {
-                    // Item detail overlay: close on q/Esc.
-                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                        state.overlay = OverlayMode::None;
-                    }
-                    continue;
-                }
-                OverlayMode::Hitl { selected } => {
-                    let hitl_items: Vec<_> = all_items
-                        .iter()
-                        .filter(|i| i.phase() == QueuePhase::Hitl)
-                        .collect();
-                    let count = hitl_items.len();
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            state.overlay = OverlayMode::None;
-                        }
-                        KeyCode::Down | KeyCode::Char('j') if count > 0 => {
-                            state.overlay = OverlayMode::Hitl {
-                                selected: (*selected + 1).min(count.saturating_sub(1)),
-                            };
-                        }
-                        KeyCode::Up | KeyCode::Char('k') if count > 0 => {
-                            state.overlay = OverlayMode::Hitl {
-                                selected: selected.saturating_sub(1),
-                            };
-                        }
-                        KeyCode::Enter => {
-                            // Open the selected HITL item's detail overlay.
-                            if let Some(item) = hitl_items.get(*selected) {
-                                state.overlay = OverlayMode::ItemDetail(item.work_id.clone());
-                            }
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-                OverlayMode::None => {}
+            // An open overlay owns the keyboard: its keys take precedence over the
+            // global ones below.
+            let hitl_work_ids: Vec<String> = all_items
+                .iter()
+                .filter(|i| i.phase() == QueuePhase::Hitl)
+                .map(|i| i.work_id.clone())
+                .collect();
+            if handle_overlay_key(&mut state, key.code, &hitl_work_ids, &responder) {
+                continue;
+            }
+
+            if switch_tab_key(&mut state, key.code) {
+                continue;
             }
 
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                // Tab switching keys: letter keys for direct jump.
-                KeyCode::Char('d') => {
-                    state.active_tab = DashboardTab::Dashboard;
-                }
-                KeyCode::Char('w') => {
-                    state.active_tab = DashboardTab::PerWorkspace;
-                }
-                KeyCode::Char('b') => {
-                    state.active_tab = DashboardTab::Board;
-                }
-                KeyCode::Char('n') => {
-                    state.active_tab = DashboardTab::DataSource;
-                }
-                KeyCode::Char('x') => {
-                    state.active_tab = DashboardTab::Scripts;
-                }
                 KeyCode::Char('h') => {
-                    state.overlay = OverlayMode::Hitl { selected: 0 };
+                    state.toast = None;
+                    state.overlay = OverlayMode::Hitl {
+                        selected: 0,
+                        retry_input: None,
+                    };
                 }
                 KeyCode::Char('?') => {
                     state.overlay = OverlayMode::Help;
@@ -705,6 +685,216 @@ fn run_loop(
             }
         }
     }
+}
+
+/// Path label recorded as `via` for responses given in the dashboard.
+const TUI_VIA: &str = "tui";
+
+/// Respondent recorded as `by`: `$USER`, or `tui` when it is unset or empty.
+fn tui_respondent() -> String {
+    std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| TUI_VIA.to_string())
+}
+
+/// Sends HITL responses given in the overlay through the shared first-wins contract.
+struct HitlResponder<'a> {
+    service: &'a HitlService,
+    by: String,
+}
+
+impl HitlResponder<'_> {
+    /// Respond to the current request of `work_id` and describe the result.
+    fn respond(&self, work_id: &str, action: HitlAction, notes: Option<String>) -> String {
+        let response = HitlResponse {
+            target: HitlTarget::Item(work_id.to_string()),
+            action,
+            by: self.by.clone(),
+            via: TUI_VIA.to_string(),
+            path: ConfirmPath::Direct,
+            notes,
+        };
+        match self.service.respond(&response) {
+            Ok(outcome) => describe_respond_outcome(work_id, action, &outcome),
+            Err(e) => format!("error: {work_id}: {e}"),
+        }
+    }
+}
+
+/// One-line toast text for a response attempt.
+fn describe_respond_outcome(work_id: &str, action: HitlAction, outcome: &RespondOutcome) -> String {
+    match outcome {
+        RespondOutcome::Won { .. } => format!("{work_id}: {action} 응답 확정 - 해결됨 · 처리 중"),
+        RespondOutcome::AlreadyHandled(winner) => format!(
+            "already_handled: {work_id} 는 이미 {} 가 {} 로 {} 응답함 ({})",
+            winner.by,
+            winner.via,
+            winner.action,
+            format_transition_time(&winner.at),
+        ),
+        RespondOutcome::NotFound => format!("not_found: {work_id} 에 응답할 HITL 요청이 없음"),
+        RespondOutcome::InvalidAction => {
+            format!("invalid_action: {work_id} 에 {action} 응답을 적용할 수 없음")
+        }
+        RespondOutcome::Unauthorized => format!("unauthorized: {work_id} 에 응답할 권한이 없음"),
+    }
+}
+
+/// Handle a key while an overlay is open. Returns `true` when an overlay
+/// consumed the key; the global keys must then be skipped.
+///
+/// `hitl_work_ids` lists the items in the HITL phase in overlay order.
+fn handle_overlay_key(
+    state: &mut DashboardState,
+    code: KeyCode,
+    hitl_work_ids: &[String],
+    responder: &HitlResponder<'_>,
+) -> bool {
+    match state.overlay.clone() {
+        OverlayMode::None => false,
+        OverlayMode::Help => {
+            state.overlay = OverlayMode::None;
+            true
+        }
+        OverlayMode::ItemDetail(_) => {
+            if matches!(code, KeyCode::Char('q') | KeyCode::Esc) {
+                state.overlay = OverlayMode::None;
+            }
+            true
+        }
+        OverlayMode::Hitl {
+            selected,
+            retry_input,
+        } => {
+            handle_hitl_overlay_key(state, code, selected, retry_input, hitl_work_ids, responder);
+            true
+        }
+    }
+}
+
+fn handle_hitl_overlay_key(
+    state: &mut DashboardState,
+    code: KeyCode,
+    selected: usize,
+    retry_input: Option<String>,
+    hitl_work_ids: &[String],
+    responder: &HitlResponder<'_>,
+) {
+    let count = hitl_work_ids.len();
+    let selected_id = hitl_work_ids.get(selected);
+
+    if let Some(mut input) = retry_input {
+        match code {
+            KeyCode::Esc => {
+                state.overlay = OverlayMode::Hitl {
+                    selected,
+                    retry_input: None,
+                };
+            }
+            KeyCode::Enter => {
+                if let Some(work_id) = selected_id {
+                    let notes = (!input.trim().is_empty()).then(|| input.trim().to_string());
+                    state.toast = Some(responder.respond(work_id, HitlAction::Retry, notes));
+                }
+                state.overlay = OverlayMode::Hitl {
+                    selected,
+                    retry_input: None,
+                };
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                state.overlay = OverlayMode::Hitl {
+                    selected,
+                    retry_input: Some(input),
+                };
+            }
+            KeyCode::Char(c) => {
+                input.push(c);
+                state.overlay = OverlayMode::Hitl {
+                    selected,
+                    retry_input: Some(input),
+                };
+            }
+            _ => {
+                state.overlay = OverlayMode::Hitl {
+                    selected,
+                    retry_input: Some(input),
+                };
+            }
+        }
+        return;
+    }
+
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            state.toast = None;
+            state.overlay = OverlayMode::None;
+        }
+        KeyCode::Down | KeyCode::Char('j') if count > 0 => {
+            state.overlay = OverlayMode::Hitl {
+                selected: (selected + 1).min(count - 1),
+                retry_input: None,
+            };
+        }
+        KeyCode::Up | KeyCode::Char('k') if count > 0 => {
+            state.overlay = OverlayMode::Hitl {
+                selected: selected.saturating_sub(1),
+                retry_input: None,
+            };
+        }
+        KeyCode::Enter => {
+            if let Some(work_id) = selected_id {
+                state.overlay = OverlayMode::ItemDetail(work_id.clone());
+            }
+        }
+        KeyCode::Char('r') if selected_id.is_some() => {
+            state.overlay = OverlayMode::Hitl {
+                selected,
+                retry_input: Some(String::new()),
+            };
+        }
+        KeyCode::Char(c @ ('d' | 's' | 'p')) => {
+            let action = match c {
+                'd' => HitlAction::Done,
+                's' => HitlAction::Skip,
+                _ => HitlAction::Replan,
+            };
+            if let Some(work_id) = selected_id {
+                state.toast = Some(responder.respond(work_id, action, None));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Jump to a tab by its letter key. Returns `true` when the key was a tab key.
+///
+/// `x` is reserved for cancelling a running item and switches nothing.
+fn switch_tab_key(state: &mut DashboardState, code: KeyCode) -> bool {
+    let tab = match code {
+        KeyCode::Char('d') => DashboardTab::Dashboard,
+        KeyCode::Char('w') => DashboardTab::PerWorkspace,
+        KeyCode::Char('b') => DashboardTab::Board,
+        KeyCode::Char('n') => DashboardTab::DataSource,
+        KeyCode::Char('t') => DashboardTab::Scripts,
+        _ => return false,
+    };
+    state.active_tab = tab;
+    true
+}
+
+/// Requests that currently decide what an item in Hitl shows: the open one,
+/// else the confirmed one still waiting for post-processing.
+fn current_hitl_requests(db: &Database) -> HashMap<String, HitlRequest> {
+    let mut by_work_id = HashMap::new();
+    for request in db.pending_post_processing().unwrap_or_default() {
+        by_work_id.insert(request.work_id.clone(), request);
+    }
+    for request in db.open_hitl_requests().unwrap_or_default() {
+        by_work_id.insert(request.work_id.clone(), request);
+    }
+    by_work_id
 }
 
 /// Handle Up/k navigation.
@@ -890,7 +1080,7 @@ fn render_tab_bar(active: DashboardTab) -> Paragraph<'static> {
         ("w", "Workspace", DashboardTab::PerWorkspace),
         ("b", "Board", DashboardTab::Board),
         ("n", "DataSource", DashboardTab::DataSource),
-        ("x", "Scripts", DashboardTab::Scripts),
+        ("t", "Scripts", DashboardTab::Scripts),
     ];
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -2070,7 +2260,7 @@ fn render_help_overlay(frame: &mut ratatui::Frame) {
             Span::raw("Switch to DataSource status tab"),
         ]),
         Line::from(vec![
-            Span::styled("  x       ", Style::default().fg(Color::Yellow)),
+            Span::styled("  t       ", Style::default().fg(Color::Yellow)),
             Span::raw("Switch to Scripts statistics tab"),
         ]),
         Line::from(vec![
@@ -2157,8 +2347,14 @@ fn render_item_detail_overlay(frame: &mut ratatui::Frame, db: &Database, work_id
         .and_then(|sid| db.get_history(sid).ok())
         .unwrap_or_default();
 
-    let lines =
-        build_detail_lines_with_history(work_id, item.ok().as_ref(), &transitions, &history);
+    let hitl = current_hitl_requests(db).remove(work_id);
+    let lines = build_detail_lines_with_history(
+        work_id,
+        item.ok().as_ref(),
+        &transitions,
+        &history,
+        hitl.as_ref(),
+    );
 
     let paragraph = Paragraph::new(lines).block(
         Block::default()
@@ -2180,7 +2376,7 @@ fn build_detail_lines<'a>(
     item: Option<&QueueItem>,
     transitions: &[TransitionEvent],
 ) -> Vec<Line<'a>> {
-    build_detail_lines_with_history(work_id, item, transitions, &[])
+    build_detail_lines_with_history(work_id, item, transitions, &[], None)
 }
 
 /// Build the text lines for the item detail overlay with judgment history.
@@ -2192,6 +2388,7 @@ fn build_detail_lines_with_history<'a>(
     item: Option<&QueueItem>,
     transitions: &[TransitionEvent],
     history: &[HistoryEvent],
+    hitl: Option<&HitlRequest>,
 ) -> Vec<Line<'a>> {
     let mut lines: Vec<Line<'a>> = Vec::new();
 
@@ -2237,11 +2434,7 @@ fn build_detail_lines_with_history<'a>(
                 Span::raw(item.updated_at.clone()),
             ]));
 
-            // HITL details (if present).
-            if item.hitl_created_at.is_some()
-                || item.hitl_reason.is_some()
-                || item.hitl_notes.is_some()
-            {
+            if let Some(request) = hitl {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "HITL Details:",
@@ -2249,37 +2442,53 @@ fn build_detail_lines_with_history<'a>(
                         .add_modifier(Modifier::BOLD)
                         .fg(Color::Yellow),
                 )));
-                if let Some(ref hitl_at) = item.hitl_created_at {
+                let label = |text: &'static str| {
+                    Span::styled(text, Style::default().add_modifier(Modifier::BOLD))
+                };
+                lines.push(Line::from(vec![
+                    label("  Status: "),
+                    Span::raw(hitl_status_label(request)),
+                ]));
+                lines.push(Line::from(vec![
+                    label("  Entered: "),
+                    Span::raw(request.opened_at.clone()),
+                ]));
+                if let Some(ref reason) = request.reason {
                     lines.push(Line::from(vec![
-                        Span::styled("  Entered: ", Style::default().add_modifier(Modifier::BOLD)),
-                        Span::raw(hitl_at.clone()),
-                    ]));
-                }
-                if let Some(ref reason) = item.hitl_reason {
-                    lines.push(Line::from(vec![
-                        Span::styled("  Reason: ", Style::default().add_modifier(Modifier::BOLD)),
+                        label("  Reason: "),
                         Span::raw(reason.to_string()),
                     ]));
                 }
-                if let Some(ref respondent) = item.hitl_respondent {
+                if let Some(ref notes) = request.notes {
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            "  Respondent: ",
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(respondent.clone()),
-                    ]));
-                }
-                if let Some(ref notes) = item.hitl_notes {
-                    lines.push(Line::from(vec![
-                        Span::styled("  Notes: ", Style::default().add_modifier(Modifier::BOLD)),
+                        label("  Notes: "),
                         Span::raw(notes.clone()),
                     ]));
                 }
-                if let Some(ref timeout) = item.hitl_timeout_at {
+                if let Some(ref timeout) = request.timeout_at {
                     lines.push(Line::from(vec![
-                        Span::styled("  Timeout: ", Style::default().add_modifier(Modifier::BOLD)),
+                        label("  Timeout: "),
                         Span::raw(timeout.clone()),
+                    ]));
+                }
+                if let Some(ref resolution) = request.resolution {
+                    lines.push(Line::from(vec![
+                        label("  Respondent: "),
+                        Span::raw(format!("{} via {}", resolution.by, resolution.via)),
+                    ]));
+                    lines.push(Line::from(vec![
+                        label("  Action: "),
+                        Span::raw(resolution.action.to_string()),
+                    ]));
+                    lines.push(Line::from(vec![
+                        label("  Resolved: "),
+                        Span::raw(resolution.at.clone()),
+                    ]));
+                }
+                if let Some(ref notes) = request.resolution_notes {
+                    lines.push(Line::from(vec![
+                        label("  Response notes: "),
+                        Span::raw(notes.clone()),
                     ]));
                 }
             }
@@ -2412,7 +2621,13 @@ fn build_detail_lines_with_history<'a>(
 /// Displays a centered popup with a list of HITL items showing their
 /// work ID, title, reason, and entry time. Users can navigate the list
 /// with j/k and press Enter to view item details.
-fn render_hitl_overlay(frame: &mut ratatui::Frame, db: &Database, selected: usize) {
+fn render_hitl_overlay(
+    frame: &mut ratatui::Frame,
+    db: &Database,
+    selected: usize,
+    retry_input: Option<&str>,
+    toast: Option<&str>,
+) {
     let area = centered_rect(70, 75, frame.area());
     frame.render_widget(Clear, area);
 
@@ -2420,7 +2635,8 @@ fn render_hitl_overlay(frame: &mut ratatui::Frame, db: &Database, selected: usiz
         .list_items(Some(QueuePhase::Hitl), None)
         .unwrap_or_default();
 
-    let lines = build_hitl_overlay_lines(&hitl_items, selected);
+    let requests = current_hitl_requests(db);
+    let lines = build_hitl_overlay_lines(&hitl_items, &requests, selected, retry_input, toast);
 
     let paragraph = Paragraph::new(lines).block(
         Block::default()
@@ -2433,7 +2649,16 @@ fn render_hitl_overlay(frame: &mut ratatui::Frame, db: &Database, selected: usiz
 }
 
 /// Build the text lines for the HITL overlay.
-fn build_hitl_overlay_lines(hitl_items: &[QueueItem], selected: usize) -> Vec<Line<'static>> {
+///
+/// Each item shows its `hitl_requests` row; a confirmed request shows
+/// `해결됨 · 처리 중` until the daemon finishes post-processing.
+fn build_hitl_overlay_lines(
+    hitl_items: &[QueueItem],
+    requests: &HashMap<String, HitlRequest>,
+    selected: usize,
+    retry_input: Option<&str>,
+    toast: Option<&str>,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     lines.push(Line::from(Span::styled(
@@ -2476,52 +2701,106 @@ fn build_hitl_overlay_lines(hitl_items: &[QueueItem], selected: usize) -> Vec<Li
 
             // Indented detail lines.
             let detail_indent = "    ";
-            if let Some(ref reason) = item.hitl_reason {
+            let request = requests.get(&item.work_id);
+            if let Some(request) = request {
                 lines.push(Line::from(vec![
                     Span::raw(detail_indent.to_string()),
-                    Span::styled("Reason: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled(reason.to_string(), Style::default().fg(Color::Red)),
+                    Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        hitl_status_label(request),
+                        Style::default().fg(Color::Magenta),
+                    ),
                 ]));
-            }
-            if let Some(ref hitl_at) = item.hitl_created_at {
-                let time_display = format_transition_time(hitl_at);
+                if let Some(ref reason) = request.reason {
+                    lines.push(Line::from(vec![
+                        Span::raw(detail_indent.to_string()),
+                        Span::styled("Reason: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::styled(reason.to_string(), Style::default().fg(Color::Red)),
+                    ]));
+                }
                 lines.push(Line::from(vec![
                     Span::raw(detail_indent.to_string()),
                     Span::styled("Entered: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled(time_display, Style::default().fg(Color::DarkGray)),
-                ]));
-            }
-            if let Some(ref notes) = item.hitl_notes {
-                lines.push(Line::from(vec![
-                    Span::raw(detail_indent.to_string()),
-                    Span::styled("Notes: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(notes.clone()),
-                ]));
-            }
-            if let Some(ref timeout) = item.hitl_timeout_at {
-                let time_display = format_transition_time(timeout);
-                lines.push(Line::from(vec![
-                    Span::raw(detail_indent.to_string()),
-                    Span::styled("Timeout: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled(time_display, Style::default().fg(Color::DarkGray)),
-                ]));
-            }
-
-            if is_selected {
-                lines.push(Line::from(vec![
-                    Span::raw(detail_indent.to_string()),
-                    Span::styled("Actions: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled("[Enter] ", Style::default().fg(Color::Green)),
-                    Span::raw("View details  "),
                     Span::styled(
-                        "Use `belt hitl approve/reject/modify` to respond",
+                        format_transition_time(&request.opened_at),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
+                if let Some(ref notes) = request.notes {
+                    lines.push(Line::from(vec![
+                        Span::raw(detail_indent.to_string()),
+                        Span::styled("Notes: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(notes.clone()),
+                    ]));
+                }
+                if let Some(ref timeout) = request.timeout_at {
+                    lines.push(Line::from(vec![
+                        Span::raw(detail_indent.to_string()),
+                        Span::styled("Timeout: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            format_transition_time(timeout),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+                if let Some(ref resolution) = request.resolution {
+                    lines.push(Line::from(vec![
+                        Span::raw(detail_indent.to_string()),
+                        Span::styled("Answered: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(format!(
+                            "{} by {} via {}",
+                            resolution.action, resolution.by, resolution.via
+                        )),
+                    ]));
+                }
+            }
+
+            if is_selected {
+                let answerable = request.is_none_or(|r| r.status == HitlStatus::Open);
+                let mut actions = vec![
+                    Span::raw(detail_indent.to_string()),
+                    Span::styled("Actions: ", Style::default().add_modifier(Modifier::BOLD)),
+                ];
+                if answerable {
+                    for (key, label) in [
+                        ("[d] ", "done  "),
+                        ("[r] ", "retry  "),
+                        ("[s] ", "skip  "),
+                        ("[p] ", "replan  "),
+                    ] {
+                        actions.push(Span::styled(key, Style::default().fg(Color::Green)));
+                        actions.push(Span::raw(label));
+                    }
+                }
+                actions.push(Span::styled("[Enter] ", Style::default().fg(Color::Green)));
+                actions.push(Span::raw("View details"));
+                lines.push(Line::from(actions));
             }
 
             lines.push(Line::from(""));
         }
+    }
+
+    if let Some(input) = retry_input {
+        lines.push(Line::from(vec![
+            Span::styled("retry 지시> ", Style::default().fg(Color::Yellow)),
+            Span::raw(input.to_string()),
+            Span::styled("_", Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("[Enter] ", Style::default().fg(Color::Green)),
+            Span::raw("Send  "),
+            Span::styled("[Esc] ", Style::default().fg(Color::Red)),
+            Span::raw("Cancel input"),
+        ]));
+        return lines;
+    }
+    if let Some(toast) = toast {
+        lines.push(Line::from(Span::styled(
+            toast.to_string(),
+            Style::default().fg(Color::Magenta),
+        )));
+        lines.push(Line::from(""));
     }
 
     lines.push(Line::from(vec![
@@ -2534,6 +2813,15 @@ fn build_hitl_overlay_lines(hitl_items: &[QueueItem], selected: usize) -> Vec<Li
     ]));
 
     lines
+}
+
+/// Status text of a request: open, or confirmed and waiting for the daemon.
+fn hitl_status_label(request: &HitlRequest) -> &'static str {
+    match request.status {
+        HitlStatus::Open => "대기 중",
+        HitlStatus::Resolved => "해결됨 · 처리 중",
+        HitlStatus::Expired => "만료됨 · 처리 중",
+    }
 }
 
 /// Format an RFC 3339 timestamp to a shorter display form.
@@ -2867,6 +3155,7 @@ fn format_number(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use belt_core::hitl::HitlId;
     use belt_infra::db::RuntimeStats;
 
     use super::*;
@@ -4270,24 +4559,46 @@ mod tests {
     }
 
     #[test]
-    fn build_detail_lines_shows_hitl_details() {
+    fn build_detail_lines_shows_hitl_details_from_request() {
+        let db = make_db();
+        let hitl_id = open_hitl_item(&db, "src1", Some("needs review"));
+        let request = db.hitl_request(&hitl_id).unwrap().unwrap();
+        let mut item = QueueItem::new(
+            request.work_id.clone(),
+            "src1".to_string(),
+            "ws1".to_string(),
+            "analyze".to_string(),
+        );
+        // Legacy columns must not be shown.
+        item.hitl_notes = Some("legacy notes".to_string());
+
+        let lines = build_detail_lines_with_history(
+            &request.work_id,
+            Some(&item),
+            &[],
+            &[],
+            Some(&request),
+        );
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+        assert!(text.contains("HITL Details:"));
+        assert!(text.contains("Entered:"));
+        assert!(text.contains("evaluate_failure"));
+        assert!(text.contains("needs review"));
+        assert!(!text.contains("legacy notes"));
+    }
+
+    #[test]
+    fn build_detail_lines_hides_hitl_section_without_request() {
         let mut item = QueueItem::new(
             "w1".to_string(),
             "src1".to_string(),
             "ws1".to_string(),
             "analyze".to_string(),
         );
-        item.hitl_created_at = Some("2026-03-25T10:00:00Z".to_string());
-        item.hitl_reason = Some(belt_core::queue::HitlReason::RetryMaxExceeded);
-        item.hitl_notes = Some("needs review".to_string());
-
+        item.hitl_notes = Some("legacy notes".to_string());
         let lines = build_detail_lines("w1", Some(&item), &[]);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
-        assert!(text.contains("HITL Details:"));
-        assert!(text.contains("Entered:"));
-        assert!(text.contains("Reason:"));
-        assert!(text.contains("Notes:"));
-        assert!(text.contains("needs review"));
+        assert!(!text.contains("HITL Details:"));
     }
 
     #[test]
@@ -4351,8 +4662,11 @@ mod tests {
     #[test]
     fn overlay_mode_hitl_preserves_selected() {
         let mut state = DashboardState::new();
-        state.overlay = OverlayMode::Hitl { selected: 3 };
-        if let OverlayMode::Hitl { selected } = state.overlay {
+        state.overlay = OverlayMode::Hitl {
+            selected: 3,
+            retry_input: None,
+        };
+        if let OverlayMode::Hitl { selected, .. } = state.overlay {
             assert_eq!(selected, 3);
         } else {
             panic!("Expected Hitl overlay");
@@ -4363,7 +4677,7 @@ mod tests {
 
     #[test]
     fn build_hitl_overlay_lines_empty() {
-        let lines = build_hitl_overlay_lines(&[], 0);
+        let lines = build_hitl_overlay_lines(&[], &HashMap::new(), 0, None, None);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
         assert!(text.contains("no items in HITL phase"));
         assert!(text.contains("Awaiting Human Review"));
@@ -4379,8 +4693,6 @@ mod tests {
         );
         item1.set_phase_unchecked(QueuePhase::Hitl);
         item1.title = Some("Fix auth bug".to_string());
-        item1.hitl_reason = Some(belt_core::queue::HitlReason::RetryMaxExceeded);
-        item1.hitl_created_at = Some("2026-03-25T10:00:00Z".to_string());
 
         let mut item2 = QueueItem::new(
             "w2".to_string(),
@@ -4390,7 +4702,12 @@ mod tests {
         );
         item2.set_phase_unchecked(QueuePhase::Hitl);
 
-        let lines = build_hitl_overlay_lines(&[item1, item2], 0);
+        let db = make_db();
+        let hitl_id = open_hitl_item(&db, "src1", None);
+        let request = db.hitl_request(&hitl_id).unwrap().unwrap();
+        let requests = HashMap::from([("w1".to_string(), request)]);
+
+        let lines = build_hitl_overlay_lines(&[item1, item2], &requests, 0, None, None);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
         assert!(text.contains("2 item(s) pending review"));
         assert!(text.contains("w1"));
@@ -4411,10 +4728,416 @@ mod tests {
         );
         item.set_phase_unchecked(QueuePhase::Hitl);
 
-        let lines = build_hitl_overlay_lines(&[item], 0);
+        let lines = build_hitl_overlay_lines(&[item], &HashMap::new(), 0, None, None);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
         // Selected item should show actions.
         assert!(text.contains("View details"));
+    }
+
+    // ---- HITL overlay responses ----
+
+    /// Collect an item, move it to Running and open a HITL request for it.
+    fn open_hitl_item(db: &Database, source: &str, notes: Option<&str>) -> HitlId {
+        use belt_core::queue::HitlReason;
+        use belt_core::transition::{
+            Actor, TransitionOutcome, TransitionReason, TransitionRequest,
+        };
+        use belt_infra::db::{CollectOutcome, NewItem, OpenHitlOutcome, OpenHitlRequest};
+
+        let CollectOutcome::Inserted { work_id } = db
+            .insert_collected(&NewItem {
+                source_id: format!("github:org/repo#{source}"),
+                workspace_id: "ws1".to_string(),
+                state: "analyze".to_string(),
+                title: None,
+                actor: Actor::Daemon,
+            })
+            .unwrap()
+        else {
+            panic!("expected a new item");
+        };
+        for (from, to) in [
+            (QueuePhase::Pending, QueuePhase::Ready),
+            (QueuePhase::Ready, QueuePhase::Running),
+        ] {
+            let outcome = db
+                .transition(&TransitionRequest {
+                    work_id: work_id.clone(),
+                    expected_from: from,
+                    to,
+                    actor: Actor::Daemon,
+                    reason: TransitionReason::Manual,
+                    detail: None,
+                })
+                .unwrap();
+            assert!(matches!(outcome, TransitionOutcome::Applied { .. }));
+        }
+        let OpenHitlOutcome::Opened { hitl_id, .. } = db
+            .open_hitl(&OpenHitlRequest {
+                work_id,
+                expected_from: QueuePhase::Running,
+                reason: HitlReason::EvaluateFailure,
+                notes: notes.map(str::to_string),
+                actor: Actor::Daemon,
+                transition_reason: TransitionReason::Escalation(
+                    belt_core::escalation::EscalationAction::Hitl,
+                ),
+                timeout_at: None,
+                terminal_action: None,
+            })
+            .unwrap()
+        else {
+            panic!("expected the request to open");
+        };
+        hitl_id
+    }
+
+    fn hitl_state() -> DashboardState {
+        let mut state = DashboardState::new();
+        state.overlay = OverlayMode::Hitl {
+            selected: 0,
+            retry_input: None,
+        };
+        state
+    }
+
+    fn responder_for<'a>(service: &'a HitlService, by: &str) -> HitlResponder<'a> {
+        HitlResponder {
+            service,
+            by: by.to_string(),
+        }
+    }
+
+    fn press(
+        state: &mut DashboardState,
+        code: KeyCode,
+        ids: &[String],
+        responder: &HitlResponder<'_>,
+    ) -> bool {
+        handle_overlay_key(state, code, ids, responder)
+    }
+
+    #[test]
+    fn overlay_open_d_responds_done_without_switching_tab() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let hitl_id = open_hitl_item(service.database(), "1", None);
+        let work_id = service
+            .database()
+            .hitl_request(&hitl_id)
+            .unwrap()
+            .unwrap()
+            .work_id;
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+        state.active_tab = DashboardTab::Board;
+
+        let consumed = press(&mut state, KeyCode::Char('d'), &[work_id], &responder);
+
+        assert!(consumed);
+        assert_eq!(state.active_tab, DashboardTab::Board);
+        let request = service.database().hitl_request(&hitl_id).unwrap().unwrap();
+        assert_eq!(request.status, HitlStatus::Resolved);
+        let resolution = request.resolution.unwrap();
+        assert_eq!(resolution.action, HitlAction::Done);
+        assert_eq!(resolution.by, "alice");
+        assert_eq!(resolution.via, "tui");
+        assert!(state.toast.as_deref().unwrap().contains("해결됨 · 처리 중"));
+    }
+
+    #[test]
+    fn overlay_closed_d_keeps_global_tab_behavior() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let responder = responder_for(&service, "alice");
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Board;
+
+        assert!(!press(&mut state, KeyCode::Char('d'), &[], &responder));
+        assert!(switch_tab_key(&mut state, KeyCode::Char('d')));
+        assert_eq!(state.active_tab, DashboardTab::Dashboard);
+    }
+
+    #[test]
+    fn overlay_open_r_starts_retry_input_not_refresh() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let hitl_id = open_hitl_item(service.database(), "1", None);
+        let work_id = service
+            .database()
+            .hitl_request(&hitl_id)
+            .unwrap()
+            .unwrap()
+            .work_id;
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+        let ids = [work_id];
+
+        assert!(press(&mut state, KeyCode::Char('r'), &ids, &responder));
+        assert_eq!(
+            state.overlay,
+            OverlayMode::Hitl {
+                selected: 0,
+                retry_input: Some(String::new())
+            }
+        );
+        // Typing is text, not commands: `d` and `q` must not respond or close.
+        for c in ['f', 'i', 'x', 'd', 'q'] {
+            press(&mut state, KeyCode::Char(c), &ids, &responder);
+        }
+        assert_eq!(
+            service
+                .database()
+                .hitl_request(&hitl_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            HitlStatus::Open
+        );
+        press(&mut state, KeyCode::Enter, &ids, &responder);
+
+        let request = service.database().hitl_request(&hitl_id).unwrap().unwrap();
+        let resolution = request.resolution.clone().unwrap();
+        assert_eq!(resolution.action, HitlAction::Retry);
+        assert_eq!(request.resolution_notes.as_deref(), Some("fixdq"));
+        assert_eq!(
+            state.overlay,
+            OverlayMode::Hitl {
+                selected: 0,
+                retry_input: None
+            }
+        );
+    }
+
+    #[test]
+    fn overlay_retry_input_esc_cancels_without_responding() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let hitl_id = open_hitl_item(service.database(), "1", None);
+        let work_id = service
+            .database()
+            .hitl_request(&hitl_id)
+            .unwrap()
+            .unwrap()
+            .work_id;
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+        let ids = [work_id];
+
+        press(&mut state, KeyCode::Char('r'), &ids, &responder);
+        press(&mut state, KeyCode::Esc, &ids, &responder);
+
+        assert!(matches!(
+            state.overlay,
+            OverlayMode::Hitl {
+                retry_input: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            service
+                .database()
+                .hitl_request(&hitl_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            HitlStatus::Open
+        );
+    }
+
+    #[test]
+    fn overlay_s_and_p_respond_skip_and_replan() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let first = open_hitl_item(service.database(), "1", None);
+        let second = open_hitl_item(service.database(), "2", None);
+        let ids: Vec<String> = [&first, &second]
+            .iter()
+            .map(|id| {
+                service
+                    .database()
+                    .hitl_request(id)
+                    .unwrap()
+                    .unwrap()
+                    .work_id
+            })
+            .collect();
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+
+        press(&mut state, KeyCode::Char('s'), &ids, &responder);
+        press(&mut state, KeyCode::Char('j'), &ids, &responder);
+        press(&mut state, KeyCode::Char('p'), &ids, &responder);
+
+        let action_of = |id: &HitlId| {
+            service
+                .database()
+                .hitl_request(id)
+                .unwrap()
+                .unwrap()
+                .resolution
+                .unwrap()
+                .action
+        };
+        assert_eq!(action_of(&first), HitlAction::Skip);
+        assert_eq!(action_of(&second), HitlAction::Replan);
+    }
+
+    #[test]
+    fn overlay_late_response_shows_already_handled() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let hitl_id = open_hitl_item(service.database(), "1", None);
+        let work_id = service
+            .database()
+            .hitl_request(&hitl_id)
+            .unwrap()
+            .unwrap()
+            .work_id;
+        let ids = [work_id.clone()];
+        let mut state = hitl_state();
+        service
+            .respond(&HitlResponse {
+                target: HitlTarget::Item(work_id),
+                action: HitlAction::Skip,
+                by: "bob".to_string(),
+                via: "cli".to_string(),
+                path: ConfirmPath::Direct,
+                notes: None,
+            })
+            .unwrap();
+
+        press(
+            &mut state,
+            KeyCode::Char('d'),
+            &ids,
+            &responder_for(&service, "alice"),
+        );
+
+        let toast = state.toast.unwrap();
+        assert!(toast.contains("already_handled"), "{toast}");
+        assert!(toast.contains("bob"), "{toast}");
+        assert!(toast.contains("cli"), "{toast}");
+        assert!(toast.contains("skip"), "{toast}");
+        let request = service.database().hitl_request(&hitl_id).unwrap().unwrap();
+        assert_eq!(request.resolution.unwrap().action, HitlAction::Skip);
+    }
+
+    #[test]
+    fn overlay_response_to_item_without_request_shows_not_found() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+
+        press(
+            &mut state,
+            KeyCode::Char('d'),
+            &["missing".to_string()],
+            &responder,
+        );
+
+        assert!(state.toast.unwrap().contains("not_found"));
+    }
+
+    #[test]
+    fn overlay_action_keys_without_items_do_nothing() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+
+        for c in ['d', 'r', 's', 'p'] {
+            assert!(press(&mut state, KeyCode::Char(c), &[], &responder));
+        }
+
+        assert!(state.toast.is_none());
+        assert_eq!(state.overlay, hitl_state().overlay);
+    }
+
+    #[test]
+    fn overlay_esc_closes_and_clears_toast() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+        state.toast = Some("old".to_string());
+
+        assert!(press(&mut state, KeyCode::Esc, &[], &responder));
+
+        assert_eq!(state.overlay, OverlayMode::None);
+        assert!(state.toast.is_none());
+    }
+
+    #[test]
+    fn overlay_lists_resolved_request_as_processing() {
+        let db = make_db();
+        let service = HitlService::new(Arc::new(db));
+        let hitl_id = open_hitl_item(service.database(), "1", Some("check logs"));
+        let work_id = service
+            .database()
+            .hitl_request(&hitl_id)
+            .unwrap()
+            .unwrap()
+            .work_id;
+        press(
+            &mut hitl_state(),
+            KeyCode::Char('d'),
+            std::slice::from_ref(&work_id),
+            &responder_for(&service, "alice"),
+        );
+
+        let items = service
+            .database()
+            .list_items(Some(QueuePhase::Hitl), None)
+            .unwrap();
+        let requests = current_hitl_requests(service.database());
+        let lines = build_hitl_overlay_lines(&items, &requests, 0, None, None);
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+
+        assert!(text.contains("해결됨 · 처리 중"), "{text}");
+        assert!(text.contains("check logs"), "{text}");
+        assert!(!text.contains("belt hitl approve"));
+    }
+
+    #[test]
+    fn overlay_lines_show_toast_and_retry_prompt() {
+        let toast = build_hitl_overlay_lines(&[], &HashMap::new(), 0, None, Some("hello toast"));
+        let text: String = toast.iter().map(|l| format!("{l}")).collect();
+        assert!(text.contains("hello toast"));
+
+        let prompt = build_hitl_overlay_lines(&[], &HashMap::new(), 0, Some("typed"), None);
+        let text: String = prompt.iter().map(|l| format!("{l}")).collect();
+        assert!(text.contains("typed"));
+    }
+
+    // ---- tab keys ----
+
+    #[test]
+    fn t_jumps_to_scripts_tab() {
+        let mut state = DashboardState::new();
+        assert!(switch_tab_key(&mut state, KeyCode::Char('t')));
+        assert_eq!(state.active_tab, DashboardTab::Scripts);
+    }
+
+    #[test]
+    fn x_does_not_switch_tab() {
+        let mut state = DashboardState::new();
+        assert!(!switch_tab_key(&mut state, KeyCode::Char('x')));
+        assert_eq!(state.active_tab, DashboardTab::Dashboard);
+    }
+
+    #[test]
+    fn tab_bar_labels_scripts_with_t() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 3)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(render_tab_bar(DashboardTab::Dashboard), frame.area())
+            })
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("[t] Scripts"), "{rendered}");
+        assert!(!rendered.contains("[x]"), "{rendered}");
     }
 
     // ---- build_detail_lines_with_history ----
@@ -4450,7 +5173,7 @@ mod tests {
             },
         ];
 
-        let lines = build_detail_lines_with_history("w1", Some(&item), &[], &history);
+        let lines = build_detail_lines_with_history("w1", Some(&item), &[], &history, None);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
         assert!(text.contains("Judgment History:"));
         assert!(text.contains("[analyze]"));
@@ -4471,7 +5194,7 @@ mod tests {
             "analyze".to_string(),
         );
 
-        let lines = build_detail_lines_with_history("w1", Some(&item), &[], &[]);
+        let lines = build_detail_lines_with_history("w1", Some(&item), &[], &[], None);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
         // Should not contain the Judgment History header when empty.
         assert!(!text.contains("Judgment History:"));
@@ -4492,14 +5215,13 @@ mod tests {
             "analyze".to_string(),
         );
         item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_reason = Some(belt_core::queue::HitlReason::RetryMaxExceeded);
         db.insert_item(&item).unwrap();
 
         let backend = TestBackend::new(80, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_hitl_overlay(frame, &db, 0);
+                render_hitl_overlay(frame, &db, 0, None, None);
             })
             .unwrap();
     }
@@ -4514,7 +5236,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_hitl_overlay(frame, &db, 0);
+                render_hitl_overlay(frame, &db, 0, None, None);
             })
             .unwrap();
     }
