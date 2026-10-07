@@ -257,12 +257,13 @@ impl Database {
     ///
     /// Also refreshes `updated_at` to the current UTC time.
     ///
-    /// Scheduled to be replaced by [`Database::transition`], which applies the
-    /// transition contract and records the transition log. This method
-    /// overwrites the phase without either.
+    /// Test setup only: it overwrites the phase without the transition
+    /// contract or the transition log, so production code uses
+    /// [`Database::transition`].
     ///
     /// # Errors
     /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn update_phase(&self, work_id: &str, phase: QueuePhase) -> Result<(), BeltError> {
         let now = Utc::now().to_rfc3339();
         let conn = self

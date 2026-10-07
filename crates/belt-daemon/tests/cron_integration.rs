@@ -788,6 +788,33 @@ mod hitl_timeout {
     }
 
     #[test]
+    fn two_overdue_requests_of_one_workspace_are_each_expired() {
+        let db = test_db();
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("workspace.yml");
+        std::fs::write(
+            &config,
+            "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      2: hitl\n      terminal: skip\n",
+        )
+        .unwrap();
+        db.add_workspace("test-ws", config.to_str().unwrap())
+            .unwrap();
+        let service = HitlService::new(Arc::clone(&db));
+        let first_item = running_item(&db, "test-ws", "10");
+        let second_item = running_item(&db, "test-ws", "11");
+        let first = open_hitl(&service, &first_item, Some(past()), None);
+        let second = open_hitl(&service, &second_item, Some(past()), None);
+
+        run_job(&db);
+
+        for id in [&first, &second] {
+            let request = db.hitl_request(id).unwrap().unwrap();
+            assert_eq!(request.status, HitlStatus::Expired, "{id}");
+            assert_eq!(request.resolution.unwrap().action, HitlAction::Skip);
+        }
+    }
+
+    #[test]
     fn unresolvable_terminal_leaves_request_open() {
         let db = test_db();
         let service = HitlService::new(Arc::clone(&db));
