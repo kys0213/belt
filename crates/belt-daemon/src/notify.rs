@@ -523,14 +523,34 @@ impl Notifier {
     /// # Errors
     /// `BeltError` when the store fails.
     pub fn register_deliveries(&self, hitl_id: &HitlId) -> Result<Vec<String>, BeltError> {
+        self.register(hitl_id, true)
+    }
+
+    /// [`Notifier::register_deliveries`] for every open request, so a
+    /// registration that failed when the request was observed is made up on
+    /// the next round. Quiet about routed names without an implementation
+    /// (already logged when the request was first observed). Idempotent.
+    ///
+    /// # Errors
+    /// `BeltError` when the store fails.
+    pub fn register_open_deliveries(&self) -> Result<(), BeltError> {
+        for request in self.db.open_hitl_requests()? {
+            self.register(&request.hitl_id, false)?;
+        }
+        Ok(())
+    }
+
+    fn register(&self, hitl_id: &HitlId, warn_missing: bool) -> Result<Vec<String>, BeltError> {
         let mut registered = Vec::new();
         for name in route(ChannelEvent::HitlRequested, &self.config) {
             if !self.channels.contains_key(&name) {
-                tracing::warn!(
-                    channel = %name,
-                    %hitl_id,
-                    "no implementation for notification channel; HITL request shown on the dashboard only"
-                );
+                if warn_missing {
+                    tracing::warn!(
+                        channel = %name,
+                        %hitl_id,
+                        "no implementation for notification channel; HITL request shown on the dashboard only"
+                    );
+                }
                 continue;
             }
             self.db.ensure_delivery(hitl_id, &name)?;

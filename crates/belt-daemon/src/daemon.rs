@@ -2980,6 +2980,9 @@ impl Daemon {
             return;
         };
 
+        if let Err(e) = notifier.register_open_deliveries() {
+            tracing::error!("HITL request deliveries not registered: {e}");
+        }
         match notifier.deliver_due().await {
             Ok(reports) => {
                 for report in reports {

@@ -299,3 +299,33 @@ async fn daemon_without_a_notifier_ticks_as_before() {
             .is_empty()
     );
 }
+
+#[tokio::test]
+async fn request_claimed_without_a_registered_delivery_is_registered_and_sent_next_tick() {
+    let tmp = TempDir::new().unwrap();
+    let channel = RecordingChannel::new(false);
+    let mut daemon = with_origin(daemon(&tmp), &channel);
+    let (_, hitl_id) = open_hitl(&mut daemon);
+    // The claim is stored but the registration did not happen (it failed when
+    // the request was observed): observation never hands the request out again.
+    assert_eq!(daemon.database().claim_opened_hooks().unwrap().len(), 1);
+    assert!(
+        daemon
+            .database()
+            .deliveries_of(&hitl_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    daemon.tick().await.unwrap();
+
+    let requests: Vec<_> = channel
+        .sent()
+        .into_iter()
+        .filter(|m| m.kind == MessageKind::Event(ChannelEvent::HitlRequested))
+        .collect();
+    assert_eq!(requests.len(), 1);
+    let deliveries = daemon.database().deliveries_of(&hitl_id).unwrap();
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(deliveries[0].status, DeliveryStatus::Sent);
+}
