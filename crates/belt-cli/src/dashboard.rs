@@ -1852,6 +1852,7 @@ fn render_dashboard_tab(
             Constraint::Min(8),
             Constraint::Length(10),
             Constraint::Length(10),
+            Constraint::Length(5),
         ])
         .split(area);
 
@@ -1877,6 +1878,87 @@ fn render_dashboard_tab(
 
     let runtime_widget = render_runtime_panel_tui(db);
     frame.render_widget(runtime_widget, chunks[3]);
+
+    frame.render_widget(render_notification_panel(db), chunks[4]);
+}
+
+/// How far back `notification_failed` events count for the alerts panel.
+const NOTIFICATION_ALERT_WINDOW_HOURS: i64 = 1;
+/// How many of the newest log rows are scanned for `notification_failed`.
+const NOTIFICATION_ALERT_SCAN_ROWS: u64 = 500;
+
+/// Warning lines of the notification panel: HITL request deliveries of open
+/// requests that ended `failed`, per channel, and the progress/reply
+/// notification failures of the last hour.
+fn notification_alert_lines(db: &Database, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+    use belt_infra::db::{DeliveryStatus, transition_kind};
+
+    let mut lines = Vec::new();
+    match db.open_hitl_requests() {
+        Ok(requests) => {
+            for request in requests {
+                match db.deliveries_of(&request.hitl_id) {
+                    Ok(deliveries) => {
+                        for d in deliveries
+                            .iter()
+                            .filter(|d| d.status == DeliveryStatus::Failed)
+                        {
+                            lines.push(format!(
+                                "⚠ HITL 요청 전달 실패: {} · {} · 시도 {}회 · failed",
+                                request.work_id, d.channel, d.attempts
+                            ));
+                        }
+                    }
+                    Err(e) => lines.push(format!("⚠ 전달 상태 조회 실패: {e}")),
+                }
+            }
+        }
+        Err(e) => lines.push(format!("⚠ HITL 요청 조회 실패: {e}")),
+    }
+
+    let since = db
+        .latest_transition_seq()
+        .map(|head| head.saturating_sub(NOTIFICATION_ALERT_SCAN_ROWS))
+        .and_then(|cursor| db.transitions_since(cursor));
+    match since {
+        Ok(rows) => {
+            let window = chrono::Duration::hours(NOTIFICATION_ALERT_WINDOW_HOURS);
+            let failed = rows
+                .iter()
+                .filter(|e| e.kind == transition_kind::NOTIFICATION_FAILED)
+                .filter(|e| {
+                    chrono::DateTime::parse_from_rfc3339(&e.created_at)
+                        .is_ok_and(|at| now.signed_duration_since(at) <= window)
+                })
+                .count();
+            if failed > 0 {
+                lines.push(format!(
+                    "⚠ 알림 실패 {failed}건 ({NOTIFICATION_ALERT_WINDOW_HOURS}h)"
+                ));
+            }
+        }
+        Err(e) => lines.push(format!("⚠ 알림 이력 조회 실패: {e}")),
+    }
+    lines
+}
+
+/// The notification panel: delivery and notification failures.
+fn render_notification_panel(db: &Database) -> Paragraph<'static> {
+    let lines = notification_alert_lines(db, chrono::Utc::now());
+    let body: Vec<Line<'static>> = if lines.is_empty() {
+        vec![Line::from("경고 없음")]
+    } else {
+        lines
+            .into_iter()
+            .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::Yellow))))
+            .collect()
+    };
+    Paragraph::new(body).block(
+        Block::default()
+            .title(" 알림 ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    )
 }
 
 /// Render the per-workspace tab showing items filtered by the selected workspace.
@@ -4252,6 +4334,54 @@ mod tests {
         let mut state = DashboardState::new();
         state.active_tab = DashboardTab::Scripts;
         assert_eq!(state.tab_key(), 4);
+    }
+
+    #[test]
+    fn notification_alerts_show_failed_deliveries_and_recent_notification_failures() {
+        use belt_core::transition::Actor;
+        use belt_infra::db::{DeliveryAttempt, EventRecord, transition_kind};
+
+        let db = make_db();
+        assert!(notification_alert_lines(&db, chrono::Utc::now()).is_empty());
+
+        let hitl_id = open_hitl_item(&db, "1", None);
+        let work_id = db.hitl_request(&hitl_id).unwrap().unwrap().work_id;
+        db.ensure_delivery(&hitl_id, "team-chat").unwrap();
+        for _ in 0..belt_infra::db::DELIVERY_MAX_ATTEMPTS {
+            db.mark_delivery(
+                &hitl_id,
+                "team-chat",
+                &DeliveryAttempt::Failed {
+                    error: "down".to_string(),
+                },
+            )
+            .unwrap();
+        }
+        db.record_event(&EventRecord {
+            work_id: &work_id,
+            kind: transition_kind::NOTIFICATION_FAILED,
+            actor: Actor::Daemon,
+            reason: Some("failed"),
+            detail: Some("origin: down"),
+        })
+        .unwrap();
+
+        let lines = notification_alert_lines(&db, chrono::Utc::now());
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("team-chat") && l.contains("failed")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("알림 실패 1건")),
+            "{lines:?}"
+        );
+
+        // Two hours later the notification failure no longer counts.
+        let later = chrono::Utc::now() + chrono::Duration::hours(2);
+        let lines = notification_alert_lines(&db, later);
+        assert!(lines.iter().all(|l| !l.contains("알림 실패")), "{lines:?}");
     }
 
     #[test]
