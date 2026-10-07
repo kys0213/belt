@@ -2185,6 +2185,93 @@ sources:
         assert_eq!(h.daemon.handlers_in_flight(), 0);
     }
 
+    /// Start a `slow` handler and a `hang` execution whose cancel the daemon
+    /// accepted; the hanging one never returns, so only a drain ends it.
+    async fn slow_and_canceled_hang() -> (Harness<ScriptedRuntime>, u32) {
+        let mut h = harness_with(
+            &[("github:org/repo#1", "slow"), ("github:org/repo#2", "hang")],
+            2,
+            Database::open_in_memory().unwrap(),
+            Arc::new(ScriptedRuntime::default()),
+        );
+        tick_quickly(&mut h.daemon).await;
+        let pid = reported_pid(&h.daemon, "github:org/repo#1:slow").await;
+        request(h.daemon.db(), "github:org/repo#2:hang");
+        tick_quickly(&mut h.daemon).await;
+        assert!(
+            h.daemon
+                .db()
+                .transitions_of("github:org/repo#2:hang")
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "cancel_accepted")
+        );
+        assert_eq!(h.daemon.handlers_in_flight(), 2);
+        (h, pid)
+    }
+
+    #[tokio::test]
+    async fn a_second_interrupt_kills_the_handlers_and_fails_the_running_items() {
+        let (mut h, pid) = slow_and_canceled_hang().await;
+        let slow = "github:org/repo#1:slow";
+        let hang = "github:org/repo#2:hang";
+
+        h.daemon.request_shutdown();
+        h.daemon
+            .drain_until_interrupted(
+                Duration::from_secs(30),
+                tokio::time::sleep(Duration::from_millis(300)),
+            )
+            .await;
+
+        eventually("the handler to die", || !process_alive(pid)).await;
+        assert_eq!(phase(&h.daemon, slow), QueuePhase::Failed);
+        assert!(
+            h.daemon.get_item(slow).unwrap().worktree_preserved,
+            "the worktree is preserved"
+        );
+        assert_eq!(phase(&h.daemon, hang), QueuePhase::Skipped);
+        assert_eq!(
+            closed_result(h.daemon.db(), hang).as_deref(),
+            Some("canceled")
+        );
+        assert_eq!(h.daemon.handlers_in_flight(), 0);
+        assert_eq!(h.daemon.running_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_drain_timeout_ends_an_accepted_cancel_skipped_and_rolls_back_the_rest() {
+        let (mut h, pid) = slow_and_canceled_hang().await;
+        let slow = "github:org/repo#1:slow";
+        let hang = "github:org/repo#2:hang";
+
+        h.daemon.request_shutdown();
+        h.daemon
+            .drain_until_interrupted(Duration::from_millis(500), std::future::pending())
+            .await;
+
+        eventually("the handler to die", || !process_alive(pid)).await;
+        assert_eq!(phase(&h.daemon, slow), QueuePhase::Pending);
+        assert_eq!(phase(&h.daemon, hang), QueuePhase::Skipped);
+        let log = h.daemon.db().transitions_of(hang).unwrap();
+        let enter = log.iter().rfind(|e| e.kind == "phase_enter").unwrap();
+        assert_eq!(enter.reason.as_deref(), Some("canceled"));
+        assert!(
+            !log.iter().any(|e| e.reason.as_deref() == Some("rollback")),
+            "a canceled execution is not rolled back"
+        );
+        assert_eq!(
+            closed_result(h.daemon.db(), hang).as_deref(),
+            Some("canceled")
+        );
+        assert_eq!(
+            history_statuses(h.daemon.db(), "github:org/repo#2"),
+            vec!["skipped".to_string()]
+        );
+        assert_eq!(h.daemon.handlers_in_flight(), 0);
+        assert_eq!(h.daemon.running_count(), 0);
+    }
+
     // ---- restart --------------------------------------------------------
 
     fn claim(db: &Database, source_id: &str, state: &str) -> String {

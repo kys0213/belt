@@ -2634,6 +2634,25 @@ impl Daemon {
     /// - a second SIGINT: the handler groups are killed, then Running →
     ///   Failed.
     pub async fn drain_with_timeout(&mut self, timeout: std::time::Duration) {
+        self.drain_until_interrupted(timeout, async {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::error!("SIGINT not observable during the drain: {e}");
+                std::future::pending::<()>().await;
+            }
+        })
+        .await;
+    }
+
+    /// [`Daemon::drain_with_timeout`] with the second interrupt given as
+    /// `interrupt` instead of a SIGINT: when it completes first, the handler
+    /// groups are killed and Running → Failed (an execution canceled by
+    /// request ends Skipped `canceled`).
+    pub async fn drain_until_interrupted(
+        &mut self,
+        timeout: std::time::Duration,
+        interrupt: impl std::future::Future<Output = ()>,
+    ) {
+        tokio::pin!(interrupt);
         let canceled = self.spawn_running();
         Self::log_outcomes(&canceled);
         if self.in_flight.is_empty() {
@@ -2673,7 +2692,7 @@ impl Daemon {
                     self.rollback_running_to_pending();
                     return;
                 }
-                _ = tokio::signal::ctrl_c() => {
+                () = &mut interrupt => {
                     tracing::warn!("received second SIGINT, force-failing running items");
                     self.stop_all_handlers().await;
                     self.force_fail_running();
