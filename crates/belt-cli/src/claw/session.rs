@@ -146,11 +146,19 @@ pub fn collect_status() -> Option<StatusSummary> {
     collect_status_from_db(&db)
 }
 
+/// Turn a store error into `None` after logging it, so a failing store does not
+/// silently look like an empty one.
+fn warn_on_error<T, E: std::fmt::Display>(what: &str, result: Result<T, E>) -> Option<T> {
+    result
+        .inspect_err(|e| tracing::warn!("status banner: {what} failed: {e}"))
+        .ok()
+}
+
 /// Collect system status from a given database handle.
 ///
 /// Separated from [`collect_status`] so tests can inject an in-memory DB.
 fn collect_status_from_db(db: &belt_infra::db::Database) -> Option<StatusSummary> {
-    let phase_counts = db.count_items_by_phase().ok()?;
+    let phase_counts = warn_on_error("count_items_by_phase", db.count_items_by_phase())?;
     let total_items: u32 = phase_counts.iter().map(|(_, c)| *c).sum();
     let hitl_pending = phase_counts
         .iter()
@@ -158,12 +166,15 @@ fn collect_status_from_db(db: &belt_infra::db::Database) -> Option<StatusSummary
         .map(|(_, c)| *c)
         .unwrap_or(0);
 
-    let events = db.list_recent_transition_events(5).ok()?;
+    let events = warn_on_error(
+        "list_recent_transition_events",
+        db.list_recent_transition_events(5),
+    )?;
     let recent_events = events.into_iter().map(into_recent_event).collect();
 
     let mut hitl_items = Vec::new();
-    for request in db.open_hitl_requests().ok()? {
-        let item = db.get_item(&request.work_id).ok()?;
+    for request in warn_on_error("open_hitl_requests", db.open_hitl_requests())? {
+        let item = warn_on_error("get_item", db.get_item(&request.work_id))?;
         hitl_items.push(HitlItemSummary {
             work_id: item.work_id,
             workspace: item.workspace_id,

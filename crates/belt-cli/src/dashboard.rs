@@ -34,6 +34,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 
+use belt_core::hitl::HitlId;
 use belt_core::hitl::{ConfirmPath, HitlAction, HitlStatus, RespondOutcome};
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
@@ -515,6 +516,11 @@ fn run_loop(
             state.per_ws_kanban_row = ws_col_len.saturating_sub(1);
         }
 
+        // The HITL overlay answers exactly the requests it draws, so the data is
+        // loaded once per frame and shared by drawing and key handling.
+        let hitl_view =
+            matches!(state.overlay, OverlayMode::Hitl { .. }).then(|| HitlOverlayView::load(db));
+
         terminal.draw(|frame| {
             // Tab bar at top.
             let outer_chunks = Layout::default()
@@ -582,7 +588,8 @@ fn run_loop(
                 } => {
                     render_hitl_overlay(
                         frame,
-                        db,
+                        hitl_view.as_ref().and_then(|v| v.as_ref().ok()),
+                        hitl_view.as_ref().and_then(|v| v.as_ref().err()),
                         *selected,
                         retry_input.as_deref(),
                         state.toast.as_deref(),
@@ -598,12 +605,11 @@ fn run_loop(
         {
             // An open overlay owns the keyboard: its keys take precedence over the
             // global ones below.
-            let hitl_work_ids: Vec<String> = all_items
-                .iter()
-                .filter(|i| i.phase() == QueuePhase::Hitl)
-                .map(|i| i.work_id.clone())
-                .collect();
-            if handle_overlay_key(&mut state, key.code, &hitl_work_ids, &responder) {
+            let hitl_rows = match &hitl_view {
+                Some(Ok(view)) => view.rows(),
+                _ => Vec::new(),
+            };
+            if handle_overlay_key(&mut state, key.code, &hitl_rows, &responder) {
                 continue;
             }
 
@@ -698,6 +704,41 @@ fn tui_respondent() -> String {
         .unwrap_or_else(|| TUI_VIA.to_string())
 }
 
+/// One item of the HITL overlay and the request drawn for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HitlRow {
+    work_id: String,
+    hitl_id: Option<HitlId>,
+}
+
+/// Snapshot of what the HITL overlay draws.
+struct HitlOverlayView {
+    items: Vec<QueueItem>,
+    requests: HashMap<String, HitlRequest>,
+}
+
+impl HitlOverlayView {
+    fn load(db: &Database) -> anyhow::Result<Self> {
+        Ok(Self {
+            items: db.list_items(Some(QueuePhase::Hitl), None)?,
+            requests: current_hitl_requests(db)?,
+        })
+    }
+
+    fn rows(&self) -> Vec<HitlRow> {
+        self.items
+            .iter()
+            .map(|item| HitlRow {
+                work_id: item.work_id.clone(),
+                hitl_id: self
+                    .requests
+                    .get(&item.work_id)
+                    .map(|request| request.hitl_id.clone()),
+            })
+            .collect()
+    }
+}
+
 /// Sends HITL responses given in the overlay through the shared first-wins contract.
 struct HitlResponder<'a> {
     service: &'a HitlService,
@@ -705,10 +746,18 @@ struct HitlResponder<'a> {
 }
 
 impl HitlResponder<'_> {
-    /// Respond to the current request of `work_id` and describe the result.
-    fn respond(&self, work_id: &str, action: HitlAction, notes: Option<String>) -> String {
+    /// Respond to the request drawn for `row` and describe the result.
+    ///
+    /// A row with a request is answered by its `hitl_id`, so a request re-opened
+    /// for the same item after the frame was drawn is left untouched.
+    fn respond(&self, row: &HitlRow, action: HitlAction, notes: Option<String>) -> String {
+        let work_id = row.work_id.as_str();
+        let target = match &row.hitl_id {
+            Some(id) => HitlTarget::Id(id.clone()),
+            None => HitlTarget::Item(work_id.to_string()),
+        };
         let response = HitlResponse {
-            target: HitlTarget::Item(work_id.to_string()),
+            target,
             action,
             by: self.by.clone(),
             via: TUI_VIA.to_string(),
@@ -744,11 +793,11 @@ fn describe_respond_outcome(work_id: &str, action: HitlAction, outcome: &Respond
 /// Handle a key while an overlay is open. Returns `true` when an overlay
 /// consumed the key; the global keys must then be skipped.
 ///
-/// `hitl_work_ids` lists the items in the HITL phase in overlay order.
+/// `hitl_rows` lists the items in the HITL phase in overlay order.
 fn handle_overlay_key(
     state: &mut DashboardState,
     code: KeyCode,
-    hitl_work_ids: &[String],
+    hitl_rows: &[HitlRow],
     responder: &HitlResponder<'_>,
 ) -> bool {
     match state.overlay.clone() {
@@ -767,7 +816,7 @@ fn handle_overlay_key(
             selected,
             retry_input,
         } => {
-            handle_hitl_overlay_key(state, code, selected, retry_input, hitl_work_ids, responder);
+            handle_hitl_overlay_key(state, code, selected, retry_input, hitl_rows, responder);
             true
         }
     }
@@ -778,11 +827,11 @@ fn handle_hitl_overlay_key(
     code: KeyCode,
     selected: usize,
     retry_input: Option<String>,
-    hitl_work_ids: &[String],
+    hitl_rows: &[HitlRow],
     responder: &HitlResponder<'_>,
 ) {
-    let count = hitl_work_ids.len();
-    let selected_id = hitl_work_ids.get(selected);
+    let count = hitl_rows.len();
+    let selected_row = hitl_rows.get(selected);
 
     if let Some(mut input) = retry_input {
         match code {
@@ -793,9 +842,9 @@ fn handle_hitl_overlay_key(
                 };
             }
             KeyCode::Enter => {
-                if let Some(work_id) = selected_id {
+                if let Some(row) = selected_row {
                     let notes = (!input.trim().is_empty()).then(|| input.trim().to_string());
-                    state.toast = Some(responder.respond(work_id, HitlAction::Retry, notes));
+                    state.toast = Some(responder.respond(row, HitlAction::Retry, notes));
                 }
                 state.overlay = OverlayMode::Hitl {
                     selected,
@@ -844,11 +893,11 @@ fn handle_hitl_overlay_key(
             };
         }
         KeyCode::Enter => {
-            if let Some(work_id) = selected_id {
-                state.overlay = OverlayMode::ItemDetail(work_id.clone());
+            if let Some(row) = selected_row {
+                state.overlay = OverlayMode::ItemDetail(row.work_id.clone());
             }
         }
-        KeyCode::Char('r') if selected_id.is_some() => {
+        KeyCode::Char('r') if selected_row.is_some() => {
             state.overlay = OverlayMode::Hitl {
                 selected,
                 retry_input: Some(String::new()),
@@ -860,8 +909,8 @@ fn handle_hitl_overlay_key(
                 's' => HitlAction::Skip,
                 _ => HitlAction::Replan,
             };
-            if let Some(work_id) = selected_id {
-                state.toast = Some(responder.respond(work_id, action, None));
+            if let Some(row) = selected_row {
+                state.toast = Some(responder.respond(row, action, None));
             }
         }
         _ => {}
@@ -886,15 +935,15 @@ fn switch_tab_key(state: &mut DashboardState, code: KeyCode) -> bool {
 
 /// Requests that currently decide what an item in Hitl shows: the open one,
 /// else the confirmed one still waiting for post-processing.
-fn current_hitl_requests(db: &Database) -> HashMap<String, HitlRequest> {
+fn current_hitl_requests(db: &Database) -> anyhow::Result<HashMap<String, HitlRequest>> {
     let mut by_work_id = HashMap::new();
-    for request in db.pending_post_processing().unwrap_or_default() {
+    for request in db.pending_post_processing()? {
         by_work_id.insert(request.work_id.clone(), request);
     }
-    for request in db.open_hitl_requests().unwrap_or_default() {
+    for request in db.open_hitl_requests()? {
         by_work_id.insert(request.work_id.clone(), request);
     }
-    by_work_id
+    Ok(by_work_id)
 }
 
 /// Handle Up/k navigation.
@@ -2347,14 +2396,20 @@ fn render_item_detail_overlay(frame: &mut ratatui::Frame, db: &Database, work_id
         .and_then(|sid| db.get_history(sid).ok())
         .unwrap_or_default();
 
-    let hitl = current_hitl_requests(db).remove(work_id);
-    let lines = build_detail_lines_with_history(
+    let hitl = current_hitl_requests(db);
+    let mut lines = build_detail_lines_with_history(
         work_id,
         item.ok().as_ref(),
         &transitions,
         &history,
-        hitl.as_ref(),
+        hitl.as_ref()
+            .ok()
+            .and_then(|requests| requests.get(work_id)),
     );
+    if let Err(e) = &hitl {
+        lines.push(Line::from(""));
+        lines.push(hitl_error_line(e));
+    }
 
     let paragraph = Paragraph::new(lines).block(
         Block::default()
@@ -2623,7 +2678,8 @@ fn build_detail_lines_with_history<'a>(
 /// with j/k and press Enter to view item details.
 fn render_hitl_overlay(
     frame: &mut ratatui::Frame,
-    db: &Database,
+    view: Option<&HitlOverlayView>,
+    error: Option<&anyhow::Error>,
     selected: usize,
     retry_input: Option<&str>,
     toast: Option<&str>,
@@ -2631,12 +2687,13 @@ fn render_hitl_overlay(
     let area = centered_rect(70, 75, frame.area());
     frame.render_widget(Clear, area);
 
-    let hitl_items: Vec<QueueItem> = db
-        .list_items(Some(QueuePhase::Hitl), None)
-        .unwrap_or_default();
-
-    let requests = current_hitl_requests(db);
-    let lines = build_hitl_overlay_lines(&hitl_items, &requests, selected, retry_input, toast);
+    let lines = match (view, error) {
+        (Some(view), _) => {
+            build_hitl_overlay_lines(&view.items, &view.requests, selected, retry_input, toast)
+        }
+        (None, Some(e)) => vec![hitl_error_line(e)],
+        (None, None) => Vec::new(),
+    };
 
     let paragraph = Paragraph::new(lines).block(
         Block::default()
@@ -2646,6 +2703,14 @@ fn render_hitl_overlay(
     );
 
     frame.render_widget(paragraph, area);
+}
+
+/// Banner line shown when the HITL state could not be read from the store.
+fn hitl_error_line(error: &anyhow::Error) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("error: HITL 상태를 읽지 못함: {error}"),
+        Style::default().fg(Color::Red),
+    ))
 }
 
 /// Build the text lines for the HITL overlay.
@@ -4752,13 +4817,24 @@ mod tests {
         else {
             panic!("expected a new item");
         };
+        run_and_open_hitl(db, &work_id, notes)
+    }
+
+    /// Move a Pending item to Running and open a HITL request for it.
+    fn run_and_open_hitl(db: &Database, work_id: &str, notes: Option<&str>) -> HitlId {
+        use belt_core::queue::HitlReason;
+        use belt_core::transition::{
+            Actor, TransitionOutcome, TransitionReason, TransitionRequest,
+        };
+        use belt_infra::db::{OpenHitlOutcome, OpenHitlRequest};
+
         for (from, to) in [
             (QueuePhase::Pending, QueuePhase::Ready),
             (QueuePhase::Ready, QueuePhase::Running),
         ] {
             let outcome = db
                 .transition(&TransitionRequest {
-                    work_id: work_id.clone(),
+                    work_id: work_id.to_string(),
                     expected_from: from,
                     to,
                     actor: Actor::Daemon,
@@ -4770,7 +4846,7 @@ mod tests {
         }
         let OpenHitlOutcome::Opened { hitl_id, .. } = db
             .open_hitl(&OpenHitlRequest {
-                work_id,
+                work_id: work_id.to_string(),
                 expected_from: QueuePhase::Running,
                 reason: HitlReason::EvaluateFailure,
                 notes: notes.map(str::to_string),
@@ -4786,6 +4862,25 @@ mod tests {
             panic!("expected the request to open");
         };
         hitl_id
+    }
+
+    /// Retry-confirm and post-process `old`, then open a fresh request for the same item.
+    fn reopen_hitl(db: &Database, old: &HitlId, work_id: &str) -> HitlId {
+        use belt_core::transition::{Actor, TransitionReason, TransitionRequest};
+
+        db.complete_post_processing(
+            old,
+            &TransitionRequest {
+                work_id: work_id.to_string(),
+                expected_from: QueuePhase::Hitl,
+                to: QueuePhase::Pending,
+                actor: Actor::Daemon,
+                reason: TransitionReason::PostProcessing(HitlAction::Retry),
+                detail: None,
+            },
+        )
+        .unwrap();
+        run_and_open_hitl(db, work_id, None)
     }
 
     fn hitl_state() -> DashboardState {
@@ -4810,7 +4905,15 @@ mod tests {
         ids: &[String],
         responder: &HitlResponder<'_>,
     ) -> bool {
-        handle_overlay_key(state, code, ids, responder)
+        let requests = current_hitl_requests(responder.service.database()).unwrap();
+        let rows: Vec<HitlRow> = ids
+            .iter()
+            .map(|work_id| HitlRow {
+                work_id: work_id.clone(),
+                hitl_id: requests.get(work_id).map(|r| r.hitl_id.clone()),
+            })
+            .collect();
+        handle_overlay_key(state, code, &rows, responder)
     }
 
     #[test]
@@ -5078,7 +5181,7 @@ mod tests {
             .database()
             .list_items(Some(QueuePhase::Hitl), None)
             .unwrap();
-        let requests = current_hitl_requests(service.database());
+        let requests = current_hitl_requests(service.database()).unwrap();
         let lines = build_hitl_overlay_lines(&items, &requests, 0, None, None);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
 
@@ -5096,6 +5199,96 @@ mod tests {
         let prompt = build_hitl_overlay_lines(&[], &HashMap::new(), 0, Some("typed"), None);
         let text: String = prompt.iter().map(|l| format!("{l}")).collect();
         assert!(text.contains("typed"));
+    }
+
+    #[test]
+    fn overlay_view_surfaces_store_error_instead_of_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("ALTER TABLE hitl_requests RENAME TO hitl_requests_gone;")
+            .unwrap();
+
+        let error = match HitlOverlayView::load(&db) {
+            Ok(_) => panic!("a broken store must not load as an empty overlay"),
+            Err(e) => e,
+        };
+
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|frame| render_hitl_overlay(frame, None, Some(&error), 0, None, None))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("error: HITL"), "{screen}");
+    }
+
+    #[test]
+    fn overlay_answers_the_drawn_request_not_a_reopened_one() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let old_id = open_hitl_item(service.database(), "1", None);
+        let work_id = service
+            .database()
+            .hitl_request(&old_id)
+            .unwrap()
+            .unwrap()
+            .work_id;
+        let drawn = HitlOverlayView::load(service.database()).unwrap().rows();
+        assert_eq!(drawn[0].hitl_id.as_ref(), Some(&old_id));
+
+        // Another path answers the drawn request, the item leaves Hitl and a new
+        // request is opened for the same work_id.
+        service
+            .respond(&HitlResponse {
+                target: HitlTarget::Id(old_id.clone()),
+                action: HitlAction::Retry,
+                by: "bob".to_string(),
+                via: "cli".to_string(),
+                path: ConfirmPath::Direct,
+                notes: None,
+            })
+            .unwrap();
+        let new_id = reopen_hitl(service.database(), &old_id, &work_id);
+        assert_ne!(new_id, old_id);
+
+        let mut state = hitl_state();
+        handle_overlay_key(
+            &mut state,
+            KeyCode::Char('d'),
+            &drawn,
+            &responder_for(&service, "alice"),
+        );
+
+        let toast = state.toast.unwrap();
+        assert!(toast.contains("already_handled"), "{toast}");
+        let new_request = service.database().hitl_request(&new_id).unwrap().unwrap();
+        assert_eq!(new_request.status, HitlStatus::Open);
+    }
+
+    #[test]
+    fn open_overlay_swallows_t_instead_of_switching_tab() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+        state.active_tab = DashboardTab::Board;
+
+        // The run loop only reaches `switch_tab_key` when the overlay did not consume the key.
+        assert!(handle_overlay_key(
+            &mut state,
+            KeyCode::Char('t'),
+            &[],
+            &responder
+        ));
+        assert_eq!(state.active_tab, DashboardTab::Board);
     }
 
     // ---- tab keys ----
@@ -5213,11 +5406,12 @@ mod tests {
         item.set_phase_unchecked(QueuePhase::Hitl);
         db.insert_item(&item).unwrap();
 
+        let view = HitlOverlayView::load(&db).unwrap();
         let backend = TestBackend::new(80, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_hitl_overlay(frame, &db, 0, None, None);
+                render_hitl_overlay(frame, Some(&view), None, 0, None, None);
             })
             .unwrap();
     }
@@ -5228,11 +5422,12 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let db = make_db();
+        let view = HitlOverlayView::load(&db).unwrap();
         let backend = TestBackend::new(80, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_hitl_overlay(frame, &db, 0, None, None);
+                render_hitl_overlay(frame, Some(&view), None, 0, None, None);
             })
             .unwrap();
     }
