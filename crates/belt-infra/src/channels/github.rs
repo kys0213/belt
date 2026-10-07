@@ -369,6 +369,19 @@ impl ResponseInbox for GitHubOriginChannel {
                     );
                     continue;
                 }
+                let Some(respondent) = comment
+                    .author
+                    .map(|a| a.login)
+                    .filter(|login| !login.is_empty())
+                else {
+                    // The allowlist is checked against the respondent; a
+                    // comment nobody can be named for cannot pass it.
+                    self.warn_skipped(
+                        &comment.url,
+                        "ignoring a comment without an author (deleted account?)",
+                    );
+                    continue;
+                };
                 let (body, explicit) = match parse_command(text) {
                     Some((Command::Action(a), id)) => (InboundBody::Action(a), id),
                     Some((Command::Confirm, id)) => (InboundBody::Confirm, id),
@@ -383,7 +396,7 @@ impl ResponseInbox for GitHubOriginChannel {
                 };
                 responses.push(InboundResponse {
                     external_id: comment.url,
-                    respondent: comment.author.map(|a| a.login).unwrap_or_default(),
+                    respondent,
                     hitl_ref,
                     body,
                 });
@@ -514,6 +527,29 @@ mod tests {
                 .map(|(n, login, body, at)| comment_json(n, login, body, at))
                 .collect(),
         )
+    }
+
+    #[tokio::test]
+    async fn poll_skips_comments_without_an_author() {
+        // A deleted account shows as a null author (or an empty login).
+        let mut null_author = comment_json("1", "x", "/belt done", "2026-10-07T01:00:00Z");
+        null_author["author"] = serde_json::Value::Null;
+        let mut no_author = comment_json("2", "x", "/belt done", "2026-10-07T01:00:00Z");
+        no_author.as_object_mut().unwrap().remove("author");
+        let json = json_of(vec![
+            null_author,
+            no_author,
+            comment_json("3", "", "/belt done", "2026-10-07T01:00:00Z"),
+            comment_json("4", "alice", "/belt skip", "2026-10-07T02:00:00Z"),
+        ]);
+        let shell = RecordingShell::ok(&json);
+        let rs = channel(&shell)
+            .poll(&[target("h-1", WID, SINCE)])
+            .await
+            .unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs[0].respondent, "alice");
+        assert!(rs[0].external_id.ends_with("issuecomment-4"));
     }
 
     #[tokio::test]
