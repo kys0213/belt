@@ -1808,6 +1808,26 @@ pub mod transition_kind {
     /// A HITL response was refused; `reason` is `already_handled` or
     /// `unauthorized`. The phase columns are empty: no transition happened.
     pub const HITL_RESPONSE_REJECTED: &str = "hitl_response_rejected";
+    /// A LifecycleHook call failed; `reason` names the callback, `detail`
+    /// carries the error. The failure changed no phase.
+    pub const HOOK: &str = "hook";
+    /// A non-fatal step of HITL post-processing failed; post-processing went on.
+    pub const POST_PROCESSING_ERROR: &str = "post_processing_error";
+    /// HITL post-processing gave up after repeated result-transition
+    /// failures and moved the item from Hitl to Failed.
+    pub const POST_PROCESSING_FAILED: &str = "post_processing_failed";
+}
+
+/// A non-phase event to append to the `transition_log` with
+/// [`Database::record_event`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventRecord<'a> {
+    pub work_id: &'a str,
+    /// See [`transition_kind`]; never [`transition_kind::PHASE_ENTER`].
+    pub kind: &'a str,
+    pub actor: Actor,
+    pub reason: Option<&'a str>,
+    pub detail: Option<&'a str>,
 }
 
 /// One row of the append-only `transition_log`.
@@ -2069,8 +2089,9 @@ impl Database {
     /// `replan_count`) with an `item_created` row naming the origin.
     /// [`DeriveKind::EscalationRetry`] hands the worktree over
     /// (`worktree_owner` = the origin's owner, or the origin itself);
-    /// [`DeriveKind::Replan`] leaves the owner empty and records a
-    /// failure-count reset point. If the origin's transition is refused,
+    /// [`DeriveKind::Replan`] leaves the owner empty, counts one more replan
+    /// in the derived item's `replan_count` and records a failure-count reset
+    /// point. If the origin's transition is refused,
     /// nothing is derived.
     ///
     /// # Errors
@@ -2115,7 +2136,12 @@ impl Database {
                 origin.item.state.clone(),
             );
             derived.title = origin.item.title.clone();
-            derived.replan_count = origin.item.replan_count;
+            // `replan_count` counts the lineage's replans: inherited, plus
+            // this derivation when it is one.
+            derived.replan_count = match req.kind {
+                DeriveKind::EscalationRetry => origin.item.replan_count,
+                DeriveKind::Replan => origin.item.replan_count + 1,
+            };
             derived.derived_from = Some(origin.item.work_id.clone());
             derived.lineage_root = origin.item.lineage_root.clone();
             insert_queue_row(tx, &derived)?;
@@ -2215,6 +2241,47 @@ impl Database {
                 .map_err(sql_err)?
                 .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
             insert_reset_row(tx, &source_id, &state, work_id)
+        })
+    }
+
+    /// Append a non-phase event about an item to the transition log and
+    /// return its `seq`. Phase changes are recorded only by the transition
+    /// contract, so a `phase_enter` kind is refused.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`; `BeltError::Database`
+    /// for a `phase_enter` kind or on I/O failure.
+    pub fn record_event(&self, event: &EventRecord<'_>) -> Result<u64, BeltError> {
+        if event.kind == transition_kind::PHASE_ENTER {
+            return Err(BeltError::Database(format!(
+                "{} is recorded only by a transition, not as an event of {}",
+                transition_kind::PHASE_ENTER,
+                event.work_id
+            )));
+        }
+        self.write_tx(|tx| {
+            let source_id: String = tx
+                .query_row(
+                    "SELECT source_id FROM queue_items WHERE work_id = ?1",
+                    params![event.work_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(sql_err)?
+                .ok_or_else(|| BeltError::ItemNotFound(event.work_id.to_string()))?;
+            append_log(
+                tx,
+                &LogRecord {
+                    work_id: event.work_id,
+                    source_id: &source_id,
+                    kind: event.kind,
+                    from_phase: None,
+                    to_phase: None,
+                    actor: &actor_str(&event.actor),
+                    reason: event.reason,
+                    detail: event.detail,
+                },
+            )
         })
     }
 
@@ -5597,6 +5664,80 @@ mod tests {
             panic!("expected Derived");
         };
         assert_eq!(db.get_item(&work_id).unwrap().replan_count, 1);
+    }
+
+    #[test]
+    fn derive_replan_counts_one_more_lineage_replan() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        db.increment_replan_count(&first).unwrap();
+        run_to_running(&db, &first);
+        let hitl_id = opened(&db, &first);
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id),
+            &resolution(HitlAction::Replan, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+
+        let DeriveOutcome::Derived { work_id } = db
+            .derive(&DeriveRequest {
+                reason: TransitionReason::PostProcessing(HitlAction::Replan),
+                ..derive_request(&first, QueuePhase::Hitl, DeriveKind::Replan)
+            })
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+        assert_eq!(db.get_item(&work_id).unwrap().replan_count, 2);
+        assert_eq!(db.get_item(&first).unwrap().replan_count, 1);
+    }
+
+    #[test]
+    fn record_event_appends_a_non_phase_row() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+
+        let seq = db
+            .record_event(&EventRecord {
+                work_id: &first,
+                kind: transition_kind::HOOK,
+                actor: Actor::Daemon,
+                reason: Some("on_hitl_resolved"),
+                detail: Some("label api down"),
+            })
+            .unwrap();
+
+        let row = db.transitions_of(&first).unwrap().pop().unwrap();
+        assert_eq!(row.seq, seq);
+        assert_eq!(row.kind, "hook");
+        assert_eq!(row.source_id, "s1");
+        assert_eq!((row.from_phase, row.to_phase), (None, None));
+        assert_eq!(row.actor, "daemon");
+        assert_eq!(row.reason.as_deref(), Some("on_hitl_resolved"));
+        assert_eq!(row.detail.as_deref(), Some("label api down"));
+    }
+
+    #[test]
+    fn record_event_refuses_phase_entries_and_unknown_items() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        let event = |work_id, kind| EventRecord {
+            work_id,
+            kind,
+            actor: Actor::Daemon,
+            reason: None,
+            detail: None,
+        };
+
+        assert!(matches!(
+            db.record_event(&event(&first, transition_kind::PHASE_ENTER)),
+            Err(BeltError::Database(_))
+        ));
+        assert!(matches!(
+            db.record_event(&event("missing", transition_kind::HOOK)),
+            Err(BeltError::ItemNotFound(_))
+        ));
     }
 
     #[test]
