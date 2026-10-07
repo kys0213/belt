@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use belt_core::error::BeltError;
@@ -2061,41 +2061,55 @@ impl Database {
         })
     }
 
-    /// Failures of `(source_id, state)` since its last reset point.
+    /// Failures of the lineage `work_id` belongs to since its last reset point.
     ///
-    /// Reads the attempt history in insertion order and applies
-    /// [`belt_core::lineage::count_since_reset`].
+    /// Collects the attempt history of every item sharing `work_id`'s
+    /// `lineage_root` in insertion order and applies
+    /// [`belt_core::lineage::count_since_reset`]. A re-collected item starts a
+    /// new lineage and does not inherit earlier lineages' failures.
     ///
     /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`.
     /// `BeltError::Database` on I/O failure or a history status that maps to
     /// no attempt status (`failed`, `reset`, `running`, `done`/`success`,
     /// `skipped`, `hitl`).
-    pub fn failure_count(&self, source_id: &str, state: &str) -> Result<u32, BeltError> {
+    pub fn failure_count(&self, work_id: &str) -> Result<u32, BeltError> {
         let conn = self.lock_conn()?;
+        let root = lineage_root_of(&conn, work_id)?;
         let mut stmt = conn
-            .prepare("SELECT status FROM history WHERE source_id = ?1 AND state = ?2 ORDER BY id")
+            .prepare(
+                "SELECT h.status FROM history h
+                 JOIN queue_items q ON q.work_id = h.work_id
+                 WHERE q.lineage_root = ?1 ORDER BY h.id",
+            )
             .map_err(sql_err)?;
         let attempts = stmt
-            .query_map(params![source_id, state], |row| row.get::<_, String>(0))
+            .query_map(params![root], |row| row.get::<_, String>(0))
             .map_err(sql_err)?
             .map(|status| attempt_status(&status.map_err(sql_err)?))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(count_since_reset(&attempts))
     }
 
-    /// Record a failure-count reset point for `(source_id, state)`.
-    ///
-    /// `work_id` is the item the reset happened on (the HITL-retried item).
+    /// Record a failure-count reset point on the lineage of `work_id`
+    /// (the HITL-retried item).
     ///
     /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`.
     /// `BeltError::Database` on I/O failure.
-    pub fn record_reset(
-        &self,
-        source_id: &str,
-        state: &str,
-        work_id: &str,
-    ) -> Result<(), BeltError> {
-        self.write_tx(|tx| insert_reset_row(tx, source_id, state, work_id))
+    pub fn record_reset(&self, work_id: &str) -> Result<(), BeltError> {
+        self.write_tx(|tx| {
+            let (source_id, state): (String, String) = tx
+                .query_row(
+                    "SELECT source_id, state FROM queue_items WHERE work_id = ?1",
+                    params![work_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(sql_err)?
+                .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+            insert_reset_row(tx, &source_id, &state, work_id)
+        })
     }
 
     /// Transition log rows with `seq` greater than the cursor, oldest first.
@@ -2433,6 +2447,17 @@ fn insert_queue_row(conn: &Connection, item: &QueueItem) -> Result<(), BeltError
     )
     .map_err(sql_err)?;
     Ok(())
+}
+
+fn lineage_root_of(conn: &Connection, work_id: &str) -> Result<String, BeltError> {
+    conn.query_row(
+        "SELECT lineage_root FROM queue_items WHERE work_id = ?1",
+        params![work_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(sql_err)?
+    .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))
 }
 
 fn insert_reset_row(
@@ -4748,7 +4773,7 @@ mod tests {
         assert_eq!(owner(&first), None);
         assert_eq!(owner(&second).as_deref(), Some(first.as_str()));
         assert_eq!(owner(&third).as_deref(), Some(first.as_str()));
-        assert_eq!(db.failure_count("s1", "implement").unwrap(), 1);
+        assert_eq!(db.failure_count(&first).unwrap(), 1);
     }
 
     #[test]
@@ -4759,7 +4784,7 @@ mod tests {
         history(&db, &first, "s1", "implement", "failed");
         history(&db, &first, "s1", "implement", "failed");
         step(&db, &first, QueuePhase::Running, QueuePhase::Hitl);
-        assert_eq!(db.failure_count("s1", "implement").unwrap(), 2);
+        assert_eq!(db.failure_count(&first).unwrap(), 2);
 
         let outcome = db
             .derive(&DeriveRequest {
@@ -4771,7 +4796,9 @@ mod tests {
         let DeriveOutcome::Derived { work_id } = outcome else {
             panic!("expected Derived, got {outcome:?}");
         };
-        assert_eq!(db.failure_count("s1", "implement").unwrap(), 0);
+        assert_eq!(db.failure_count(&work_id).unwrap(), 0);
+        history(&db, &work_id, "s1", "implement", "failed");
+        assert_eq!(db.failure_count(&first).unwrap(), 1);
         let conn = db.conn.lock().unwrap();
         let owner: Option<String> = conn
             .query_row(
@@ -4842,30 +4869,85 @@ mod tests {
     #[test]
     fn failure_count_counts_only_failures_after_the_last_reset() {
         let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        let other = inserted_id(collect(&db, "s1", "other"));
+        let foreign = inserted_id(collect(&db, "s2", "implement"));
         for status in ["failed", "done", "failed"] {
-            history(&db, "s1:implement", "s1", "implement", status);
+            history(&db, &first, "s1", "implement", status);
         }
-        history(&db, "s1:other", "s1", "other", "failed");
-        history(&db, "s2:implement", "s2", "implement", "failed");
-        assert_eq!(db.failure_count("s1", "implement").unwrap(), 2);
+        history(&db, &other, "s1", "other", "failed");
+        history(&db, &foreign, "s2", "implement", "failed");
+        assert_eq!(db.failure_count(&first).unwrap(), 2);
 
-        db.record_reset("s1", "implement", "s1:implement").unwrap();
-        assert_eq!(db.failure_count("s1", "implement").unwrap(), 0);
+        db.record_reset(&first).unwrap();
+        assert_eq!(db.failure_count(&first).unwrap(), 0);
 
-        history(&db, "s1:implement:2", "s1", "implement", "failed");
-        assert_eq!(db.failure_count("s1", "implement").unwrap(), 1);
-        // Other series are untouched by the reset.
-        assert_eq!(db.failure_count("s1", "other").unwrap(), 1);
+        history(&db, &first, "s1", "implement", "failed");
+        assert_eq!(db.failure_count(&first).unwrap(), 1);
+        // Other lineages are untouched by the reset.
+        assert_eq!(db.failure_count(&other).unwrap(), 1);
+        assert_eq!(db.failure_count(&foreign).unwrap(), 1);
+    }
+
+    #[test]
+    fn failure_count_does_not_carry_over_to_a_recollected_lineage() {
+        let db = test_db();
+        let a = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &a);
+        history(&db, &a, "s1", "implement", "failed");
+        history(&db, &a, "s1", "implement", "failed");
+        step(&db, &a, QueuePhase::Running, QueuePhase::Completed);
+        step(&db, &a, QueuePhase::Completed, QueuePhase::Done);
+        assert_eq!(db.failure_count(&a).unwrap(), 2);
+
+        let b = inserted_id(collect(&db, "s1", "implement"));
+        assert_ne!(a, b);
+        assert_eq!(db.failure_count(&b).unwrap(), 0);
+        history(&db, &b, "s1", "implement", "failed");
+        assert_eq!(db.failure_count(&b).unwrap(), 1);
+        assert_eq!(db.failure_count(&a).unwrap(), 2);
+    }
+
+    #[test]
+    fn failure_count_accumulates_across_escalation_retry_derivation() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+        history(&db, &first, "s1", "implement", "failed");
+        let DeriveOutcome::Derived { work_id: second } = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+        history(&db, &second, "s1", "implement", "failed");
+        assert_eq!(db.failure_count(&second).unwrap(), 2);
+        assert_eq!(db.failure_count(&first).unwrap(), 2);
+    }
+
+    #[test]
+    fn failure_count_and_record_reset_reject_unknown_work_id() {
+        let db = test_db();
+        assert!(matches!(
+            db.failure_count("nope"),
+            Err(BeltError::ItemNotFound(_))
+        ));
+        assert!(matches!(
+            db.record_reset("nope"),
+            Err(BeltError::ItemNotFound(_))
+        ));
     }
 
     #[test]
     fn failure_count_rejects_unknown_history_status() {
         let db = test_db();
-        history(&db, "s1:implement", "s1", "implement", "weird");
-        assert!(matches!(
-            db.failure_count("s1", "implement"),
-            Err(BeltError::Database(_))
-        ));
+        let id = inserted_id(collect(&db, "s1", "implement"));
+        history(&db, &id, "s1", "implement", "weird");
+        assert!(matches!(db.failure_count(&id), Err(BeltError::Database(_))));
     }
 
     #[test]

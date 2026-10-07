@@ -45,7 +45,7 @@ pub enum AttemptStatus {
     Failed,
     Skipped,
     Hitl,
-    /// 리셋 지점 — HITL retry 확정, replan 파생, 새 계열 시작.
+    /// 리셋 지점 — HITL retry 확정, replan 파생. 재수집은 새 계열이라 리셋 지점이 아니다.
     Reset,
 }
 
