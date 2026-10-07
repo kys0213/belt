@@ -1059,6 +1059,123 @@ fn queue_skip_running_with_a_stale_daemon_pid_file_is_canceled_directly() {
     assert_eq!(stdout_json(&out)["result"], "canceled_directly");
 }
 
+/// What the daemon double does with the cancel request it finds.
+#[derive(Clone, Copy)]
+enum DaemonReaction {
+    /// Accepts it and never closes it.
+    AcceptOnly,
+    /// Accepts it, moves the item to Skipped, closes it `canceled`.
+    Cancel,
+    /// The handler finished first: the item moves on and the request closes
+    /// `too_late`.
+    TooLate,
+}
+
+/// Stands in for a running daemon: the pid file names a live process (this
+/// test), no IPC port is published, and a thread plays the daemon's side of
+/// the cancel request on its own database connection.
+struct DaemonDouble(Option<std::thread::JoinHandle<()>>);
+
+impl DaemonDouble {
+    fn start(belt_home: &std::path::Path, reaction: DaemonReaction) -> Self {
+        use belt_infra::db::CancelResult;
+        std::fs::write(belt_home.join("daemon.pid"), std::process::id().to_string()).unwrap();
+        let db_path = belt_home.join("belt.db");
+        Self(Some(std::thread::spawn(move || {
+            let db = Database::open(db_path.to_str().unwrap()).expect("open daemon-side db");
+            let daemon = Actor::Daemon;
+            let open = (0..500)
+                .find_map(|_| {
+                    let found = db.open_cancel_requests().unwrap().into_iter().next();
+                    if found.is_none() {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    found
+                })
+                .expect("the CLI should record a cancel request");
+            match reaction {
+                DaemonReaction::AcceptOnly => {
+                    db.accept_cancel(open.id, &daemon).unwrap();
+                }
+                DaemonReaction::Cancel => {
+                    db.accept_cancel(open.id, &daemon).unwrap();
+                    daemon_move(&db, &open.work_id, QueuePhase::Running, QueuePhase::Skipped);
+                    db.close_cancel(open.id, CancelResult::Canceled, &daemon)
+                        .unwrap();
+                }
+                DaemonReaction::TooLate => {
+                    daemon_move(
+                        &db,
+                        &open.work_id,
+                        QueuePhase::Running,
+                        QueuePhase::Completed,
+                    );
+                    db.close_cancel(open.id, CancelResult::TooLate, &daemon)
+                        .unwrap();
+                }
+            }
+        })))
+    }
+
+    fn finish(mut self) {
+        self.0
+            .take()
+            .unwrap()
+            .join()
+            .expect("daemon double panicked");
+    }
+}
+
+#[test]
+fn queue_skip_running_closed_by_the_daemon_is_canceled() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Running);
+    let daemon = DaemonDouble::start(tmp.path(), DaemonReaction::Cancel);
+
+    let out = run_belt(tmp.path(), &["queue", "skip", &id, "--json"]);
+    daemon.finish();
+
+    assert!(out.status.success(), "{out:?}");
+    let v = stdout_json(&out);
+    assert_eq!(v["success"], true);
+    assert_eq!(v["result"], "canceled");
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Skipped);
+}
+
+#[test]
+fn queue_skip_running_too_late_is_refused_with_the_current_phase() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Running);
+    let daemon = DaemonDouble::start(tmp.path(), DaemonReaction::TooLate);
+
+    let out = run_belt(tmp.path(), &["queue", "skip", &id, "--json"]);
+    daemon.finish();
+
+    assert!(!out.status.success(), "{out:?}");
+    let v = stdout_json(&out);
+    assert_eq!(v["success"], false);
+    assert_eq!(v["reason"], "too_late");
+    assert_eq!(v["current"], "completed");
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Completed);
+}
+
+#[test]
+fn queue_skip_running_accepted_but_not_closed_exits_zero_as_accepted() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Running);
+    let daemon = DaemonDouble::start(tmp.path(), DaemonReaction::AcceptOnly);
+
+    // The CLI waits out its limit (10s) before reporting the accepted request.
+    let out = run_belt(tmp.path(), &["queue", "skip", &id, "--json"]);
+    daemon.finish();
+
+    assert!(out.status.success(), "{out:?}");
+    let v = stdout_json(&out);
+    assert_eq!(v["success"], true);
+    assert_eq!(v["result"], "accepted");
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Running);
+}
+
 #[test]
 fn queue_skip_hitl_awaiting_post_processing_is_busy_and_records_no_request() {
     let (tmp, db) = setup_belt_home();
