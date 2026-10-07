@@ -8,14 +8,19 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use belt_core::error::BeltError;
 use belt_core::escalation::EscalationAction;
+use belt_core::lineage::{AttemptStatus, CollectDecision, collect_decision, count_since_reset};
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::runtime::TokenUsage;
+use belt_core::transition::{
+    Actor, GuardDecision, ItemSnapshot, Processing, TransitionOutcome, TransitionReason,
+    TransitionRequest, guard,
+};
 
 use crate::db_migrations;
 
@@ -234,46 +239,24 @@ impl Database {
 
     /// Insert a new queue item.
     ///
+    /// Writes no transition log row and issues no `work_id`; collection goes
+    /// through [`Database::insert_collected`].
+    ///
     /// # Errors
-    /// Returns `BeltError::Database` on constraint violation or I/O error.
+    /// Returns `BeltError::Database` on constraint violation, I/O error, or an
+    /// empty `lineage_root`.
     pub fn insert_item(&self, item: &QueueItem) -> Result<(), BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        conn.execute(
-            &format!(
-                "INSERT INTO queue_items ({QUEUE_ITEM_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"
-            ),
-            params![
-                item.work_id,
-                item.source_id,
-                item.workspace_id,
-                item.state,
-                phase_to_str(item.phase()),
-                item.title,
-                item.created_at,
-                item.updated_at,
-                item.hitl_created_at,
-                item.hitl_respondent,
-                item.hitl_notes,
-                item.hitl_reason.map(|r| r.to_string()),
-                item.hitl_timeout_at,
-                item.hitl_terminal_action.map(|a| a.to_string()),
-                item.replan_count,
-                item.worktree_preserved,
-                item.previous_worktree_path,
-                item.derived_from,
-                item.lineage_root,
-            ],
-        )
-        .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(())
+        let conn = self.lock_conn()?;
+        insert_queue_row(&conn, item)
     }
 
     /// Update the phase of an existing queue item.
     ///
     /// Also refreshes `updated_at` to the current UTC time.
+    ///
+    /// Scheduled to be replaced by [`Database::transition`], which applies the
+    /// transition contract and records the transition log. This method
+    /// overwrites the phase without either.
     ///
     /// # Errors
     /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
@@ -393,6 +376,10 @@ impl Database {
     /// Update HITL metadata when responding to a HITL item.
     ///
     /// Sets `hitl_respondent`, `hitl_notes`, phase, and refreshes `updated_at`.
+    ///
+    /// Scheduled to be replaced by the HITL request API, where the first
+    /// response wins and the item leaves Hitl only through daemon
+    /// post-processing. This method decides nothing about who wins.
     ///
     /// # Errors
     /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
@@ -1794,6 +1781,710 @@ impl Database {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| BeltError::Database(e.to_string()))?;
         Ok(events)
+    }
+}
+
+// ---- Transition / lineage store API ----------------------------------------
+
+/// Values of `transition_log.kind` written by this binary.
+///
+/// Rows copied from the legacy `transition_events` table keep their original
+/// `event_type` (`handler`, `evaluate`, `on_done`, ...) and are marked by the
+/// `legacy` actor, so readers must treat `kind` as an open vocabulary. The
+/// legacy phase kind is the same word as [`PHASE_ENTER`], which keeps phase
+/// history uniform across the migration.
+pub mod transition_kind {
+    /// An item entered a phase (`from_phase` → `to_phase`).
+    pub const PHASE_ENTER: &str = "phase_enter";
+    /// An item was created: collected, or derived (origin in `detail`).
+    pub const ITEM_CREATED: &str = "item_created";
+    /// A transition was refused with `busy` because the item is being processed.
+    pub const TRANSITION_REJECTED: &str = "transition_rejected";
+    /// A transition found a phase other than the expected one.
+    pub const TRANSITION_CONFLICT: &str = "transition_conflict";
+}
+
+/// One row of the append-only `transition_log`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionLogEntry {
+    /// Global, strictly increasing, never reused.
+    pub seq: u64,
+    pub work_id: String,
+    pub source_id: String,
+    /// See [`transition_kind`]; legacy rows carry their original event type.
+    pub kind: String,
+    /// Phase before the event; `None` for creation and non-phase events.
+    pub from_phase: Option<String>,
+    pub to_phase: Option<String>,
+    /// `daemon`, `cli`, `tui`, `cron`, an external channel name, or `legacy`.
+    pub actor: String,
+    pub reason: Option<String>,
+    pub detail: Option<String>,
+    /// RFC 3339.
+    pub created_at: String,
+}
+
+/// An item to create from collection. The `work_id` is issued by the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewItem {
+    pub source_id: String,
+    pub workspace_id: String,
+    pub state: String,
+    pub title: Option<String>,
+    pub actor: Actor,
+}
+
+/// Result of [`Database::insert_collected`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollectOutcome {
+    /// A new Pending item (first item of a new lineage) was created.
+    Inserted { work_id: String },
+    /// The same `(source_id, state)` still has an item that is not Done or Skipped.
+    Duplicate,
+}
+
+/// Why an item is being derived. Decides worktree and failure-count handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeriveKind {
+    /// escalation retry: the origin's worktree is handed over to the derived item.
+    EscalationRetry,
+    /// replan: the derived item gets a new worktree and a failure-count reset point.
+    Replan,
+}
+
+/// Request to end `work_id` as Skipped and continue the work in a derived item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeriveRequest {
+    pub work_id: String,
+    pub expected_from: QueuePhase,
+    pub kind: DeriveKind,
+    pub actor: Actor,
+    pub reason: TransitionReason,
+    pub detail: Option<String>,
+}
+
+/// Result of [`Database::derive`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeriveOutcome {
+    Derived {
+        work_id: String,
+    },
+    /// The origin's transition was refused; nothing was derived.
+    Rejected(TransitionOutcome),
+}
+
+/// What a transition attempt inside a transaction decided.
+enum Step {
+    Applied {
+        seq: u64,
+    },
+    Rejected(TransitionOutcome),
+    /// The request maps to a HITL response; the HITL API owns that race.
+    HitlResponse,
+}
+
+/// Fields of a `transition_log` row to append.
+struct LogRecord<'a> {
+    work_id: &'a str,
+    source_id: &'a str,
+    kind: &'a str,
+    from_phase: Option<&'a str>,
+    to_phase: Option<&'a str>,
+    actor: &'a str,
+    reason: Option<&'a str>,
+    detail: Option<&'a str>,
+}
+
+impl Database {
+    /// Attempt a phase transition through the transition contract.
+    ///
+    /// One `BEGIN IMMEDIATE` transaction: read the current state, ask
+    /// [`belt_core::transition::guard`], then (only on `Proceed`) change the
+    /// phase and append a `phase_enter` row. `busy` and `conflict` refusals
+    /// are committed as `transition_rejected` / `transition_conflict` rows;
+    /// `invalid_action` leaves no row. Refusals are values, not errors.
+    ///
+    /// A request that leaves Hitl without being a daemon post-processing
+    /// transition corresponds to a HITL response; until the HITL API exists
+    /// it is reported as `InvalidAction { current: Hitl }` and changes nothing.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`, `BeltError::Database`
+    /// on I/O failure.
+    pub fn transition(&self, req: &TransitionRequest) -> Result<TransitionOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let (_, step) = transition_in_tx(tx, req)?;
+            Ok(match step {
+                Step::Applied { seq } => TransitionOutcome::Applied { seq },
+                Step::Rejected(outcome) => outcome,
+                Step::HitlResponse => TransitionOutcome::InvalidAction {
+                    current: QueuePhase::Hitl,
+                },
+            })
+        })
+    }
+
+    /// Create the first item of a new lineage from collection.
+    ///
+    /// One transaction: read the phases of the same `(source_id, state)` and
+    /// the highest issued sequence, apply
+    /// [`belt_core::lineage::collect_decision`], then insert the Pending item
+    /// (`lineage_root` = its own `work_id`, no origin) and an `item_created` row.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or unreadable stored phases.
+    pub fn insert_collected(&self, new: &NewItem) -> Result<CollectOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let (phases, max_seq) = read_series(tx, &new.source_id, &new.state)?;
+            let work_id = match collect_decision(&phases, max_seq) {
+                CollectDecision::Duplicate => return Ok(CollectOutcome::Duplicate),
+                CollectDecision::New { seq } => issue_work_id(&new.source_id, &new.state, seq),
+            };
+            let mut item = QueueItem::new(
+                work_id.clone(),
+                new.source_id.clone(),
+                new.workspace_id.clone(),
+                new.state.clone(),
+            );
+            item.title = new.title.clone();
+            insert_queue_row(tx, &item)?;
+            append_log(
+                tx,
+                &LogRecord {
+                    work_id: &work_id,
+                    source_id: &new.source_id,
+                    kind: transition_kind::ITEM_CREATED,
+                    from_phase: None,
+                    to_phase: Some(phase_to_str(QueuePhase::Pending)),
+                    actor: &actor_str(&new.actor),
+                    reason: Some("collected"),
+                    detail: None,
+                },
+            )?;
+            Ok(CollectOutcome::Inserted { work_id })
+        })
+    }
+
+    /// End an item as Skipped and continue its work in a derived Pending item.
+    ///
+    /// One transaction: transition the origin to Skipped through the same
+    /// contract as [`Database::transition`], then insert the derived item
+    /// (next sequence, `derived_from` = origin, same `lineage_root`, inherited
+    /// `replan_count`) with an `item_created` row naming the origin.
+    /// [`DeriveKind::EscalationRetry`] hands the worktree over
+    /// (`worktree_owner` = the origin's owner, or the origin itself);
+    /// [`DeriveKind::Replan`] leaves the owner empty and records a
+    /// failure-count reset point. If the origin's transition is refused,
+    /// nothing is derived.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown origin; `BeltError::Database`
+    /// on I/O failure or when the `(source_id, state)` already has another open item.
+    pub fn derive(&self, req: &DeriveRequest) -> Result<DeriveOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let skip = TransitionRequest {
+                work_id: req.work_id.clone(),
+                expected_from: req.expected_from,
+                to: QueuePhase::Skipped,
+                actor: req.actor.clone(),
+                reason: req.reason.clone(),
+                detail: req.detail.clone(),
+            };
+            let (origin, step) = transition_in_tx(tx, &skip)?;
+            match step {
+                Step::Applied { .. } => {}
+                Step::Rejected(outcome) => return Ok(DeriveOutcome::Rejected(outcome)),
+                Step::HitlResponse => {
+                    return Ok(DeriveOutcome::Rejected(TransitionOutcome::InvalidAction {
+                        current: QueuePhase::Hitl,
+                    }));
+                }
+            }
+
+            let (phases, max_seq) = read_series(tx, &origin.item.source_id, &origin.item.state)?;
+            let seq = match collect_decision(&phases, max_seq) {
+                CollectDecision::New { seq: Some(n) } => n,
+                CollectDecision::New { seq: None } | CollectDecision::Duplicate => {
+                    return Err(BeltError::Database(format!(
+                        "cannot derive from {}: another item of ({}, {}) is still open",
+                        req.work_id, origin.item.source_id, origin.item.state
+                    )));
+                }
+            };
+            let work_id = issue_work_id(&origin.item.source_id, &origin.item.state, Some(seq));
+            let mut derived = QueueItem::new(
+                work_id.clone(),
+                origin.item.source_id.clone(),
+                origin.item.workspace_id.clone(),
+                origin.item.state.clone(),
+            );
+            derived.title = origin.item.title.clone();
+            derived.replan_count = origin.item.replan_count;
+            derived.derived_from = Some(origin.item.work_id.clone());
+            derived.lineage_root = origin.item.lineage_root.clone();
+            insert_queue_row(tx, &derived)?;
+
+            match req.kind {
+                DeriveKind::EscalationRetry => {
+                    let owner = origin
+                        .worktree_owner
+                        .as_deref()
+                        .unwrap_or(&origin.item.work_id);
+                    tx.execute(
+                        "UPDATE queue_items SET worktree_owner = ?1 WHERE work_id = ?2",
+                        params![owner, work_id],
+                    )
+                    .map_err(sql_err)?;
+                }
+                DeriveKind::Replan => insert_reset_row(
+                    tx,
+                    &origin.item.source_id,
+                    &origin.item.state,
+                    &origin.item.work_id,
+                )?,
+            }
+
+            append_log(
+                tx,
+                &LogRecord {
+                    work_id: &work_id,
+                    source_id: &origin.item.source_id,
+                    kind: transition_kind::ITEM_CREATED,
+                    from_phase: None,
+                    to_phase: Some(phase_to_str(QueuePhase::Pending)),
+                    actor: &actor_str(&req.actor),
+                    reason: Some("derived"),
+                    detail: Some(&origin.item.work_id),
+                },
+            )?;
+            Ok(DeriveOutcome::Derived { work_id })
+        })
+    }
+
+    /// Failures of `(source_id, state)` since its last reset point.
+    ///
+    /// Reads the attempt history in insertion order and applies
+    /// [`belt_core::lineage::count_since_reset`].
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or a history status that maps to
+    /// no attempt status (`failed`, `reset`, `running`, `done`/`success`,
+    /// `skipped`, `hitl`).
+    pub fn failure_count(&self, source_id: &str, state: &str) -> Result<u32, BeltError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare("SELECT status FROM history WHERE source_id = ?1 AND state = ?2 ORDER BY id")
+            .map_err(sql_err)?;
+        let attempts = stmt
+            .query_map(params![source_id, state], |row| row.get::<_, String>(0))
+            .map_err(sql_err)?
+            .map(|status| attempt_status(&status.map_err(sql_err)?))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(count_since_reset(&attempts))
+    }
+
+    /// Record a failure-count reset point for `(source_id, state)`.
+    ///
+    /// `work_id` is the item the reset happened on (the HITL-retried item).
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn record_reset(
+        &self,
+        source_id: &str,
+        state: &str,
+        work_id: &str,
+    ) -> Result<(), BeltError> {
+        self.write_tx(|tx| insert_reset_row(tx, source_id, state, work_id))
+    }
+
+    /// Transition log rows with `seq` greater than the cursor, oldest first.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn transitions_since(&self, seq: u64) -> Result<Vec<TransitionLogEntry>, BeltError> {
+        let cursor = i64::try_from(seq)
+            .map_err(|_| BeltError::Database(format!("seq cursor out of range: {seq}")))?;
+        self.query_log("WHERE seq > ?1", params![cursor])
+    }
+
+    /// All transition log rows of one item, oldest first.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn transitions_of(&self, work_id: &str) -> Result<Vec<TransitionLogEntry>, BeltError> {
+        self.query_log("WHERE work_id = ?1", params![work_id])
+    }
+
+    /// The most recently created item of the lineage `work_id` belongs to.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`.
+    pub fn latest_in_lineage(&self, work_id: &str) -> Result<QueueItem, BeltError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {QUEUE_ITEM_COLUMNS} FROM queue_items
+                 WHERE lineage_root = (SELECT lineage_root FROM queue_items WHERE work_id = ?1)
+                 ORDER BY rowid DESC LIMIT 1"
+            ))
+            .map_err(sql_err)?;
+        let mut rows = stmt.query(params![work_id]).map_err(sql_err)?;
+        match rows.next().map_err(sql_err)? {
+            Some(row) => row_to_queue_item(row),
+            None => Err(BeltError::ItemNotFound(work_id.to_string())),
+        }
+    }
+
+    fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, BeltError> {
+        self.conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))
+    }
+
+    /// Run `f` in a `BEGIN IMMEDIATE` transaction; commit when it returns `Ok`.
+    fn write_tx<T>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T, BeltError>,
+    ) -> Result<T, BeltError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let value = f(&tx)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(value)
+    }
+
+    fn query_log(
+        &self,
+        filter: &str,
+        args: impl rusqlite::Params,
+    ) -> Result<Vec<TransitionLogEntry>, BeltError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT seq, work_id, source_id, kind, from_phase, to_phase, actor, reason, detail, created_at
+                 FROM transition_log {filter} ORDER BY seq"
+            ))
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(args, |row| {
+                Ok(TransitionLogEntry {
+                    seq: u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0),
+                    work_id: row.get(1)?,
+                    source_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    from_phase: row.get(4)?,
+                    to_phase: row.get(5)?,
+                    actor: row.get(6)?,
+                    reason: row.get(7)?,
+                    detail: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })
+            .map_err(sql_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_err)?;
+        Ok(rows)
+    }
+}
+
+fn sql_err(e: rusqlite::Error) -> BeltError {
+    BeltError::Database(e.to_string())
+}
+
+/// An item as read inside a transition transaction.
+struct StoredItem {
+    item: QueueItem,
+    worktree_owner: Option<String>,
+    snapshot: ItemSnapshot,
+}
+
+fn read_stored_item(tx: &Transaction<'_>, work_id: &str) -> Result<StoredItem, BeltError> {
+    let mut stmt = tx
+        .prepare(&format!(
+            "SELECT {QUEUE_ITEM_COLUMNS}, worktree_owner FROM queue_items WHERE work_id = ?1"
+        ))
+        .map_err(sql_err)?;
+    let mut rows = stmt.query(params![work_id]).map_err(sql_err)?;
+    let Some(row) = rows.next().map_err(sql_err)? else {
+        return Err(BeltError::ItemNotFound(work_id.to_string()));
+    };
+    let item = row_to_queue_item(row)?;
+    let worktree_owner = col(row, 19)?;
+    let processing = processing_of(tx, &item)?;
+    let snapshot = ItemSnapshot {
+        phase: item.phase(),
+        processing,
+    };
+    Ok(StoredItem {
+        item,
+        worktree_owner,
+        snapshot,
+    })
+}
+
+/// Running means the daemon's handler owns the item; Hitl means a resolved or
+/// expired request is waiting for the daemon's post-processing.
+fn processing_of(tx: &Transaction<'_>, item: &QueueItem) -> Result<Option<Processing>, BeltError> {
+    match item.phase() {
+        QueuePhase::Running => Ok(Some(Processing::Handler)),
+        QueuePhase::Hitl => {
+            let waiting: bool = tx
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM hitl_requests
+                     WHERE work_id = ?1 AND status IN ('resolved', 'expired') AND post_processed_at IS NULL)",
+                    params![item.work_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_err)?;
+            Ok(waiting.then_some(Processing::PostProcessing))
+        }
+        QueuePhase::Pending
+        | QueuePhase::Ready
+        | QueuePhase::Completed
+        | QueuePhase::Done
+        | QueuePhase::Failed
+        | QueuePhase::Skipped => Ok(None),
+    }
+}
+
+/// Guard, then CAS and log, inside the caller's transaction.
+fn transition_in_tx(
+    tx: &Transaction<'_>,
+    req: &TransitionRequest,
+) -> Result<(StoredItem, Step), BeltError> {
+    let stored = read_stored_item(tx, &req.work_id)?;
+    let actor = actor_str(&req.actor);
+    let current = phase_to_str(stored.snapshot.phase);
+    let step = match guard(&stored.snapshot, req) {
+        GuardDecision::Proceed => {
+            let now = Utc::now().to_rfc3339();
+            let changed = tx
+                .execute(
+                    "UPDATE queue_items SET phase = ?1, updated_at = ?2 WHERE work_id = ?3 AND phase = ?4",
+                    params![phase_to_str(req.to), now, req.work_id, current],
+                )
+                .map_err(sql_err)?;
+            if changed != 1 {
+                return Err(BeltError::Database(format!(
+                    "phase compare-and-set on {} changed {changed} rows under an immediate transaction",
+                    req.work_id
+                )));
+            }
+            let reason = reason_str(&req.reason);
+            let seq = append_log(
+                tx,
+                &LogRecord {
+                    work_id: &req.work_id,
+                    source_id: &stored.item.source_id,
+                    kind: transition_kind::PHASE_ENTER,
+                    from_phase: Some(current),
+                    to_phase: Some(phase_to_str(req.to)),
+                    actor: &actor,
+                    reason: Some(&reason),
+                    detail: req.detail.as_deref(),
+                },
+            )?;
+            Step::Applied { seq }
+        }
+        GuardDecision::Reject(outcome) => {
+            let kind = match outcome {
+                TransitionOutcome::Busy { .. } => Some(transition_kind::TRANSITION_REJECTED),
+                TransitionOutcome::Conflict { .. } => Some(transition_kind::TRANSITION_CONFLICT),
+                TransitionOutcome::InvalidAction { .. } | TransitionOutcome::Applied { .. } => None,
+            };
+            if let Some(kind) = kind {
+                append_log(
+                    tx,
+                    &LogRecord {
+                        work_id: &req.work_id,
+                        source_id: &stored.item.source_id,
+                        kind,
+                        from_phase: Some(current),
+                        to_phase: Some(phase_to_str(req.to)),
+                        actor: &actor,
+                        reason: None,
+                        detail: req.detail.as_deref(),
+                    },
+                )?;
+            }
+            Step::Rejected(outcome)
+        }
+        GuardDecision::ConvertToHitlResponse(_) => Step::HitlResponse,
+    };
+    Ok((stored, step))
+}
+
+fn append_log(tx: &Transaction<'_>, rec: &LogRecord<'_>) -> Result<u64, BeltError> {
+    tx.execute(
+        "INSERT INTO transition_log
+         (work_id, source_id, kind, from_phase, to_phase, actor, reason, detail, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            rec.work_id,
+            rec.source_id,
+            rec.kind,
+            rec.from_phase,
+            rec.to_phase,
+            rec.actor,
+            rec.reason,
+            rec.detail,
+            Utc::now().to_rfc3339(),
+        ],
+    )
+    .map_err(sql_err)?;
+    u64::try_from(tx.last_insert_rowid())
+        .map_err(|_| BeltError::Database("transition_log seq out of range".to_string()))
+}
+
+/// Phases of every item of `(source_id, state)` and the highest sequence ever
+/// issued for it. The base `work_id` counts as 1. Issued ids are also read
+/// from the transition log, so a removed item's `work_id` is never reissued.
+fn read_series(
+    tx: &Transaction<'_>,
+    source_id: &str,
+    state: &str,
+) -> Result<(Vec<QueuePhase>, Option<u32>), BeltError> {
+    let phases = {
+        let mut stmt = tx
+            .prepare("SELECT phase FROM queue_items WHERE source_id = ?1 AND state = ?2")
+            .map_err(sql_err)?;
+        stmt.query_map(params![source_id, state], |row| row.get::<_, String>(0))
+            .map_err(sql_err)?
+            .map(|phase| str_to_phase(&phase.map_err(sql_err)?))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let base = QueueItem::make_work_id(source_id, state);
+    let prefix = format!("{base}:");
+    let issued = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT work_id FROM queue_items WHERE source_id = ?1 AND state = ?2
+                 UNION
+                 SELECT work_id FROM transition_log WHERE source_id = ?1 AND substr(work_id, 1, ?3) = ?4",
+            )
+            .map_err(sql_err)?;
+        let prefix_len = i64::try_from(base.chars().count())
+            .map_err(|_| BeltError::Database("work_id prefix too long".to_string()))?;
+        stmt.query_map(params![source_id, state, prefix_len, base], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(sql_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql_err)?
+    };
+    let max_seq = issued
+        .iter()
+        .filter_map(|id| {
+            if *id == base {
+                Some(1)
+            } else {
+                id.strip_prefix(&prefix)?.parse::<u32>().ok()
+            }
+        })
+        .max();
+    Ok((phases, max_seq))
+}
+
+fn issue_work_id(source_id: &str, state: &str, seq: Option<u32>) -> String {
+    match seq {
+        None => QueueItem::make_work_id(source_id, state),
+        Some(n) => QueueItem::make_derived_work_id(source_id, state, n),
+    }
+}
+
+/// Insert a `queue_items` row. An empty `lineage_root` (serde default for
+/// items deserialized without one) is rejected: every item belongs to a lineage.
+fn insert_queue_row(conn: &Connection, item: &QueueItem) -> Result<(), BeltError> {
+    if item.lineage_root.is_empty() {
+        return Err(BeltError::Database(format!(
+            "queue item {} has an empty lineage_root",
+            item.work_id
+        )));
+    }
+    conn.execute(
+        &format!(
+            "INSERT INTO queue_items ({QUEUE_ITEM_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)"
+        ),
+        params![
+            item.work_id,
+            item.source_id,
+            item.workspace_id,
+            item.state,
+            phase_to_str(item.phase()),
+            item.title,
+            item.created_at,
+            item.updated_at,
+            item.hitl_created_at,
+            item.hitl_respondent,
+            item.hitl_notes,
+            item.hitl_reason.map(|r| r.to_string()),
+            item.hitl_timeout_at,
+            item.hitl_terminal_action.map(|a| a.to_string()),
+            item.replan_count,
+            item.worktree_preserved,
+            item.previous_worktree_path,
+            item.derived_from,
+            item.lineage_root,
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn insert_reset_row(
+    tx: &Transaction<'_>,
+    source_id: &str,
+    state: &str,
+    work_id: &str,
+) -> Result<(), BeltError> {
+    tx.execute(
+        "INSERT INTO history (work_id, source_id, state, status, attempt, summary, error, created_at)
+         VALUES (?1, ?2, ?3, ?4, 0, NULL, NULL, ?5)",
+        params![work_id, source_id, state, HISTORY_STATUS_RESET, Utc::now().to_rfc3339()],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+/// `history.status` of a failure-count reset point.
+const HISTORY_STATUS_RESET: &str = "reset";
+
+fn attempt_status(status: &str) -> Result<AttemptStatus, BeltError> {
+    match status {
+        "failed" => Ok(AttemptStatus::Failed),
+        HISTORY_STATUS_RESET => Ok(AttemptStatus::Reset),
+        "running" => Ok(AttemptStatus::Running),
+        "done" | "success" => Ok(AttemptStatus::Done),
+        "skipped" => Ok(AttemptStatus::Skipped),
+        "hitl" => Ok(AttemptStatus::Hitl),
+        other => Err(BeltError::Database(format!(
+            "unknown history status: {other}"
+        ))),
+    }
+}
+
+fn actor_str(actor: &Actor) -> String {
+    match actor {
+        Actor::Daemon => "daemon".to_string(),
+        Actor::Cli => "cli".to_string(),
+        Actor::Tui => "tui".to_string(),
+        Actor::Cron => "cron".to_string(),
+        Actor::Channel(name) => name.clone(),
+    }
+}
+
+fn reason_str(reason: &TransitionReason) -> String {
+    match reason {
+        TransitionReason::Manual => "manual".to_string(),
+        TransitionReason::Derived => "derived".to_string(),
+        TransitionReason::Canceled => "canceled".to_string(),
+        TransitionReason::Rollback => "rollback".to_string(),
+        TransitionReason::Escalation(action) => format!("escalation:{action}"),
+        TransitionReason::PostProcessing(action) => format!("post_processing:{action}"),
     }
 }
 
@@ -3572,5 +4263,638 @@ mod tests {
         assert_eq!(rows[0].3, 2); // executions
         assert_eq!(rows[1].0, "sonnet");
         assert_eq!(rows[1].3, 1);
+    }
+
+    // ---- Transition / lineage store API ------------------------------------
+
+    use belt_core::transition::{Actor, Processing, TransitionOutcome, TransitionReason};
+
+    fn new_item(source_id: &str, state: &str) -> NewItem {
+        NewItem {
+            source_id: source_id.to_string(),
+            workspace_id: "ws".to_string(),
+            state: state.to_string(),
+            title: None,
+            actor: Actor::Daemon,
+        }
+    }
+
+    fn collect(db: &Database, source_id: &str, state: &str) -> CollectOutcome {
+        db.insert_collected(&new_item(source_id, state)).unwrap()
+    }
+
+    fn inserted_id(outcome: CollectOutcome) -> String {
+        match outcome {
+            CollectOutcome::Inserted { work_id } => work_id,
+            CollectOutcome::Duplicate => panic!("expected Inserted"),
+        }
+    }
+
+    fn request(work_id: &str, from: QueuePhase, to: QueuePhase, actor: Actor) -> TransitionRequest {
+        TransitionRequest {
+            work_id: work_id.to_string(),
+            expected_from: from,
+            to,
+            actor,
+            reason: TransitionReason::Manual,
+            detail: None,
+        }
+    }
+
+    fn step(db: &Database, work_id: &str, from: QueuePhase, to: QueuePhase) {
+        let outcome = db
+            .transition(&request(work_id, from, to, Actor::Daemon))
+            .unwrap();
+        assert!(
+            matches!(outcome, TransitionOutcome::Applied { .. }),
+            "{from:?}->{to:?} gave {outcome:?}"
+        );
+    }
+
+    fn run_to_running(db: &Database, work_id: &str) {
+        step(db, work_id, QueuePhase::Pending, QueuePhase::Ready);
+        step(db, work_id, QueuePhase::Ready, QueuePhase::Running);
+    }
+
+    fn history(db: &Database, work_id: &str, source_id: &str, state: &str, status: &str) {
+        db.append_history(&HistoryEvent {
+            work_id: work_id.to_string(),
+            source_id: source_id.to_string(),
+            state: state.to_string(),
+            status: status.to_string(),
+            attempt: 1,
+            summary: None,
+            error: None,
+            created_at: Utc::now().to_rfc3339(),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn transition_applies_and_logs_phase_enter_in_same_commit() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "analyze"));
+
+        let outcome = db
+            .transition(&request(
+                &id,
+                QueuePhase::Pending,
+                QueuePhase::Ready,
+                Actor::Cron,
+            ))
+            .unwrap();
+
+        let TransitionOutcome::Applied { seq } = outcome else {
+            panic!("expected Applied, got {outcome:?}");
+        };
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Ready);
+        let log = db.transitions_of(&id).unwrap();
+        let last = log.last().unwrap();
+        assert_eq!(last.seq, seq);
+        assert_eq!(last.kind, transition_kind::PHASE_ENTER);
+        assert_eq!(last.from_phase.as_deref(), Some("pending"));
+        assert_eq!(last.to_phase.as_deref(), Some("ready"));
+        assert_eq!(last.actor, "cron");
+        assert_eq!(last.reason.as_deref(), Some("manual"));
+    }
+
+    #[test]
+    fn transition_conflict_returns_current_phase_and_logs_conflict() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "analyze"));
+        step(&db, &id, QueuePhase::Pending, QueuePhase::Ready);
+
+        let outcome = db
+            .transition(&request(
+                &id,
+                QueuePhase::Pending,
+                QueuePhase::Ready,
+                Actor::Cli,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            TransitionOutcome::Conflict {
+                current: QueuePhase::Ready
+            }
+        );
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Ready);
+        let last = db.transitions_of(&id).unwrap().pop().unwrap();
+        assert_eq!(last.kind, transition_kind::TRANSITION_CONFLICT);
+        assert_eq!(last.actor, "cli");
+    }
+
+    #[test]
+    fn transition_on_running_item_is_busy_for_non_owner_and_logged() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "analyze"));
+        run_to_running(&db, &id);
+
+        let outcome = db
+            .transition(&request(
+                &id,
+                QueuePhase::Running,
+                QueuePhase::Skipped,
+                Actor::Cli,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            TransitionOutcome::Busy {
+                processing: Processing::Handler
+            }
+        );
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Running);
+        let last = db.transitions_of(&id).unwrap().pop().unwrap();
+        assert_eq!(last.kind, transition_kind::TRANSITION_REJECTED);
+        // The owner is never blocked by its own lock.
+        step(&db, &id, QueuePhase::Running, QueuePhase::Completed);
+    }
+
+    #[test]
+    fn hitl_item_in_post_processing_is_busy_for_non_owner() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "analyze"));
+        run_to_running(&db, &id);
+        step(&db, &id, QueuePhase::Running, QueuePhase::Hitl);
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO hitl_requests (hitl_id, work_id, status, opened_at, resolved_at, action)
+                 VALUES ('h1', ?1, 'resolved', 't', 't', 'retry')",
+                params![id],
+            )
+            .unwrap();
+        }
+
+        let outcome = db
+            .transition(&request(
+                &id,
+                QueuePhase::Hitl,
+                QueuePhase::Skipped,
+                Actor::Cli,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            TransitionOutcome::Busy {
+                processing: Processing::PostProcessing
+            }
+        );
+    }
+
+    #[test]
+    fn hitl_exit_without_matching_action_is_invalid_and_not_applied() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "analyze"));
+        run_to_running(&db, &id);
+        step(&db, &id, QueuePhase::Running, QueuePhase::Hitl);
+
+        let outcome = db
+            .transition(&request(
+                &id,
+                QueuePhase::Hitl,
+                QueuePhase::Pending,
+                Actor::Cli,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            TransitionOutcome::InvalidAction {
+                current: QueuePhase::Hitl
+            }
+        );
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+    }
+
+    #[test]
+    fn transition_outside_state_machine_is_invalid_action_without_log() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "analyze"));
+        let before = db.transitions_of(&id).unwrap().len();
+
+        let outcome = db
+            .transition(&request(
+                &id,
+                QueuePhase::Pending,
+                QueuePhase::Done,
+                Actor::Cli,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            TransitionOutcome::InvalidAction {
+                current: QueuePhase::Pending
+            }
+        );
+        assert_eq!(db.transitions_of(&id).unwrap().len(), before);
+    }
+
+    #[test]
+    fn transition_of_unknown_item_is_item_not_found() {
+        let db = test_db();
+        let err = db
+            .transition(&request(
+                "nope",
+                QueuePhase::Pending,
+                QueuePhase::Ready,
+                Actor::Daemon,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, BeltError::ItemNotFound(_)));
+    }
+
+    #[test]
+    fn concurrent_transitions_on_one_item_apply_once_and_conflict_once() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        let path = path.to_str().unwrap().to_string();
+        let setup = Database::open(&path).unwrap();
+
+        for round in 0..10 {
+            let id = inserted_id(collect(&setup, &format!("s{round}"), "analyze"));
+            let barrier = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = path.clone();
+                    let id = id.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let db = Database::open(&path).unwrap();
+                        barrier.wait();
+                        db.transition(&request(
+                            &id,
+                            QueuePhase::Pending,
+                            QueuePhase::Ready,
+                            Actor::Cli,
+                        ))
+                    })
+                })
+                .collect();
+            let outcomes: Vec<_> = handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap()
+                        .expect("no database error under contention")
+                })
+                .collect();
+
+            let applied = outcomes
+                .iter()
+                .filter(|o| matches!(o, TransitionOutcome::Applied { .. }))
+                .count();
+            let conflicts = outcomes
+                .iter()
+                .filter(|o| {
+                    matches!(
+                        o,
+                        TransitionOutcome::Conflict {
+                            current: QueuePhase::Ready
+                        }
+                    )
+                })
+                .count();
+            assert_eq!((applied, conflicts), (1, 1), "round {round}: {outcomes:?}");
+        }
+    }
+
+    #[test]
+    fn transition_log_seq_is_strictly_increasing_across_items() {
+        let db = test_db();
+        let a = inserted_id(collect(&db, "s1", "analyze"));
+        let b = inserted_id(collect(&db, "s2", "analyze"));
+        step(&db, &a, QueuePhase::Pending, QueuePhase::Ready);
+        step(&db, &b, QueuePhase::Pending, QueuePhase::Ready);
+        step(&db, &a, QueuePhase::Ready, QueuePhase::Running);
+
+        let all = db.transitions_since(0).unwrap();
+        assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
+        let cursor = all[1].seq;
+        let rest = db.transitions_since(cursor).unwrap();
+        assert_eq!(rest.len(), all.len() - 2);
+        assert!(rest.iter().all(|e| e.seq > cursor));
+    }
+
+    #[test]
+    fn insert_collected_first_item_uses_base_work_id_and_logs_creation() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "gh:o/r#1", "implement"));
+
+        assert_eq!(id, "gh:o/r#1:implement");
+        let item = db.get_item(&id).unwrap();
+        assert_eq!(item.lineage_root, id);
+        assert_eq!(item.derived_from, None);
+        let log = db.transitions_of(&id).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].kind, transition_kind::ITEM_CREATED);
+        assert_eq!(log[0].from_phase, None);
+        assert_eq!(log[0].to_phase.as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn insert_collected_is_duplicate_while_an_item_is_open() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "implement"));
+        assert_eq!(collect(&db, "s1", "implement"), CollectOutcome::Duplicate);
+
+        // Failed is not terminal for collection (C-26).
+        run_to_running(&db, &id);
+        step(&db, &id, QueuePhase::Running, QueuePhase::Failed);
+        assert_eq!(collect(&db, "s1", "implement"), CollectOutcome::Duplicate);
+        assert_eq!(db.list_items(None, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn insert_collected_after_terminal_items_takes_next_sequence() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        step(&db, &first, QueuePhase::Pending, QueuePhase::Skipped);
+
+        let second = inserted_id(collect(&db, "s1", "implement"));
+        assert_eq!(second, "s1:implement:2");
+        step(&db, &second, QueuePhase::Pending, QueuePhase::Skipped);
+
+        let third = inserted_id(collect(&db, "s1", "implement"));
+        assert_eq!(third, "s1:implement:3");
+        // A recollected item starts a new lineage with no origin.
+        let item = db.get_item(&third).unwrap();
+        assert_eq!(item.lineage_root, third);
+        assert_eq!(item.derived_from, None);
+        // Another state of the same source is independent.
+        assert_eq!(inserted_id(collect(&db, "s1", "analyze")), "s1:analyze");
+    }
+
+    #[test]
+    fn insert_collected_never_reuses_a_work_id_of_a_removed_item() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        step(&db, &first, QueuePhase::Pending, QueuePhase::Skipped);
+        let second = inserted_id(collect(&db, "s1", "implement"));
+        step(&db, &second, QueuePhase::Pending, QueuePhase::Skipped);
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("DELETE FROM queue_items", []).unwrap();
+        }
+
+        assert_eq!(
+            inserted_id(collect(&db, "s1", "implement")),
+            "s1:implement:3"
+        );
+    }
+
+    #[test]
+    fn insert_item_rejects_empty_lineage_root() {
+        let db = test_db();
+        let mut item = sample_item();
+        item.lineage_root = String::new();
+        let err = db.insert_item(&item).unwrap_err();
+        assert!(matches!(err, BeltError::Database(_)));
+        assert!(matches!(
+            db.get_item(&item.work_id),
+            Err(BeltError::ItemNotFound(_))
+        ));
+    }
+
+    fn derive_request(work_id: &str, from: QueuePhase, kind: DeriveKind) -> DeriveRequest {
+        DeriveRequest {
+            work_id: work_id.to_string(),
+            expected_from: from,
+            kind,
+            actor: Actor::Daemon,
+            reason: TransitionReason::Derived,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn derive_retry_skips_origin_and_creates_pending_item_with_origin_recorded() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+
+        let outcome = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap();
+
+        let DeriveOutcome::Derived { work_id } = outcome else {
+            panic!("expected Derived, got {outcome:?}");
+        };
+        assert_eq!(work_id, "s1:implement:2");
+        assert_eq!(db.get_item(&first).unwrap().phase(), QueuePhase::Skipped);
+        let derived = db.get_item(&work_id).unwrap();
+        assert_eq!(derived.phase(), QueuePhase::Pending);
+        assert_eq!(derived.derived_from.as_deref(), Some(first.as_str()));
+        assert_eq!(derived.lineage_root, first);
+        let created = db.transitions_of(&work_id).unwrap();
+        assert_eq!(created[0].kind, transition_kind::ITEM_CREATED);
+        assert_eq!(created[0].reason.as_deref(), Some("derived"));
+        assert_eq!(created[0].detail.as_deref(), Some(first.as_str()));
+        let origin_log = db.transitions_of(&first).unwrap();
+        let ended = origin_log.last().unwrap();
+        assert_eq!(ended.to_phase.as_deref(), Some("skipped"));
+        assert_eq!(ended.reason.as_deref(), Some("derived"));
+    }
+
+    #[test]
+    fn derive_retry_hands_worktree_over_and_keeps_failure_count() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+        history(&db, &first, "s1", "implement", "failed");
+
+        let DeriveOutcome::Derived { work_id: second } = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+        run_to_running(&db, &second);
+        let DeriveOutcome::Derived { work_id: third } = db
+            .derive(&derive_request(
+                &second,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+
+        let owner = |id: &str| -> Option<String> {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT worktree_owner FROM queue_items WHERE work_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(owner(&first), None);
+        assert_eq!(owner(&second).as_deref(), Some(first.as_str()));
+        assert_eq!(owner(&third).as_deref(), Some(first.as_str()));
+        assert_eq!(db.failure_count("s1", "implement").unwrap(), 1);
+    }
+
+    #[test]
+    fn derive_replan_resets_failure_count_and_starts_a_new_worktree() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+        history(&db, &first, "s1", "implement", "failed");
+        history(&db, &first, "s1", "implement", "failed");
+        step(&db, &first, QueuePhase::Running, QueuePhase::Hitl);
+        assert_eq!(db.failure_count("s1", "implement").unwrap(), 2);
+
+        let outcome = db
+            .derive(&DeriveRequest {
+                reason: TransitionReason::PostProcessing(belt_core::hitl::HitlAction::Replan),
+                ..derive_request(&first, QueuePhase::Hitl, DeriveKind::Replan)
+            })
+            .unwrap();
+
+        let DeriveOutcome::Derived { work_id } = outcome else {
+            panic!("expected Derived, got {outcome:?}");
+        };
+        assert_eq!(db.failure_count("s1", "implement").unwrap(), 0);
+        let conn = db.conn.lock().unwrap();
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT worktree_owner FROM queue_items WHERE work_id = ?1",
+                params![work_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, None);
+    }
+
+    #[test]
+    fn derive_inherits_replan_count() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        db.increment_replan_count(&first).unwrap();
+        run_to_running(&db, &first);
+
+        let DeriveOutcome::Derived { work_id } = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+        assert_eq!(db.get_item(&work_id).unwrap().replan_count, 1);
+    }
+
+    #[test]
+    fn derive_rejected_by_guard_leaves_everything_untouched() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+
+        let outcome = db
+            .derive(&DeriveRequest {
+                actor: Actor::Cli,
+                ..derive_request(&first, QueuePhase::Running, DeriveKind::EscalationRetry)
+            })
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DeriveOutcome::Rejected(TransitionOutcome::Busy {
+                processing: Processing::Handler
+            })
+        );
+
+        let outcome = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Ready,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DeriveOutcome::Rejected(TransitionOutcome::Conflict {
+                current: QueuePhase::Running
+            })
+        );
+        assert_eq!(db.get_item(&first).unwrap().phase(), QueuePhase::Running);
+        assert_eq!(db.list_items(None, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failure_count_counts_only_failures_after_the_last_reset() {
+        let db = test_db();
+        for status in ["failed", "done", "failed"] {
+            history(&db, "s1:implement", "s1", "implement", status);
+        }
+        history(&db, "s1:other", "s1", "other", "failed");
+        history(&db, "s2:implement", "s2", "implement", "failed");
+        assert_eq!(db.failure_count("s1", "implement").unwrap(), 2);
+
+        db.record_reset("s1", "implement", "s1:implement").unwrap();
+        assert_eq!(db.failure_count("s1", "implement").unwrap(), 0);
+
+        history(&db, "s1:implement:2", "s1", "implement", "failed");
+        assert_eq!(db.failure_count("s1", "implement").unwrap(), 1);
+        // Other series are untouched by the reset.
+        assert_eq!(db.failure_count("s1", "other").unwrap(), 1);
+    }
+
+    #[test]
+    fn failure_count_rejects_unknown_history_status() {
+        let db = test_db();
+        history(&db, "s1:implement", "s1", "implement", "weird");
+        assert!(matches!(
+            db.failure_count("s1", "implement"),
+            Err(BeltError::Database(_))
+        ));
+    }
+
+    #[test]
+    fn latest_in_lineage_follows_derivation_and_ignores_other_lineages() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+        let DeriveOutcome::Derived { work_id: second } = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+
+        assert_eq!(db.latest_in_lineage(&first).unwrap().work_id, second);
+        assert_eq!(db.latest_in_lineage(&second).unwrap().work_id, second);
+
+        // A recollected item is a different lineage.
+        step(&db, &second, QueuePhase::Pending, QueuePhase::Skipped);
+        let third = inserted_id(collect(&db, "s1", "implement"));
+        assert_eq!(db.latest_in_lineage(&first).unwrap().work_id, second);
+        assert_eq!(db.latest_in_lineage(&third).unwrap().work_id, third);
+        assert!(matches!(
+            db.latest_in_lineage("missing"),
+            Err(BeltError::ItemNotFound(_))
+        ));
     }
 }
