@@ -4,15 +4,14 @@
 //! - `run()`: interactive ratatui-based real-time TUI dashboard with multiple tabs
 //! - `render_runtime_panel()`: text-based runtime statistics panel for non-TUI output
 //!
-//! The dashboard supports six tabs:
+//! The dashboard supports five tabs:
 //! - **Dashboard** (`d`): phase summary + running/recent items
 //! - **PerWorkspace** (`w`): items filtered by a selected workspace
-//! - **Spec** (`s`): spec progress view
 //! - **Board** (`b`): kanban-style board with columns per queue phase
 //! - **DataSource** (`n`): real-time DataSource connection status panel
 //! - **Scripts** (`x`): script execution statistics with success/fail rates
 //!
-//! Tab switching: `d/w/s/b/n/x` to jump, or `Tab`/`Shift+Tab` to cycle.
+//! Tab switching: `d/w/b/n/x` to jump, or `Tab`/`Shift+Tab` to cycle.
 //! Item selection with arrow keys and item detail overlay (Enter).
 //! Help overlay (`h`) showing all available key bindings.
 //! Scroll positions are preserved per tab.
@@ -37,7 +36,6 @@ use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
-use belt_core::spec::{Spec, SpecStatus, extract_acceptance_criteria};
 use belt_infra::db::{Database, HistoryEvent, ScriptExecStats, TransitionEvent};
 use belt_infra::workspace_loader::load_workspace_config;
 
@@ -199,11 +197,6 @@ enum OverlayMode {
         /// Selected index in the HITL items list.
         selected: usize,
     },
-    /// Spec acceptance criteria detail overlay for a given spec index.
-    SpecDetail {
-        /// Index of the spec in the specs list.
-        spec_index: usize,
-    },
 }
 
 /// Which top-level tab is displayed.
@@ -213,8 +206,6 @@ enum DashboardTab {
     Dashboard,
     /// Per-workspace view showing items grouped by workspace.
     PerWorkspace,
-    /// Spec progress view showing specs and their statuses.
-    Spec,
     /// Kanban board with columns per queue phase.
     Board,
     /// DataSource connection status panel.
@@ -228,8 +219,7 @@ impl DashboardTab {
     fn next(self) -> Self {
         match self {
             DashboardTab::Dashboard => DashboardTab::PerWorkspace,
-            DashboardTab::PerWorkspace => DashboardTab::Spec,
-            DashboardTab::Spec => DashboardTab::Board,
+            DashboardTab::PerWorkspace => DashboardTab::Board,
             DashboardTab::Board => DashboardTab::DataSource,
             DashboardTab::DataSource => DashboardTab::Scripts,
             DashboardTab::Scripts => DashboardTab::Dashboard,
@@ -241,8 +231,7 @@ impl DashboardTab {
         match self {
             DashboardTab::Dashboard => DashboardTab::Scripts,
             DashboardTab::PerWorkspace => DashboardTab::Dashboard,
-            DashboardTab::Spec => DashboardTab::PerWorkspace,
-            DashboardTab::Board => DashboardTab::Spec,
+            DashboardTab::Board => DashboardTab::PerWorkspace,
             DashboardTab::DataSource => DashboardTab::Board,
             DashboardTab::Scripts => DashboardTab::DataSource,
         }
@@ -307,7 +296,6 @@ impl DashboardState {
         tab_states.insert(2, TabState::default());
         tab_states.insert(3, TabState::default());
         tab_states.insert(4, TabState::default());
-        tab_states.insert(5, TabState::default());
 
         Self {
             active_tab: DashboardTab::Dashboard,
@@ -327,10 +315,9 @@ impl DashboardState {
         match self.active_tab {
             DashboardTab::Dashboard => 0,
             DashboardTab::PerWorkspace => 1,
-            DashboardTab::Spec => 2,
-            DashboardTab::Board => 3,
-            DashboardTab::DataSource => 4,
-            DashboardTab::Scripts => 5,
+            DashboardTab::Board => 2,
+            DashboardTab::DataSource => 3,
+            DashboardTab::Scripts => 4,
         }
     }
 
@@ -382,7 +369,6 @@ fn run_loop(
             .collect();
         let recent_items = collect_recent_items(db);
         let workspaces = db.list_workspaces().unwrap_or_default();
-        let specs = db.list_specs(None, None).unwrap_or_default();
         let datasource_entries = collect_datasource_status(&workspaces, &all_items, Some(db));
 
         // Compute list length for navigation clamping.
@@ -412,7 +398,6 @@ fn run_loop(
                     0
                 }
             }
-            DashboardTab::Spec => specs.len(),
             DashboardTab::Board => 0, // Board uses column/row navigation, not a single list.
             DashboardTab::DataSource => datasource_entries.len(),
             DashboardTab::Scripts => db
@@ -546,14 +531,6 @@ fn run_loop(
                         &per_ws_kanban_columns,
                     );
                 }
-                DashboardTab::Spec => {
-                    render_spec_tab(
-                        frame,
-                        outer_chunks[1],
-                        &specs,
-                        state.current_tab_state().selected_index,
-                    );
-                }
                 DashboardTab::Board => {
                     render_board_tab(frame, outer_chunks[1], &board_columns, &state);
                 }
@@ -586,9 +563,6 @@ fn run_loop(
                 }
                 OverlayMode::Hitl { selected } => {
                     render_hitl_overlay(frame, db, *selected);
-                }
-                OverlayMode::SpecDetail { spec_index } => {
-                    render_spec_detail_overlay(frame, &specs, *spec_index);
                 }
             }
         })?;
@@ -642,13 +616,6 @@ fn run_loop(
                     }
                     continue;
                 }
-                OverlayMode::SpecDetail { .. } => {
-                    // Spec detail overlay: close on q/Esc.
-                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                        state.overlay = OverlayMode::None;
-                    }
-                    continue;
-                }
                 OverlayMode::None => {}
             }
 
@@ -657,9 +624,6 @@ fn run_loop(
                 // Tab switching keys: letter keys for direct jump.
                 KeyCode::Char('d') => {
                     state.active_tab = DashboardTab::Dashboard;
-                }
-                KeyCode::Char('s') => {
-                    state.active_tab = DashboardTab::Spec;
                 }
                 KeyCode::Char('w') => {
                     state.active_tab = DashboardTab::PerWorkspace;
@@ -816,7 +780,7 @@ fn handle_nav_left(state: &mut DashboardState, workspaces: &[(String, String, St
             state.board_selected_col = state.board_selected_col.saturating_sub(1);
             state.board_selected_row = 0;
         }
-        DashboardTab::Spec | DashboardTab::DataSource | DashboardTab::Scripts => {}
+        DashboardTab::DataSource | DashboardTab::Scripts => {}
     }
     let _ = workspaces;
 }
@@ -850,7 +814,7 @@ fn handle_nav_right(
                 state.board_selected_row = 0;
             }
         }
-        DashboardTab::Spec | DashboardTab::DataSource | DashboardTab::Scripts => {}
+        DashboardTab::DataSource | DashboardTab::Scripts => {}
     }
 }
 
@@ -901,11 +865,6 @@ fn handle_enter(
                 }
             }
         }
-        DashboardTab::Spec => {
-            // Open spec acceptance criteria detail overlay.
-            let idx = state.current_tab_state().selected_index;
-            state.overlay = OverlayMode::SpecDetail { spec_index: idx };
-        }
         DashboardTab::DataSource | DashboardTab::Scripts => {
             // No overlay on Enter for DataSource/Scripts tabs.
         }
@@ -929,7 +888,6 @@ fn render_tab_bar(active: DashboardTab) -> Paragraph<'static> {
     let tabs = [
         ("d", "Dashboard", DashboardTab::Dashboard),
         ("w", "Workspace", DashboardTab::PerWorkspace),
-        ("s", "Spec", DashboardTab::Spec),
         ("b", "Board", DashboardTab::Board),
         ("n", "DataSource", DashboardTab::DataSource),
         ("x", "Scripts", DashboardTab::Scripts),
@@ -1564,7 +1522,7 @@ fn render_dashboard_tab(
 ///
 /// Layout:
 /// - Workspace selector bar + view/filter indicators (top)
-/// - Workspace phase summary + spec progress side by side (middle)
+/// - Workspace phase summary (middle)
 /// - Items view: table or kanban (bottom)
 fn render_per_workspace_tab(
     frame: &mut ratatui::Frame,
@@ -1648,14 +1606,7 @@ fn render_per_workspace_tab(
     let selected_ws = &workspaces[state.selected_workspace].0;
     let ws_items = db.list_items(None, Some(selected_ws)).unwrap_or_default();
 
-    // Workspace summary: phase counts + spec progress side by side.
-    let summary_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
-
-    render_workspace_phase_summary(frame, summary_cols[0], &ws_items);
-    render_workspace_spec_progress(frame, db, summary_cols[1], selected_ws);
+    render_workspace_phase_summary(frame, chunks[1], &ws_items);
 
     // Render either table or kanban view.
     match state.per_ws_view {
@@ -1882,199 +1833,6 @@ fn render_workspace_phase_summary(frame: &mut ratatui::Frame, area: Rect, ws_ite
     frame.render_widget(summary, area);
 }
 
-/// Render spec progress for a single workspace.
-fn render_workspace_spec_progress(
-    frame: &mut ratatui::Frame,
-    db: &Database,
-    area: Rect,
-    workspace_id: &str,
-) {
-    let specs = db.list_specs(Some(workspace_id), None).unwrap_or_default();
-    let total = specs.len();
-    let completed = specs
-        .iter()
-        .filter(|s| s.status == SpecStatus::Completed)
-        .count();
-    let active = specs
-        .iter()
-        .filter(|s| s.status == SpecStatus::Active)
-        .count();
-    let progress_pct = if total > 0 {
-        (completed as f64 / total as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let bar_width = 15usize;
-    let filled = (completed * bar_width).checked_div(total).unwrap_or(0);
-    let empty = bar_width.saturating_sub(filled);
-
-    let line = Line::from(vec![
-        Span::styled(
-            format!("{total} specs"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(format!("active:{active}"), Style::default().fg(Color::Blue)),
-        Span::raw(" "),
-        Span::styled(
-            format!("done:{completed}"),
-            Style::default().fg(Color::Green),
-        ),
-        Span::raw("  ["),
-        Span::styled("#".repeat(filled), Style::default().fg(Color::Green)),
-        Span::styled("-".repeat(empty), Style::default().fg(Color::DarkGray)),
-        Span::raw("]"),
-        Span::styled(
-            format!(" {progress_pct:.0}%"),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-
-    let paragraph = Paragraph::new(line).block(
-        Block::default()
-            .title(" Spec Progress ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
-    );
-    frame.render_widget(paragraph, area);
-}
-
-/// Render the spec progress tab showing all specs with status and progress.
-fn render_spec_tab(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    specs: &[belt_core::spec::Spec],
-    selected: usize,
-) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(5)])
-        .split(area);
-
-    // Spec status summary (progress overview).
-    let status_counts = count_spec_statuses(specs);
-    let total = specs.len();
-    let completed = status_counts.completed;
-    let progress_pct = if total > 0 {
-        (completed as f64 / total as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let summary_spans = vec![
-        Span::styled(
-            format!("Total: {total}"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("draft: {}", status_counts.draft),
-            Style::default().fg(Color::Gray),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("active: {}", status_counts.active),
-            Style::default().fg(Color::Blue),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("paused: {}", status_counts.paused),
-            Style::default().fg(Color::Yellow),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("completing: {}", status_counts.completing),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("completed: {completed}"),
-            Style::default().fg(Color::Green),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("Progress: {progress_pct:.0}%"),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-
-    // Build a progress bar line.
-    let bar_width = 30usize;
-    let filled = (completed * bar_width).checked_div(total).unwrap_or(0);
-    let empty = bar_width.saturating_sub(filled);
-    let bar_line = Line::from(vec![
-        Span::raw("  ["),
-        Span::styled("#".repeat(filled), Style::default().fg(Color::Green)),
-        Span::styled("-".repeat(empty), Style::default().fg(Color::DarkGray)),
-        Span::raw("]"),
-    ]);
-
-    let summary = Paragraph::new(vec![Line::from(summary_spans), Line::from(""), bar_line]).block(
-        Block::default()
-            .title(" Spec Progress ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
-    );
-    frame.render_widget(summary, chunks[0]);
-
-    // Spec list table.
-    let rows: Vec<Row<'static>> = specs
-        .iter()
-        .enumerate()
-        .map(|(i, spec)| {
-            let status_str = spec.status.as_str().to_string();
-            let color = spec_status_color(&status_str);
-            let ws = spec.workspace_id.clone();
-            let row = Row::new(vec![
-                Cell::from(spec.name.clone()),
-                Cell::from(ws),
-                Cell::from(status_str).style(Style::default().fg(color)),
-                Cell::from(spec.updated_at.clone()),
-            ]);
-            if i == selected {
-                row.style(
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                row
-            }
-        })
-        .collect();
-
-    let header = Row::new(vec!["Name", "Workspace", "Status", "Updated"])
-        .style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .bottom_margin(1);
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Percentage(30),
-            Constraint::Percentage(20),
-            Constraint::Percentage(15),
-            Constraint::Percentage(35),
-        ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .title(" Specs ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
-    );
-    frame.render_widget(table, chunks[1]);
-}
-
 /// Render the scripts execution statistics tab.
 ///
 /// Layout:
@@ -2282,49 +2040,6 @@ fn render_recent_executions(frame: &mut ratatui::Frame, area: Rect, events: &[Hi
     frame.render_widget(table, area);
 }
 
-/// Aggregate counts of spec statuses.
-struct SpecStatusCounts {
-    draft: usize,
-    active: usize,
-    paused: usize,
-    completing: usize,
-    completed: usize,
-}
-
-fn count_spec_statuses(specs: &[belt_core::spec::Spec]) -> SpecStatusCounts {
-    let mut counts = SpecStatusCounts {
-        draft: 0,
-        active: 0,
-        paused: 0,
-        completing: 0,
-        completed: 0,
-    };
-    for spec in specs {
-        match spec.status {
-            SpecStatus::Draft => counts.draft += 1,
-            SpecStatus::Active => counts.active += 1,
-            SpecStatus::Paused => counts.paused += 1,
-            SpecStatus::Completing => counts.completing += 1,
-            SpecStatus::Completed => counts.completed += 1,
-            SpecStatus::Archived => {} // excluded from list by default
-        }
-    }
-    counts
-}
-
-/// Map spec status strings to colors.
-fn spec_status_color(status: &str) -> Color {
-    match status {
-        "draft" => Color::Gray,
-        "active" => Color::Blue,
-        "paused" => Color::Yellow,
-        "completing" => Color::Cyan,
-        "completed" => Color::Green,
-        "archived" => Color::DarkGray,
-        _ => Color::White,
-    }
-}
-
 /// Render the help overlay showing all key bindings.
 fn render_help_overlay(frame: &mut ratatui::Frame) {
     let area = centered_rect(50, 60, frame.area());
@@ -2345,10 +2060,6 @@ fn render_help_overlay(frame: &mut ratatui::Frame) {
         Line::from(vec![
             Span::styled("  w       ", Style::default().fg(Color::Yellow)),
             Span::raw("Switch to Per-Workspace tab"),
-        ]),
-        Line::from(vec![
-            Span::styled("  s       ", Style::default().fg(Color::Yellow)),
-            Span::raw("Switch to Spec progress tab"),
         ]),
         Line::from(vec![
             Span::styled("  b       ", Style::default().fg(Color::Yellow)),
@@ -2397,7 +2108,7 @@ fn render_help_overlay(frame: &mut ratatui::Frame) {
         ]),
         Line::from(vec![
             Span::styled("  Enter   ", Style::default().fg(Color::Cyan)),
-            Span::raw("Open item/spec detail overlay"),
+            Span::raw("Open item detail overlay"),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -2821,202 +2532,6 @@ fn build_hitl_overlay_lines(hitl_items: &[QueueItem], selected: usize) -> Vec<Li
         Span::styled("[q/Esc] ", Style::default().fg(Color::Red)),
         Span::raw("Close"),
     ]));
-
-    lines
-}
-
-/// Render the spec acceptance criteria detail overlay.
-///
-/// Displays a centered popup showing the spec's metadata, acceptance
-/// criteria extracted from the spec content, and completion progress.
-fn render_spec_detail_overlay(frame: &mut ratatui::Frame, specs: &[Spec], spec_index: usize) {
-    let area = centered_rect(65, 75, frame.area());
-    frame.render_widget(Clear, area);
-
-    let lines = build_spec_detail_lines(specs, spec_index);
-
-    let paragraph = Paragraph::new(lines).block(
-        Block::default()
-            .title(" Spec Details ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
-    );
-
-    frame.render_widget(paragraph, area);
-}
-
-/// Build the text lines for the spec acceptance criteria detail overlay.
-fn build_spec_detail_lines(specs: &[Spec], spec_index: usize) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    let Some(spec) = specs.get(spec_index) else {
-        lines.push(Line::from(Span::styled(
-            "(spec not found)",
-            Style::default().fg(Color::Red),
-        )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "[q/Esc] Close",
-            Style::default().fg(Color::DarkGray),
-        )));
-        return lines;
-    };
-
-    let status_str = spec.status.as_str().to_string();
-    let status_color = spec_status_color(&status_str);
-
-    // Spec metadata.
-    lines.push(Line::from(vec![
-        Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(spec.name.clone()),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("ID: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(spec.id.clone()),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Workspace: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(spec.workspace_id.clone()),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(status_str, Style::default().fg(status_color)),
-    ]));
-    if let Some(priority) = spec.priority {
-        lines.push(Line::from(vec![
-            Span::styled("Priority: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(priority.to_string()),
-        ]));
-    }
-    if let Some(ref labels) = spec.labels {
-        lines.push(Line::from(vec![
-            Span::styled("Labels: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(labels.clone()),
-        ]));
-    }
-    if let Some(ref entry_point) = spec.entry_point {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Entry Points: ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(entry_point.clone()),
-        ]));
-    }
-    if let Some(ref depends) = spec.depends_on {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Depends On: ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(depends.clone()),
-        ]));
-    }
-    if let Some(ref issues) = spec.decomposed_issues {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Decomposed Issues: ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(issues.clone()),
-        ]));
-    }
-
-    // Acceptance criteria section.
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Acceptance Criteria:",
-        Style::default()
-            .add_modifier(Modifier::BOLD)
-            .add_modifier(Modifier::UNDERLINED)
-            .fg(Color::Cyan),
-    )));
-
-    let criteria = extract_acceptance_criteria(&spec.content);
-    if criteria.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no acceptance criteria found in spec content)",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else {
-        let total = criteria.len();
-        // Build progress bar.
-        let completed_count = match spec.status {
-            SpecStatus::Completed => total,
-            SpecStatus::Completing => total.saturating_sub(1).max(total * 3 / 4),
-            SpecStatus::Active => total / 3,
-            _ => 0,
-        };
-        let progress_pct = if total > 0 {
-            (completed_count as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        };
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                format!("Progress: {completed_count}/{total} ({progress_pct:.0}%)"),
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
-
-        let bar_width = 20usize;
-        let filled = (completed_count * bar_width)
-            .checked_div(total)
-            .unwrap_or(0);
-        let empty = bar_width.saturating_sub(filled);
-        lines.push(Line::from(vec![
-            Span::raw("  ["),
-            Span::styled("#".repeat(filled), Style::default().fg(Color::Green)),
-            Span::styled("-".repeat(empty), Style::default().fg(Color::DarkGray)),
-            Span::raw("]"),
-        ]));
-        lines.push(Line::from(""));
-
-        for (i, criterion) in criteria.iter().enumerate() {
-            let idx = i + 1;
-            let is_done = i < completed_count;
-            let marker = if is_done { "[x]" } else { "[ ]" };
-            let marker_color = if is_done { Color::Green } else { Color::Gray };
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    format!("{marker} AC{idx}: "),
-                    Style::default().fg(marker_color),
-                ),
-                Span::raw(criterion.clone()),
-            ]));
-        }
-    }
-
-    // Test commands section.
-    if let Some(ref test_cmds) = spec.test_commands {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Test Commands:",
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(Color::Blue),
-        )));
-        for cmd in test_cmds
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            lines.push(Line::from(vec![
-                Span::raw("  $ "),
-                Span::styled(cmd.to_string(), Style::default().fg(Color::Cyan)),
-            ]));
-        }
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "[q/Esc] Close",
-        Style::default().fg(Color::DarkGray),
-    )));
 
     lines
 }
@@ -3857,8 +3372,7 @@ mod tests {
     #[test]
     fn tab_cycle_forward() {
         assert_eq!(DashboardTab::Dashboard.next(), DashboardTab::PerWorkspace);
-        assert_eq!(DashboardTab::PerWorkspace.next(), DashboardTab::Spec);
-        assert_eq!(DashboardTab::Spec.next(), DashboardTab::Board);
+        assert_eq!(DashboardTab::PerWorkspace.next(), DashboardTab::Board);
         assert_eq!(DashboardTab::Board.next(), DashboardTab::DataSource);
         assert_eq!(DashboardTab::DataSource.next(), DashboardTab::Scripts);
         assert_eq!(DashboardTab::Scripts.next(), DashboardTab::Dashboard);
@@ -3869,8 +3383,7 @@ mod tests {
         assert_eq!(DashboardTab::Dashboard.prev(), DashboardTab::Scripts);
         assert_eq!(DashboardTab::Scripts.prev(), DashboardTab::DataSource);
         assert_eq!(DashboardTab::DataSource.prev(), DashboardTab::Board);
-        assert_eq!(DashboardTab::Board.prev(), DashboardTab::Spec);
-        assert_eq!(DashboardTab::Spec.prev(), DashboardTab::PerWorkspace);
+        assert_eq!(DashboardTab::Board.prev(), DashboardTab::PerWorkspace);
         assert_eq!(DashboardTab::PerWorkspace.prev(), DashboardTab::Dashboard);
     }
 
@@ -3910,72 +3423,13 @@ mod tests {
         assert_eq!(state.current_tab_state().selected_index, 5);
     }
 
-    // ---- spec_status_color ----
-
-    #[test]
-    fn spec_status_color_known_statuses() {
-        assert_eq!(spec_status_color("draft"), Color::Gray);
-        assert_eq!(spec_status_color("active"), Color::Blue);
-        assert_eq!(spec_status_color("paused"), Color::Yellow);
-        assert_eq!(spec_status_color("completing"), Color::Cyan);
-        assert_eq!(spec_status_color("completed"), Color::Green);
-        assert_eq!(spec_status_color("archived"), Color::DarkGray);
-    }
-
-    #[test]
-    fn spec_status_color_unknown_returns_white() {
-        assert_eq!(spec_status_color("unknown"), Color::White);
-        assert_eq!(spec_status_color(""), Color::White);
-    }
-
-    // ---- count_spec_statuses ----
-
-    #[test]
-    fn count_spec_statuses_empty() {
-        let counts = count_spec_statuses(&[]);
-        assert_eq!(counts.draft, 0);
-        assert_eq!(counts.active, 0);
-        assert_eq!(counts.paused, 0);
-        assert_eq!(counts.completing, 0);
-        assert_eq!(counts.completed, 0);
-    }
-
-    #[test]
-    fn count_spec_statuses_mixed() {
-        use belt_core::spec::Spec;
-
-        let mut specs = Vec::new();
-        let mut s1 = Spec::new("s1".into(), "ws".into(), "n1".into(), "c".into());
-        // Draft by default
-        specs.push(s1.clone());
-
-        s1.id = "s2".into();
-        s1.status = SpecStatus::Active;
-        specs.push(s1.clone());
-
-        s1.id = "s3".into();
-        s1.status = SpecStatus::Completed;
-        specs.push(s1.clone());
-
-        s1.id = "s4".into();
-        s1.status = SpecStatus::Completed;
-        specs.push(s1);
-
-        let counts = count_spec_statuses(&specs);
-        assert_eq!(counts.draft, 1);
-        assert_eq!(counts.active, 1);
-        assert_eq!(counts.completed, 2);
-        assert_eq!(counts.paused, 0);
-        assert_eq!(counts.completing, 0);
-    }
-
     // ---- DashboardTab equality ----
 
     #[test]
     fn dashboard_tab_equality() {
         assert_eq!(DashboardTab::Dashboard, DashboardTab::Dashboard);
-        assert_ne!(DashboardTab::Dashboard, DashboardTab::Spec);
-        assert_ne!(DashboardTab::Spec, DashboardTab::PerWorkspace);
+        assert_ne!(DashboardTab::Dashboard, DashboardTab::Board);
+        assert_ne!(DashboardTab::Board, DashboardTab::PerWorkspace);
         assert_ne!(DashboardTab::Board, DashboardTab::Dashboard);
     }
 
@@ -4006,14 +3460,14 @@ mod tests {
     #[test]
     fn tab_next_full_cycle_returns_to_start() {
         let start = DashboardTab::Dashboard;
-        let result = start.next().next().next().next().next().next();
+        let result = start.next().next().next().next().next();
         assert_eq!(result, start);
     }
 
     #[test]
     fn tab_prev_full_cycle_returns_to_start() {
         let start = DashboardTab::Dashboard;
-        let result = start.prev().prev().prev().prev().prev().prev();
+        let result = start.prev().prev().prev().prev().prev();
         assert_eq!(result, start);
     }
 
@@ -4022,12 +3476,11 @@ mod tests {
         for tab in [
             DashboardTab::Dashboard,
             DashboardTab::PerWorkspace,
-            DashboardTab::Spec,
             DashboardTab::Board,
             DashboardTab::DataSource,
             DashboardTab::Scripts,
         ] {
-            assert_eq!(tab.next().next().next().next().next().next(), tab);
+            assert_eq!(tab.next().next().next().next().next(), tab);
         }
     }
 
@@ -4036,12 +3489,11 @@ mod tests {
         for tab in [
             DashboardTab::Dashboard,
             DashboardTab::PerWorkspace,
-            DashboardTab::Spec,
             DashboardTab::Board,
             DashboardTab::DataSource,
             DashboardTab::Scripts,
         ] {
-            assert_eq!(tab.prev().prev().prev().prev().prev().prev(), tab);
+            assert_eq!(tab.prev().prev().prev().prev().prev(), tab);
         }
     }
 
@@ -4050,7 +3502,6 @@ mod tests {
         for tab in [
             DashboardTab::Dashboard,
             DashboardTab::PerWorkspace,
-            DashboardTab::Spec,
             DashboardTab::Board,
             DashboardTab::DataSource,
             DashboardTab::Scripts,
@@ -4064,7 +3515,6 @@ mod tests {
         for tab in [
             DashboardTab::Dashboard,
             DashboardTab::PerWorkspace,
-            DashboardTab::Spec,
             DashboardTab::Board,
             DashboardTab::DataSource,
             DashboardTab::Scripts,
@@ -4085,17 +3535,14 @@ mod tests {
         state.active_tab = DashboardTab::PerWorkspace;
         assert_eq!(state.tab_key(), 1);
 
-        state.active_tab = DashboardTab::Spec;
+        state.active_tab = DashboardTab::Board;
         assert_eq!(state.tab_key(), 2);
 
-        state.active_tab = DashboardTab::Board;
+        state.active_tab = DashboardTab::DataSource;
         assert_eq!(state.tab_key(), 3);
 
-        state.active_tab = DashboardTab::DataSource;
-        assert_eq!(state.tab_key(), 4);
-
         state.active_tab = DashboardTab::Scripts;
-        assert_eq!(state.tab_key(), 5);
+        assert_eq!(state.tab_key(), 4);
     }
 
     // ---- Board view state ----
@@ -4181,15 +3628,15 @@ mod tests {
         state.active_tab = DashboardTab::PerWorkspace;
         state.current_tab_state_mut().selected_index = 10;
 
-        // Modify Spec tab state.
-        state.active_tab = DashboardTab::Spec;
+        // Modify Board tab state.
+        state.active_tab = DashboardTab::Board;
         state.current_tab_state_mut().selected_index = 20;
 
         // Verify each tab has its own state.
         state.active_tab = DashboardTab::PerWorkspace;
         assert_eq!(state.current_tab_state().selected_index, 10);
 
-        state.active_tab = DashboardTab::Spec;
+        state.active_tab = DashboardTab::Board;
         assert_eq!(state.current_tab_state().selected_index, 20);
 
         // Dashboard tab should still be at 0.
@@ -4252,10 +3699,10 @@ mod tests {
     }
 
     #[test]
-    fn datasource_tab_key_is_four() {
+    fn datasource_tab_key_is_three() {
         let mut state = DashboardState::new();
         state.active_tab = DashboardTab::DataSource;
-        assert_eq!(state.tab_key(), 4);
+        assert_eq!(state.tab_key(), 3);
     }
 
     #[test]
@@ -4315,10 +3762,10 @@ mod tests {
     }
 
     #[test]
-    fn scripts_tab_key_is_five() {
+    fn scripts_tab_key_is_four() {
         let mut state = DashboardState::new();
         state.active_tab = DashboardTab::Scripts;
-        assert_eq!(state.tab_key(), 5);
+        assert_eq!(state.tab_key(), 4);
     }
 
     #[test]
@@ -4912,17 +4359,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn overlay_mode_spec_detail_preserves_index() {
-        let mut state = DashboardState::new();
-        state.overlay = OverlayMode::SpecDetail { spec_index: 5 };
-        if let OverlayMode::SpecDetail { spec_index } = state.overlay {
-            assert_eq!(spec_index, 5);
-        } else {
-            panic!("Expected SpecDetail overlay");
-        }
-    }
-
     // ---- build_hitl_overlay_lines ----
 
     #[test]
@@ -4979,69 +4415,6 @@ mod tests {
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
         // Selected item should show actions.
         assert!(text.contains("View details"));
-    }
-
-    // ---- build_spec_detail_lines ----
-
-    #[test]
-    fn build_spec_detail_lines_not_found() {
-        let lines = build_spec_detail_lines(&[], 0);
-        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
-        assert!(text.contains("spec not found"));
-    }
-
-    #[test]
-    fn build_spec_detail_lines_with_acceptance_criteria() {
-        let spec = belt_core::spec::Spec::new(
-            "spec-1".to_string(),
-            "ws1".to_string(),
-            "Auth Feature".to_string(),
-            "## Overview\nSome description.\n## Acceptance Criteria\n- Login works\n- Logout works\n- Token refresh works\n## Tests\ntest commands".to_string(),
-        );
-
-        let lines = build_spec_detail_lines(&[spec], 0);
-        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
-        assert!(text.contains("Auth Feature"));
-        assert!(text.contains("spec-1"));
-        assert!(text.contains("Acceptance Criteria:"));
-        assert!(text.contains("AC1:"));
-        assert!(text.contains("Login works"));
-        assert!(text.contains("AC2:"));
-        assert!(text.contains("Logout works"));
-        assert!(text.contains("AC3:"));
-        assert!(text.contains("Token refresh works"));
-        assert!(text.contains("Progress:"));
-    }
-
-    #[test]
-    fn build_spec_detail_lines_no_acceptance_criteria() {
-        let spec = belt_core::spec::Spec::new(
-            "spec-2".to_string(),
-            "ws1".to_string(),
-            "Simple Spec".to_string(),
-            "## Overview\nNo AC section here.".to_string(),
-        );
-
-        let lines = build_spec_detail_lines(&[spec], 0);
-        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
-        assert!(text.contains("no acceptance criteria found"));
-    }
-
-    #[test]
-    fn build_spec_detail_lines_shows_test_commands() {
-        let mut spec = belt_core::spec::Spec::new(
-            "spec-3".to_string(),
-            "ws1".to_string(),
-            "Test Spec".to_string(),
-            "## Overview\nContent.".to_string(),
-        );
-        spec.test_commands = Some("cargo test, cargo clippy".to_string());
-
-        let lines = build_spec_detail_lines(&[spec], 0);
-        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
-        assert!(text.contains("Test Commands:"));
-        assert!(text.contains("cargo test"));
-        assert!(text.contains("cargo clippy"));
     }
 
     // ---- build_detail_lines_with_history ----
@@ -5146,41 +4519,29 @@ mod tests {
             .unwrap();
     }
 
-    // ---- render_spec_detail_overlay no-panic ----
+    // ---- tab bar ----
 
     #[test]
-    fn render_spec_detail_overlay_no_panic() {
+    fn tab_bar_has_no_spec_tab() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
-        let spec = belt_core::spec::Spec::new(
-            "spec-1".to_string(),
-            "ws1".to_string(),
-            "Auth Feature".to_string(),
-            "## Overview\nDesc.\n## Acceptance Criteria\n- AC one\n- AC two\n".to_string(),
-        );
-
-        let backend = TestBackend::new(80, 40);
+        let backend = TestBackend::new(160, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_spec_detail_overlay(frame, &[spec], 0);
+                frame.render_widget(render_tab_bar(DashboardTab::Dashboard), frame.area());
             })
             .unwrap();
-    }
-
-    #[test]
-    fn render_spec_detail_overlay_out_of_bounds_no_panic() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let backend = TestBackend::new(80, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                render_spec_detail_overlay(frame, &[], 5);
-            })
-            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Dashboard"));
+        assert!(!text.contains("Spec"), "tab bar still shows Spec: {text}");
     }
 
     // ---- DashboardState::new() comprehensive defaults ----
@@ -5198,8 +4559,8 @@ mod tests {
         assert_eq!(state.per_ws_kanban_col, 0);
         assert_eq!(state.per_ws_kanban_row, 0);
         assert_eq!(state.status_filter, StatusFilter::All);
-        // All 6 tab states should exist (keys 0..=5).
-        for key in 0..=5u8 {
+        // All 5 tab states should exist (keys 0..=4).
+        for key in 0..=4u8 {
             assert!(
                 state.tab_states.contains_key(&key),
                 "tab_states should contain key {key}"
@@ -5490,17 +4851,6 @@ mod tests {
         let workspaces: Vec<(String, String, String)> = Vec::new();
         handle_nav_left(&mut state, &workspaces);
         assert_eq!(state.board_selected_col, 0);
-    }
-
-    #[test]
-    fn handle_nav_left_spec_noop() {
-        let mut state = DashboardState::new();
-        state.active_tab = DashboardTab::Spec;
-        state.current_tab_state_mut().selected_index = 3;
-        let workspaces: Vec<(String, String, String)> = Vec::new();
-        handle_nav_left(&mut state, &workspaces);
-        // Spec tab left arrow should be a no-op.
-        assert_eq!(state.current_tab_state().selected_index, 3);
     }
 
     // ---- handle_nav_right ----
@@ -5819,32 +5169,6 @@ mod tests {
             state.overlay,
             OverlayMode::ItemDetail("w-kanban1".to_string())
         );
-    }
-
-    #[test]
-    fn handle_enter_spec_tab_no_overlay() {
-        let mut state = DashboardState::new();
-        state.active_tab = DashboardTab::Spec;
-
-        let running: Vec<QueueItem> = Vec::new();
-        let recent: Vec<QueueItem> = Vec::new();
-        let all: Vec<QueueItem> = Vec::new();
-        let workspaces: Vec<(String, String, String)> = Vec::new();
-        let db = make_db();
-        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
-        let per_ws_columns: Vec<Vec<&QueueItem>> = Vec::new();
-
-        handle_enter(
-            &mut state,
-            &running,
-            &recent,
-            &all,
-            &workspaces,
-            &db,
-            &board_columns,
-            &per_ws_columns,
-        );
-        assert!(matches!(state.overlay, OverlayMode::SpecDetail { .. }));
     }
 
     #[test]

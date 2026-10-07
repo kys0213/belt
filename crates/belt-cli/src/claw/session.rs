@@ -65,18 +65,11 @@ pub struct RecentEvent {
 
 /// Per-workspace statistics displayed alongside the system-wide status banner.
 ///
-/// Provides a breakdown of spec lifecycle counts and queue item counts
-/// scoped to a single workspace.
+/// Provides queue item counts scoped to a single workspace.
 #[derive(Debug, Default)]
 pub struct WorkspaceStats {
     /// Name of the workspace these stats belong to.
     pub workspace_name: String,
-    /// Number of specs in `active` status.
-    pub active_spec_count: u32,
-    /// Number of specs in `completing` status.
-    pub completing_count: u32,
-    /// Number of specs in `completed` status.
-    pub completed_count: u32,
     /// Number of queue items in `pending` phase for this workspace.
     pub pending_items_count: u32,
     /// Number of queue items in `running` phase for this workspace.
@@ -211,22 +204,6 @@ fn collect_workspace_stats_from_db(
     db: &belt_infra::db::Database,
     workspace: &str,
 ) -> Option<WorkspaceStats> {
-    use belt_core::spec::SpecStatus;
-
-    // Count specs by status for this workspace.
-    let specs = db.list_specs(Some(workspace), None).ok()?;
-    let mut active_spec_count: u32 = 0;
-    let mut completing_count: u32 = 0;
-    let mut completed_count: u32 = 0;
-    for spec in &specs {
-        match spec.status {
-            SpecStatus::Active => active_spec_count += 1,
-            SpecStatus::Completing => completing_count += 1,
-            SpecStatus::Completed => completed_count += 1,
-            _ => {}
-        }
-    }
-
     // Count queue items by phase for this workspace.
     let items = db.list_items(None, Some(workspace)).ok()?;
     let mut pending_items_count: u32 = 0;
@@ -258,9 +235,6 @@ fn collect_workspace_stats_from_db(
 
     Some(WorkspaceStats {
         workspace_name: workspace.to_string(),
-        active_spec_count,
-        completing_count,
-        completed_count,
         pending_items_count,
         running_items_count,
         recent_hitl_events,
@@ -376,11 +350,6 @@ fn write_workspace_stats_banner<W: Write>(
     stats: &WorkspaceStats,
 ) -> io::Result<()> {
     writeln!(output, "--- Workspace: {} ---", stats.workspace_name)?;
-    writeln!(
-        output,
-        "Specs: active={}, completing={}, completed={}",
-        stats.active_spec_count, stats.completing_count, stats.completed_count
-    )?;
     writeln!(
         output,
         "Items: pending={}, running={}",
@@ -722,7 +691,7 @@ mod tests {
             .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("/auto"));
-        assert!(out.contains("/spec"));
+        assert!(!out.contains("/spec"));
         assert!(out.contains("/claw"));
     }
 
@@ -1235,7 +1204,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_dispatches_spec_command() {
+    async fn session_rejects_removed_spec_command() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/spec issue-42\n/quit\n" as &[u8]);
@@ -1244,8 +1213,7 @@ mod tests {
             .await
             .unwrap();
         let out = String::from_utf8(output).unwrap();
-        assert!(out.contains("[spec]"));
-        assert!(out.contains("issue-42"));
+        assert!(out.contains("Unknown command: /spec"));
     }
 
     #[tokio::test]
@@ -1307,7 +1275,7 @@ mod tests {
     async fn session_multiple_commands_in_sequence() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
-        let mut input = Cursor::new(b"/help\n/auto\n/spec\n/quit\n" as &[u8]);
+        let mut input = Cursor::new(b"/help\n/auto\n/quit\n" as &[u8]);
         let mut output = Vec::new();
         run_session(&config, &mut input, &mut output, None, None)
             .await
@@ -1315,7 +1283,6 @@ mod tests {
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("/auto"));
         assert!(out.contains("[auto]"));
-        assert!(out.contains("[spec]"));
         assert!(out.contains("Goodbye."));
     }
 
@@ -1426,9 +1393,6 @@ mod tests {
     fn workspace_stats_banner_displays_counts() {
         let stats = WorkspaceStats {
             workspace_name: "my-project".to_string(),
-            active_spec_count: 3,
-            completing_count: 1,
-            completed_count: 5,
             pending_items_count: 4,
             running_items_count: 2,
             recent_hitl_events: vec![],
@@ -1437,9 +1401,6 @@ mod tests {
         write_workspace_stats_banner(&mut output, &stats).unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("Workspace: my-project"));
-        assert!(out.contains("active=3"));
-        assert!(out.contains("completing=1"));
-        assert!(out.contains("completed=5"));
         assert!(out.contains("pending=4"));
         assert!(out.contains("running=2"));
     }
@@ -1448,9 +1409,6 @@ mod tests {
     fn workspace_stats_banner_shows_hitl_events() {
         let stats = WorkspaceStats {
             workspace_name: "ws".to_string(),
-            active_spec_count: 0,
-            completing_count: 0,
-            completed_count: 0,
             pending_items_count: 0,
             running_items_count: 0,
             recent_hitl_events: vec![RecentEvent {
@@ -1487,9 +1445,6 @@ mod tests {
         let config = make_config(&tmp);
         let stats = WorkspaceStats {
             workspace_name: "test-ws".to_string(),
-            active_spec_count: 2,
-            completing_count: 0,
-            completed_count: 1,
             pending_items_count: 3,
             running_items_count: 1,
             recent_hitl_events: vec![],
@@ -1501,7 +1456,6 @@ mod tests {
             .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("Workspace: test-ws ---"));
-        assert!(out.contains("active=2"));
         assert!(out.contains("pending=3"));
     }
 
@@ -1524,9 +1478,6 @@ mod tests {
         let db = belt_infra::db::Database::open_in_memory().unwrap();
         let stats = collect_workspace_stats_from_db(&db, "ws1").unwrap();
         assert_eq!(stats.workspace_name, "ws1");
-        assert_eq!(stats.active_spec_count, 0);
-        assert_eq!(stats.completing_count, 0);
-        assert_eq!(stats.completed_count, 0);
         assert_eq!(stats.pending_items_count, 0);
         assert_eq!(stats.running_items_count, 0);
         assert!(stats.recent_hitl_events.is_empty());
@@ -1536,28 +1487,8 @@ mod tests {
     fn collect_workspace_stats_from_populated_db() {
         use belt_core::phase::QueuePhase;
         use belt_core::queue::QueueItem;
-        use belt_core::spec::{Spec, SpecStatus};
 
         let db = belt_infra::db::Database::open_in_memory().unwrap();
-
-        // Insert specs.
-        let mut spec1 = Spec::new(
-            "sp1".to_string(),
-            "ws1".to_string(),
-            "Spec 1".to_string(),
-            "content".to_string(),
-        );
-        spec1.status = SpecStatus::Active;
-        db.insert_spec(&spec1).unwrap();
-
-        let mut spec2 = Spec::new(
-            "sp2".to_string(),
-            "ws1".to_string(),
-            "Spec 2".to_string(),
-            "content".to_string(),
-        );
-        spec2.status = SpecStatus::Completing;
-        db.insert_spec(&spec2).unwrap();
 
         // Insert queue items.
         let item1 = QueueItem::new(
@@ -1578,9 +1509,6 @@ mod tests {
         db.update_phase("w2", QueuePhase::Running).unwrap();
 
         let stats = collect_workspace_stats_from_db(&db, "ws1").unwrap();
-        assert_eq!(stats.active_spec_count, 1);
-        assert_eq!(stats.completing_count, 1);
-        assert_eq!(stats.completed_count, 0);
         assert_eq!(stats.pending_items_count, 1);
         assert_eq!(stats.running_items_count, 1);
     }
@@ -1588,29 +1516,8 @@ mod tests {
     #[test]
     fn collect_workspace_stats_filters_by_workspace() {
         use belt_core::queue::QueueItem;
-        use belt_core::spec::{Spec, SpecStatus};
 
         let db = belt_infra::db::Database::open_in_memory().unwrap();
-
-        // Insert spec in ws1.
-        let mut spec = Spec::new(
-            "sp1".to_string(),
-            "ws1".to_string(),
-            "Spec".to_string(),
-            "content".to_string(),
-        );
-        spec.status = SpecStatus::Active;
-        db.insert_spec(&spec).unwrap();
-
-        // Insert spec in ws2.
-        let mut spec2 = Spec::new(
-            "sp2".to_string(),
-            "ws2".to_string(),
-            "Other".to_string(),
-            "content".to_string(),
-        );
-        spec2.status = SpecStatus::Active;
-        db.insert_spec(&spec2).unwrap();
 
         // Insert item in ws2.
         let item = QueueItem::new(
@@ -1623,12 +1530,10 @@ mod tests {
 
         // Stats for ws1 should not include ws2 data.
         let stats = collect_workspace_stats_from_db(&db, "ws1").unwrap();
-        assert_eq!(stats.active_spec_count, 1);
         assert_eq!(stats.pending_items_count, 0);
 
         // Stats for ws2 should not include ws1 data.
         let stats2 = collect_workspace_stats_from_db(&db, "ws2").unwrap();
-        assert_eq!(stats2.active_spec_count, 1);
         assert_eq!(stats2.pending_items_count, 1);
     }
 

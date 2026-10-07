@@ -400,3 +400,19 @@ fn cron_trigger_nonexistent_job_fails() {
         "stderr should mention the missing job: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// belt spec (removed)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn spec_subcommand_does_not_exist() {
+    let (tmp, _db) = setup_belt_home();
+    let output = run_belt(tmp.path(), &["spec", "list"]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unrecognized subcommand"),
+        "expected clap rejection, got: {stderr}"
+    );
+}
