@@ -485,3 +485,70 @@ async fn execute_running_saves_token_usage_on_failure() {
     assert_eq!(rows[0].input_tokens, 300);
     assert_eq!(rows[0].output_tokens, 100);
 }
+
+/// 이름이 "evaluate"인 cron job을 심고(last_run_at=now, 1시간 간격 — 스스로는 발화하지 않음),
+/// Daemon 진행 중에 그 job이 force_trigger 로 발화되는지 센다.
+fn evaluate_named_probe() -> (
+    belt_daemon::cron::CronEngine,
+    Arc<std::sync::atomic::AtomicU32>,
+) {
+    use belt_daemon::cron::{CronContext, CronEngine, CronHandler, CronJobDef, CronSchedule};
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    struct Probe(Arc<AtomicU32>);
+    impl CronHandler for Probe {
+        fn execute(&self, _ctx: &CronContext) -> Result<(), belt_core::error::BeltError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let count = Arc::new(AtomicU32::new(0));
+    let mut engine = CronEngine::new();
+    engine.register(CronJobDef {
+        name: "evaluate".to_string(),
+        schedule: CronSchedule::Interval(std::time::Duration::from_secs(3600)),
+        workspace: None,
+        enabled: true,
+        last_run_at: Some(chrono::Utc::now()),
+        handler: Box::new(Probe(Arc::clone(&count))),
+    });
+    (engine, count)
+}
+
+/// Completed 전이가 cron "evaluate" 를 force_trigger 하지 않는다 (execute_running 경로).
+/// 평가는 tick 의 정규 단계로만 돈다.
+#[tokio::test]
+async fn execute_running_does_not_force_trigger_evaluate_cron() {
+    let tmp = TempDir::new().unwrap();
+    let mut source = MockDataSource::new("github");
+    source.add_item(test_item("github:org/repo#1", "analyze"));
+    let (engine, count) = evaluate_named_probe();
+    let mut daemon = setup_daemon(&tmp, source, vec![0]).with_cron_engine(engine);
+
+    daemon.collect().await.unwrap();
+    daemon.advance();
+    daemon.execute_running().await;
+    assert_eq!(daemon.items_in_phase(QueuePhase::Completed).len(), 1);
+
+    daemon.tick().await.unwrap();
+
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+/// 한 tick 안에서 Completed 가 되어도 cron "evaluate" 는 발화하지 않고,
+/// Completed 아이템은 같은 tick 의 정규 평가 단계에서 처리된다.
+#[tokio::test]
+async fn tick_evaluates_completed_without_cron_trigger() {
+    let tmp = TempDir::new().unwrap();
+    let mut source = MockDataSource::new("github");
+    source.add_item(test_item("github:org/repo#1", "analyze"));
+    let (engine, count) = evaluate_named_probe();
+    // 핸들러 1회 + 평가 1회
+    let mut daemon = setup_daemon(&tmp, source, vec![0, 0]).with_cron_engine(engine);
+
+    daemon.tick().await.unwrap();
+
+    assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(daemon.items_in_phase(QueuePhase::Completed).len(), 0);
+}

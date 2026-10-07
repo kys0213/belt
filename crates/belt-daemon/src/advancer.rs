@@ -12,9 +12,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-use belt_core::dependency::{DependencyGuard, SpecDependencyGuard};
 use belt_core::phase::QueuePhase;
-use belt_core::queue::{HitlReason, QueueItem};
+use belt_core::queue::QueueItem;
 use belt_core::state_machine;
 use belt_infra::db::{Database, TransitionEvent};
 
@@ -71,18 +70,16 @@ fn record_transition(
 /// Drives queue items through the advance phase of the daemon lifecycle.
 ///
 /// Responsibilities:
-/// 1. Filter items for advance eligibility (dependency gate, conflict detection)
+/// 1. Filter items for advance eligibility (queue dependency gate)
 /// 2. Update `QueueItem.phase` via `transit` / state_machine
 /// 3. Emit transition events to the database
-/// 4. Handle escalation decisions (HITL entry on spec conflicts)
-/// 5. Return updated count for the daemon to log
+/// 4. Return updated count for the daemon to log
 pub struct Advancer<'a> {
     queue: &'a mut VecDeque<QueueItem>,
     tracker: &'a mut ConcurrencyTracker,
     db: &'a Option<Arc<Database>>,
     ws_name: &'a str,
     ws_concurrency: u32,
-    dependency_guard: &'a SpecDependencyGuard,
 }
 
 impl<'a> Advancer<'a> {
@@ -93,7 +90,6 @@ impl<'a> Advancer<'a> {
         db: &'a Option<Arc<Database>>,
         ws_name: &'a str,
         ws_concurrency: u32,
-        dependency_guard: &'a SpecDependencyGuard,
     ) -> Self {
         Self {
             queue,
@@ -101,7 +97,6 @@ impl<'a> Advancer<'a> {
             db,
             ws_name,
             ws_concurrency,
-            dependency_guard,
         }
     }
 
@@ -111,7 +106,7 @@ impl<'a> Advancer<'a> {
     pub fn run(&mut self) -> usize {
         let mut advanced = 0;
 
-        // Pending -> Ready (uses safe transit + dependency gate + conflict detection)
+        // Pending -> Ready (uses safe transit)
         let pending_indices: Vec<usize> = self
             .queue
             .iter()
@@ -122,16 +117,6 @@ impl<'a> Advancer<'a> {
 
         for idx in pending_indices {
             if state_machine::transit(QueuePhase::Pending, QueuePhase::Ready).is_err() {
-                continue;
-            }
-
-            // Dependency gate: check if the spec's depends_on specs are all completed.
-            if !self.check_dependency_gate(&self.queue[idx].source_id.clone()) {
-                tracing::debug!(
-                    "dependency gate blocked: {} (source={})",
-                    self.queue[idx].work_id,
-                    self.queue[idx].source_id
-                );
                 continue;
             }
 
@@ -146,30 +131,6 @@ impl<'a> Advancer<'a> {
                     "phase_enter",
                     None,
                 );
-
-                // Conflict detection: after transitioning to Ready, check if spec
-                // entry_points overlap with other active specs. If so, escalate to HITL.
-                let conflict = self.check_conflict_gate(&self.queue[idx].source_id.clone());
-                if let Some(notes) = conflict {
-                    tracing::warn!(
-                        work_id = %self.queue[idx].work_id,
-                        "spec conflict detected, escalating to HITL: {notes}"
-                    );
-                    let now = Utc::now().to_rfc3339();
-                    let _ = transit(&mut self.queue[idx], QueuePhase::Hitl);
-                    record_transition(
-                        self.db,
-                        &self.queue[idx].work_id,
-                        &self.queue[idx].source_id,
-                        QueuePhase::Ready,
-                        QueuePhase::Hitl,
-                        "phase_enter",
-                        Some(notes.clone()),
-                    );
-                    self.queue[idx].hitl_created_at = Some(now);
-                    self.queue[idx].hitl_reason = Some(HitlReason::SpecConflict);
-                    self.queue[idx].hitl_notes = Some(notes);
-                }
             }
         }
 
@@ -264,29 +225,6 @@ impl<'a> Advancer<'a> {
         }
     }
 
-    /// Check whether a queue item's associated spec has all dependencies completed.
-    fn check_dependency_gate(&self, source_id: &str) -> bool {
-        let db = match self.db {
-            Some(db) => db,
-            None => return true,
-        };
-
-        let spec = match db.get_spec(source_id) {
-            Ok(spec) => spec,
-            Err(_) => return true,
-        };
-
-        let result = self
-            .dependency_guard
-            .check_dependencies(&spec, |dep_id| db.get_spec(dep_id).ok());
-
-        if !result.is_ready() {
-            tracing::trace!("spec {} blocked by dependencies: {:?}", spec.id, result);
-        }
-
-        result.is_ready()
-    }
-
     /// Check whether a queue item's queue_dependencies are all Done.
     fn check_queue_dependency_gate(&self, work_id: &str) -> bool {
         let db = match self.db {
@@ -355,38 +293,6 @@ impl<'a> Advancer<'a> {
 
         true
     }
-
-    /// Check whether a queue item's associated spec has entry_point conflicts.
-    fn check_conflict_gate(&self, source_id: &str) -> Option<String> {
-        let db = match self.db {
-            Some(db) => db,
-            None => return None,
-        };
-
-        let spec = match db.get_spec(source_id) {
-            Ok(spec) => spec,
-            Err(_) => return None,
-        };
-
-        let db_ref = Arc::clone(db);
-        let result = self.dependency_guard.check_conflicts(&spec, || {
-            db_ref
-                .list_specs(None, Some(belt_core::spec::SpecStatus::Active))
-                .unwrap_or_default()
-        });
-
-        match result {
-            belt_core::dependency::ConflictCheckResult::Clear => None,
-            belt_core::dependency::ConflictCheckResult::Conflict {
-                conflicting_specs,
-                overlapping_paths,
-            } => Some(format!(
-                "spec-conflict: entry_point overlap with [{}] on paths [{}]",
-                conflicting_specs.join(", "),
-                overlapping_paths.join(", ")
-            )),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -403,9 +309,8 @@ mod tests {
         let mut queue = make_queue(vec![test_item("w1", "analyze")]);
         let mut tracker = ConcurrencyTracker::new(4);
         let db: Option<Arc<Database>> = None;
-        let dep_guard = SpecDependencyGuard;
 
-        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2, &dep_guard);
+        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2);
 
         let advanced = advancer.run();
         assert_eq!(advanced, 2); // Pending->Ready + Ready->Running
@@ -422,10 +327,9 @@ mod tests {
         let mut queue = make_queue(items);
         let mut tracker = ConcurrencyTracker::new(4);
         let db: Option<Arc<Database>> = None;
-        let dep_guard = SpecDependencyGuard;
 
         // ws_concurrency = 1, so only one item should reach Running
-        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 1, &dep_guard);
+        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 1);
 
         let _advanced = advancer.run();
 
@@ -444,9 +348,8 @@ mod tests {
         ]);
         let mut tracker = ConcurrencyTracker::new(4);
         let db: Option<Arc<Database>> = None;
-        let dep_guard = SpecDependencyGuard;
 
-        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2, &dep_guard);
+        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2);
 
         advancer.advance_pending_to_ready();
 
@@ -466,13 +369,12 @@ mod tests {
 
         let mut tracker = ConcurrencyTracker::new(4);
         let db: Option<Arc<Database>> = None;
-        let dep_guard = SpecDependencyGuard;
 
         let mut limits = HashMap::new();
         limits.insert("ws-a".to_string(), 1);
         limits.insert("ws-b".to_string(), 1);
 
-        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2, &dep_guard);
+        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2);
 
         advancer.advance_ready_to_running(&limits, 1);
 
@@ -484,9 +386,8 @@ mod tests {
         let mut queue: VecDeque<QueueItem> = VecDeque::new();
         let mut tracker = ConcurrencyTracker::new(4);
         let db: Option<Arc<Database>> = None;
-        let dep_guard = SpecDependencyGuard;
 
-        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2, &dep_guard);
+        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2);
 
         let advanced = advancer.run();
         assert_eq!(advanced, 0);
@@ -518,9 +419,8 @@ mod tests {
         let mut queue = make_queue(vec![item]);
         let mut tracker = ConcurrencyTracker::new(4);
         let db_opt: Option<Arc<Database>> = Some(Arc::clone(&db));
-        let dep_guard = SpecDependencyGuard;
 
-        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
+        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
 
         assert!(advancer.check_queue_dependency_gate("my-work-id"));
     }
@@ -549,9 +449,8 @@ mod tests {
         let mut queue = make_queue(vec![item]);
         let mut tracker = ConcurrencyTracker::new(4);
         let db_opt: Option<Arc<Database>> = Some(Arc::clone(&db));
-        let dep_guard = SpecDependencyGuard;
 
-        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
+        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
 
         assert!(!advancer.check_queue_dependency_gate("my-work-id"));
     }
@@ -573,9 +472,8 @@ mod tests {
         let mut queue = make_queue(vec![item]);
         let mut tracker = ConcurrencyTracker::new(4);
         let db_opt: Option<Arc<Database>> = Some(Arc::clone(&db));
-        let dep_guard = SpecDependencyGuard;
 
-        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
+        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
 
         assert!(advancer.check_queue_dependency_gate("my-work-id"));
     }

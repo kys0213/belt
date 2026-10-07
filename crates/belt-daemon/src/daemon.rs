@@ -8,7 +8,6 @@ use chrono::Utc;
 
 use belt_core::action::Action;
 use belt_core::context::{HistoryEntry, ItemContext, QueueContext, SourceContext};
-use belt_core::dependency::SpecDependencyGuard;
 use belt_core::error::BeltError;
 use belt_core::escalation::EscalationAction;
 use belt_core::lifecycle::{HookContext, LifecycleHook, NoopLifecycleHook};
@@ -76,14 +75,12 @@ pub struct Daemon {
     /// History events with full lineage information for failure tracking.
     history_events: Vec<HistoryEvent>,
     evaluator: Evaluator,
-    /// Cron engine for scheduling periodic jobs (evaluate, hitl_timeout, etc.).
+    /// Cron engine for scheduling periodic jobs (hitl_timeout, daily_report, etc.).
     cron_engine: Option<CronEngine>,
     /// Graceful shutdown 플래그. true이면 새 아이템 수집을 중단한다.
     shutdown_requested: bool,
     /// Evaluator 스크립트 실행을 위한 Belt home 디렉토리.
     belt_home: PathBuf,
-    /// Dependency guard for spec execution ordering.
-    dependency_guard: SpecDependencyGuard,
     /// Lifecycle hook called at phase transitions (on_enter, on_done, on_fail, on_escalation).
     ///
     /// When `hook_loader` is `Some`, this serves as the fallback for workspaces
@@ -161,7 +158,6 @@ impl Daemon {
             belt_home: PathBuf::from(
                 std::env::var("BELT_HOME").unwrap_or_else(|_| ".belt".to_string()),
             ),
-            dependency_guard: SpecDependencyGuard,
             hook: Arc::new(NoopLifecycleHook),
             hook_loader: None,
         }
@@ -177,7 +173,6 @@ impl Daemon {
         let deps = BuiltinJobDeps {
             db: Arc::clone(&db),
             worktree_mgr: Arc::clone(&self.worktree_mgr),
-            workspace_root: self.belt_home.clone(),
             report_dir: report_dir.clone(),
         };
         let mut cron = self.cron_engine.take().unwrap_or_default();
@@ -193,7 +188,6 @@ impl Daemon {
                 let ws_deps = BuiltinJobDeps {
                     db: Arc::clone(&db),
                     worktree_mgr: Arc::clone(&self.worktree_mgr),
-                    workspace_root: self.belt_home.clone(),
                     report_dir: report_dir.clone(),
                 };
                 seed_workspace_crons(&mut cron, ws_name, ws_deps);
@@ -409,8 +403,8 @@ impl Daemon {
     /// Auto-transition Pending -> Ready -> Running (respecting concurrency).
     ///
     /// Delegates to [`crate::advancer::Advancer`] which encapsulates all
-    /// advance-phase logic (dependency gates, conflict detection, transition
-    /// event recording, concurrency enforcement).
+    /// advance-phase logic (queue dependency gate, transition event
+    /// recording, concurrency enforcement).
     pub fn advance(&mut self) -> usize {
         use crate::advancer::Advancer;
 
@@ -422,7 +416,6 @@ impl Daemon {
             &self.db,
             &ws_name,
             ws_concurrency,
-            &self.dependency_guard,
         );
         advancer.run()
     }
@@ -439,7 +432,6 @@ impl Daemon {
             &self.db,
             &ws_name,
             ws_concurrency,
-            &self.dependency_guard,
         );
         advancer.advance_pending_to_ready();
     }
@@ -463,7 +455,6 @@ impl Daemon {
             &self.db,
             &ws_name,
             ws_concurrency,
-            &self.dependency_guard,
         );
         advancer.advance_ready_to_running(ws_concurrency_limits, default_concurrency);
     }
@@ -818,12 +809,6 @@ impl Daemon {
                 self.tracker.release(&ws_name);
                 self.queue.push_back(item.clone());
 
-                // CR-11: Completed 전이 시 자동 force_trigger("evaluate").
-                if let Some(ref mut engine) = self.cron_engine {
-                    engine.force_trigger("evaluate");
-                    tracing::debug!("force_trigger(evaluate) after Completed: {}", item.work_id);
-                }
-
                 ItemOutcome::Completed(item)
             }
             ExecutionOutcome::Failed { error, result } => {
@@ -1109,11 +1094,7 @@ impl Daemon {
             item.hitl_notes = Some(n);
         }
 
-        // Capture spec-completion metadata before match borrows item.
-        let is_spec_completion = item.state == "spec_completion";
-        let is_spec_conflict = item.hitl_reason == Some(HitlReason::SpecConflict);
-        let spec_id = item.source_id.clone();
-        let source_id_clone = spec_id.clone();
+        let source_id_clone = item.source_id.clone();
 
         match action {
             HitlRespondAction::Done => {
@@ -1134,12 +1115,6 @@ impl Daemon {
                             "handler",
                             Some("hitl respond: done".to_string()),
                         );
-                        if is_spec_completion {
-                            self.apply_spec_completion_transition(&spec_id);
-                        }
-                        if is_spec_conflict {
-                            self.apply_spec_conflict_approved(&spec_id);
-                        }
                     }
                     Ok(false) => {
                         Self::record_transition(
@@ -1185,9 +1160,6 @@ impl Daemon {
                     "handler",
                     Some("hitl respond: retry".to_string()),
                 );
-                if is_spec_completion {
-                    self.apply_spec_active_revert(&spec_id);
-                }
                 Ok(())
             }
             HitlRespondAction::Skip => {
@@ -1201,12 +1173,6 @@ impl Daemon {
                     "handler",
                     Some("hitl respond: skip".to_string()),
                 );
-                if is_spec_completion {
-                    self.apply_spec_active_revert(&spec_id);
-                }
-                if is_spec_conflict {
-                    self.apply_spec_conflict_rejected(&spec_id);
-                }
                 Ok(())
             }
             HitlRespondAction::Replan => {
@@ -1283,109 +1249,6 @@ impl Daemon {
 
                 Ok(())
             }
-        }
-    }
-
-    /// Transition a spec from Completing to Completed in the database.
-    ///
-    /// Called when a `spec_completion` HITL item is approved (Done).
-    /// Logs a warning and continues if the database is unavailable or the
-    /// transition fails -- the queue item has already moved to Done.
-    fn apply_spec_completion_transition(&self, spec_id: &str) {
-        if let Some(db) = &self.db {
-            match db.update_spec_status(spec_id, belt_core::spec::SpecStatus::Completed) {
-                Ok(()) => {
-                    tracing::info!(
-                        spec_id = %spec_id,
-                        "spec transitioned from Completing to Completed via HITL approval"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        spec_id = %spec_id,
-                        error = %e,
-                        "failed to transition spec to Completed after HITL approval"
-                    );
-                }
-            }
-        } else {
-            tracing::warn!(
-                spec_id = %spec_id,
-                "no database configured — cannot transition spec to Completed"
-            );
-        }
-    }
-
-    /// Revert a spec from Completing to Active in the database.
-    ///
-    /// Called when a `spec_completion` HITL item is rejected (Skip) or
-    /// needs additional modifications (Retry).
-    fn apply_spec_active_revert(&self, spec_id: &str) {
-        if let Some(db) = &self.db {
-            match db.update_spec_status(spec_id, belt_core::spec::SpecStatus::Active) {
-                Ok(()) => {
-                    tracing::info!(
-                        spec_id = %spec_id,
-                        "spec reverted from Completing to Active via HITL rejection/retry"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        spec_id = %spec_id,
-                        error = %e,
-                        "failed to revert spec to Active after HITL rejection/retry"
-                    );
-                }
-            }
-        } else {
-            tracing::warn!(
-                spec_id = %spec_id,
-                "no database configured — cannot revert spec to Active"
-            );
-        }
-    }
-
-    /// Handle approval of a spec conflict HITL item.
-    ///
-    /// When the user approves conflicting specs to proceed in parallel,
-    /// this method logs the decision. The item has already been transitioned
-    /// to Done, so the conflicting spec's queue item will proceed normally
-    /// on the next `advance()` cycle.
-    fn apply_spec_conflict_approved(&self, spec_id: &str) {
-        tracing::info!(
-            spec_id = %spec_id,
-            "spec conflict approved — conflicting specs will proceed in parallel"
-        );
-    }
-
-    /// Handle rejection of a spec conflict HITL item.
-    ///
-    /// When the user rejects the later spec due to conflict, this method
-    /// pauses the conflicting spec in the database so it no longer competes
-    /// for the overlapping entry points. The queue item has already been
-    /// transitioned to Skipped.
-    fn apply_spec_conflict_rejected(&self, spec_id: &str) {
-        if let Some(db) = &self.db {
-            match db.update_spec_status(spec_id, belt_core::spec::SpecStatus::Paused) {
-                Ok(()) => {
-                    tracing::info!(
-                        spec_id = %spec_id,
-                        "spec paused due to conflict rejection"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        spec_id = %spec_id,
-                        error = %e,
-                        "failed to pause spec after conflict rejection"
-                    );
-                }
-            }
-        } else {
-            tracing::warn!(
-                spec_id = %spec_id,
-                "no database configured — cannot pause spec after conflict rejection"
-            );
         }
     }
 
@@ -1809,12 +1672,10 @@ impl Daemon {
         }
 
         let outcomes = self.execute_running().await;
-        let mut has_completed = false;
         for outcome in &outcomes {
             match outcome {
                 ItemOutcome::Completed(item) => {
                     tracing::info!("completed: {}", item.work_id);
-                    has_completed = true;
                 }
                 ItemOutcome::Failed {
                     item,
@@ -1832,17 +1693,10 @@ impl Daemon {
             }
         }
 
-        // handler 성공 → Completed 전이 후 force_trigger("evaluate") (D-10).
-        // force_trigger는 cron의 last_run_at을 리셋하여 다음 tick에서 즉시 실행.
-        if has_completed && let Some(ref mut engine) = self.cron_engine {
-            engine.force_trigger("evaluate");
-            tracing::debug!("force_trigger(evaluate) after handler completion");
-        }
-
         // Evaluator로 Completed 아이템 평가 (Done vs HITL).
         self.evaluate_completed().await;
 
-        // Cron jobs: HITL timeout, daily report, log cleanup, evaluate 등.
+        // Cron jobs: HITL timeout, daily report, log cleanup 등.
         if let Some(ref mut engine) = self.cron_engine {
             engine.tick();
         }
@@ -4432,169 +4286,6 @@ sources:
 
         // collect() should have been skipped due to shutdown.
         assert_eq!(daemon.queue_items().len(), 0);
-    }
-
-    // --- spec completion HITL response tests ---
-
-    #[tokio::test]
-    async fn respond_hitl_done_spec_completion_transitions_spec_to_completed() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let daemon = setup_daemon(&tmp, source, vec![]);
-
-        // Set up an in-memory database with a spec in Completing status.
-        let db = Database::open_in_memory().unwrap();
-        let mut spec = belt_core::spec::Spec::new(
-            "spec-42".to_string(),
-            "test-ws".to_string(),
-            "Test Spec".to_string(),
-            "content".to_string(),
-        );
-        spec.status = belt_core::spec::SpecStatus::Completing;
-        db.insert_spec(&spec).unwrap();
-
-        let mut daemon = daemon.with_db(db);
-
-        // Create a spec_completion HITL item.
-        let mut item = QueueItem::new(
-            "spec-completion:spec-42:hitl".to_string(),
-            "spec-42".to_string(),
-            "test-ws".to_string(),
-            "spec_completion".to_string(),
-        );
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_reason = Some(HitlReason::SpecCompletionReview);
-        daemon.push_item(item);
-
-        // Approve (Done) the HITL item.
-        let result = daemon
-            .respond_hitl(
-                "spec-completion:spec-42:hitl",
-                HitlRespondAction::Done,
-                Some("reviewer".into()),
-                None,
-            )
-            .await;
-        assert!(result.is_ok());
-
-        // Queue item should be Done.
-        assert_eq!(
-            daemon
-                .get_item("spec-completion:spec-42:hitl")
-                .unwrap()
-                .phase(),
-            QueuePhase::Done
-        );
-
-        // Spec should have transitioned to Completed.
-        let updated_spec = daemon.db.as_ref().unwrap().get_spec("spec-42").unwrap();
-        assert_eq!(updated_spec.status, belt_core::spec::SpecStatus::Completed);
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_skip_spec_completion_reverts_spec_to_active() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let daemon = setup_daemon(&tmp, source, vec![]);
-
-        let db = Database::open_in_memory().unwrap();
-        let mut spec = belt_core::spec::Spec::new(
-            "spec-43".to_string(),
-            "test-ws".to_string(),
-            "Test Spec".to_string(),
-            "content".to_string(),
-        );
-        spec.status = belt_core::spec::SpecStatus::Completing;
-        db.insert_spec(&spec).unwrap();
-
-        let mut daemon = daemon.with_db(db);
-
-        let mut item = QueueItem::new(
-            "spec-completion:spec-43:hitl".to_string(),
-            "spec-43".to_string(),
-            "test-ws".to_string(),
-            "spec_completion".to_string(),
-        );
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_reason = Some(HitlReason::SpecCompletionReview);
-        daemon.push_item(item);
-
-        // Reject (Skip) the HITL item.
-        let result = daemon
-            .respond_hitl(
-                "spec-completion:spec-43:hitl",
-                HitlRespondAction::Skip,
-                Some("reviewer".into()),
-                None,
-            )
-            .await;
-        assert!(result.is_ok());
-
-        // Queue item should be Skipped.
-        assert_eq!(
-            daemon
-                .get_item("spec-completion:spec-43:hitl")
-                .unwrap()
-                .phase(),
-            QueuePhase::Skipped
-        );
-
-        // Spec should revert to Active after rejection.
-        let updated_spec = daemon.db.as_ref().unwrap().get_spec("spec-43").unwrap();
-        assert_eq!(updated_spec.status, belt_core::spec::SpecStatus::Active);
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_retry_spec_completion_reverts_spec_to_active() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let daemon = setup_daemon(&tmp, source, vec![]);
-
-        let db = Database::open_in_memory().unwrap();
-        let mut spec = belt_core::spec::Spec::new(
-            "spec-44".to_string(),
-            "test-ws".to_string(),
-            "Test Spec".to_string(),
-            "content".to_string(),
-        );
-        spec.status = belt_core::spec::SpecStatus::Completing;
-        db.insert_spec(&spec).unwrap();
-
-        let mut daemon = daemon.with_db(db);
-
-        let mut item = QueueItem::new(
-            "spec-completion:spec-44:hitl".to_string(),
-            "spec-44".to_string(),
-            "test-ws".to_string(),
-            "spec_completion".to_string(),
-        );
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_reason = Some(HitlReason::SpecCompletionReview);
-        daemon.push_item(item);
-
-        // Retry (additional modifications needed) the HITL item.
-        let result = daemon
-            .respond_hitl(
-                "spec-completion:spec-44:hitl",
-                HitlRespondAction::Retry,
-                Some("reviewer".into()),
-                None,
-            )
-            .await;
-        assert!(result.is_ok());
-
-        // Queue item should be Pending (retried).
-        assert_eq!(
-            daemon
-                .get_item("spec-completion:spec-44:hitl")
-                .unwrap()
-                .phase(),
-            QueuePhase::Pending
-        );
-
-        // Spec should revert to Active for additional modifications.
-        let updated_spec = daemon.db.as_ref().unwrap().get_spec("spec-44").unwrap();
-        assert_eq!(updated_spec.status, belt_core::spec::SpecStatus::Active);
     }
 
     // ---------------------------------------------------------------

@@ -8,7 +8,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use belt_core::error::BeltError;
-use belt_daemon::cron::{CronContext, CronEngine, CronHandler, CronJobDef, CronSchedule};
+use belt_daemon::cron::{
+    BuiltinJobDeps, CronContext, CronEngine, CronHandler, CronJobDef, CronSchedule, builtin_jobs,
+    seed_workspace_crons,
+};
 use belt_infra::db::Database;
 use chrono::{TimeZone, Utc};
 
@@ -485,7 +488,7 @@ fn sync_preserves_workspace_scoped_builtins() {
     let mut engine = CronEngine::new();
 
     let (ws_builtin, _) = make_counting_job(
-        "my-workspace:evaluate",
+        "my-workspace:knowledge_extraction",
         CronSchedule::Interval(Duration::from_secs(60)),
     );
     engine.register(ws_builtin);
@@ -516,4 +519,47 @@ fn sync_is_idempotent() {
 
     engine.sync_custom_jobs_from_db(&db);
     assert_eq!(engine.job_count(), 1, "third sync should still be 1");
+}
+
+fn builtin_deps(tmp: &tempfile::TempDir) -> BuiltinJobDeps {
+    BuiltinJobDeps {
+        db: Arc::new(Database::open_in_memory().unwrap()),
+        worktree_mgr: Arc::new(belt_infra::worktree::MockWorktreeManager::new(
+            tmp.path().to_path_buf(),
+        )),
+        report_dir: None,
+    }
+}
+
+/// evaluate와 gap_detection은 builtin cron job이 아니다.
+/// 전역 builtin 목록에도, workspace builtin 시드에도 등록되지 않는다.
+#[test]
+fn builtin_jobs_exclude_evaluate_and_gap_detection() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let global: Vec<String> = builtin_jobs(builtin_deps(&tmp))
+        .into_iter()
+        .map(|j| j.name)
+        .collect();
+    assert!(
+        !global
+            .iter()
+            .any(|n| n == "evaluate" || n == "gap_detection")
+    );
+
+    // hitl_timeout, daily_report, log_cleanup, knowledge_extraction 4개만 남는다.
+    let mut engine = CronEngine::new();
+    seed_workspace_crons(&mut engine, "ws", builtin_deps(&tmp));
+    assert_eq!(engine.job_count(), 4);
+
+    // 남은 4개는 이름으로 지울 수 있고, evaluate/gap_detection 은 지울 대상이 없다.
+    for name in ["evaluate", "gap_detection"] {
+        let before = engine.job_count();
+        engine.unregister(&format!("ws:{name}"));
+        assert_eq!(
+            engine.job_count(),
+            before,
+            "ws:{name} must not be registered"
+        );
+    }
 }
