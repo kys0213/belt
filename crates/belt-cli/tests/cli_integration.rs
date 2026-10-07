@@ -166,6 +166,51 @@ fn context_json_output() {
     assert_eq!(parsed["queue"]["state"], "implement");
 }
 
+#[test]
+fn context_json_exposes_derived_from_only_for_derived_items() {
+    let (tmp, db) = setup_belt_home();
+
+    let origin = QueueItem::new(
+        "ctx-origin".to_string(),
+        "src-d".to_string(),
+        "ws-ctx".to_string(),
+        "implement".to_string(),
+    );
+    db.insert_item(&origin).expect("insert origin");
+
+    let mut derived = QueueItem::new(
+        "ctx-derived".to_string(),
+        "src-d".to_string(),
+        "ws-ctx".to_string(),
+        "implement".to_string(),
+    );
+    derived.derived_from = Some("ctx-origin".to_string());
+    db.insert_item(&derived).expect("insert derived");
+
+    let run = |work_id: &str| -> serde_json::Value {
+        let output = run_belt(tmp.path(), &["context", work_id, "--json"]);
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("valid JSON")
+    };
+
+    let derived_json = run("ctx-derived");
+    assert_eq!(derived_json["queue"]["derived_from"], "ctx-origin");
+
+    let origin_json = run("ctx-origin");
+    assert!(
+        origin_json["queue"]
+            .as_object()
+            .expect("queue object")
+            .get("derived_from")
+            .is_none(),
+        "derived_from key must be omitted for non-derived items"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // hitl respond: EscalationAction / HitlRespondAction parsing
 // ---------------------------------------------------------------------------

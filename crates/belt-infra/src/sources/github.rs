@@ -415,6 +415,7 @@ impl GitHubDataSource {
                 phase: item.phase().as_str().to_string(),
                 state: item.state.clone(),
                 source_id: item.source_id.clone(),
+                derived_from: item.derived_from.clone(),
             },
             source: SourceContext {
                 source_type: "github".to_string(),

@@ -273,6 +273,7 @@ mod tests {
                     phase: "running".to_string(),
                     state: state.to_string(),
                     source_id: "github:org/repo#42".to_string(),
+                    derived_from: None,
                 },
                 source: SourceContext {
                     source_type: "github".to_string(),
@@ -452,6 +453,7 @@ mod tests {
                     phase: "running".to_string(),
                     state: "implement".to_string(),
                     source_id: "jira:PROJ-42".to_string(),
+                    derived_from: None,
                 },
                 source: SourceContext {
                     source_type: "jira".to_string(),

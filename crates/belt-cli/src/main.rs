@@ -2614,6 +2614,7 @@ async fn main() -> anyhow::Result<()> {
                             phase: item.phase().as_str().to_string(),
                             state: item.state.clone(),
                             source_id: item.source_id.clone(),
+                            derived_from: item.derived_from.clone(),
                         },
                         source: belt_core::context::SourceContext {
                             source_type: "unknown".to_string(),

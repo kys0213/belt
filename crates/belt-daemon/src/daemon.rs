@@ -2670,6 +2670,7 @@ impl Daemon {
                     phase: format!("{}", item.phase()),
                     state: item.state.clone(),
                     source_id: item.source_id.clone(),
+                    derived_from: item.derived_from.clone(),
                 },
                 source: SourceContext {
                     source_type: String::new(),
@@ -2701,6 +2702,7 @@ impl Daemon {
                     phase: format!("{}", item.phase()),
                     state: item.state.clone(),
                     source_id: item.source_id.clone(),
+                    derived_from: item.derived_from.clone(),
                 },
                 source: SourceContext {
                     source_type: String::new(),
