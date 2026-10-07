@@ -28,13 +28,12 @@ Belt는 Linux, macOS, Windows에서 동작해야 한다. 릴리스 바이너리�
 
 ### 2. Shell 실행 (`sh -c`, `bash -c`)
 
-**영향 범위**: handler script 실행, cron script, test runner, on_done/on_fail
+**영향 범위**: handler script 실행, cron script, on_done/on_fail
 
 | 파일 | 셸 | Windows 호환 |
 |------|-----|-------------|
 | `executor.rs` | `bash -c` | ❌ bash 미설치 시 실패 |
 | `cron.rs` (ScriptJob) | `sh -c` | ❌ sh 미존재 |
-| `test_runner.rs` | `sh -c` | ❌ sh 미존재 |
 | `main.rs` (cron run) | `sh -c` | ❌ sh 미존재 |
 
 **대안 설계**: Windows에서는 `cmd.exe /C` 또는 `powershell -Command`로 분기. 또는 workspace yaml에 `shell: bash|cmd|pwsh` 설정 추가.
@@ -160,7 +159,6 @@ pub fn default_notifier() -> Box<dyn DaemonNotifier> {
 |------|---------|
 | `executor.rs`: `Command::new("bash").arg("-c")` | `shell.execute(script, dir, vars)` |
 | `cron.rs` ScriptJob: `Command::new("sh").arg("-c")` | `shell.execute(script, dir, vars)` |
-| `test_runner.rs`: `Command::new("sh").arg("-c")` | `shell.execute(cmd, dir, vars)` |
 | `main.rs` cron run: `Command::new("sh").arg("-c")` | `shell.execute(script, dir, vars)` |
 | `main.rs` signal_daemon: `kill(pid, SIGUSR1)` | `notifier.notify(pid)` |
 | `daemon.rs` run_select_loop: `signal::unix::signal(USR1)` | 플랫폼별 `#[cfg]` 유지 (이벤트 루프는 trait 추상화 어려움) |

@@ -33,7 +33,7 @@ Daemon이 모르는 것: hook이 실제로 무엇을 하는지 (결과만 받음
 
 | 구성 요소 | 책임 |
 |-----------|------|
-| **Advancer** | Pending→Ready→Running 전이, dependency gate (DB), spec 충돌 검출 |
+| **Advancer** | Pending→Ready→Running 전이, dependency gate (DB) |
 | **Executor** | handler 실행 + hook 트리거, 실패 시 stagnation 분석 + lateral plan + escalation |
 | **Evaluator** | Completed → Done/HITL 분류 (per-item) |
 | **HitlService** | HITL 열기·판정·timeout 만료의 단일 계약. 후처리와 phase 전이는 하지 않는다 |
@@ -68,7 +68,7 @@ flowchart TD
     S0 --> S1["1 DB 관찰: 작업 사본을 DB 에 맞춤"]
     S1 --> S2["2 수집: DataSource 결과를 즉시 DB 에 Pending 기록"]
     S2 --> S3["3 HITL 후처리: resolved 또는 expired 이면서 미완료"]
-    S3 --> S4["4 HITL 요청 전달: 상태 기반, 다음 tick 재시도, 전달 재시도 상한"]
+    S3 --> S4["4 HITL 열림 반영(on_hitl_opened)과 요청 전달: 상태 기반, 다음 tick 재시도, 전달 재시도 상한"]
     S4 --> S5["5 응답 polling: 1회 처리, allowlist, 판정"]
     S5 --> S6["6 진행 알림: 전이 이력 순서, best-effort"]
     S6 --> S7["7 advance, execute, evaluate, cron"]
@@ -76,6 +76,8 @@ flowchart TD
 ```
 
 - 4단계의 HITL 요청 전달은 실패하면 이후 tick에서 다시 시도하며, **전달 재시도 상한**에 이르면 멈춘다. 상한의 값은 구현이 정한다. 이 값은 [HITL 해결 후처리](#hitl-해결-후처리)의 **후처리 실패 상한**(N)과 별개의 카운터다.
+- 4단계의 `on_hitl_opened`는 daemon이 open HITL 요청을 관찰하면 열린 경로(escalation, evaluate, `belt queue hitl`)와 무관하게 요청마다 한 번 호출한다. 실패는 비치명이고 재시도하지 않는다. 관찰 시점에 이미 확정된 요청은 건너뛴다.
+- 5단계의 응답 polling은 daemon이 꺼져 있는 동안 외부 channel에 온 응답도 재시작 뒤 소급 수신한다. 그 사이 다른 경로가 확정했으면 `already_handled`로 처리한다.
 - wake 신호는 취소 요청처럼 tick을 기다리면 안 되는 용도를 **다른 용도의 wake와 구분**해야 한다. 구분 없이 일반 깨움으로 취급하면 취소 처리가 tick 간격만큼 늦어진다. 구분 수단은 구현이 정한다.
 - wake 신호를 받으면 0번부터 즉시 실행한다.
 - **handler 실행 중에도 취소 요청을 받을 수 있어야 한다.** 한 바퀴가 handler 완료를 기다리며 막히지 않는다.
@@ -91,7 +93,7 @@ sequenceDiagram
     participant H as LifecycleHook
     participant EV as Evaluator
 
-    A->>DB: Pending to Ready 전이 spec dependency gate
+    A->>DB: Pending to Ready 전이
     A->>DB: Ready to Running 전이 queue dependency gate와 concurrency
     alt 전이가 applied
         E->>H: on_enter
@@ -122,17 +124,19 @@ flowchart TD
     L -- "아니오" --> R["3 전이 이력에 stagnation 기록"]
     LP --> R
     R --> C["4 failure_count 로 escalation 결정"]
-    C --> OE["5 on_escalation 트리거"]
+    C --> T["5 결과 전이 commit (retry 또는 retry_with_comment는 원 아이템 Skipped + 파생 아이템 Pending, hitl은 Running to Hitl)"]
+    T --> AP{"전이 결과가 applied 인가"}
+    AP -- "conflict" --> NH["hook 없음, DB phase 를 따름"]
+    AP -- "예" --> OE["6 on_escalation 트리거"]
     OE --> OF{"retry 인가"}
     OF -- "아니오" --> ON["on_fail 트리거"]
-    OF -- "예" --> T
-    ON --> T["6 상태 전이"]
-    T --> TR{"escalation"}
-    TR -- "retry 또는 retry_with_comment" --> N["새 아이템 Pending, worktree 보존"]
-    TR -- "hitl" --> HI["lateral 이력을 notes 로 HITL 요청 생성, worktree 보존"]
+    OF -- "예" --> END["종료"]
 ```
 
-lateral_plan은 retry로 생성된 새 아이템이 다시 Running에 진입할 때 handler prompt에 추가 컨텍스트로 주입된다.
+- retry 계열은 worktree를 정리하지 않고 파생 아이템에 인계한다. hitl은 lateral 이력을 HITL 메모로 담은 요청을 열고 worktree를 보존한다.
+- 결과 전이가 먼저 commit되므로 hook 실패는 상태를 되돌리지 않는다.
+
+lateral_plan은 파생 아이템이 Running에 진입할 때 handler prompt에 추가 컨텍스트로 주입된다.
 
 ```
 원래 prompt: "이슈를 구현해줘"
@@ -207,31 +211,33 @@ daemon의 작업 사본은 DB와 어긋날 수 있다(CLI·TUI·evaluator의 전
 flowchart TD
     P["후처리 대상 요청"] --> A{"확정 액션"}
     A -- "done" --> D1["on_done"]
-    D1 -- "실패" --> FAIL["Hitl to Failed"]
-    D1 -- "성공" --> D2["spec 완료 승인 또는 spec 충돌 승인 해당 시"]
-    D2 --> D3["on_hitl_resolved"]
+    D1 -- "실패" --> DF["on_hitl_resolved"]
+    DF --> FAIL["Hitl to Failed"]
+    D1 -- "성공" --> D3["on_hitl_resolved"]
     D3 --> D4["worktree 정리"]
     D4 --> DONE["Hitl to Done"]
     A -- "retry" --> R1["사용자 지시를 lateral plan 으로 주입"]
-    R1 --> R2["on_hitl_resolved"]
+    R1 --> R15["failure_count 리셋 지점 기록"]
+    R15 --> R2["on_hitl_resolved"]
     R2 --> PEND["Hitl to Pending"]
     A -- "skip" --> S1["worktree 정리"]
     S1 --> S2["on_hitl_resolved"]
     S2 --> SKIP["Hitl to Skipped"]
-    A -- "replan" --> PC{"replan 상한 이내?"}
+    A -- "replan" --> PC{"계열 replan 3회 초과?"}
     PC -- "초과" --> PF["on_hitl_resolved"]
-    PF --> PFAIL["Hitl to Failed"]
-    PC -- "이내" --> P1["replan 아이템을 Hitl 로 생성"]
+    PF --> PFAIL["Hitl to Failed (worktree 보존)"]
+    PC -- "이내" --> P1["파생 아이템 Pending 생성 (실패 맥락 주입, 새 worktree)"]
     P1 --> P2["on_hitl_resolved"]
-    P2 --> PEND
-    A -- "expired" --> E1["terminal action 을 위 액션과 같은 방식으로 적용"]
+    P2 --> P3["worktree 정리"]
+    P3 --> PSKIP["Hitl to Skipped"]
+    A -- "expired" --> E1["terminal 값 skip 또는 replan 을 위 액션과 같은 방식으로 적용"]
 ```
 
 | 규칙 | 내용 |
 |------|------|
 | 전달 보장 | **at-least-once**. 완료 표시 전에 crash하면 재실행된다 |
 | 마지막 전이 | 결과 전이와 후처리 완료 표시는 한 트랜잭션이다 |
-| 멱등 | 아이템 생성(이미 같은 replan 아이템이 있으면 no-op)과 spec 상태 전이(이미 목표 상태면 no-op)는 멱등이다 |
+| 멱등 | 파생 아이템 생성은 멱등이다(같은 HITL 요청에서 이미 파생된 아이템이 있으면 no-op) |
 | on_done | 사용자 script를 포함해 **두 번 실행될 수 있다** |
 | on_done 실패 | Hitl→Failed. on_done 계약을 HITL 경로에서도 지킨다 |
 | 그 밖의 단계 실패 | 비치명. `post_processing_error`를 이력에 남기고 dashboard에 경고한 뒤 다음 단계로 진행한다 |
@@ -249,7 +255,8 @@ flowchart TD
 ```mermaid
 flowchart TD
     S["daemon 시작"] --> K["이전 daemon 이 남긴 handler 프로세스 종료"]
-    K --> RB["Running 아이템을 Pending 으로 롤백, worktree 보존"]
+    K --> CX["열린 취소 요청 종결"]
+    CX --> RB["남은 Running 아이템을 Pending 으로 롤백, worktree 보존"]
     RB --> L["non-terminal 아이템을 DB 에서 복원"]
     L --> T["tick 루프 시작"]
     T --> PP["미완료 HITL 후처리는 다음 tick에서 재실행"]
@@ -257,6 +264,7 @@ flowchart TD
 
 - **단일 daemon 전제**: 한 DB에는 daemon이 하나만 동작한다. 그래서 시작 시 남아 있는 handler 프로세스는 모두 이전 daemon의 것이고, 롤백 전에 안전하게 종료할 수 있다.
 - 종료 대상은 handler 프로세스 식별 정보에 기록된 프로세스(하위 프로세스 포함)다. 종료하지 않으면 롤백 뒤에도 worktree를 계속 수정할 수 있다.
+- 열린 취소 요청(Requested·Accepted)은 롤백보다 먼저 종결한다. 대상 아이템이 Running이면 Pending으로 롤백하지 않고 Running→Skipped로 바꾸며 요청을 `canceled`로 닫는다. Running이 아니면 `too_late`로 닫는다.
 - 후처리 중이던 HITL은 상태 기반이라 재시작 뒤 다시 실행되고 누락되지 않는다.
 - daemon이 꺼져 있는 동안 CLI가 응답한 HITL도 재시작 후 후처리된다. 정지 중 일어난 전이의 진행 알림은 보내지 않는다.
 
@@ -264,13 +272,9 @@ flowchart TD
 
 ## Dependency Gate
 
-### Spec Dependency Gate
-
-Pending→Ready 전이 시 스펙 간 의존 관계를 확인한다.
-
 ### Queue Dependency Gate
 
-Ready→Running 전이 시 확인한다. dependency phase 확인은 **DB 조회 기반**이다.
+Ready→Running 전이 시 확인한다. dependency phase 확인은 **DB 조회 기반**이다. 선행 아이템이 파생되면 gate는 그 계열의 최신 아이템 phase로 판정한다.
 
 | dependency 상태 | 판정 |
 |-----------------|------|
@@ -286,10 +290,6 @@ Ready→Running 전이 시 확인한다. dependency phase 확인은 **DB 조회 
 | **orphan** | gate open | 삭제된 아이템에 의존하면 영원히 차단됨 |
 | **dependency가 Failed/Skipped** | gate blocked | 전제 조건 미충족 — 운영자가 해결하거나 의존 관계를 제거해야 함 |
 | **자기 자신에 의존** | 등록 시점에 거부 | 순환의 특수 케이스 |
-
-### Conflict Gate
-
-entry_point 겹침을 DB 기반으로 감지한다.
 
 ---
 
@@ -312,7 +312,8 @@ handler는 Daemon이 직접 실행한다. 작업의 핵심 로직.
 | `on_enter` | Running 진입 후, handler 실행 전 | Hook impl |
 | `on_done` | evaluate Done 판정 후, HITL done 후처리 | Hook impl |
 | `on_fail` | 실패 시 (retry 제외) | Hook impl |
-| `on_escalation` | escalation 결정 후 | Hook impl |
+| `on_escalation` | escalation 결정 후, 결과 전이 commit 뒤 | Hook impl |
+| `on_hitl_opened` | HITL 요청이 열린 뒤 daemon 관찰 시 | Hook impl (비치명) |
 | `on_hitl_resolved` | HITL 후처리 중 | Hook impl (비치명) |
 
 Daemon은 hook을 트리거만 한다. 취소된 실행과 conflict로 끝난 실행의 hook은 트리거하지 않는다. 상세: [LifecycleHook](./lifecycle-hook.md)
@@ -362,6 +363,8 @@ flowchart TD
 
 - [ ] tick마다 결정에 앞서 작업 사본을 DB에 맞춘다
 - [ ] 수집한 아이템은 즉시 DB에 Pending으로 기록된다
+- [ ] 실패 처리에서 결과 전이가 applied일 때만 on_escalation·on_fail이 호출된다
+- [ ] 모든 HITL 열기에서 on_hitl_opened가 한 번 호출된다
 - [ ] 점유가 conflict면 handler를 띄우지 않고 on_enter와 `started` 이벤트도 없다
 - [ ] evaluator 판정 전이가 conflict면 판정 결과를 버린다
 - [ ] Running에서 나가는 결과 전이는 on_fail·on_escalation보다 먼저 commit되어, conflict로 끝난 실행은 이 hook을 실행하지 않는다
@@ -371,8 +374,9 @@ flowchart TD
 ### HITL 후처리
 
 - [ ] CLI·TUI 판정의 후처리가 다음 tick에 실행되고 재시작 뒤에도 누락되지 않는다
-- [ ] 후처리는 at-least-once이고, 아이템 생성과 spec 전이는 멱등이며, on_done은 두 번 실행될 수 있다
-- [ ] 후처리 대상에 spec 완료 승인과 spec 충돌 승인이 포함된다
+- [ ] 후처리는 at-least-once이고, 파생 아이템 생성은 멱등이며, on_done은 두 번 실행될 수 있다
+- [ ] HITL retry는 failure_count 리셋 지점이다
+- [ ] replan 이내는 원 아이템 Skipped + 파생 아이템 Pending이다
 - [ ] on_done 실패는 Hitl→Failed이고, on_done 외 단계가 실패해도 결과 전이에 도달한다
 - [ ] 결과 전이가 연속 N회 실패하면 Hitl→Failed와 `post_processing_failed` 이력으로 끝나 아이템이 영구히 busy로 남지 않는다
 
@@ -380,6 +384,7 @@ flowchart TD
 
 - [ ] 시작 시 non-terminal 아이템을 DB에서 복원한다
 - [ ] Running→Pending 롤백 전에 이전 daemon이 남긴 handler 프로세스를 종료한다
+- [ ] 재시작 시 열린 취소 요청을 롤백보다 먼저 종결한다
 - [ ] 위 정리는 한 DB에 daemon이 하나라는 전제에 의존한다
 
 ### 구성 요소
@@ -427,4 +432,4 @@ flowchart TD
 - [Stagnation Detection](./stagnation.md) — Composite Similarity + Lateral Thinking
 - [DataSource](./datasource.md) — 수집/컨텍스트 추상화
 - [AgentRuntime](./agent-runtime.md) — LLM 실행 추상화
-- [Cron 엔진](./cron-engine.md) — 품질 루프, hitl-timeout
+- [Cron 엔진](./cron-engine.md) — 주기 작업, hitl-timeout

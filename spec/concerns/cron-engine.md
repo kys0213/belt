@@ -1,7 +1,7 @@
-# Cron 엔진 — 주기 실행 + 품질 루프
+# Cron 엔진 — 주기 실행
 
 > 주기적으로 실행되는 작업을 관리한다.
-> 파이프라인은 1회성, 품질은 Cron이 지속 감시하여 새 아이템을 생성.
+> 주기 작업(인프라 유지, 지식 추출, 사용자 정의)을 실행한다.
 
 ---
 
@@ -9,39 +9,10 @@
 
 ```
 1. 인프라 유지 — hitl-timeout, log-cleanup, daily-report (결정적)
-2. 품질 루프 — gap-detection, knowledge-extract (LLM 사용)
+2. 지식 추출 — knowledge-extract (LLM 사용)
 
 ※ evaluate는 Daemon tick 루프의 정규 단계로 이동. 상세: [Evaluator](./evaluator.md)
 ```
-
----
-
-## 품질 루프
-
-파이프라인이 아이템을 처리한 후, Cron이 지속적으로 결과물을 검증한다.
-
-```
-Pipeline: issue → analyze → implement → review → Done
-                                                   │
-Cron: gap-detection ─── 스펙 vs 코드 비교 ──────────┘
-        │
-        ▼
-      gap 발견 → 중복 검사 → 새 이슈 생성 → DataSource.collect() → 파이프라인 재진입
-```
-
-부족하면 되돌아가는 게 아니라 **새 아이템이 생긴다**.
-
-### Dedupe 가드
-
-gap-detection이 이슈를 생성하기 전, DataSource의 현재 open 아이템 목록을 조회하여 **동일 gap에 대한 아이템이 이미 존재하면 skip**한다.
-
-```
-gap 발견 → DataSource에서 open 아이템 조회 (Pending/Ready/Running)
-  → 동일 gap에 해당하는 아이템 존재 → skip (이미 처리 중)
-  → 해당 아이템 없음 → 새 이슈 생성
-```
-
-이를 통해 동일 문제에 대한 이슈 무한 증식을 방지한다.
 
 ---
 
@@ -53,13 +24,12 @@ gap 발견 → DataSource에서 open 아이템 조회 (Pending/Ready/Running)
 |-----|------|------|
 | hitl-timeout | 5분 | 기한이 지난 open HITL 요청을 만료 경합에 올림 (후처리는 daemon tick) |
 | daily-report | 매일 06시 | 일간 리포트 |
-| log-cleanup | 매일 00시 | 오래된 로그/worktree 삭제 |
+| log-cleanup | 매일 00시 | 보존 worktree(TTL 초과)와 daemon 로그 정리. 전이 이력·HITL 기록은 지우지 않는다 |
 
-### 품질 루프 (Per-workspace, LLM 사용)
+### 지식 추출 (Per-workspace, LLM 사용)
 
 | Job | 주기 | 동작 |
 |-----|------|------|
-| gap-detection | 1시간 | 스펙-코드 대조, gap 발견 시 이슈 생성 |
 | knowledge-extract | 1시간 | merged PR 지식 추출 |
 
 ### 사용자 정의 (예시)
@@ -111,7 +81,7 @@ force_trigger(job_name):
 ```
 
 - 동기적으로 실행하지 않는다. cron의 `last_run_at`을 리셋할 뿐.
-- gap-detection 등 품질 루프 job에 사용.
+- knowledge-extract나 사용자 정의 job에 사용.
 
 > **evaluate는 cron job이 아니라 Daemon tick의 정규 단계다**. Completed 아이템은 Evaluator가 다음 tick에서 Progressive Pipeline으로 판정한다. 상세: [Evaluator](./evaluator.md)
 

@@ -24,7 +24,7 @@ loop {
     advancer.advance()           // 전이
     executor.execute()           // 실행
     evaluator.evaluate()         // 판정 — 완료 아이템을 Done/HITL로 분류
-    cron_engine.tick()           // 품질 루프
+    cron_engine.tick()           // 주기 작업
 }
 ```
 
@@ -259,7 +259,7 @@ Evaluator는 cron job이 아닌 **Daemon tick 루프의 정규 단계**이다. E
 |------|------|
 | Daemon tick 순서 | collect → advance → execute → evaluate → cron |
 | Evaluator 위치 | cron job → Daemon 모듈 |
-| CronEngine | evaluate 제거, 품질 루프(gap-detection 등)만 담당 |
+| CronEngine | evaluate 제거, 주기 작업(knowledge-extract, hitl-timeout 등)만 담당 |
 | workspace yaml | `evaluate.mechanical` 섹션 추가 (검증 커맨드) |
 
 ---

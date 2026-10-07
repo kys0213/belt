@@ -186,7 +186,7 @@ LLM이 실패 분석·대안 접근·실행 계획을 직접 생성하는 방식
 
 ### HITL에 lateral 이력 첨부
 
-failure_count가 hitl에 도달하면, 현재 lateral_plan과 해당 work_id의 `stagnation` 이벤트 이력이 `hitl_notes`에 첨부된다.
+failure_count가 hitl에 도달하면, 현재 lateral_plan과 **계열**(파생 원본으로 이어진 아이템들)의 `stagnation` 이벤트 이력이 HITL 메모에 첨부된다.
 
 ```
 ## Lateral Thinking History
