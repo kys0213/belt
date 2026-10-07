@@ -170,8 +170,8 @@ impl<'a> Advancer<'a> {
             expected_from: from,
             to,
             actor: Actor::Daemon,
-            reason: TransitionReason::Manual,
-            detail: Some("advance".to_string()),
+            reason: TransitionReason::Advance,
+            detail: None,
         };
         match db.transition(&request) {
             Ok(TransitionOutcome::Applied { .. }) => {

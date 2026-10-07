@@ -64,8 +64,8 @@ fn setup_daemon_with_db(
         Arc::new(registry),
         Box::new(worktree_mgr),
         4,
+        db,
     )
-    .with_db(db)
 }
 
 /// After a full tick (collect -> advance -> execute -> evaluate), the daemon
@@ -105,7 +105,7 @@ async fn run_evaluate_records_token_usage_in_db() {
     daemon.tick().await.unwrap();
 
     // Verify token usage was persisted in the database.
-    let db = daemon.db().expect("daemon should have a database");
+    let db = daemon.db();
     let rows = db
         .get_token_usage_by_work_id("github:org/repo#1:analyze")
         .unwrap();
@@ -297,4 +297,151 @@ async fn build_evaluate_prompt_reflects_workspace_config() {
         !prompt2.contains("production-api"),
         "prompt should not contain a different workspace name"
     );
+}
+
+// ---------------------------------------------------------------------------
+// DB-owned evaluator transitions (Completed -> Done / Hitl)
+// ---------------------------------------------------------------------------
+
+mod store_judgement {
+    use belt_core::hitl::HitlId;
+    use belt_core::hitl::HitlStatus;
+    use belt_core::queue::HitlReason;
+    use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
+    use belt_daemon::daemon::Daemon;
+
+    use super::*;
+
+    fn single_item_daemon(tmp: &TempDir, exit_codes: Vec<i32>) -> Daemon {
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+        setup_daemon_with_db(tmp, source, exit_codes, vec![])
+    }
+
+    /// `(from, to, reason)` of every phase entry, oldest first.
+    fn phase_enters(daemon: &Daemon, work_id: &str) -> Vec<(String, String, String)> {
+        daemon
+            .db()
+            .transitions_of(work_id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "phase_enter")
+            .map(|e| {
+                (
+                    e.from_phase.unwrap(),
+                    e.to_phase.unwrap(),
+                    e.reason.unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn enter(from: &str, to: &str) -> (String, String, String) {
+        (from.to_string(), to.to_string(), "advance".to_string())
+    }
+
+    #[tokio::test]
+    async fn done_judgement_is_committed_to_the_store() {
+        let tmp = TempDir::new().unwrap();
+        let mut daemon = single_item_daemon(&tmp, vec![0, 0]);
+
+        daemon.tick().await.unwrap();
+
+        let work_id = "github:org/repo#1:analyze";
+        assert_eq!(
+            phase_enters(&daemon, work_id),
+            vec![
+                enter("pending", "ready"),
+                enter("ready", "running"),
+                enter("running", "completed"),
+                enter("completed", "done"),
+            ]
+        );
+        assert_eq!(
+            daemon.db().get_item(work_id).unwrap().phase(),
+            QueuePhase::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_evaluate_failure_opens_a_hitl_request_in_the_store() {
+        let tmp = TempDir::new().unwrap();
+        // handler succeeds, the evaluate subprocess fails
+        let mut daemon = single_item_daemon(&tmp, vec![0, 1]).with_max_eval_failures(1);
+
+        daemon.tick().await.unwrap();
+
+        let work_id = "github:org/repo#1:analyze";
+        assert_eq!(
+            phase_enters(&daemon, work_id).last(),
+            Some(&enter("completed", "hitl"))
+        );
+        assert_eq!(
+            daemon.db().get_item(work_id).unwrap().phase(),
+            QueuePhase::Hitl
+        );
+        let entering = daemon
+            .db()
+            .transitions_of(work_id)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.to_phase.as_deref() == Some("hitl"))
+            .unwrap();
+        let request = daemon
+            .db()
+            .hitl_request(&HitlId::new(format!("hitl-{}", entering.seq)))
+            .unwrap()
+            .expect("a request is opened together with the phase change");
+        assert_eq!(request.status, HitlStatus::Open);
+        assert_eq!(request.reason, Some(HitlReason::EvaluateFailure));
+        assert_eq!(daemon.items_in_phase(QueuePhase::Hitl).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn judgement_is_discarded_when_a_human_moved_the_item_first() {
+        let tmp = TempDir::new().unwrap();
+        let mut daemon = single_item_daemon(&tmp, vec![0, 0]);
+
+        daemon.collect().await.unwrap();
+        daemon.advance();
+        daemon.execute_running().await;
+        let work_id = "github:org/repo#1:analyze";
+        let outcome = daemon
+            .db()
+            .transition(&TransitionRequest {
+                work_id: work_id.to_string(),
+                expected_from: QueuePhase::Completed,
+                to: QueuePhase::Failed,
+                actor: Actor::Cli,
+                reason: TransitionReason::Manual,
+                detail: None,
+            })
+            .unwrap();
+        assert!(
+            matches!(outcome, TransitionOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+
+        daemon.tick().await.unwrap();
+
+        assert_eq!(
+            daemon.db().get_item(work_id).unwrap().phase(),
+            QueuePhase::Failed,
+            "the stored phase wins"
+        );
+        let log = daemon.db().transitions_of(work_id).unwrap();
+        assert!(
+            log.iter()
+                .any(|e| e.kind == "transition_conflict" && e.actor == "daemon"),
+            "daemon conflict must be logged: {log:?}"
+        );
+        assert!(
+            !phase_enters(&daemon, work_id)
+                .iter()
+                .any(|(_, to, _)| to == "done"),
+            "the discarded judgement must not appear as Done"
+        );
+        assert_eq!(daemon.items_in_phase(QueuePhase::Completed).len(), 0);
+        assert_eq!(daemon.items_in_phase(QueuePhase::Failed).len(), 1);
+    }
 }

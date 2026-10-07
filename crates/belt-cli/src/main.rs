@@ -479,8 +479,8 @@ async fn start_daemon(
         Arc::new(registry),
         Box::new(worktree_mgr),
         max_concurrent,
+        db,
     )
-    .with_db(db)
     .with_belt_home(belt_home);
 
     // Write PID file so `belt stop` can find the daemon process.

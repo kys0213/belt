@@ -108,14 +108,14 @@ async fn e2e_full_pipeline_analyze() {
     // Verify transition events in DB.
     let db = open_db(&db_path(&tmp));
     let work_id = &completed[0].work_id;
-    let events = db.list_transition_events(work_id).unwrap();
+    let events = db.transitions_of(work_id).unwrap();
     assert!(
         !events.is_empty(),
         "transition events should be recorded in DB"
     );
 
     // Verify at least one event has event_type containing phase transition.
-    let has_phase_event = events.iter().any(|e| e.event_type == "phase_enter");
+    let has_phase_event = events.iter().any(|e| e.kind == "phase_enter");
     assert!(
         has_phase_event,
         "should have at least one phase_enter event, got: {events:?}"

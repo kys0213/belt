@@ -3029,6 +3029,7 @@ fn actor_str(actor: &Actor) -> String {
 fn reason_str(reason: &TransitionReason) -> String {
     match reason {
         TransitionReason::Manual => "manual".to_string(),
+        TransitionReason::Advance => "advance".to_string(),
         TransitionReason::Derived => "derived".to_string(),
         TransitionReason::Canceled => "canceled".to_string(),
         TransitionReason::Rollback => "rollback".to_string(),

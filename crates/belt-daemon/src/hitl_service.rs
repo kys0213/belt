@@ -11,11 +11,13 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
+use belt_core::error::BeltError;
 use belt_core::escalation::EscalationAction;
 use belt_core::lifecycle::{HookContext, LifecycleHook};
 use belt_core::phase::QueuePhase;
 use belt_core::queue::{HitlReason, QueueItem};
-use belt_infra::db::{Database, TransitionEvent};
+use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
+use belt_infra::db::{Database, OpenHitlOutcome, OpenHitlRequest, TransitionEvent};
 use belt_infra::worktree::WorktreeManager;
 
 /// Spawn an async hook task if a Tokio runtime is available.
@@ -31,6 +33,33 @@ where
     }
 }
 
+/// Phase an escalated execution leaves: escalation decides the fate of a failed run.
+const ESCALATION_FROM: QueuePhase = QueuePhase::Running;
+
+/// Result of committing an escalation decision to the store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EscalationCommit {
+    /// The store applied the transition; hook and memory were updated.
+    Applied,
+    /// The stored phase differs from the expected one. Nothing else ran.
+    Conflict { current: QueuePhase },
+    /// The transition contract refused the request (busy or invalid action).
+    Rejected(TransitionOutcome),
+}
+
+impl From<TransitionOutcome> for EscalationCommit {
+    fn from(outcome: TransitionOutcome) -> Self {
+        match outcome {
+            TransitionOutcome::Applied { .. } => EscalationCommit::Applied,
+            TransitionOutcome::Conflict { current } => EscalationCommit::Conflict { current },
+            refused
+            @ (TransitionOutcome::Busy { .. } | TransitionOutcome::InvalidAction { .. }) => {
+                EscalationCommit::Rejected(refused)
+            }
+        }
+    }
+}
+
 /// Drives HITL escalation logic for the daemon lifecycle.
 ///
 /// Responsibilities:
@@ -40,7 +69,7 @@ where
 /// 4. Record transition events to the database
 pub struct HitlService<'a> {
     queue: &'a mut VecDeque<QueueItem>,
-    db: &'a Option<Arc<Database>>,
+    db: &'a Arc<Database>,
     hook: &'a Arc<dyn LifecycleHook>,
     worktree_mgr: &'a Arc<dyn WorktreeManager>,
 }
@@ -49,7 +78,7 @@ impl<'a> HitlService<'a> {
     /// Create a new `HitlService` with borrowed daemon state.
     pub fn new(
         queue: &'a mut VecDeque<QueueItem>,
-        db: &'a Option<Arc<Database>>,
+        db: &'a Arc<Database>,
         hook: &'a Arc<dyn LifecycleHook>,
         worktree_mgr: &'a Arc<dyn WorktreeManager>,
     ) -> Self {
@@ -61,19 +90,42 @@ impl<'a> HitlService<'a> {
         }
     }
 
-    /// Handle an escalation action for a queue item.
+    /// Handle an escalation action for a queue item that failed while Running.
     ///
-    /// Routes the action to the appropriate state transition:
-    /// - `Retry`/`RetryWithComment`: clone item back to Pending with lateral plan
-    /// - `Skip`: transition to Skipped
-    /// - `Hitl`/`Replan`: transition to Hitl with lateral thinking notes
+    /// The result transition is committed to the store first; the hook and the
+    /// in-memory queue follow only when it was applied (spec: the transition
+    /// commits before any hook runs). Until the derivation rules replace it,
+    /// the transition is the interim mapping of each action:
+    /// - `Retry`/`RetryWithComment`: the same row goes Running -> Pending
+    /// - `Skip`: Running -> Skipped
+    /// - `Hitl`/`Replan`: Running -> Hitl together with an open HITL request
+    ///   carrying the lateral thinking notes
+    ///
+    /// # Errors
+    /// `BeltError` when the store fails (I/O, unknown work_id). Nothing is
+    /// changed in memory in that case.
     pub fn handle_escalation(
         &mut self,
         item: &mut QueueItem,
         action: EscalationAction,
         lateral_plan: Option<String>,
         hook_ctx: HookContext,
-    ) {
+    ) -> Result<EscalationCommit, BeltError> {
+        let hitl_notes = match action {
+            EscalationAction::Hitl | EscalationAction::Replan => {
+                Self::build_lateral_hitl_notes(self.db, &item.work_id, &lateral_plan)
+            }
+            EscalationAction::Retry
+            | EscalationAction::RetryWithComment
+            | EscalationAction::Skip => None,
+        };
+        match self.commit(item, action, hitl_notes.clone())? {
+            EscalationCommit::Applied => {}
+            refused @ (EscalationCommit::Conflict { .. } | EscalationCommit::Rejected(_)) => {
+                return Ok(refused);
+            }
+        }
+
         // Lifecycle hook: on_escalation -- fire and forget, log only on failure.
         let hook = Arc::clone(self.hook);
         let esc_action = action;
@@ -108,6 +160,8 @@ impl<'a> HitlService<'a> {
                 // Inject lateral plan into retry item when stagnation was detected.
                 retry_item.lateral_plan = lateral_plan;
                 self.queue.push_back(retry_item);
+                // The returned item records the failed attempt; the retry lives on in the queue.
+                item.set_phase_unchecked(QueuePhase::Failed);
             }
             EscalationAction::Skip => {
                 item.set_phase_unchecked(QueuePhase::Skipped);
@@ -116,11 +170,49 @@ impl<'a> HitlService<'a> {
                 item.set_phase_unchecked(QueuePhase::Hitl);
                 item.hitl_created_at = Some(now);
                 item.hitl_reason = Some(HitlReason::RetryMaxExceeded);
-                item.hitl_notes =
-                    Self::build_lateral_hitl_notes(self.db, &item.work_id, &lateral_plan);
+                item.hitl_notes = hitl_notes;
                 self.queue.push_back(item.clone());
             }
         }
+        Ok(EscalationCommit::Applied)
+    }
+
+    /// Commit the store transition that realizes `action` for a Running item.
+    fn commit(
+        &self,
+        item: &QueueItem,
+        action: EscalationAction,
+        hitl_notes: Option<String>,
+    ) -> Result<EscalationCommit, BeltError> {
+        let to = match action {
+            EscalationAction::Retry | EscalationAction::RetryWithComment => QueuePhase::Pending,
+            EscalationAction::Skip => QueuePhase::Skipped,
+            EscalationAction::Hitl | EscalationAction::Replan => {
+                let outcome = self.db.open_hitl(&OpenHitlRequest {
+                    work_id: item.work_id.clone(),
+                    expected_from: ESCALATION_FROM,
+                    reason: HitlReason::RetryMaxExceeded,
+                    notes: hitl_notes,
+                    actor: Actor::Daemon,
+                    transition_reason: TransitionReason::Escalation(action),
+                    timeout_at: None,
+                    terminal_action: None,
+                })?;
+                return Ok(match outcome {
+                    OpenHitlOutcome::Opened { .. } => EscalationCommit::Applied,
+                    OpenHitlOutcome::Rejected(refused) => EscalationCommit::from(refused),
+                });
+            }
+        };
+        let outcome = self.db.transition(&TransitionRequest {
+            work_id: item.work_id.clone(),
+            expected_from: ESCALATION_FROM,
+            to,
+            actor: Actor::Daemon,
+            reason: TransitionReason::Escalation(action),
+            detail: Some(format!("escalation: {action}")),
+        })?;
+        Ok(EscalationCommit::from(outcome))
     }
 
     /// Build hitl_notes markdown from lateral plan and stagnation events.
@@ -129,14 +221,13 @@ impl<'a> HitlService<'a> {
     /// history so that human reviewers can see what automated approaches were
     /// already attempted.
     pub fn build_lateral_hitl_notes(
-        db: &Option<Arc<Database>>,
+        db: &Database,
         work_id: &str,
         lateral_plan: &Option<String>,
     ) -> Option<String> {
         // Only produce notes when there is a lateral plan or stagnation events.
         let stagnation_events: Vec<TransitionEvent> = db
-            .as_ref()
-            .and_then(|db| db.list_transition_events(work_id).ok())
+            .list_transition_events(work_id)
             .unwrap_or_default()
             .into_iter()
             .filter(|e| e.event_type == "stagnation")
@@ -188,6 +279,7 @@ impl<'a> HitlService<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use belt_core::hitl::{HitlId, HitlStatus};
     use belt_core::lifecycle::NoopLifecycleHook;
     use belt_core::queue::testing::test_item;
     use belt_infra::worktree::MockWorktreeManager;
@@ -212,7 +304,7 @@ mod tests {
                 work_id: work_id.to_string(),
                 workspace: "test-ws".to_string(),
                 queue: QueueContext {
-                    phase: "failed".to_string(),
+                    phase: "running".to_string(),
                     state: "implement".to_string(),
                     source_id: "src:1".to_string(),
                 },
@@ -231,16 +323,40 @@ mod tests {
         }
     }
 
+    /// A store holding one Running item, the state an escalation starts from.
+    fn running_item_in_store() -> (Arc<Database>, QueueItem) {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let mut item = test_item("src:1", "implement");
+        item.set_phase_unchecked(QueuePhase::Running);
+        db.insert_item(&item).unwrap();
+        (db, item)
+    }
+
+    fn entered(db: &Database, work_id: &str) -> Vec<(String, String, String)> {
+        db.transitions_of(work_id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "phase_enter")
+            .map(|e| {
+                (
+                    e.from_phase.unwrap(),
+                    e.to_phase.unwrap(),
+                    e.reason.unwrap(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn build_lateral_hitl_notes_returns_none_without_plan_or_events() {
-        let db: Option<Arc<Database>> = None;
+        let db = Database::open_in_memory().unwrap();
         let result = HitlService::build_lateral_hitl_notes(&db, "work:1", &None);
         assert!(result.is_none());
     }
 
     #[test]
     fn build_lateral_hitl_notes_includes_plan() {
-        let db: Option<Arc<Database>> = None;
+        let db = Database::open_in_memory().unwrap();
         let plan = Some("try a different approach".to_string());
         let result = HitlService::build_lateral_hitl_notes(&db, "work:1", &plan);
         let notes = result.expect("should have notes");
@@ -251,7 +367,7 @@ mod tests {
 
     #[test]
     fn build_lateral_hitl_notes_includes_stagnation_events() {
-        let db_inner = Database::open_in_memory().unwrap();
+        let db = Database::open_in_memory().unwrap();
         let ev = TransitionEvent {
             id: "ev-stag-1".to_string(),
             work_id: "work:1".to_string(),
@@ -271,9 +387,8 @@ mod tests {
             ),
             created_at: chrono::Utc::now().to_rfc3339(),
         };
-        db_inner.insert_transition_event(&ev).unwrap();
+        db.insert_transition_event(&ev).unwrap();
 
-        let db: Option<Arc<Database>> = Some(Arc::new(db_inner));
         let plan = Some("contrarian approach".to_string());
         let result = HitlService::build_lateral_hitl_notes(&db, "work:1", &plan);
         let notes = result.expect("should have notes");
@@ -286,17 +401,18 @@ mod tests {
     fn handle_escalation_retry_stores_lateral_plan() {
         let tmp = TempDir::new().unwrap();
         let mut queue = VecDeque::new();
-        let db: Option<Arc<Database>> = None;
+        let (db, mut item) = running_item_in_store();
         let (hook, worktree_mgr) = setup_deps(&tmp);
 
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Failed);
         let plan = Some("\n\n## Lateral Plan\ntest plan".to_string());
         let hook_ctx = make_hook_ctx(&item.work_id);
 
         let mut svc = HitlService::new(&mut queue, &db, &hook, &worktree_mgr);
-        svc.handle_escalation(&mut item, EscalationAction::Retry, plan.clone(), hook_ctx);
+        let commit = svc
+            .handle_escalation(&mut item, EscalationAction::Retry, plan.clone(), hook_ctx)
+            .unwrap();
 
+        assert_eq!(commit, EscalationCommit::Applied);
         let retry = svc.queue.back().expect("should have retry item");
         assert_eq!(retry.phase(), QueuePhase::Pending);
         assert_eq!(retry.lateral_plan, plan);
@@ -306,54 +422,119 @@ mod tests {
     fn handle_escalation_retry_without_plan_clears_lateral_plan() {
         let tmp = TempDir::new().unwrap();
         let mut queue = VecDeque::new();
-        let db: Option<Arc<Database>> = None;
+        let (db, mut item) = running_item_in_store();
         let (hook, worktree_mgr) = setup_deps(&tmp);
 
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Failed);
         item.lateral_plan = Some("old plan".to_string());
         let hook_ctx = make_hook_ctx(&item.work_id);
 
         let mut svc = HitlService::new(&mut queue, &db, &hook, &worktree_mgr);
-        svc.handle_escalation(&mut item, EscalationAction::Retry, None, hook_ctx);
+        svc.handle_escalation(&mut item, EscalationAction::Retry, None, hook_ctx)
+            .unwrap();
 
         let retry = svc.queue.back().expect("should have retry item");
         assert!(retry.lateral_plan.is_none());
     }
 
     #[test]
+    fn handle_escalation_retry_moves_the_same_row_back_to_pending() {
+        let tmp = TempDir::new().unwrap();
+        let mut queue = VecDeque::new();
+        let (db, mut item) = running_item_in_store();
+        let (hook, worktree_mgr) = setup_deps(&tmp);
+        let hook_ctx = make_hook_ctx(&item.work_id);
+
+        let mut svc = HitlService::new(&mut queue, &db, &hook, &worktree_mgr);
+        svc.handle_escalation(
+            &mut item,
+            EscalationAction::RetryWithComment,
+            None,
+            hook_ctx,
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.get_item(&item.work_id).unwrap().phase(),
+            QueuePhase::Pending
+        );
+        assert_eq!(
+            entered(&db, &item.work_id),
+            vec![(
+                "running".to_string(),
+                "pending".to_string(),
+                "escalation:retry_with_comment".to_string()
+            )]
+        );
+    }
+
+    #[test]
     fn handle_escalation_hitl_transitions_to_hitl_phase() {
         let tmp = TempDir::new().unwrap();
         let mut queue = VecDeque::new();
-        let db: Option<Arc<Database>> = None;
+        let (db, mut item) = running_item_in_store();
         let (hook, worktree_mgr) = setup_deps(&tmp);
 
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Failed);
         let plan = Some("some plan".to_string());
         let hook_ctx = make_hook_ctx(&item.work_id);
 
         let mut svc = HitlService::new(&mut queue, &db, &hook, &worktree_mgr);
-        svc.handle_escalation(&mut item, EscalationAction::Hitl, plan, hook_ctx);
+        svc.handle_escalation(&mut item, EscalationAction::Hitl, plan, hook_ctx)
+            .unwrap();
 
         let hitl = svc.queue.back().expect("should have hitl item");
         assert_eq!(hitl.phase(), QueuePhase::Hitl);
     }
 
     #[test]
-    fn handle_escalation_hitl_attaches_lateral_notes() {
+    fn handle_escalation_hitl_opens_request_with_notes() {
         let tmp = TempDir::new().unwrap();
         let mut queue = VecDeque::new();
-        let db: Option<Arc<Database>> = None;
+        let (db, mut item) = running_item_in_store();
         let (hook, worktree_mgr) = setup_deps(&tmp);
-
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Failed);
         let plan = Some("try a different algorithm".to_string());
         let hook_ctx = make_hook_ctx(&item.work_id);
 
         let mut svc = HitlService::new(&mut queue, &db, &hook, &worktree_mgr);
-        svc.handle_escalation(&mut item, EscalationAction::Hitl, plan, hook_ctx);
+        svc.handle_escalation(&mut item, EscalationAction::Hitl, plan, hook_ctx)
+            .unwrap();
+
+        assert_eq!(
+            db.get_item(&item.work_id).unwrap().phase(),
+            QueuePhase::Hitl
+        );
+        let log = db.transitions_of(&item.work_id).unwrap();
+        let entering = log
+            .iter()
+            .find(|e| e.to_phase.as_deref() == Some("hitl"))
+            .expect("running -> hitl must be logged");
+        assert_eq!(entering.reason.as_deref(), Some("escalation:hitl"));
+        let request = db
+            .hitl_request(&HitlId::new(format!("hitl-{}", entering.seq)))
+            .unwrap()
+            .expect("an open request must exist");
+        assert_eq!(request.status, HitlStatus::Open);
+        assert_eq!(request.reason, Some(HitlReason::RetryMaxExceeded));
+        assert!(
+            request
+                .notes
+                .as_deref()
+                .is_some_and(|n| n.contains("try a different algorithm"))
+        );
+    }
+
+    #[test]
+    fn handle_escalation_hitl_attaches_lateral_notes() {
+        let tmp = TempDir::new().unwrap();
+        let mut queue = VecDeque::new();
+        let (db, mut item) = running_item_in_store();
+        let (hook, worktree_mgr) = setup_deps(&tmp);
+
+        let plan = Some("try a different algorithm".to_string());
+        let hook_ctx = make_hook_ctx(&item.work_id);
+
+        let mut svc = HitlService::new(&mut queue, &db, &hook, &worktree_mgr);
+        svc.handle_escalation(&mut item, EscalationAction::Hitl, plan, hook_ctx)
+            .unwrap();
 
         let hitl = svc.queue.back().expect("should have hitl item");
         let notes = hitl.hitl_notes.as_ref().expect("hitl_notes should be set");
@@ -366,15 +547,13 @@ mod tests {
     fn handle_escalation_hitl_no_notes_without_plan_or_events() {
         let tmp = TempDir::new().unwrap();
         let mut queue = VecDeque::new();
-        let db: Option<Arc<Database>> = None;
+        let (db, mut item) = running_item_in_store();
         let (hook, worktree_mgr) = setup_deps(&tmp);
-
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Failed);
         let hook_ctx = make_hook_ctx(&item.work_id);
 
         let mut svc = HitlService::new(&mut queue, &db, &hook, &worktree_mgr);
-        svc.handle_escalation(&mut item, EscalationAction::Hitl, None, hook_ctx);
+        svc.handle_escalation(&mut item, EscalationAction::Hitl, None, hook_ctx)
+            .unwrap();
 
         let hitl = svc.queue.back().expect("should have hitl item");
         assert_eq!(hitl.phase(), QueuePhase::Hitl);
@@ -385,16 +564,46 @@ mod tests {
     fn handle_escalation_skip_transitions_to_skipped() {
         let tmp = TempDir::new().unwrap();
         let mut queue = VecDeque::new();
-        let db: Option<Arc<Database>> = None;
+        let (db, mut item) = running_item_in_store();
         let (hook, worktree_mgr) = setup_deps(&tmp);
-
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Failed);
         let hook_ctx = make_hook_ctx(&item.work_id);
 
         let mut svc = HitlService::new(&mut queue, &db, &hook, &worktree_mgr);
-        svc.handle_escalation(&mut item, EscalationAction::Skip, None, hook_ctx);
+        svc.handle_escalation(&mut item, EscalationAction::Skip, None, hook_ctx)
+            .unwrap();
 
         assert_eq!(item.phase(), QueuePhase::Skipped);
+        assert_eq!(
+            db.get_item(&item.work_id).unwrap().phase(),
+            QueuePhase::Skipped
+        );
+    }
+
+    #[test]
+    fn handle_escalation_conflict_changes_nothing_in_memory() {
+        let tmp = TempDir::new().unwrap();
+        let mut queue = VecDeque::new();
+        let (db, mut item) = running_item_in_store();
+        let (hook, worktree_mgr) = setup_deps(&tmp);
+        db.update_phase(&item.work_id, QueuePhase::Skipped).unwrap();
+        let hook_ctx = make_hook_ctx(&item.work_id);
+
+        let mut svc = HitlService::new(&mut queue, &db, &hook, &worktree_mgr);
+        let commit = svc
+            .handle_escalation(&mut item, EscalationAction::Hitl, None, hook_ctx)
+            .unwrap();
+
+        assert_eq!(
+            commit,
+            EscalationCommit::Conflict {
+                current: QueuePhase::Skipped
+            }
+        );
+        assert!(svc.queue.is_empty());
+        assert_eq!(item.phase(), QueuePhase::Running);
+        assert_eq!(
+            db.get_item(&item.work_id).unwrap().phase(),
+            QueuePhase::Skipped
+        );
     }
 }

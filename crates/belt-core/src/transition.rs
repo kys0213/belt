@@ -39,6 +39,8 @@ pub enum TransitionOutcome {
 pub enum TransitionReason {
     /// 사람의 직접 조작 (`queue skip` 등).
     Manual,
+    /// daemon의 정상 진행: 점유, handler 결과, evaluate 판정.
+    Advance,
     /// 파생 아이템으로 이어져 끝남.
     Derived,
     /// 실행 중 취소.
