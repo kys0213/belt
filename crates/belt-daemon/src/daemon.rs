@@ -660,9 +660,18 @@ impl Daemon {
         if copy_phase == row.phase() {
             return;
         }
-        if self.in_flight.contains(&row.work_id) {
-            // The handler's result commit meets the stored phase as a
-            // conflict and reconciles the copy then.
+        if let Some(control) = self.in_flight.get(&row.work_id) {
+            // Only this daemon moves a Running row it executes, except the
+            // direct cancel path. The execution must not start another step
+            // for an item it no longer owns; the copy is reconciled when the
+            // handler returns.
+            if row.phase() != QueuePhase::Running && control.stop(StopReason::Superseded) {
+                tracing::warn!(
+                    work_id = %row.work_id,
+                    stored = %row.phase(),
+                    "stored phase left Running under a running handler; execution stopped"
+                );
+            }
             return;
         }
         if copy_phase == QueuePhase::Running {
@@ -1155,7 +1164,7 @@ impl Daemon {
         // result decides where the item goes next.
         self.queue.retain(|i| i.work_id != item.work_id);
         let control = self.in_flight.remove(&item.work_id);
-        let canceled = control.as_ref().and_then(|c| c.canceled_request());
+        let stop = control.as_ref().and_then(|c| c.stop_reason());
 
         // Record token usage and the on_enter event from on_enter execution if present.
         if let Some(ref r) = on_enter_result {
@@ -1175,19 +1184,27 @@ impl Daemon {
             );
         }
 
-        if let Some(request_id) = canceled {
-            match &outcome {
-                ExecutionOutcome::Completed { result: Some(r) }
-                | ExecutionOutcome::Failed {
-                    result: Some(r), ..
-                } => self.try_record_token_usage(&item, r),
-                ExecutionOutcome::Completed { result: None }
-                | ExecutionOutcome::Failed { result: None, .. }
-                | ExecutionOutcome::Skipped
-                | ExecutionOutcome::WorktreeError { .. }
-                | ExecutionOutcome::Stopped => {}
+        let record_usage = |daemon: &Self, item: &QueueItem| match &outcome {
+            ExecutionOutcome::Completed { result: Some(r) }
+            | ExecutionOutcome::Failed {
+                result: Some(r), ..
+            } => daemon.try_record_token_usage(item, r),
+            ExecutionOutcome::Completed { result: None }
+            | ExecutionOutcome::Failed { result: None, .. }
+            | ExecutionOutcome::Skipped
+            | ExecutionOutcome::WorktreeError { .. }
+            | ExecutionOutcome::Stopped => {}
+        };
+        match stop {
+            Some(StopReason::Cancel { request_id }) => {
+                record_usage(self, &item);
+                return self.finish_canceled(item, request_id);
             }
-            return self.finish_canceled(item, request_id);
+            Some(StopReason::Superseded) => {
+                record_usage(self, &item);
+                return self.follow_superseded(item, &ws_name);
+            }
+            Some(StopReason::Shutdown) | None => {}
         }
 
         match outcome {
@@ -1480,6 +1497,19 @@ impl Daemon {
             | QueuePhase::Failed => self.queue.push_back(item.clone()),
         }
         ItemOutcome::Conflicted { item, current }
+    }
+
+    /// Drop an execution stopped because its row left Running elsewhere:
+    /// follow the stored phase, with no hook, escalation or attempt history.
+    fn follow_superseded(&mut self, mut item: QueueItem, ws_name: &str) -> ItemOutcome {
+        match self.db.get_item(&item.work_id) {
+            Ok(row) => {
+                let current = row.phase();
+                item.set_phase_unchecked(current);
+                self.discard_conflicted(item, ws_name, current)
+            }
+            Err(e) => self.discard_unrecorded(item, ws_name, format!("stored phase: {e}")),
+        }
     }
 
     /// The store refused or failed to record the result: surface it, keep the stored phase.

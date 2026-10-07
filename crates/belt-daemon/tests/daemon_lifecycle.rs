@@ -1514,6 +1514,10 @@ sources:
         fn release_evaluate(&self) {
             self.release.notify_one();
         }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
     }
 
     #[async_trait::async_trait]
@@ -1889,6 +1893,73 @@ sources:
             () = body => {}
         }
         assert_eq!(h.hook.on_fail.load(Ordering::SeqCst), 0);
+    }
+
+    /// A killer that signals nothing, so only the daemon can stop a handler.
+    struct NoKill;
+
+    impl belt_core::platform::ProcessKiller for NoKill {
+        fn kill_group(&self, _pid: u32) -> Result<(), belt_core::error::BeltError> {
+            Ok(())
+        }
+    }
+
+    /// The direct path skipped the item under a live daemon (taken for
+    /// absent). On its next observation the daemon stops the execution, so
+    /// the remaining steps never run for an item it no longer owns.
+    #[tokio::test]
+    async fn an_observed_direct_skip_stops_the_execution_before_its_next_step() {
+        let runtime = Arc::new(ScriptedRuntime::default());
+        let mut h = harness_with(
+            &[("github:org/repo#1", "two_steps")],
+            2,
+            Database::open_in_memory().unwrap(),
+            Arc::clone(&runtime),
+        );
+        let work_id = "github:org/repo#1:two_steps";
+        tick_quickly(&mut h.daemon).await;
+        let pid = reported_pid(&h.daemon, work_id).await;
+
+        let other = Arc::clone(h.daemon.database());
+        let request_id = request(&other, work_id);
+        let outcome = cancel_directly(&other, &NoKill, request_id, &Actor::Cli).unwrap();
+        assert!(matches!(outcome, DirectCancelOutcome::Canceled { .. }));
+        assert!(
+            process_alive(pid),
+            "the direct path left the handler running"
+        );
+
+        tick_quickly(&mut h.daemon).await;
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), h.daemon.join_handlers())
+            .await
+            .expect("the stopped handler must end promptly");
+
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [ItemOutcome::Conflicted {
+                    current: QueuePhase::Skipped,
+                    ..
+                }]
+            ),
+            "got {outcomes:?}"
+        );
+        assert!(
+            !runtime.calls().contains(&"next step".to_string()),
+            "the next step must not run: {:?}",
+            runtime.calls()
+        );
+        assert!(!process_alive(pid), "the daemon killed the handler group");
+        assert_eq!(phase(&h.daemon, work_id), QueuePhase::Skipped);
+        assert_eq!(
+            closed_result(h.daemon.db(), work_id).as_deref(),
+            Some("canceled_directly")
+        );
+        assert_eq!(h.hook.on_fail.load(Ordering::SeqCst), 0);
+        assert_eq!(h.hook.on_escalation.load(Ordering::SeqCst), 0);
+        assert!(h.daemon.get_item(work_id).is_none());
+        assert_eq!(h.daemon.running_count(), 0);
+        assert_eq!(h.daemon.handlers_in_flight(), 0);
     }
 
     #[tokio::test]

@@ -39,6 +39,9 @@ pub(crate) enum StopReason {
     Cancel { request_id: i64 },
     /// The daemon shuts down past its drain timeout.
     Shutdown,
+    /// The stored row left Running without this daemon (the direct cancel
+    /// path): the execution no longer owns the item.
+    Superseded,
 }
 
 #[derive(Debug, Default)]
@@ -116,11 +119,16 @@ impl HandlerControl {
         self.lock().stop.is_some()
     }
 
+    /// Why the execution was stopped, if it was.
+    pub(crate) fn stop_reason(&self) -> Option<StopReason> {
+        self.lock().stop
+    }
+
     /// The accepted cancel request, when the execution was canceled.
     pub(crate) fn canceled_request(&self) -> Option<i64> {
-        match self.lock().stop {
+        match self.stop_reason() {
             Some(StopReason::Cancel { request_id }) => Some(request_id),
-            Some(StopReason::Shutdown) | None => None,
+            Some(StopReason::Shutdown | StopReason::Superseded) | None => None,
         }
     }
 
