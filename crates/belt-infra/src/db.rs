@@ -1652,6 +1652,11 @@ pub mod transition_kind {
     /// HITL post-processing gave up after repeated result-transition
     /// failures and moved the item from Hitl to Failed.
     pub const POST_PROCESSING_FAILED: &str = "post_processing_failed";
+    /// A progress notification, a HITL request delivery attempt or a reply to
+    /// an external response could not be sent; `reason` names what was sent
+    /// (an event such as `started`, or `reply`), `detail` is `<channel>: <error>`.
+    /// The failure changed no phase.
+    pub const NOTIFICATION_FAILED: &str = "notification_failed";
 }
 
 /// A non-phase event to append to the `transition_log` with
@@ -2131,6 +2136,23 @@ impl Database {
         self.query_log("WHERE seq > ?1", params![cursor])
     }
 
+    /// `seq` of the newest transition log row, or 0 for an empty log. A
+    /// consumer that must not replay the past starts its cursor here.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn latest_transition_seq(&self) -> Result<u64, BeltError> {
+        let conn = self.lock_conn()?;
+        let seq: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM transition_log",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)?;
+        u64::try_from(seq).map_err(|_| BeltError::Database(format!("negative log seq {seq}")))
+    }
+
     /// All transition log rows of one item, oldest first.
     ///
     /// # Errors
@@ -2381,6 +2403,34 @@ impl Database {
     pub fn open_hitl_requests(&self) -> Result<Vec<HitlRequest>, BeltError> {
         let conn = self.lock_conn()?;
         read_open_requests(&conn)
+    }
+
+    /// Requests whose external responses are still worth reading: every open
+    /// request, and every confirmed one whose confirmation is at or after
+    /// `confirmed_since` (RFC 3339, UTC) so that late responses can still be
+    /// answered `already_handled`. Ordered by creation.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn hitl_requests_to_poll(
+        &self,
+        confirmed_since: &str,
+    ) -> Result<Vec<HitlRequest>, BeltError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {HITL_COLUMNS} FROM hitl_requests
+                 WHERE status = 'open'
+                    OR (status IN ('resolved', 'expired') AND resolved_at >= ?1)
+                 ORDER BY rowid"
+            ))
+            .map_err(sql_err)?;
+        let mut rows = stmt.query(params![confirmed_since]).map_err(sql_err)?;
+        let mut requests = Vec::new();
+        while let Some(row) = rows.next().map_err(sql_err)? {
+            requests.push(row_to_hitl_request(row)?);
+        }
+        Ok(requests)
     }
 
     /// Claim the `on_hitl_opened` notification of every open request that
@@ -8174,5 +8224,39 @@ mod tests {
                 .status,
             ProposalStatus::Superseded
         );
+    }
+
+    #[test]
+    fn latest_transition_seq_follows_the_log() {
+        let db = test_db();
+        assert_eq!(db.latest_transition_seq().unwrap(), 0);
+        let id = running_item(&db, "s1");
+        let last = db.transitions_of(&id).unwrap().last().unwrap().seq;
+        assert_eq!(db.latest_transition_seq().unwrap(), last);
+        assert!(db.transitions_since(last).unwrap().is_empty());
+    }
+
+    #[test]
+    fn requests_to_poll_are_open_ones_and_those_confirmed_since_the_cutoff() {
+        let db = test_db();
+        let open = opened(&db, &running_item(&db, "q1"));
+        let confirmed = opened(&db, &running_item(&db, "q2"));
+        let before = Utc::now().to_rfc3339();
+        db.resolve_hitl(
+            &HitlTarget::Id(confirmed.clone()),
+            &resolution(HitlAction::Done, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+
+        let ids = |cutoff: &str| -> Vec<HitlId> {
+            db.hitl_requests_to_poll(cutoff)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.hitl_id)
+                .collect()
+        };
+        assert_eq!(ids(&before), vec![open.clone(), confirmed]);
+        assert_eq!(ids("2999-01-01T00:00:00+00:00"), vec![open]);
     }
 }
