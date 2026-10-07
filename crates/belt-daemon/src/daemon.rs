@@ -533,9 +533,6 @@ impl Daemon {
     /// claims, so such a row has no handler behind it.
     fn observe_store(&mut self) -> Result<()> {
         let entries = self.db.transitions_since(self.store_cursor)?;
-        if let Some(last) = entries.last() {
-            self.store_cursor = last.seq;
-        }
 
         let mut seen = std::collections::HashSet::new();
         for entry in &entries {
@@ -562,6 +559,12 @@ impl Daemon {
             .list_items(Some(QueuePhase::Hitl), Some(&self.config.name))?
         {
             self.follow_row(row);
+        }
+
+        // The cursor moves only after every entry was followed: an error
+        // above returns before it, so the next tick sees the same changes.
+        if let Some(last) = entries.last() {
+            self.store_cursor = last.seq;
         }
         Ok(())
     }

@@ -1179,6 +1179,55 @@ mod store_owned {
     }
 
     #[tokio::test]
+    async fn tick_sees_changes_again_after_an_observation_error() {
+        let tmp = TempDir::new().unwrap();
+        let path = db_path(&tmp);
+        let mut daemon = daemon_over(
+            &tmp,
+            SharedSource::default(),
+            Database::open(&path).unwrap(),
+        );
+        daemon.restore_from_store().unwrap();
+        daemon.request_shutdown(); // observe only: no collect, no advance
+
+        let cli = Database::open(&path).unwrap();
+        let created = cli
+            .insert_collected(&belt_infra::db::NewItem {
+                source_id: "github:org/repo#9".to_string(),
+                workspace_id: "test-ws".to_string(),
+                state: "analyze".to_string(),
+                title: None,
+                actor: Actor::Cli,
+            })
+            .unwrap();
+        let belt_infra::db::CollectOutcome::Inserted { work_id } = created else {
+            panic!("expected a new item, got {created:?}");
+        };
+
+        // The row cannot be read, as under a locked or damaged store.
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute(
+            "UPDATE queue_items SET phase = 'bogus' WHERE work_id = ?1",
+            [&work_id],
+        )
+        .unwrap();
+        assert!(daemon.tick().await.is_err());
+        assert!(daemon.get_item(&work_id).is_none());
+
+        raw.execute(
+            "UPDATE queue_items SET phase = 'pending' WHERE work_id = ?1",
+            [&work_id],
+        )
+        .unwrap();
+        daemon.tick().await.unwrap();
+        assert_eq!(
+            daemon.get_item(&work_id).map(|i| i.phase()),
+            Some(QueuePhase::Pending),
+            "the change that failed to read is observed on the next tick"
+        );
+    }
+
+    #[tokio::test]
     async fn memory_only_hitl_exit_does_not_overwrite_the_store() {
         let tmp = TempDir::new().unwrap();
         let path = db_path(&tmp);
