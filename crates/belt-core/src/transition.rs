@@ -80,7 +80,10 @@ pub enum GuardDecision {
 
 /// 가드 판정 (순수 함수). 순서는 `queue-state-machine` 전이 계약 흐름도를 따른다.
 ///
-/// 1. 처리 중이고 행위자가 소유자(daemon)가 아니면 `Busy`
+/// 1. 처리 중이고 행위자가 소유자(daemon)가 아니면 `Busy`. 유일한 예외는
+///    실행 중 취소다: 사유가 [`TransitionReason::Canceled`]인 Running→Skipped는
+///    막지 않는다. 열린 취소 요청이 있을 때만 이 사유를 쓰게 하는 것은
+///    저장소의 취소 API가 강제한다.
 /// 2. Hitl 출구인데 daemon 후처리가 아니면 HITL 응답으로 대응되는지에 따라
 ///    `ConvertToHitlResponse` 또는 `InvalidAction`
 /// 3. daemon 후처리라도 확정되고 후처리 전인 요청이 없으면(open 요청뿐이거나
@@ -92,6 +95,7 @@ pub fn guard(snapshot: &ItemSnapshot, req: &TransitionRequest) -> GuardDecision 
 
     if let Some(processing) = snapshot.processing
         && req.actor != Actor::Daemon
+        && !is_running_cancel(current, req)
     {
         return GuardDecision::Reject(TransitionOutcome::Busy { processing });
     }
@@ -120,6 +124,13 @@ pub fn guard(snapshot: &ItemSnapshot, req: &TransitionRequest) -> GuardDecision 
     }
 
     GuardDecision::Proceed
+}
+
+/// 처리 중 잠금의 예외인 실행 중 취소(Running→Skipped, 사유 `Canceled`)인지.
+fn is_running_cancel(current: QueuePhase, req: &TransitionRequest) -> bool {
+    current == QueuePhase::Running
+        && req.to == QueuePhase::Skipped
+        && req.reason == TransitionReason::Canceled
 }
 
 /// Hitl 출구 요청의 목표 phase에 대응되는 HITL 응답. 대응이 없으면 `None`.
@@ -183,6 +194,39 @@ mod tests {
             d,
             GuardDecision::Reject(TransitionOutcome::Busy {
                 processing: Processing::Handler
+            })
+        );
+    }
+
+    #[test]
+    fn canceled_reason_lets_cli_and_tui_skip_a_running_handler() {
+        for actor in [Actor::Cli, Actor::Tui] {
+            let r = req(Running, Skipped, actor, TransitionReason::Canceled);
+            assert_eq!(
+                guard(&snap(Running, Some(Processing::Handler)), &r),
+                GuardDecision::Proceed
+            );
+        }
+    }
+
+    #[test]
+    fn canceled_reason_is_no_exception_for_other_edges() {
+        let busy_handler = GuardDecision::Reject(TransitionOutcome::Busy {
+            processing: Processing::Handler,
+        });
+        for to in [Pending, Completed, Hitl, Failed] {
+            let r = req(Running, to, Actor::Cli, TransitionReason::Canceled);
+            assert_eq!(
+                guard(&snap(Running, Some(Processing::Handler)), &r),
+                busy_handler,
+                "Running -> {to:?}"
+            );
+        }
+        let r = req(Hitl, Skipped, Actor::Cli, TransitionReason::Canceled);
+        assert_eq!(
+            guard(&snap(Hitl, Some(Processing::PostProcessing)), &r),
+            GuardDecision::Reject(TransitionOutcome::Busy {
+                processing: Processing::PostProcessing
             })
         );
     }

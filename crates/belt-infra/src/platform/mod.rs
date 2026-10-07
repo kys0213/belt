@@ -59,6 +59,40 @@ pub fn default_process_killer() -> Box<dyn ProcessKiller> {
     }
 }
 
+/// What the platform can tell about a recorded handler pid before it is killed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HandlerProbe {
+    /// A live group leader started no earlier than the item entered Running:
+    /// the recorded handler.
+    Handler,
+    /// No process holds the pid.
+    Gone,
+    /// A live process holds the pid but cannot be the handler; the reason says why.
+    Reused(String),
+    /// The platform cannot tell; the reason says why.
+    Unknown(String),
+}
+
+/// Check whether `pid` still names the handler process that a previous
+/// daemon recorded for an item Running since `running_since`.
+///
+/// Every handler is spawned as the leader of its own process group, and it
+/// cannot start before its item entered Running; a pid that fails either
+/// test was reused by another process.
+///
+/// - **Unix**: `getpgid` and the elapsed time reported by `ps`
+/// - **Windows**: always [`HandlerProbe::Unknown`]
+pub fn probe_handler(pid: u32, running_since: chrono::DateTime<chrono::Utc>) -> HandlerProbe {
+    #[cfg(unix)]
+    {
+        unix::probe_handler(pid, running_since)
+    }
+    #[cfg(windows)]
+    {
+        windows::probe_handler(pid, running_since)
+    }
+}
+
 /// Spawns `cmd` as the leader of a new process group, reports its pid to
 /// `sink` right after the spawn, and collects its output.
 ///

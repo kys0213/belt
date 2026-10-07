@@ -68,6 +68,14 @@ fn setup_daemon_with_db(
     )
 }
 
+/// A tick starts the handler without waiting for it; once it ends, the next
+/// tick evaluates the Completed item.
+async fn tick_through_evaluation(daemon: &mut Daemon) {
+    daemon.tick().await.unwrap();
+    daemon.join_handlers().await;
+    daemon.tick().await.unwrap();
+}
+
 /// After a full tick (collect -> advance -> execute -> evaluate), the daemon
 /// should record token usage from the evaluate subprocess to the database.
 ///
@@ -101,8 +109,8 @@ async fn run_evaluate_records_token_usage_in_db() {
         ],
     );
 
-    // Run a full tick: collect -> advance -> execute -> evaluate.
-    daemon.tick().await.unwrap();
+    // collect -> advance -> execute -> evaluate.
+    tick_through_evaluation(&mut daemon).await;
 
     // Verify token usage was persisted in the database.
     let db = daemon.db();
@@ -345,7 +353,7 @@ mod store_judgement {
         let tmp = TempDir::new().unwrap();
         let mut daemon = single_item_daemon(&tmp, vec![0, 0]);
 
-        daemon.tick().await.unwrap();
+        tick_through_evaluation(&mut daemon).await;
 
         let work_id = "github:org/repo#1:analyze";
         assert_eq!(
@@ -369,7 +377,7 @@ mod store_judgement {
         // handler succeeds, the evaluate subprocess fails
         let mut daemon = single_item_daemon(&tmp, vec![0, 1]).with_max_eval_failures(1);
 
-        daemon.tick().await.unwrap();
+        tick_through_evaluation(&mut daemon).await;
 
         let work_id = "github:org/repo#1:analyze";
         assert_eq!(
@@ -537,7 +545,7 @@ mod store_judgement {
         let tmp = TempDir::new().unwrap();
         let (mut daemon, _) = racing_daemon(&tmp, 0);
 
-        daemon.tick().await.unwrap();
+        tick_through_evaluation(&mut daemon).await;
 
         assert_eq!(
             daemon.db().get_item(RACE_WORK_ID).unwrap().phase(),
@@ -559,7 +567,7 @@ mod store_judgement {
         let (daemon, db_path) = racing_daemon(&tmp, 1);
         let mut daemon = daemon.with_max_eval_failures(1);
 
-        daemon.tick().await.unwrap();
+        tick_through_evaluation(&mut daemon).await;
 
         assert_eq!(
             daemon.db().get_item(RACE_WORK_ID).unwrap().phase(),

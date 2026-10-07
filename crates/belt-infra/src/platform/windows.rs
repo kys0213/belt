@@ -87,6 +87,17 @@ impl ProcessKiller for WindowsProcessKiller {
     }
 }
 
+/// Windows side of [`super::probe_handler`]: the start time of a process is
+/// not checked here, so a recorded pid cannot be told from a reused one.
+pub(crate) fn probe_handler(
+    pid: u32,
+    _running_since: chrono::DateTime<chrono::Utc>,
+) -> super::HandlerProbe {
+    super::HandlerProbe::Unknown(format!(
+        "pid {pid}: process identity is not verified on Windows"
+    ))
+}
+
 /// Sends a wake-up notification to a daemon process via a named pipe on Windows.
 ///
 /// The daemon is expected to listen on `\\.\pipe\belt-daemon-{pid}`.

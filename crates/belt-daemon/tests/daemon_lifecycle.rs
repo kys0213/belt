@@ -162,6 +162,9 @@ async fn tick_runs_full_cycle() {
     assert_eq!(daemon.queue_items().len(), 0);
 
     daemon.tick().await.unwrap();
+    // A tick does not wait for the handler it started.
+    daemon.join_handlers().await;
+    daemon.tick().await.unwrap();
 
     // After a full tick, the item was collected, advanced, executed, and evaluated.
     // The evaluator may have completed the item (removing it from queue) or
@@ -327,10 +330,11 @@ async fn multiple_ticks_process_items() {
 
     let mut daemon = setup_daemon(&tmp, source, vec![0, 0]);
 
-    // First tick: collect + advance + execute + evaluate.
+    // First tick: collect + advance + start the handlers; then they end.
     daemon.tick().await.unwrap();
+    daemon.join_handlers().await;
 
-    // After tick, no items should be in Pending or Running.
+    // After the handlers end, no items should be in Pending or Running.
     let pending = daemon.items_in_phase(QueuePhase::Pending).len();
     let running = daemon.items_in_phase(QueuePhase::Running).len();
     assert_eq!(pending, 0, "no items should be Pending after first tick");
@@ -1386,5 +1390,618 @@ mod store_owned {
             .await
             .expect("run must fail at start, not loop");
         assert!(result.is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Non-blocking handlers, cancellation, restart closing and graceful shutdown
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+mod cancel {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Duration;
+
+    use belt_core::lifecycle::{HookContext, LifecycleHook};
+    use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
+    use belt_daemon::cancel::cancel_directly;
+    use belt_infra::db::{CollectOutcome, DirectCancelOutcome, NewItem, RequestCancelOutcome};
+
+    use super::*;
+
+    /// `slow` runs a real process until it is killed, `short` one that ends
+    /// after a second, `fast` the mock runtime.
+    fn cancel_config(concurrency: u32) -> WorkspaceConfig {
+        let yaml = format!(
+            r#"
+name: test-ws
+concurrency: {concurrency}
+sources:
+  github:
+    url: https://github.com/org/repo
+    states:
+      slow:
+        trigger:
+          label: "belt:slow"
+        handlers:
+          - script: "sleep 30"
+        on_fail:
+          - script: "echo failed"
+      short:
+        trigger:
+          label: "belt:short"
+        handlers:
+          - script: "sleep 1"
+      fast:
+        trigger:
+          label: "belt:fast"
+        handlers:
+          - prompt: "do it"
+    escalation:
+      1: retry
+      2: hitl
+      terminal: skip
+"#
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    /// Counts the reactions a canceled execution must not trigger.
+    #[derive(Default)]
+    struct Reactions {
+        on_done: AtomicU32,
+        on_fail: AtomicU32,
+        on_escalation: AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl LifecycleHook for Reactions {
+        async fn on_enter(&self, _ctx: &HookContext) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn on_done(&self, _ctx: &HookContext) -> anyhow::Result<()> {
+            self.on_done.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn on_fail(&self, _ctx: &HookContext) -> anyhow::Result<()> {
+            self.on_fail.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn on_escalation(
+            &self,
+            _ctx: &HookContext,
+            _action: EscalationAction,
+        ) -> anyhow::Result<()> {
+            self.on_escalation.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct Harness {
+        daemon: Daemon,
+        runtime: Arc<MockRuntime>,
+        hook: Arc<Reactions>,
+        _tmp: TempDir,
+    }
+
+    fn harness(items: &[(&str, &str)], concurrency: u32, db: Database) -> Harness {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        for (source_id, state) in items {
+            source.add_item(test_item(source_id, state));
+        }
+        let runtime = Arc::new(MockRuntime::new("mock", vec![0, 0, 0, 0]));
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::clone(&runtime) as Arc<dyn belt_core::runtime::AgentRuntime>);
+        let hook = Arc::new(Reactions::default());
+        let daemon = Daemon::new(
+            cancel_config(concurrency),
+            vec![Box::new(source)],
+            Arc::new(registry),
+            Box::new(MockWorktreeManager::new(tmp.path().to_path_buf())),
+            4,
+            db,
+        )
+        .with_hook(Arc::clone(&hook) as Arc<dyn LifecycleHook>);
+        Harness {
+            daemon,
+            runtime,
+            hook,
+            _tmp: tmp,
+        }
+    }
+
+    fn request(db: &Database, work_id: &str) -> i64 {
+        match db.request_cancel(work_id, "alice", &Actor::Cli).unwrap() {
+            RequestCancelOutcome::Opened { id } => id,
+            other => panic!("expected a new request, got {other:?}"),
+        }
+    }
+
+    /// The result `work_id`'s last cancel request closed with, if closed.
+    fn closed_result(db: &Database, work_id: &str) -> Option<String> {
+        let open = db.open_cancel_requests().unwrap();
+        if open.iter().any(|r| r.work_id == work_id) {
+            return None;
+        }
+        db.transitions_of(work_id)
+            .unwrap()
+            .into_iter()
+            .rfind(|e| e.kind == "cancel_closed")
+            .and_then(|e| e.reason)
+    }
+
+    fn phase(daemon: &Daemon, work_id: &str) -> QueuePhase {
+        daemon.db().get_item(work_id).unwrap().phase()
+    }
+
+    fn process_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    /// Poll `cond` every 20ms for up to 10s.
+    async fn eventually(what: &str, mut cond: impl FnMut() -> bool) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !cond() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {what}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn reported_pid(daemon: &Daemon, work_id: &str) -> u32 {
+        let mut pid = None;
+        eventually("the handler pid", || {
+            pid = daemon.db().handler_process(work_id).unwrap();
+            pid.is_some()
+        })
+        .await;
+        pid.unwrap()
+    }
+
+    async fn tick_quickly(daemon: &mut Daemon) {
+        tokio::time::timeout(Duration::from_secs(5), daemon.tick())
+            .await
+            .expect("a tick must not wait for running handlers")
+            .unwrap();
+    }
+
+    async fn wait_exit(child: &mut std::process::Child) -> std::process::ExitStatus {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the process must be stopped")
+    }
+
+    fn history_statuses(db: &Database, source_id: &str) -> Vec<String> {
+        db.get_history(source_id)
+            .unwrap()
+            .into_iter()
+            .map(|h| h.status)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_running_handler_is_killed_and_the_item_ends_skipped_canceled() {
+        let mut h = harness(
+            &[("github:org/repo#1", "slow")],
+            2,
+            Database::open_in_memory().unwrap(),
+        );
+        let work_id = "github:org/repo#1:slow";
+
+        tick_quickly(&mut h.daemon).await;
+        assert_eq!(phase(&h.daemon, work_id), QueuePhase::Running);
+        let pid = reported_pid(&h.daemon, work_id).await;
+        assert!(process_alive(pid));
+
+        request(h.daemon.db(), work_id);
+        tick_quickly(&mut h.daemon).await;
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), h.daemon.join_handlers())
+            .await
+            .expect("the canceled handler must end promptly");
+
+        assert!(
+            matches!(outcomes.as_slice(), [ItemOutcome::Canceled(_)]),
+            "got {outcomes:?}"
+        );
+        assert_eq!(phase(&h.daemon, work_id), QueuePhase::Skipped);
+        assert_eq!(
+            closed_result(h.daemon.db(), work_id).as_deref(),
+            Some("canceled")
+        );
+        assert!(!process_alive(pid), "the handler process group is gone");
+        assert_eq!(h.hook.on_fail.load(Ordering::SeqCst), 0);
+        assert_eq!(h.hook.on_escalation.load(Ordering::SeqCst), 0);
+        assert_eq!(h.hook.on_done.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            history_statuses(h.daemon.db(), "github:org/repo#1"),
+            vec!["skipped".to_string()]
+        );
+        assert_eq!(h.daemon.db().failure_count(work_id).unwrap(), 0);
+        let log = h.daemon.db().transitions_of(work_id).unwrap();
+        let kinds: Vec<&str> = log.iter().map(|e| e.kind.as_str()).collect();
+        let accepted = kinds.iter().position(|k| *k == "cancel_accepted").unwrap();
+        let closed = kinds.iter().position(|k| *k == "cancel_closed").unwrap();
+        assert!(accepted < closed, "accepted before closed: {kinds:?}");
+        let skip = log.iter().rfind(|e| e.kind == "phase_enter").unwrap();
+        assert_eq!(skip.to_phase.as_deref(), Some("skipped"));
+        assert_eq!(skip.reason.as_deref(), Some("canceled"));
+        assert_eq!(skip.actor, "daemon");
+        assert_eq!(h.daemon.running_count(), 0);
+        assert_eq!(h.daemon.handlers_in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_requested_before_the_spawn_never_runs_the_handler() {
+        let mut h = harness(
+            &[("github:org/repo#1", "fast")],
+            2,
+            Database::open_in_memory().unwrap(),
+        );
+        let work_id = "github:org/repo#1:fast";
+        h.daemon.collect().await.unwrap();
+        h.daemon.advance();
+        assert_eq!(phase(&h.daemon, work_id), QueuePhase::Running);
+
+        request(h.daemon.db(), work_id);
+        let outcomes = h.daemon.execute_running().await;
+
+        assert!(
+            matches!(outcomes.as_slice(), [ItemOutcome::Canceled(_)]),
+            "got {outcomes:?}"
+        );
+        assert!(h.runtime.calls().is_empty(), "the handler never ran");
+        assert_eq!(phase(&h.daemon, work_id), QueuePhase::Skipped);
+        assert_eq!(
+            closed_result(h.daemon.db(), work_id).as_deref(),
+            Some("canceled")
+        );
+        assert_eq!(h.hook.on_fail.load(Ordering::SeqCst), 0);
+        assert_eq!(h.hook.on_escalation.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            history_statuses(h.daemon.db(), "github:org/repo#1"),
+            vec!["skipped".to_string()]
+        );
+        assert_eq!(h.daemon.running_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_after_the_handler_finished_is_too_late() {
+        let mut h = harness(
+            &[("github:org/repo#1", "fast")],
+            2,
+            Database::open_in_memory().unwrap(),
+        );
+        let work_id = "github:org/repo#1:fast";
+        h.daemon.collect().await.unwrap();
+        h.daemon.advance();
+        h.daemon.execute_running().await;
+        assert_eq!(phase(&h.daemon, work_id), QueuePhase::Completed);
+
+        request(h.daemon.db(), work_id);
+        h.daemon.tick().await.unwrap();
+
+        assert_eq!(
+            closed_result(h.daemon.db(), work_id).as_deref(),
+            Some("too_late")
+        );
+        assert_ne!(phase(&h.daemon, work_id), QueuePhase::Skipped);
+        assert!(
+            !h.daemon
+                .db()
+                .transitions_of(work_id)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "cancel_accepted"),
+            "a late request is not accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_for_an_item_in_hitl_is_too_late_and_leaves_the_hitl_alone() {
+        let mut h = harness(
+            &[("github:org/repo#1", "fast")],
+            2,
+            Database::open_in_memory().unwrap(),
+        );
+        let work_id = "github:org/repo#1:fast";
+        h.daemon.collect().await.unwrap();
+        h.daemon.advance();
+        h.daemon
+            .mark_hitl(
+                work_id,
+                belt_core::queue::HitlReason::ManualEscalation,
+                None,
+            )
+            .unwrap();
+        assert_eq!(phase(&h.daemon, work_id), QueuePhase::Hitl);
+
+        request(h.daemon.db(), work_id);
+        h.daemon.tick().await.unwrap();
+
+        assert_eq!(
+            closed_result(h.daemon.db(), work_id).as_deref(),
+            Some("too_late")
+        );
+        assert_eq!(phase(&h.daemon, work_id), QueuePhase::Hitl);
+    }
+
+    #[tokio::test]
+    async fn other_items_keep_moving_while_a_handler_runs() {
+        let mut h = harness(
+            &[("github:org/repo#1", "slow"), ("github:org/repo#2", "fast")],
+            2,
+            Database::open_in_memory().unwrap(),
+        );
+        let slow = "github:org/repo#1:slow";
+        let fast = "github:org/repo#2:fast";
+
+        tick_quickly(&mut h.daemon).await;
+        let pid = reported_pid(&h.daemon, slow).await;
+        for _ in 0..50 {
+            if phase(&h.daemon, fast) != QueuePhase::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            tick_quickly(&mut h.daemon).await;
+        }
+        assert_ne!(
+            phase(&h.daemon, fast),
+            QueuePhase::Running,
+            "the fast item finished while the slow handler still runs"
+        );
+        assert_eq!(phase(&h.daemon, slow), QueuePhase::Running);
+
+        request(h.daemon.db(), slow);
+        tick_quickly(&mut h.daemon).await;
+        h.daemon.join_handlers().await;
+        assert_eq!(phase(&h.daemon, slow), QueuePhase::Skipped);
+        assert!(!process_alive(pid));
+    }
+
+    #[tokio::test]
+    async fn non_blocking_handlers_still_respect_the_concurrency_limit() {
+        let mut h = harness(
+            &[
+                ("github:org/repo#1", "slow"),
+                ("github:org/repo#2", "slow"),
+                ("github:org/repo#3", "slow"),
+            ],
+            2,
+            Database::open_in_memory().unwrap(),
+        );
+
+        for _ in 0..3 {
+            tick_quickly(&mut h.daemon).await;
+        }
+        assert_eq!(h.daemon.handlers_in_flight(), 2);
+        assert_eq!(h.daemon.running_count(), 2);
+        assert_eq!(h.daemon.items_in_phase(QueuePhase::Ready).len(), 1);
+
+        h.daemon.request_shutdown();
+        h.daemon
+            .drain_with_timeout(Duration::from_millis(500))
+            .await;
+        assert_eq!(h.daemon.handlers_in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_waits_for_a_handler_that_ends_in_time() {
+        let mut h = harness(
+            &[("github:org/repo#1", "short")],
+            2,
+            Database::open_in_memory().unwrap(),
+        );
+        let work_id = "github:org/repo#1:short";
+        tick_quickly(&mut h.daemon).await;
+        assert_eq!(h.daemon.handlers_in_flight(), 1);
+
+        h.daemon.request_shutdown();
+        h.daemon.drain_with_timeout(Duration::from_secs(30)).await;
+
+        assert_eq!(phase(&h.daemon, work_id), QueuePhase::Completed);
+        assert_eq!(h.daemon.handlers_in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_past_the_timeout_kills_the_handler_and_rolls_back() {
+        let mut h = harness(
+            &[("github:org/repo#1", "slow")],
+            2,
+            Database::open_in_memory().unwrap(),
+        );
+        let work_id = "github:org/repo#1:slow";
+        tick_quickly(&mut h.daemon).await;
+        let pid = reported_pid(&h.daemon, work_id).await;
+
+        h.daemon.request_shutdown();
+        let started = std::time::Instant::now();
+        h.daemon.drain_with_timeout(Duration::from_secs(1)).await;
+
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert_eq!(phase(&h.daemon, work_id), QueuePhase::Pending);
+        assert!(
+            h.daemon.db().get_item(work_id).unwrap().worktree_preserved,
+            "the worktree is preserved"
+        );
+        eventually("the handler to die", || !process_alive(pid)).await;
+        assert_eq!(h.daemon.handlers_in_flight(), 0);
+    }
+
+    // ---- restart --------------------------------------------------------
+
+    fn claim(db: &Database, source_id: &str, state: &str) -> String {
+        let work_id = match db
+            .insert_collected(&NewItem {
+                source_id: source_id.to_string(),
+                workspace_id: "test-ws".to_string(),
+                state: state.to_string(),
+                title: None,
+                actor: Actor::Daemon,
+            })
+            .unwrap()
+        {
+            CollectOutcome::Inserted { work_id } => work_id,
+            other => panic!("{other:?}"),
+        };
+        for (from, to) in [
+            (QueuePhase::Pending, QueuePhase::Ready),
+            (QueuePhase::Ready, QueuePhase::Running),
+        ] {
+            let outcome = db
+                .transition(&TransitionRequest {
+                    work_id: work_id.clone(),
+                    expected_from: from,
+                    to,
+                    actor: Actor::Daemon,
+                    reason: TransitionReason::Advance,
+                    detail: None,
+                })
+                .unwrap();
+            assert!(matches!(outcome, TransitionOutcome::Applied { .. }));
+        }
+        work_id
+    }
+
+    fn spawn_group_leader() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn restart_closes_open_cancels_before_rolling_back() {
+        let db = Database::open_in_memory().unwrap();
+        let requested = claim(&db, "github:org/repo#1", "slow");
+        let accepted = claim(&db, "github:org/repo#2", "slow");
+        let plain = claim(&db, "github:org/repo#3", "slow");
+        let finished = claim(&db, "github:org/repo#4", "slow");
+        request(&db, &requested);
+        let accepted_id = request(&db, &accepted);
+        assert!(db.accept_cancel(accepted_id, &Actor::Daemon).unwrap());
+        db.transition(&TransitionRequest {
+            work_id: finished.clone(),
+            expected_from: QueuePhase::Running,
+            to: QueuePhase::Completed,
+            actor: Actor::Daemon,
+            reason: TransitionReason::Advance,
+            detail: None,
+        })
+        .unwrap();
+        request(&db, &finished);
+
+        let mut h = harness(&[], 2, db);
+        h.daemon.restore_from_store().unwrap();
+
+        let db = h.daemon.db();
+        for work_id in [&requested, &accepted] {
+            assert_eq!(db.get_item(work_id).unwrap().phase(), QueuePhase::Skipped);
+            let log = db.transitions_of(work_id).unwrap();
+            let enter = log.iter().rfind(|e| e.kind == "phase_enter").unwrap();
+            assert_eq!(enter.reason.as_deref(), Some("canceled"));
+            assert!(
+                !log.iter().any(|e| e.reason.as_deref() == Some("rollback")),
+                "a canceled item is not rolled back"
+            );
+            assert_eq!(closed_result(db, work_id).as_deref(), Some("canceled"));
+        }
+        assert_eq!(db.get_item(&plain).unwrap().phase(), QueuePhase::Pending);
+        assert_eq!(
+            db.get_item(&finished).unwrap().phase(),
+            QueuePhase::Completed
+        );
+        assert_eq!(closed_result(db, &finished).as_deref(), Some("too_late"));
+        assert!(db.open_cancel_requests().unwrap().is_empty());
+        assert_eq!(
+            history_statuses(db, "github:org/repo#1"),
+            vec!["skipped".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_kills_the_previous_daemons_handler_but_not_a_reused_pid() {
+        let db = Database::open_in_memory().unwrap();
+        // Started before its item entered Running: a pid reused by another process.
+        let mut stranger = spawn_group_leader();
+        std::thread::sleep(Duration::from_millis(2100));
+        let reused = claim(&db, "github:org/repo#1", "slow");
+        let handled = claim(&db, "github:org/repo#2", "slow");
+        let mut handler = spawn_group_leader();
+        db.set_handler_process(&reused, stranger.id()).unwrap();
+        db.set_handler_process(&handled, handler.id()).unwrap();
+
+        let mut h = harness(&[], 2, db);
+        h.daemon.restore_from_store().unwrap();
+
+        let status = wait_exit(&mut handler).await;
+        assert!(!status.success(), "the previous daemon's handler is killed");
+        assert!(
+            stranger.try_wait().unwrap().is_none(),
+            "a process that predates the Running entry is left alone"
+        );
+        stranger.kill().unwrap();
+        stranger.wait().unwrap();
+
+        for work_id in [&reused, &handled] {
+            assert_eq!(
+                h.daemon.db().get_item(work_id).unwrap().phase(),
+                QueuePhase::Pending
+            );
+            assert_eq!(h.daemon.db().handler_process(work_id).unwrap(), None);
+        }
+    }
+
+    // ---- direct path (no daemon) ----------------------------------------
+
+    #[tokio::test]
+    async fn without_a_daemon_a_running_item_is_canceled_directly() {
+        let db = Database::open_in_memory().unwrap();
+        let work_id = claim(&db, "github:org/repo#1", "slow");
+        let request_id = request(&db, &work_id);
+        let killer = belt_infra::platform::default_process_killer();
+
+        let outcome = cancel_directly(&db, killer.as_ref(), request_id, &Actor::Cli).unwrap();
+
+        assert_eq!(outcome, DirectCancelOutcome::Canceled { handler: None });
+        assert_eq!(db.get_item(&work_id).unwrap().phase(), QueuePhase::Skipped);
+        assert_eq!(
+            closed_result(&db, &work_id).as_deref(),
+            Some("canceled_directly")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_direct_path_stops_a_recorded_handler() {
+        let db = Database::open_in_memory().unwrap();
+        let work_id = claim(&db, "github:org/repo#1", "slow");
+        let mut handler = spawn_group_leader();
+        db.set_handler_process(&work_id, handler.id()).unwrap();
+        let request_id = request(&db, &work_id);
+        let killer = belt_infra::platform::default_process_killer();
+
+        let outcome = cancel_directly(&db, killer.as_ref(), request_id, &Actor::Tui).unwrap();
+
+        assert!(matches!(
+            outcome,
+            DirectCancelOutcome::Canceled { handler: Some(_) }
+        ));
+        assert!(!wait_exit(&mut handler).await.success());
     }
 }

@@ -91,6 +91,83 @@ impl ProcessKiller for UnixProcessKiller {
     }
 }
 
+/// Unix side of [`super::probe_handler`].
+pub(crate) fn probe_handler(
+    pid: u32,
+    running_since: chrono::DateTime<chrono::Utc>,
+) -> super::HandlerProbe {
+    use super::HandlerProbe;
+
+    let Ok(target) = libc::pid_t::try_from(pid) else {
+        return HandlerProbe::Unknown(format!("pid {pid} is out of range"));
+    };
+    if target <= 1 {
+        return HandlerProbe::Reused(format!("pid {pid} cannot lead a handler group"));
+    }
+    // Safety: getpgid only reads the process table.
+    let group = unsafe { libc::getpgid(target) };
+    if group == -1 {
+        let err = std::io::Error::last_os_error();
+        return if err.raw_os_error() == Some(libc::ESRCH) {
+            HandlerProbe::Gone
+        } else {
+            HandlerProbe::Unknown(format!("getpgid({pid}) failed: {err}"))
+        };
+    }
+    if group != target {
+        return HandlerProbe::Reused(format!("pid {pid} is not a process group leader"));
+    }
+    let elapsed = match process_elapsed(pid) {
+        Ok(Some(elapsed)) => elapsed,
+        Ok(None) => return HandlerProbe::Gone,
+        Err(e) => return HandlerProbe::Unknown(e),
+    };
+    // `ps` truncates the elapsed time, so this is never earlier than the real start.
+    let started_at = chrono::Utc::now() - elapsed;
+    if started_at < running_since - chrono::Duration::seconds(1) {
+        return HandlerProbe::Reused(format!(
+            "pid {pid} started at {started_at}, before its item entered Running at {running_since}"
+        ));
+    }
+    HandlerProbe::Handler
+}
+
+/// Time since `pid` started, from `ps -o etime=`; `None` when no such process.
+fn process_elapsed(pid: u32) -> Result<Option<chrono::Duration>, String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "etime=", "-p", &pid.to_string()])
+        .output()
+        .map_err(|e| format!("failed to run ps: {e}"))?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    parse_etime(text)
+        .map(Some)
+        .ok_or_else(|| format!("unreadable ps elapsed time '{text}'"))
+}
+
+/// Parse the `[[dd-]hh:]mm:ss` format of `ps -o etime`.
+fn parse_etime(text: &str) -> Option<chrono::Duration> {
+    let (days, clock) = match text.split_once('-') {
+        Some((days, clock)) => (days.parse::<i64>().ok()?, clock),
+        None => (0, text),
+    };
+    let parts = clock
+        .split(':')
+        .map(|p| p.parse::<i64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    let (hours, minutes, seconds) = match parts.as_slice() {
+        [m, s] => (0, *m, *s),
+        [h, m, s] => (*h, *m, *s),
+        _ => return None,
+    };
+    Some(chrono::Duration::seconds(
+        ((days * 24 + hours) * 60 + minutes) * 60 + seconds,
+    ))
+}
+
 /// Sends `SIGUSR1` to a daemon process on Unix.
 #[derive(Debug, Default, Clone)]
 pub struct UnixDaemonNotifier;
@@ -222,6 +299,52 @@ mod tests {
             .unwrap();
         assert!(!result.success());
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn parse_etime_reads_every_ps_format() {
+        assert_eq!(parse_etime("00:07"), Some(chrono::Duration::seconds(7)));
+        assert_eq!(
+            parse_etime("01:02:03"),
+            Some(chrono::Duration::seconds(3723))
+        );
+        assert_eq!(
+            parse_etime("2-01:02:03"),
+            Some(chrono::Duration::seconds(2 * 86_400 + 3723))
+        );
+        assert_eq!(parse_etime("garbage"), None);
+    }
+
+    #[test]
+    fn probe_tells_a_handler_from_a_gone_or_reused_pid() {
+        use super::super::HandlerProbe;
+        use std::os::unix::process::CommandExt;
+
+        let before = chrono::Utc::now() - chrono::Duration::seconds(5);
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+
+        assert_eq!(probe_handler(pid, before), HandlerProbe::Handler);
+        let later = chrono::Utc::now() + chrono::Duration::seconds(30);
+        assert!(
+            matches!(probe_handler(pid, later), HandlerProbe::Reused(_)),
+            "a process older than the Running entry is not the handler"
+        );
+        let own = std::process::id();
+        if unsafe { libc::getpgid(0) } != own as libc::pid_t {
+            assert!(matches!(
+                probe_handler(own, before),
+                HandlerProbe::Reused(_)
+            ));
+        }
+
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(probe_handler(pid, before), HandlerProbe::Gone);
     }
 
     #[test]

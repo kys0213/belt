@@ -12,6 +12,7 @@ use belt_core::error::BeltError;
 use belt_core::escalation::{EscalationAction, EscalationPolicy};
 use belt_core::lifecycle::{HookContext, LifecycleHook, NoopLifecycleHook};
 use belt_core::phase::QueuePhase;
+use belt_core::platform::{ProcessKiller, ProcessSink};
 use belt_core::queue::{HITL_TIMEOUT_HOURS, HistoryEvent, HitlReason, QueueItem};
 use belt_core::runtime::RuntimeRegistry;
 use belt_core::source::DataSource;
@@ -22,9 +23,13 @@ use belt_core::stagnation::{
 use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
 use belt_core::workspace::{StateConfig, WorkspaceConfig};
 use belt_infra::db::{
-    CollectOutcome, Database, NewItem, OpenHitlOutcome, OpenHitlRequest, TransitionEvent,
+    CancelRequestRecord, CancelResult, CancelStatus, CollectOutcome, Database, NewItem,
+    OpenHitlOutcome, OpenHitlRequest, TransitionEvent,
 };
 use belt_infra::worktree::WorktreeManager;
+use tokio::task::JoinSet;
+
+use crate::cancel::{HandlerControl, StopReason};
 
 use crate::concurrency::ConcurrencyTracker;
 use crate::cron::{
@@ -102,11 +107,22 @@ pub struct Daemon {
     /// the DB and parsing the workspace yaml.  Results are cached in an LRU
     /// to avoid repeated yaml parsing.
     hook_loader: Option<Arc<DynamicHookLoader>>,
+    /// Handler executions in flight. The run loop waits on them next to the
+    /// tick and the wake signals, so a running handler never blocks a tick.
+    handlers: JoinSet<ExecutionResult>,
+    /// The control of every in-flight execution, by work_id. The item's
+    /// Running copy stays in `queue` meanwhile.
+    in_flight: HashMap<String, Arc<HandlerControl>>,
+    /// Stops handler process groups (cancel, shutdown, leftovers at start).
+    killer: Arc<dyn ProcessKiller>,
 }
 
 #[derive(Debug)]
 pub enum ItemOutcome {
     Completed(QueueItem),
+    /// The execution was canceled by request: the item ended Skipped with
+    /// no hook, escalation or failure attempt.
+    Canceled(QueueItem),
     Failed {
         item: QueueItem,
         error: String,
@@ -161,6 +177,16 @@ enum ExecutionOutcome {
     WorktreeError {
         error: String,
     },
+    /// A stop (cancel or shutdown) arrived before the next step started.
+    Stopped,
+}
+
+/// What a spawned execution needs besides its item.
+struct ExecutionDeps {
+    executor: Arc<ActionExecutor>,
+    worktree_mgr: Arc<dyn WorktreeManager>,
+    hook: Arc<dyn LifecycleHook>,
+    control: Arc<HandlerControl>,
 }
 
 impl Daemon {
@@ -201,6 +227,9 @@ impl Daemon {
             belt_home,
             hook: Arc::new(NoopLifecycleHook),
             hook_loader: None,
+            handlers: JoinSet::new(),
+            in_flight: HashMap::new(),
+            killer: Arc::from(belt_infra::platform::default_process_killer()),
         }
     }
 
@@ -490,18 +519,34 @@ impl Daemon {
 
     /// Restore the in-memory queue from the store at daemon start.
     ///
-    /// 1. Running items left by a previous daemon go back to Pending (reason
-    ///    `rollback`; the worktree stays preserved). Closing open cancel
-    ///    requests belongs to the cancel flow and is not done here.
-    /// 2. The observation cursor moves to the end of the log, so later ticks
+    /// 1. Handler processes recorded for Running items are killed, once the
+    ///    platform confirms the pid still names that handler
+    ///    ([`crate::cancel::stop_leftover_handler`]); a possibly reused pid
+    ///    is left alone and logged.
+    /// 2. Open cancel requests are closed: a Running item goes to Skipped
+    ///    (`canceled`) instead of being rolled back, any other closes
+    ///    `too_late`.
+    /// 3. The remaining Running items go back to Pending (reason
+    ///    `rollback`; the worktree stays preserved).
+    /// 4. The observation cursor moves to the end of the log, so later ticks
     ///    only see changes made after the restore.
-    /// 3. This workspace's non-terminal items are loaded, oldest first.
+    /// 5. This workspace's non-terminal items are loaded, oldest first.
     ///
     /// One daemon owns one `belt_home` and therefore one database, so every
-    /// Running row belongs to a dead daemon whatever its workspace: step 1
-    /// rolls back all workspaces. Only this workspace's items are loaded into
-    /// memory (step 3); other workspaces' daemons restore their own.
+    /// Running row belongs to a dead daemon whatever its workspace: steps
+    /// 1–3 cover all workspaces. Only this workspace's items are loaded into
+    /// memory (step 5); other workspaces' daemons restore their own.
     pub fn restore_from_store(&mut self) -> Result<usize> {
+        for item in self.db.list_items(Some(QueuePhase::Running), None)? {
+            if let Some(handler) = self.db.running_handler(&item.work_id)? {
+                crate::cancel::stop_leftover_handler(self.killer.as_ref(), &item.work_id, &handler);
+            }
+        }
+
+        for request in self.db.open_cancel_requests()? {
+            self.cancel_unowned(&request)?;
+        }
+
         for item in self.db.list_items(Some(QueuePhase::Running), None)? {
             let outcome = self.db.transition(&TransitionRequest {
                 work_id: item.work_id.clone(),
@@ -604,6 +649,11 @@ impl Daemon {
         if copy_phase == row.phase() {
             return;
         }
+        if self.in_flight.contains_key(&row.work_id) {
+            // The handler's result commit meets the stored phase as a
+            // conflict and reconciles the copy then.
+            return;
+        }
         if copy_phase == QueuePhase::Running {
             self.tracker.release(&ws_name);
         }
@@ -692,88 +742,180 @@ impl Daemon {
     // Phase 3: Execute running items (parallel)
     // ---------------------------------------------------------------
 
-    /// Execute handlers for all Running items in parallel using `tokio::spawn`.
+    /// Execute every Running item and wait until all handlers in flight end.
     ///
-    /// Running 상태의 아이템들을 `tokio::spawn`으로 동시에 실행하고
-    /// 결과를 수집한다. concurrency 제한은 `advance()`에서 이미 적용되었으므로
-    /// Running 상태인 아이템은 모두 실행 가능하다.
+    /// A convenience over [`Daemon::spawn_running`] and
+    /// [`Daemon::join_handlers`]; the run loop never waits like this.
+    /// Returns the outcomes of the items canceled before their spawn and of
+    /// every execution that ended.
     pub async fn execute_running(&mut self) -> Vec<ItemOutcome> {
-        let running_indices: Vec<usize> = self
+        let mut outcomes = self.spawn_running();
+        outcomes.extend(self.join_handlers().await);
+        outcomes
+    }
+
+    /// Start the handler of every Running item that has none in flight,
+    /// without waiting for it (concurrency was applied when it was claimed).
+    ///
+    /// Right before each spawn the store is asked for an open cancel
+    /// request: a requested item is not spawned and ends Skipped
+    /// (`canceled`). Those outcomes are returned; the rest arrive through
+    /// [`Daemon::join_handlers`] or the run loop.
+    pub fn spawn_running(&mut self) -> Vec<ItemOutcome> {
+        let unstarted: Vec<String> = self
             .queue
             .iter()
-            .enumerate()
-            .filter(|(_, item)| item.phase() == QueuePhase::Running)
-            .map(|(i, _)| i)
+            .filter(|item| {
+                item.phase() == QueuePhase::Running && !self.in_flight.contains_key(&item.work_id)
+            })
+            .map(|item| item.work_id.clone())
             .collect();
 
-        if running_indices.is_empty() {
-            return Vec::new();
-        }
-
-        // Remove running items from queue (reverse order to preserve indices).
-        let mut running_items: Vec<QueueItem> = Vec::with_capacity(running_indices.len());
-        for &idx in running_indices.iter().rev() {
-            running_items.push(self.queue.remove(idx).unwrap());
-        }
-        running_items.reverse();
-
-        // Spawn parallel tasks.
-        let mut join_set = tokio::task::JoinSet::new();
-        for item in running_items {
-            let executor = Arc::clone(&self.executor);
-            let worktree_mgr = Arc::clone(&self.worktree_mgr);
-            let ws_name = self.config.name.clone();
-            let state_config = self.find_state_config(&item.state).cloned();
-            // The worktree belongs to the item's owner: an inherited one keeps
-            // its original key, any other item gets its own.
-            let worktree_key = self
-                .db
-                .worktree_key(&item.work_id)
-                .map_err(|e| e.to_string());
-
-            let hook = Self::resolve_hook_static(&self.hook, &self.hook_loader, &ws_name);
-            join_set.spawn(async move {
-                Self::execute_item_parallel(
-                    item,
-                    state_config,
-                    executor,
-                    worktree_mgr,
-                    worktree_key,
-                    ws_name,
-                    hook,
-                )
-                .await
-            });
-        }
-
-        // Collect results and apply state updates.
         let mut outcomes = Vec::new();
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(exec_result) => {
-                    let outcome = self.apply_execution_result(exec_result).await;
-                    outcomes.push(outcome);
+        for work_id in unstarted {
+            match self.db.open_cancel_request(&work_id) {
+                Ok(None) => self.spawn_handler(&work_id),
+                Ok(Some(request)) => {
+                    let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id) else {
+                        continue;
+                    };
+                    let item = self.queue.remove(idx).expect("index from position");
+                    outcomes.extend(self.cancel_without_handler(item, &request));
                 }
-                Err(e) => {
-                    tracing::error!("spawned task panicked: {e}");
+                Err(e) => tracing::error!(
+                    work_id,
+                    "cancel requests unreadable; handler not started this tick: {e}"
+                ),
+            }
+        }
+        outcomes
+    }
+
+    fn spawn_handler(&mut self, work_id: &str) {
+        let Some(item) = self.queue.iter().find(|i| i.work_id == work_id).cloned() else {
+            return;
+        };
+        let ws_name = self.config.name.clone();
+        let state_config = self.find_state_config(&item.state).cloned();
+        // The worktree belongs to the item's owner: an inherited one keeps
+        // its original key, any other item gets its own.
+        let worktree_key = self
+            .db
+            .worktree_key(&item.work_id)
+            .map_err(|e| e.to_string());
+        let control = Arc::new(HandlerControl::new(
+            work_id,
+            Arc::clone(&self.db),
+            Arc::clone(&self.killer),
+        ));
+        self.in_flight
+            .insert(work_id.to_string(), Arc::clone(&control));
+        let deps = ExecutionDeps {
+            executor: Arc::clone(&self.executor),
+            worktree_mgr: Arc::clone(&self.worktree_mgr),
+            hook: Self::resolve_hook_static(&self.hook, &self.hook_loader, &ws_name),
+            control,
+        };
+        self.handlers.spawn(async move {
+            let control = Arc::clone(&deps.control);
+            let result =
+                Self::execute_item_parallel(item, state_config, worktree_key, ws_name, deps).await;
+            control.finish();
+            result
+        });
+    }
+
+    /// Wait until every handler in flight ends and apply each result.
+    pub async fn join_handlers(&mut self) -> Vec<ItemOutcome> {
+        let mut outcomes = Vec::new();
+        while let Some(joined) = self.handlers.join_next().await {
+            if let Some(outcome) = self.apply_joined(joined).await {
+                outcomes.push(outcome);
+            }
+        }
+        outcomes
+    }
+
+    /// Apply the results of the handlers that already ended, without waiting.
+    async fn reap_finished(&mut self) -> Vec<ItemOutcome> {
+        let mut outcomes = Vec::new();
+        while let Some(joined) = self.handlers.try_join_next() {
+            if let Some(outcome) = self.apply_joined(joined).await {
+                outcomes.push(outcome);
+            }
+        }
+        outcomes
+    }
+
+    /// Number of handler executions in flight.
+    pub fn handlers_in_flight(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    async fn apply_joined(
+        &mut self,
+        joined: Result<ExecutionResult, tokio::task::JoinError>,
+    ) -> Option<ItemOutcome> {
+        match joined {
+            Ok(exec_result) => Some(self.apply_execution_result(exec_result).await),
+            Err(e) => {
+                // The item stays Running in the store with no handler; a
+                // restart rolls it back.
+                tracing::error!("handler task did not finish: {e}");
+                None
+            }
+        }
+    }
+
+    fn log_outcomes(outcomes: &[ItemOutcome]) {
+        for outcome in outcomes {
+            match outcome {
+                ItemOutcome::Completed(item) => {
+                    tracing::info!("completed: {}", item.work_id);
+                }
+                ItemOutcome::Canceled(item) => tracing::info!("canceled: {}", item.work_id),
+                ItemOutcome::Failed {
+                    item,
+                    error,
+                    escalation,
+                } => {
+                    tracing::warn!(
+                        "failed: {} (escalation={:?}, error={})",
+                        item.work_id,
+                        escalation,
+                        error
+                    );
+                }
+                ItemOutcome::Skipped(item) => tracing::info!("skipped: {}", item.work_id),
+                ItemOutcome::Conflicted { item, current } => {
+                    tracing::warn!("discarded: {} (stored phase is {})", item.work_id, current)
+                }
+                ItemOutcome::StoreError { item, error } => {
+                    tracing::error!("not recorded: {} ({})", item.work_id, error)
                 }
             }
         }
-
-        outcomes
     }
 
     /// 단일 아이템의 handler를 실행하는 순수 async 함수.
     /// `&mut self` 의존 없이 `tokio::spawn`으로 실행 가능하다.
+    ///
+    /// 모든 프로세스는 `deps.control`에 pid를 보고하고, stop이 오면 다음
+    /// 단계(on_enter actions, handler chain)를 시작하지 않는다.
     async fn execute_item_parallel(
         mut item: QueueItem,
         state_config: Option<StateConfig>,
-        executor: Arc<ActionExecutor>,
-        worktree_mgr: Arc<dyn WorktreeManager>,
         worktree_key: Result<String, String>,
         ws_name: String,
-        hook: Arc<dyn LifecycleHook>,
+        deps: ExecutionDeps,
     ) -> ExecutionResult {
+        let ExecutionDeps {
+            executor,
+            worktree_mgr,
+            hook,
+            control,
+        } = deps;
+        let sink: Arc<dyn ProcessSink> = Arc::clone(&control) as Arc<dyn ProcessSink>;
         let worktree_key = match worktree_key {
             Ok(key) => key,
             Err(e) => {
@@ -887,10 +1029,24 @@ impl Daemon {
         }
 
         let env = ActionEnv::new(&item.work_id, &worktree);
+        let stopped = |item: QueueItem, worktree: PathBuf, on_enter_result| ExecutionResult {
+            item,
+            outcome: ExecutionOutcome::Stopped,
+            ws_name: ws_name.clone(),
+            on_fail_actions: Vec::new(),
+            worktree: Some(worktree),
+            on_enter_result,
+        };
 
         // on_enter
+        if control.is_stopped() {
+            return stopped(item, worktree, None);
+        }
         let on_enter: Vec<Action> = state_config.on_enter.iter().map(Action::from).collect();
-        let on_enter_ok = match executor.execute_all(&on_enter, &env).await {
+        let on_enter_ok = match executor
+            .execute_all_with_sink(&on_enter, &env, Arc::clone(&sink))
+            .await
+        {
             Ok(Some(r)) if !r.success() => {
                 return ExecutionResult {
                     item,
@@ -928,7 +1084,10 @@ impl Daemon {
             .map(Action::from)
             .map(|action| inject_lateral_plan(action, item.lateral_plan.as_deref()))
             .collect();
-        let result = executor.execute_all(&handlers, &env).await;
+        if control.is_stopped() {
+            return stopped(item, worktree, on_enter_ok);
+        }
+        let result = executor.execute_all_with_sink(&handlers, &env, sink).await;
 
         match result {
             Ok(Some(r)) if !r.success() => ExecutionResult {
@@ -982,6 +1141,12 @@ impl Daemon {
             on_enter_result,
         } = exec_result;
 
+        // The Running copy waited in the queue while the handler ran; the
+        // result decides where the item goes next.
+        self.queue.retain(|i| i.work_id != item.work_id);
+        let control = self.in_flight.remove(&item.work_id);
+        let canceled = control.as_ref().and_then(|c| c.canceled_request());
+
         // Record token usage and the on_enter event from on_enter execution if present.
         if let Some(ref r) = on_enter_result {
             self.try_record_token_usage(&item, r);
@@ -1000,7 +1165,30 @@ impl Daemon {
             );
         }
 
+        if let Some(request_id) = canceled {
+            match &outcome {
+                ExecutionOutcome::Completed { result: Some(r) }
+                | ExecutionOutcome::Failed {
+                    result: Some(r), ..
+                } => self.try_record_token_usage(&item, r),
+                ExecutionOutcome::Completed { result: None }
+                | ExecutionOutcome::Failed { result: None, .. }
+                | ExecutionOutcome::Skipped
+                | ExecutionOutcome::WorktreeError { .. }
+                | ExecutionOutcome::Stopped => {}
+            }
+            return self.finish_canceled(item, request_id);
+        }
+
         match outcome {
+            ExecutionOutcome::Stopped => {
+                // Only a shutdown stops an execution without a cancel, and it
+                // discards the results; the Running copy is left for its rollback.
+                let error = "execution stopped without a cancel request".to_string();
+                tracing::error!(work_id = %item.work_id, "{error}; left Running for the shutdown rollback");
+                self.queue.push_back(item.clone());
+                ItemOutcome::StoreError { item, error }
+            }
             ExecutionOutcome::Skipped => {
                 let item = match self.commit_result(
                     item,
@@ -1308,6 +1496,186 @@ impl Daemon {
                 "derived item committed but not readable; the next observation adds it"
             ),
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Cancellation (see crate::cancel)
+    // ---------------------------------------------------------------
+
+    /// Handle every open cancel request of this workspace (tick step 0).
+    ///
+    /// A Running item with a handler in flight: accept, then stop the
+    /// handler group; the item ends Skipped when the handler returns
+    /// ([`Daemon::finish_canceled`]). A Running item without one ends Skipped
+    /// now. An item no longer Running closes the request `too_late`.
+    ///
+    /// # Errors
+    /// When the open requests cannot be listed.
+    fn process_cancel_requests(&mut self) -> Result<()> {
+        for request in self.db.open_cancel_requests()? {
+            let row = match self.db.get_item(&request.work_id) {
+                Ok(row) => row,
+                Err(e) => {
+                    tracing::warn!(work_id = %request.work_id, "cancel request skipped, item unreadable: {e}");
+                    continue;
+                }
+            };
+            if row.workspace_id != self.config.name {
+                continue;
+            }
+            match row.phase() {
+                QueuePhase::Running => {}
+                QueuePhase::Pending
+                | QueuePhase::Ready
+                | QueuePhase::Completed
+                | QueuePhase::Hitl
+                | QueuePhase::Done
+                | QueuePhase::Skipped
+                | QueuePhase::Failed => {
+                    self.close_request(request.id, CancelResult::TooLate);
+                    continue;
+                }
+            }
+            if let Some(control) = self.in_flight.get(&request.work_id).cloned() {
+                if control.canceled_request().is_none() && self.accept(&request) {
+                    control.stop(StopReason::Cancel {
+                        request_id: request.id,
+                    });
+                }
+                continue;
+            }
+            match self.queue.iter().position(|i| i.work_id == request.work_id) {
+                Some(idx) => {
+                    let item = self.queue.remove(idx).expect("index from position");
+                    let outcome = self.cancel_without_handler(item, &request);
+                    Self::log_outcomes(&outcome.into_iter().collect::<Vec<_>>());
+                }
+                None => {
+                    // A Running row this daemon never claimed: nothing runs for it.
+                    if self.accept(&request) {
+                        self.cancel_unowned(&request)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark `request` accepted by the daemon. `false` when it can no longer
+    /// be acted on (closed meanwhile, or the store failed).
+    fn accept(&self, request: &CancelRequestRecord) -> bool {
+        match request.status {
+            CancelStatus::Accepted => return true,
+            CancelStatus::Closed => return false,
+            CancelStatus::Requested => {}
+        }
+        match self.db.accept_cancel(request.id, &Actor::Daemon) {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                tracing::error!(work_id = %request.work_id, "cancel request not accepted: {e}");
+                false
+            }
+        }
+    }
+
+    fn close_request(&self, request_id: i64, result: CancelResult) {
+        match self.db.close_cancel(request_id, result, &Actor::Daemon) {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(request_id, "cancel request was already closed"),
+            Err(e) => tracing::error!(request_id, ?result, "cancel request not closed: {e}"),
+        }
+    }
+
+    /// Cancel a Running item whose handler was not spawned: it never runs.
+    ///
+    /// `item` is the Running copy, already taken out of the queue. Returns
+    /// `None` when the request could not be accepted; the copy then goes
+    /// back to the queue for the next tick.
+    fn cancel_without_handler(
+        &mut self,
+        item: QueueItem,
+        request: &CancelRequestRecord,
+    ) -> Option<ItemOutcome> {
+        if !self.accept(request) {
+            self.queue.push_back(item);
+            return None;
+        }
+        Some(self.finish_canceled(item, request.id))
+    }
+
+    /// End a canceled execution of this daemon: Running→Skipped (`canceled`),
+    /// close the request, record the attempt as `skipped` and clean the
+    /// worktree (Skipped rule). No hook or escalation runs.
+    ///
+    /// `item` is the Running copy, out of the queue, holding a concurrency slot.
+    fn finish_canceled(&mut self, mut item: QueueItem, request_id: i64) -> ItemOutcome {
+        let ws_name = self.config.name.clone();
+        let outcome = Self::commit_transition(
+            &self.db,
+            &mut item,
+            QueuePhase::Skipped,
+            TransitionReason::Canceled,
+            Some(format!("cancel request {request_id}")),
+        );
+        match outcome {
+            Ok(TransitionOutcome::Applied { .. }) => {
+                self.close_request(request_id, CancelResult::Canceled);
+                self.record_history(&item, "skipped", None);
+                self.record_history_event(&item, "skipped", None);
+                self.worktree_mgr.clear_preserved(&item.source_id);
+                self.cleanup_owned_worktree(&item.work_id);
+                self.tracker.release(&ws_name);
+                ItemOutcome::Canceled(item)
+            }
+            Ok(TransitionOutcome::Conflict { current }) => {
+                self.close_request(request_id, CancelResult::TooLate);
+                self.discard_conflicted(item, &ws_name, current)
+            }
+            Ok(
+                refused
+                @ (TransitionOutcome::Busy { .. } | TransitionOutcome::InvalidAction { .. }),
+            ) => self.discard_unrecorded(
+                item,
+                &ws_name,
+                format!("cancel transition refused: {refused:?}"),
+            ),
+            Err(e) => self.discard_unrecorded(item, &ws_name, e.to_string()),
+        }
+    }
+
+    /// Close `request` for an item no handler of this daemon runs (restart,
+    /// or a Running row never claimed here): a Running item goes to Skipped
+    /// (`canceled`), any other closes `too_late`.
+    fn cancel_unowned(&mut self, request: &CancelRequestRecord) -> Result<()> {
+        if self.db.get_item(&request.work_id)?.phase() != QueuePhase::Running {
+            self.close_request(request.id, CancelResult::TooLate);
+            return Ok(());
+        }
+        let outcome = self.db.transition(&TransitionRequest {
+            work_id: request.work_id.clone(),
+            expected_from: QueuePhase::Running,
+            to: QueuePhase::Skipped,
+            actor: Actor::Daemon,
+            reason: TransitionReason::Canceled,
+            detail: Some(format!("cancel request {}", request.id)),
+        })?;
+        match outcome {
+            TransitionOutcome::Applied { .. } => {
+                self.close_request(request.id, CancelResult::Canceled);
+                let item = self.db.get_item(&request.work_id)?;
+                self.record_history(&item, "skipped", None);
+                self.record_history_event(&item, "skipped", None);
+                self.worktree_mgr.clear_preserved(&item.source_id);
+                self.cleanup_owned_worktree(&item.work_id);
+            }
+            TransitionOutcome::Conflict { .. } | TransitionOutcome::InvalidAction { .. } => {
+                self.close_request(request.id, CancelResult::TooLate);
+            }
+            TransitionOutcome::Busy { .. } => {
+                anyhow::bail!("cancel of {} was refused: {outcome:?}", request.work_id)
+            }
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------------
@@ -1935,12 +2303,22 @@ impl Daemon {
         self.tracker.release_evaluate();
     }
 
-    /// Daemon tick: observe store -> collect -> HITL post-processing ->
-    /// HITL opened hooks -> advance -> execute -> evaluate.
+    /// Daemon tick: cancel requests -> observe store -> collect -> HITL
+    /// post-processing -> HITL opened hooks -> apply ended handlers ->
+    /// advance -> start handlers -> evaluate -> cron.
+    ///
+    /// A tick never waits for a handler: handlers run in the background and
+    /// their results are applied by a later tick or by the run loop as they
+    /// end ([`Daemon::join_handlers`] waits for them explicitly).
     ///
     /// shutdown이 요청되면 collect/advance를 건너뛰고 실행 중인
     /// 아이템의 완료 처리만 수행한다.
     pub async fn tick(&mut self) -> Result<()> {
+        // A failed cancel step must not stop the rest of the tick.
+        if let Err(e) = self.process_cancel_requests() {
+            tracing::error!("cancel requests not processed: {e}");
+        }
+
         self.observe_store()?;
 
         if !self.shutdown_requested {
@@ -1956,6 +2334,10 @@ impl Daemon {
         }
         self.observe_hitl_opened().await?;
 
+        // Ended handlers free their concurrency slots before the claim.
+        let ended = self.reap_finished().await;
+        Self::log_outcomes(&ended);
+
         if !self.shutdown_requested {
             let advanced = self.advance();
             if advanced > 0 {
@@ -1963,33 +2345,8 @@ impl Daemon {
             }
         }
 
-        let outcomes = self.execute_running().await;
-        for outcome in &outcomes {
-            match outcome {
-                ItemOutcome::Completed(item) => {
-                    tracing::info!("completed: {}", item.work_id);
-                }
-                ItemOutcome::Failed {
-                    item,
-                    error,
-                    escalation,
-                } => {
-                    tracing::warn!(
-                        "failed: {} (escalation={:?}, error={})",
-                        item.work_id,
-                        escalation,
-                        error
-                    );
-                }
-                ItemOutcome::Skipped(item) => tracing::info!("skipped: {}", item.work_id),
-                ItemOutcome::Conflicted { item, current } => {
-                    tracing::warn!("discarded: {} (stored phase is {})", item.work_id, current)
-                }
-                ItemOutcome::StoreError { item, error } => {
-                    tracing::error!("not recorded: {} ({})", item.work_id, error)
-                }
-            }
-        }
+        let canceled_before_spawn = self.spawn_running();
+        Self::log_outcomes(&canceled_before_spawn);
 
         // Evaluator로 Completed 아이템 평가 (Done vs HITL).
         self.evaluate_completed().await;
@@ -2044,7 +2401,27 @@ impl Daemon {
         }
     }
 
+    /// Act on an IPC wake signal. A cancel wake runs a tick at once, whose
+    /// first step handles the open cancel requests; it is kept apart from a
+    /// cron sync so it never waits for one.
+    async fn handle_ipc_signal(&mut self, signal: belt_infra::ipc::DaemonSignal) {
+        match signal {
+            belt_infra::ipc::DaemonSignal::CronSync => {
+                self.handle_cron_trigger_signal("IPC").await;
+            }
+            belt_infra::ipc::DaemonSignal::CancelRequested => {
+                tracing::info!("cancel requested, ticking now");
+                if let Err(e) = self.tick().await {
+                    tracing::error!("tick error after a cancel wake: {e}");
+                }
+            }
+        }
+    }
+
     /// Select loop with SIGUSR1 + IPC support (unix).
+    ///
+    /// Ended handlers are applied as they end, next to the tick and the
+    /// wake signals, so nothing here waits for a running handler.
     #[cfg(unix)]
     async fn run_select_loop(&mut self, tick: &mut tokio::time::Interval) {
         let mut sigusr1 =
@@ -2059,6 +2436,10 @@ impl Daemon {
 
         loop {
             tokio::select! {
+                Some(joined) = self.handlers.join_next() => {
+                    let outcome = self.apply_joined(joined).await;
+                    Self::log_outcomes(&outcome.into_iter().collect::<Vec<_>>());
+                }
                 _ = tick.tick() => {
                     if let Err(e) = self.tick().await {
                         tracing::error!("tick error: {e}");
@@ -2073,11 +2454,7 @@ impl Daemon {
                         None => std::future::pending().await,
                     }
                 } => {
-                    match signal {
-                        belt_infra::ipc::DaemonSignal::CronSync => {
-                            self.handle_cron_trigger_signal("IPC").await;
-                        }
-                    }
+                    self.handle_ipc_signal(signal).await;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("received SIGINT, initiating graceful shutdown...");
@@ -2097,6 +2474,10 @@ impl Daemon {
 
         loop {
             tokio::select! {
+                Some(joined) = self.handlers.join_next() => {
+                    let outcome = self.apply_joined(joined).await;
+                    Self::log_outcomes(&outcome.into_iter().collect::<Vec<_>>());
+                }
                 _ = tick.tick() => {
                     if let Err(e) = self.tick().await {
                         tracing::error!("tick error: {e}");
@@ -2108,11 +2489,7 @@ impl Daemon {
                         None => std::future::pending().await,
                     }
                 } => {
-                    match signal {
-                        belt_infra::ipc::DaemonSignal::CronSync => {
-                            self.handle_cron_trigger_signal("IPC").await;
-                        }
-                    }
+                    self.handle_ipc_signal(signal).await;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("received SIGINT, initiating graceful shutdown...");
@@ -2123,56 +2500,96 @@ impl Daemon {
         }
     }
 
-    /// Running 아이템 완료 대기.
+    /// Graceful shutdown: wait up to `timeout` for the Running items.
     ///
-    /// - timeout 초과 시 Running -> Failed (강제 전이) + 에러 로깅.
-    /// - 두 번째 SIGINT 시 Running -> Pending 롤백 (worktree 보존).
-    async fn drain_with_timeout(&mut self, timeout: std::time::Duration) {
-        let running_count = self.items_in_phase(QueuePhase::Running).len();
-        if running_count == 0 {
+    /// Claimed items whose handler has not started yet are started first.
+    /// Every handler runs in its own process group, so the daemon's SIGINT
+    /// does not reach it; the daemon stops it itself:
+    ///
+    /// - all handlers end in time: their results are applied as usual.
+    /// - timeout: the handler groups are killed, then Running → Pending
+    ///   (worktree preserved). An execution already canceled by request
+    ///   ends Skipped (`canceled`) instead.
+    /// - a second SIGINT: the handler groups are killed, then Running →
+    ///   Failed.
+    pub async fn drain_with_timeout(&mut self, timeout: std::time::Duration) {
+        let canceled = self.spawn_running();
+        Self::log_outcomes(&canceled);
+        if self.in_flight.is_empty() {
+            if self.running_count() > 0 {
+                self.rollback_running_to_pending();
+            }
             return;
         }
 
         tracing::info!(
-            "draining {} running items (timeout={}s)...",
-            running_count,
+            "draining {} running handlers (timeout={}s)...",
+            self.in_flight.len(),
             timeout.as_secs()
         );
-
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
 
         loop {
             tokio::select! {
-                _ = tick.tick() => {
-                    let outcomes = self.execute_running().await;
-                    for outcome in &outcomes {
-                        if let ItemOutcome::Completed(item) = outcome {
-                            tracing::info!("drain: completed {}", item.work_id);
-                        }
-                    }
-
-                    let remaining = self.items_in_phase(QueuePhase::Running).len();
-                    if remaining == 0 {
-                        tracing::info!("all running items drained successfully");
-                        return;
+                joined = self.handlers.join_next() => {
+                    let Some(joined) = joined else {
+                        break;
+                    };
+                    let outcome = self.apply_joined(joined).await;
+                    Self::log_outcomes(&outcome.into_iter().collect::<Vec<_>>());
+                    if self.handlers.is_empty() {
+                        tracing::info!("all running handlers drained");
+                        break;
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
-                    let remaining = self.items_in_phase(QueuePhase::Running).len();
                     tracing::warn!(
-                        "drain timeout ({}s) exceeded, rolling back {} running items to pending",
+                        "drain timeout ({}s) exceeded, stopping {} handlers and rolling back to pending",
                         timeout.as_secs(),
-                        remaining
+                        self.in_flight.len()
                     );
+                    self.stop_all_handlers().await;
                     self.rollback_running_to_pending();
                     return;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     tracing::warn!("received second SIGINT, force-failing running items");
+                    self.stop_all_handlers().await;
                     self.force_fail_running();
                     return;
                 }
+            }
+        }
+        if self.running_count() > 0 {
+            self.rollback_running_to_pending();
+        }
+    }
+
+    /// Kill every handler group in flight and drop the executions.
+    ///
+    /// The results are discarded; an execution canceled by request still
+    /// ends Skipped (`canceled`), the others stay Running for the caller.
+    async fn stop_all_handlers(&mut self) {
+        for control in self.in_flight.values() {
+            control.stop(StopReason::Shutdown);
+        }
+        self.handlers.abort_all();
+        while self.handlers.join_next().await.is_some() {}
+
+        let canceled: Vec<(String, i64)> = self
+            .in_flight
+            .drain()
+            .filter_map(|(work_id, control)| {
+                control
+                    .canceled_request()
+                    .map(|request_id| (work_id, request_id))
+            })
+            .collect();
+        for (work_id, request_id) in canceled {
+            if let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id) {
+                let item = self.queue.remove(idx).expect("index from position");
+                let outcome = self.finish_canceled(item, request_id);
+                Self::log_outcomes(&[outcome]);
             }
         }
     }
@@ -2270,7 +2687,6 @@ impl Daemon {
                 // Persist worktree state to DB so it survives restart.
                 if let Err(e) = self.db.update_item_worktree_state(
                     &item.work_id,
-                    QueuePhase::Pending,
                     item.worktree_preserved,
                     item.previous_worktree_path.as_deref(),
                 ) {
@@ -4432,10 +4848,10 @@ sources:
         assert_eq!(daemon.queue_items().len(), 0);
         assert_eq!(daemon.history_events().len(), 0);
 
-        // After tick: item is collected, advanced, executed, then evaluated.
-        // The evaluator runs on_done which transitions to Done and may remove
-        // items from the queue, so we verify via history_events instead.
+        // A tick collects, advances and starts the handler without waiting
+        // for it; the result is applied once the handler ends.
         daemon.tick().await.unwrap();
+        daemon.join_handlers().await;
 
         // A "completed" history event proves the pipeline ran successfully.
         assert!(
@@ -4470,6 +4886,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![0, 0]);
 
         daemon.tick().await.unwrap();
+        daemon.join_handlers().await;
 
         // Both items should have produced "completed" history events.
         let completed_events = daemon
@@ -4494,8 +4911,9 @@ sources:
 
         daemon.request_shutdown();
 
-        // tick() should not collect new items but should execute Running ones.
+        // tick() should not collect new items but should start Running ones.
         daemon.tick().await.unwrap();
+        daemon.join_handlers().await;
 
         // The Running item should have been processed.
         assert!(daemon.items_in_phase(QueuePhase::Running).is_empty());
@@ -5172,6 +5590,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![0]);
 
         daemon.tick().await.unwrap();
+        daemon.join_handlers().await;
 
         let entries = daemon.history();
         assert!(

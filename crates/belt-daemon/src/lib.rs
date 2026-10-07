@@ -5,6 +5,7 @@
 // without a database (see their `# Panics`).
 #[doc(hidden)]
 pub mod advancer;
+pub mod cancel;
 pub mod concurrency;
 pub mod cron;
 pub mod daemon;

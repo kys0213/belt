@@ -244,10 +244,15 @@ async fn e2e_token_usage_tracking() {
     let tmp = TempDir::new().unwrap();
     let mut daemon = setup_real_daemon(&tmp);
 
-    // Run one full tick (collect → advance → execute → evaluate).
-    let tick_result = tokio::time::timeout(std::time::Duration::from_secs(120), daemon.tick())
-        .await
-        .expect("tick timed out after 120s");
+    // Run one full tick (collect → advance → execute); a tick does not wait
+    // for the handler it starts, so wait for it explicitly.
+    let tick_result = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        let result = daemon.tick().await;
+        daemon.join_handlers().await;
+        result
+    })
+    .await
+    .expect("tick timed out after 120s");
 
     assert!(tick_result.is_ok(), "tick should succeed: {tick_result:?}");
 
