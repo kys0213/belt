@@ -15,8 +15,8 @@
 | **Completed** | handler 전부 성공, evaluate 대기 (잠금 아님) |
 | **Done** | evaluate 완료 판정 + on_done script 성공 (terminal) |
 | **Hitl** | 사람 판단 필요 (응답 확정 후 후처리 중이면 처리 중 잠금) |
-| **Skipped** | escalation skip, preflight 실패, 실행 중 취소 (terminal) |
-| **Failed** | on_done script 실패, 인프라 오류, HITL 후처리 실패 등 |
+| **Skipped** | escalation skip, preflight 실패, 실행 중 취소, escalation retry·replan으로 파생됨 (terminal) |
+| **Failed** | on_done script 실패, 인프라 오류, replan 상한 초과, HITL 후처리 실패 등. 나가는 길은 skip뿐이다 |
 
 ---
 
@@ -40,38 +40,38 @@
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Pending: DataSource 수집
-    [*] --> Hitl: replan 아이템 또는 spec 완료 아이템을 HITL 로 직접 생성
+    [*] --> Pending: DataSource 수집 또는 파생 생성
     Pending --> Ready: 자동 전이
     Pending --> Skipped: skip
-    Ready --> Running: 점유 concurrency 제한
+    Ready --> Running: 점유 (concurrency, 큐 의존 gate)
     Ready --> Done: 이력 기반 사전 판정
-    Ready --> Hitl: spec 충돌 감지
     Ready --> Skipped: skip
 
     Running --> Completed: handler 전부 성공
-    Running --> Failed: handler 또는 on_enter 실패
-    Running --> Hitl: escalation hitl 또는 replan
-    Running --> Skipped: 실행 중 취소
-    Running --> Pending: 롤백 shutdown 또는 재시작
+    Running --> Failed: escalation 대상이 아닌 실패 (인프라 오류, 예를 들어 worktree 생성 실패)
+    Running --> Skipped: 실행 중 취소, 또는 escalation retry로 파생됨
+    Running --> Hitl: escalation hitl
+    Running --> Pending: shutdown 또는 재시작 롤백
 
-    Completed --> Done: evaluate 완료 판정 + on_done 성공
+    Completed --> Done: evaluate 완료 + on_done 성공
     Completed --> Failed: on_done 실패
     Completed --> Hitl: evaluate 사람 필요
 
-    Failed --> Done: 수동 done
     Failed --> Skipped: skip
 
-    Hitl --> Done: 후처리 done
-    Hitl --> Failed: 후처리 실패 또는 replan 상한 초과
-    Hitl --> Pending: 후처리 retry 또는 replan
-    Hitl --> Skipped: 후처리 skip
+    Hitl --> Done: 후처리 done 성공
+    Hitl --> Failed: on_done 실패, replan 상한 초과, 후처리 연속 실패
+    Hitl --> Skipped: 후처리 skip, 또는 replan으로 파생됨
+    Hitl --> Pending: 후처리 retry (같은 아이템)
 
     Done --> [*]
     Skipped --> [*]
 ```
 
 > 다이어그램의 전이는 허용된 전이의 집합이다. 허용되지 않은 전이 요청은 `invalid_action`으로 거절된다.
+> Failed에서 나가는 전이는 Skipped뿐이다. Failed를 Done으로 바꾸는 경로는 없다.
+> handler·on_enter 실패는 항상 escalation 대상이고 결과는 Skipped(파생) 또는 Hitl이다. `Running --> Failed`는 handler를 시작하기 전 인프라 단계가 실패한 경우에만 쓴다.
+> `Hitl --> Pending`은 HITL retry 전용이다. replan은 원 아이템 Skipped와 파생 아이템 Pending으로 나타난다.
 
 ### Running 이후의 분기
 
@@ -81,8 +81,8 @@ flowchart TD
     S -- "전부 성공" --> C["Completed"]
     S -- "handler 또는 on_enter 실패" --> A["Stagnation 분석 항상 실행"]
     A --> F{"failure_count"}
-    F -- "1 retry" --> R1["lateral_plan 주입, 새 아이템 Pending, worktree 보존, on_fail 없음"]
-    F -- "2 retry_with_comment" --> R2["lateral_plan 주입, on_fail 실행, 새 아이템 Pending, worktree 보존"]
+    F -- "1 retry" --> R1["lateral_plan 주입, 원 아이템 Skipped (파생됨), 파생 아이템 Pending, worktree 인계, on_fail 없음"]
+    F -- "2 retry_with_comment" --> R2["lateral_plan 주입, on_fail 실행, 원 아이템 Skipped (파생됨), 파생 아이템 Pending, worktree 인계"]
     F -- "3 hitl" --> H["on_fail 실행, lateral 이력 첨부, HITL 요청 생성, worktree 보존"]
     C --> E{"evaluate per-item"}
     E -- "완료 판정" --> D["on_done 실행"]
@@ -92,9 +92,38 @@ flowchart TD
     H --> P["사람 응답 후 daemon 후처리"]
     P -- "done" --> Done
     P -- "skip" --> Sk["Skipped, worktree 정리"]
-    P -- "retry 또는 replan (상한 이내)" --> Pe["Pending"]
-    P -- "replan (상한 초과)" --> Fl["Failed"]
+    P -- "retry" --> Pe["같은 아이템 Pending, failure_count 리셋"]
+    P -- "replan (상한 이내)" --> Rp["원 아이템 Skipped (파생됨), worktree 정리, 파생 아이템 Pending"]
+    P -- "replan (상한 초과)" --> Fl["Failed, worktree 보존"]
 ```
+
+---
+
+## 파생 아이템과 계열
+
+escalation retry와 replan은 원 아이템을 다시 쓰지 않고 새 `work_id`의 **파생 아이템**을 만든다. 파생 아이템은 직전 아이템의 `work_id`를 **파생 원본**으로 기록한다. 같은 최초 아이템에서 이어진 아이템들을 **계열**이라 부른다. `belt queue show`와 `belt context`가 파생 원본을 보여준다.
+
+| 항목 | 규칙 |
+|------|------|
+| 식별자 | `(source_id, state)`에서 처음 만들어지는 아이템의 `work_id`는 `{source_id}:{state}`다. 그 뒤 같은 `(source_id, state)`에서 만들어지는 아이템은 파생이든 재수집이든 `{source_id}:{state}:{n}`이다. `n`은 `(source_id, state)` 단위로 2부터 1씩 단조 증가하고 `work_id`는 재사용되지 않는다 |
+| 파생 원본 | 파생 아이템은 직전 아이템의 `work_id`를 기록한다. HITL retry는 파생이 아니라 같은 아이템이 Pending으로 돌아간다 |
+| escalation retry | 원 아이템은 Running→Skipped(사유 파생됨)로 끝난다. worktree는 정리하지 않고 파생 아이템에 **인계**한다. 인계 뒤 worktree의 소유자는 파생 아이템이다 |
+| replan (상한 이내) | 원 아이템은 Hitl→Skipped(사유 파생됨)로 끝나고 worktree는 정리된다. 같은 출처로 파생 아이템을 Pending으로 만든다. 파생 아이템은 이전 시도 이력·lateral 이력·HITL 메모를 주입받아 처음부터 계획을 다시 세우고 새 worktree를 만든다. 시작 state는 원 아이템의 state다 |
+| replan 상한 | 계열 전체에서 replan으로 파생된 횟수가 3회다. 이미 3회 파생된 계열에서 replan이 확정되면 Hitl→Failed이고 worktree는 보존한다. 사람 응답과 HITL 만료(terminal `replan`)가 같다. 상한 값은 설정으로 노출하지 않는다 |
+| failure_count | 계열의 시도 이력에서 마지막 **리셋 지점** 이후의 실패 수다. 리셋 지점은 HITL retry 확정과 replan 파생이다. 리셋 뒤 다음 실패는 escalation 1단계(retry)부터 다시 적용된다. 취소·conflict로 버려진 실행은 세지 않는다 |
+| `skipped` 이벤트 | 파생으로 끝난 Skipped는 channel event `skipped`를 내지 않는다. 작업이 파생 아이템에서 이어지기 때문이다. 계열이 끝나는 Skipped(skip 응답, terminal skip, 실행 중 취소, Pending·Ready·Failed의 skip)에만 낸다 |
+
+```mermaid
+flowchart TD
+    E["원 아이템에서 일어난 일"] --> K{"경로"}
+    K -- "escalation retry" --> A["원 아이템 Skipped (파생됨), 파생 아이템 Pending, worktree 인계, failure_count 유지, skipped 이벤트 없음"]
+    K -- "HITL retry" --> B["같은 아이템 Pending, worktree 보존, failure_count 리셋, 파생 없음"]
+    K -- "replan (상한 이내)" --> C["원 아이템 Skipped (파생됨), 파생 아이템 Pending, 새 worktree, 원 worktree 정리, failure_count 리셋, skipped 이벤트 없음"]
+    K -- "replan (상한 초과)" --> D["원 아이템 Failed, worktree 보존, 파생 없음"]
+```
+
+> 재수집 아이템(예를 들어 changes-requested 피드백 루프나 라벨이 남아 다시 수집된 경우)은 파생 원본이 없는 **새 계열의 첫 아이템**이며 다음 `n`을 받는다. 재수집이 허용되는 조건은 [DataSource](./datasource.md)의 수집 규칙을 따른다.
+> 큐 의존의 선행 아이템이 파생되면 "선행 아이템 Done 대기" gate는 그 계열의 최신 아이템 phase로 판정한다.
 
 ---
 
@@ -120,7 +149,9 @@ flowchart TD
 | `applied` | phase 변경과 전이 이력이 함께 기록되었다 |
 | `busy` | 처리 중인 아이템에 소유자가 아닌 행위자가 요청했다. 처리 종류(handler / 후처리)를 함께 알린다. 거절도 이력에 남는다 |
 | `conflict` | 잠기지 않은 phase(Pending, Ready, Completed, Failed)에서 기대 phase가 이미 달라졌다. 정상 경합의 결과이며 현재 phase를 함께 알린다 |
+| `invalid_action` | 목표 phase가 허용된 전이 집합 밖이거나 대응되는 HITL 액션이 없다 |
 
+- 결과 집합은 `applied`, `busy`, `conflict`, `invalid_action` 네 값이다.
 - `busy`, `conflict`, `invalid_action`은 오류가 아니라 값이다. 호출자는 non-zero 종료와 `--json` reason, TUI 토스트로 확인한다.
 - 동시 전이는 하나만 `applied`이고 나머지는 위 값 중 하나로 끝난다.
 - `conflict`의 예: Ready에서 사람의 skip과 daemon의 점유가 경합한다. Completed에서 evaluator와 사람의 조작이 경합한다.
@@ -137,7 +168,8 @@ stateDiagram-v2
     Ready --> Running: 점유가 곧 잠금 획득
     Running --> Completed: 결과 전이가 잠금 해제
     Running --> Failed: 결과 전이가 잠금 해제
-    Running --> Skipped: 취소가 잠금 해제
+    Running --> Skipped: 취소 또는 파생이 잠금 해제
+    Running --> Hitl: 결과 전이가 잠금 해제
     Running --> Pending: 롤백이 잠금 해제
     HitlOpen --> HitlResolved: 판정 확정이 잠금 획득
     HitlResolved --> Done: 결과 전이가 잠금 해제
@@ -157,7 +189,7 @@ stateDiagram-v2
 
 | 처리 중 | 조건 | 소유자 | 풀리는 시점 |
 |---------|------|--------|-------------|
-| (i) handler | phase가 Running | daemon | Running에서 나가는 결과 전이 (Completed, Failed, Skipped, Pending) |
+| (i) handler | phase가 Running | daemon | Running에서 나가는 결과 전이 (Completed, Failed, Skipped, Hitl, Pending) |
 | (ii) 후처리 | phase가 Hitl이고 그 HITL 요청이 확정(resolved 또는 expired)됐으나 후처리 미완료 | daemon 후처리 | Hitl에서 나가는 결과 전이 (Done, Failed, Skipped, Pending) |
 
 - **Completed는 잠금이 아니다.** evaluator가 전이 계약으로 전이하는 정당한 행위자이기 때문이다. 평가 중 사람의 조작이 이기면 evaluator의 판정은 `conflict`로 버려진다.
@@ -212,12 +244,20 @@ sequenceDiagram
     U->>H: 남은 handler 프로세스 정리
     U->>DB: 요청을 canceled_directly 로 닫음
     DB-->>U: canceled_directly
+
+    Note over U,H: 경로 3 daemon이 수락했으나 제한 시간 안에 종결 없음
+    U->>DB: 취소 요청 기록
+    U->>D: 깨움
+    D->>DB: 취소 수락 이력
+    U->>U: 제한 시간 안에 종결 없음
+    DB-->>U: accepted 수락됨 종결 대기
 ```
 
 | 결과 | 의미 |
 |------|------|
 | `canceled` | daemon이 handler를 종료하고 Running→Skipped로 바꿨다 |
 | `canceled_directly` | daemon 부재 또는 무응답으로 CLI가 직접 Running→Skipped로 바꾸고 남은 handler를 정리했다 |
+| `accepted` | daemon이 수락했으나 제한 시간 안에 종결되지 않았다. CLI는 직접 경로로 넘어가지 않고 exit 0으로 끝난다. 최종 결과는 `belt queue show`로 확인한다 |
 | `too_late` | 처리 전에 이미 Running을 벗어났다. phase는 그 결과를 따른다 |
 | `busy` | HITL 후처리 중이다 |
 
@@ -226,7 +266,7 @@ sequenceDiagram
 - 취소된 실행의 hook(on_done / on_fail / on_escalation)과 escalation은 실행하지 않는다. 시도 이력에는 `skipped`로 남아 failure_count에 영향이 없다. 토큰 사용량은 기록한다.
 - 취소된 아이템의 worktree는 Skipped 규칙(정리)을 따른다.
 - daemon 부재 중 CLI가 Skipped로 만든 아이템은 daemon이 재시작할 때 DB를 따른다.
-- 취소는 channel event `skipped`를 낸다. origin 기본 이벤트에 `skipped`가 없으므로 기본 설정에서는 외부로 나가지 않는다. 상세: [Notification](./notification.md)
+- 취소는 channel event `skipped`를 낸다. origin 기본 이벤트에 `skipped`가 없으므로 기본 설정에서는 외부로 나가지 않는다. 파생으로 끝난 Skipped는 `skipped`를 내지 않는다. 상세: [Notification](./notification.md)
 
 ---
 
@@ -240,8 +280,8 @@ stateDiagram-v2
     HitlOpen --> HitlResolved: 첫 확정 응답 또는 timeout 만료
     HitlResolved --> Done: 후처리 done 성공
     HitlResolved --> Failed: on_done 실패, replan 상한 초과 또는 후처리 연속 실패
-    HitlResolved --> Skipped: 후처리 skip
-    HitlResolved --> Pending: 후처리 retry 또는 replan
+    HitlResolved --> Skipped: 후처리 skip, 또는 replan으로 파생됨
+    HitlResolved --> Pending: 후처리 retry
     note right of HitlOpen
         phase는 Hitl
         queue skip 과 queue done 은 HITL 응답으로 전환
@@ -268,18 +308,18 @@ stateDiagram-v2
 
 | Phase / 이벤트 | Worktree |
 |----------------|----------|
-| Running | 생성 (또는 retry 시 기존 보존분 재사용) |
+| Running | 생성 (또는 인계받은 worktree·롤백으로 보존된 worktree 재사용) |
 | Completed | 유지 (evaluate 대기) |
 | Done | **정리** |
 | Hitl | 보존 (사람 확인 후 결정) |
 | Failed | 보존 (디버깅용) |
 | Skipped (취소 포함) | 정리 |
-| Retry | 보존 (이전 작업 위에서 재시도) |
+| escalation retry로 파생됨 | **인계** (정리 안 함, 소유자가 파생 아이템으로 바뀜) |
+| HITL retry (Hitl→Pending) | 보존 (이전 작업 위에서 재시도) |
 | Graceful shutdown 또는 재시작 롤백 (Running→Pending) | **보존** (재사용) |
-| hitl-timeout (HITL 만료) | **정리** |
-| log-cleanup cron | 보존된 worktree 중 TTL 초과분 정리 |
+| log-cleanup cron | 보존된 worktree 중 TTL 초과분 정리 (전이 이력 등 기록은 대상 아님) |
 
-**정리 원칙**: worktree는 **Done 또는 Skipped**가 되어야만 정리한다. HITL 만료 시에도 정리하여 좀비 worktree를 방지한다. 롤백 시에는 재사용을 위해 보존한다. 나머지 보존분(Failed 등)은 `log-cleanup` cron이 TTL(기본 7일) 기준으로 주기 정리한다. 전이 결과가 `conflict`인 실행의 worktree는 DB에 남은 phase의 규칙을 따른다.
+**정리 원칙**: worktree는 그 worktree를 소유한 아이템이 **Done 또는 Skipped**가 될 때만 정리한다. 만료로 끝난 HITL도 이 규칙을 따른다. escalation retry로 인계된 worktree의 소유자는 파생 아이템이므로 원 아이템의 Skipped로는 정리되지 않는다. 롤백 시에는 재사용을 위해 보존한다. 나머지 보존분(Failed 등)은 `log-cleanup` cron이 TTL(기본 7일) 기준으로 주기 정리한다. 전이 결과가 `conflict`인 실행의 worktree는 DB에 남은 phase의 규칙을 따른다.
 
 ---
 
@@ -288,13 +328,15 @@ stateDiagram-v2
 ```mermaid
 flowchart TD
     S["daemon 시작"] --> K["이전 daemon 이 남긴 handler 프로세스 종료"]
-    K --> RB["Running 아이템을 Pending 으로 롤백, worktree 보존"]
+    K --> CR["열린 취소 요청 종결 (Running이면 Skipped + canceled, 아니면 too_late)"]
+    CR --> RB["남은 Running 아이템을 Pending 으로 롤백, worktree 보존"]
     RB --> L["non-terminal 아이템을 DB 에서 복원"]
     L --> T["tick 시작, 이후 매 tick DB 우선"]
 ```
 
 - 시작 시 non-terminal 아이템을 DB에서 복원한다. in-memory 큐가 DB보다 앞서 존재하지 않는다.
 - 롤백 전에 이전 daemon이 남긴 handler 프로세스를 종료한다. 단일 daemon 전제이므로 남은 프로세스는 모두 이전 daemon의 것이다.
+- 프로세스 정리 뒤 열린 취소 요청(Requested·Accepted)을 먼저 종결한다. 대상 아이템이 Running이면 Pending 롤백 대신 Running→Skipped로 바꾸고 요청을 `canceled`로 닫는다. Running이 아니면 `too_late`로 닫는다. 그다음 남은 Running을 Pending으로 롤백한다.
 - daemon 부재 중 CLI가 만든 Skipped처럼 DB에 기록된 phase는 그대로 따른다.
 - 수집한 아이템은 즉시 Pending으로 DB에 기록된다.
 
@@ -310,9 +352,9 @@ flowchart TD
 
 `retry`만 on_fail을 실행하지 않는다. "조용한 재시도"로 외부 시스템에 노이즈를 주지 않는다.
 
-> `skip`과 `replan`은 hitl의 응답 경로 또는 hitl timeout 시 `terminal` 설정에 의해 적용된다. 독립적인 escalation level이 아니다. 상세는 [DataSource](./datasource.md)의 Escalation 정책 참조.
+> 레벨 값(`1`, `2`, `3`…)은 `retry`, `retry_with_comment`, `hitl`만 허용하고 `terminal`은 `skip`, `replan`만 허용한다. 그 밖의 값은 workspace 설정을 로드할 때 거부한다. 실패 횟수가 정의된 최고 레벨을 넘으면 최고 레벨의 값을 재사용한다. `skip`과 `replan`은 hitl의 응답 경로 또는 hitl timeout 시 `terminal` 설정으로 적용되며 독립적인 escalation level이 아니다. 상세는 [DataSource](./datasource.md)의 Escalation 정책 참조.
 
-failure_count는 시도 이력(append-only)에서 같은 아이템 계열의 실패 횟수로 계산한다. on_enter 실패도 handler 실패와 동일하게 포함된다.
+failure_count는 계열의 시도 이력(append-only)에서 마지막 리셋 지점 이후의 실패 수다. 리셋 지점은 HITL retry 확정과 replan 파생이며, 리셋 뒤 다음 실패는 escalation 1단계부터 다시 적용된다. 취소·conflict로 버려진 실행은 세지 않는다. on_enter 실패도 handler 실패와 동일하게 포함된다.
 
 > 과거 실패 이력이 있는 모든 실패에서 완전 일치·토큰 중복도·압축 유사도의 가중 합성 기준으로 유사도 분석을 수행한다. 패턴이 감지되면 내장 페르소나 중 하나가 선택되고, 그 페르소나의 고정 directive로 lateral_plan을 구성하여 retry 시 handler prompt에 주입한다. escalation 자체는 failure_count 기반 그대로이되, **패턴이 감지된 retry는 lateral plan으로 강화**된다. 상세: [Stagnation Detection](./stagnation.md)
 
@@ -355,7 +397,7 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 - [ ] 큐 아이템과 phase의 권위는 SQLite 하나이고, daemon의 사본과 다르면 DB를 따른다
 - [ ] 모든 phase 전이는 전이 계약을 거치고, 전이마다 전이 이력이 같은 트랜잭션으로 남는다
-- [ ] 전이 결과는 `applied | busy | conflict` 값이고 DB 에러로 끝나지 않는다
+- [ ] 전이 결과는 `applied | busy | conflict | invalid_action` 값이고 DB 에러로 끝나지 않는다
 - [ ] 동시 전이는 하나만 `applied`다
 - [ ] 허용되지 않은 전이 요청은 거절된다
 - [ ] Done, Skipped는 terminal — 이후 전이 불가
@@ -375,7 +417,15 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 - [ ] daemon 부재 시 CLI가 직접 Skipped로 바꾸고 남은 handler 프로세스를 정리하며, daemon 재시작 후에도 Skipped다
 - [ ] 무응답 판정 뒤 daemon이 늦게 결과를 내도 그 실행의 hook은 실행되지 않는다
 - [ ] handler가 먼저 끝난 경우 `too_late`이고 phase는 handler 결과를 따른다
-- [ ] 결과 값 `canceled | canceled_directly | too_late | busy`가 호출자에게 전달된다
+- [ ] daemon이 수락했으나 제한 시간 안에 종결되지 않으면 CLI는 직접 경로로 넘어가지 않고 `accepted`(exit 0)로 끝난다
+- [ ] 결과 값 `canceled | canceled_directly | accepted | too_late | busy`가 호출자에게 전달된다
+- [ ] 파생으로 끝난 Skipped는 `skipped` 이벤트를 내지 않고, 계열이 끝나는 Skipped는 낸다
+
+### 파생 아이템과 계열
+
+- [ ] 같은 `(source_id, state)`의 두 번째 이후 아이템은 파생이든 재수집이든 `{source_id}:{state}:{n}`이고 `n`은 2부터 단조 증가하며 재사용되지 않는다
+- [ ] 파생 아이템은 파생 원본을 기록하고, 재수집 아이템은 파생 원본이 없다
+- [ ] replan(상한 이내)은 원 아이템을 Skipped(파생됨)로 끝내고 원 worktree를 정리하며 새 worktree의 파생 아이템을 Pending으로 만든다
 
 ### Hitl 출구
 
@@ -387,6 +437,7 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 - [ ] 시작 시 non-terminal 아이템을 DB에서 복원한다
 - [ ] Running→Pending 롤백 전에 이전 daemon이 남긴 handler 프로세스를 종료하고 worktree는 보존한다
+- [ ] 열린 취소 요청은 롤백보다 먼저 종결된다. 대상이 Running이면 Skipped와 `canceled`, 아니면 `too_late`다
 
 ### 상태 전이 규칙
 
@@ -396,8 +447,12 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 ### Escalation 정책
 
-- [ ] failure_count=1일 때 `retry`가 적용되면 on_fail을 실행하지 않고 새 아이템으로 재시도한다
-- [ ] failure_count=2일 때 `retry_with_comment`가 적용되면 on_fail 실행 후 새 아이템으로 재시도한다
+- [ ] failure_count=1일 때 `retry`가 적용되면 on_fail을 실행하지 않고, 원 아이템은 Skipped(파생됨)가 되며 새 `work_id`의 파생 아이템으로 재시도한다
+- [ ] failure_count=2일 때 `retry_with_comment`가 적용되면 on_fail 실행 후 같은 방식으로 파생 아이템으로 재시도한다
+- [ ] escalation retry의 worktree는 정리되지 않고 파생 아이템에 인계된다
+- [ ] HITL retry 뒤 다음 실패는 escalation 1단계부터 다시 적용된다
+- [ ] replan 상한 3회는 계열 단위이고, 초과하면 Failed이며 worktree를 보존한다
+- [ ] 설정의 escalation 레벨 값이 허용 범위 밖이면 로드 시 거부된다. 실패 횟수가 최고 레벨을 넘으면 최고 레벨을 재사용한다
 - [ ] failure_count=3일 때 `hitl`이 적용되면 on_fail 실행 후 HITL 요청이 생성된다
 - [ ] on_enter 실패도 failure_count에 포함된다
 - [ ] 모든 실패에서 stagnation 분석이 실행되고, 패턴 감지 시 lateral_plan이 retry에 주입된다
@@ -412,10 +467,10 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 ### Worktree 생명주기
 
-- [ ] Running 진입 시 worktree가 생성된다 (retry 시 기존 worktree 재사용)
-- [ ] Done, Skipped 전이 시 worktree가 정리된다
+- [ ] Running 진입 시 worktree가 생성된다 (인계받은 worktree는 재사용)
+- [ ] worktree를 소유한 아이템이 Done 또는 Skipped가 될 때 정리된다. 파생으로 인계된 worktree는 정리되지 않는다
 - [ ] Hitl, Failed 전이 시 worktree가 보존된다
-- [ ] log-cleanup cron이 TTL(7일) 초과 보존 worktree를 정리한다
+- [ ] log-cleanup cron이 TTL(7일) 초과 보존 worktree만 정리하고 전이 이력 등 기록은 정리하지 않는다
 
 ---
 
