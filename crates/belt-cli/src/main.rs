@@ -364,6 +364,9 @@ enum QueueCommands {
         /// Output format.
         #[arg(long, default_value = "text")]
         format: String,
+        /// Output as JSON (same as `--format json`).
+        #[arg(long)]
+        json: bool,
     },
     /// Mark item as done (called by evaluate).
     Done {
@@ -385,17 +388,6 @@ enum QueueCommands {
     /// Skip an item.
     Skip {
         work_id: String,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Re-run on_done script for a Failed item.
-    RetryScript {
-        /// Queue item work_id.
-        work_id: String,
-        /// Script execution timeout in seconds.
-        #[arg(long)]
-        timeout: Option<u64>,
         /// Output as JSON.
         #[arg(long)]
         json: bool,
@@ -818,442 +810,504 @@ fn cmd_queue_list(
     Ok(())
 }
 
-/// `belt queue show` -- show a single queue item.
-fn cmd_queue_show(work_id: &str, format: &str) -> anyhow::Result<()> {
+/// `belt queue show` -- show a queue item with its transition history.
+fn cmd_queue_show(work_id: &str, format: &str, json: bool) -> anyhow::Result<()> {
     let db = open_db()?;
     let item = db.get_item(work_id)?;
+    let transitions = db.transitions_of(work_id)?;
+    let processing = processing_of_item(&db, &item)?;
 
-    match format {
-        "json" => {
-            println!("{}", serde_json::to_string_pretty(&item)?);
-        }
-        _ => {
-            println!("Work ID:      {}", item.work_id);
-            println!("Source ID:    {}", item.source_id);
-            println!("Workspace:    {}", item.workspace_id);
-            println!("State:        {}", item.state);
-            println!("Phase:        {}", item.phase());
-            if let Some(title) = &item.title {
-                println!("Title:        {title}");
-            }
-            println!("Created:      {}", item.created_at);
-            println!("Updated:      {}", item.updated_at);
-        }
-    }
-
-    Ok(())
-}
-
-/// `belt queue done` -- mark a queue item as Done, running on_done scripts if configured.
-async fn cmd_queue_done(work_id: &str, json: bool) -> anyhow::Result<()> {
-    let db = open_db()?;
-    let item = db.get_item(work_id)?;
-
-    // Load workspace config to find on_done scripts for this item's state.
-    let (_, config_path, _) = db.get_workspace(&item.workspace_id)?;
-    let config =
-        belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))?;
-
-    // Find the state config containing on_done scripts.
-    let state_config = config
-        .sources
-        .values()
-        .find_map(|source| source.states.get(&item.state));
-
-    let on_done_actions: Vec<belt_core::action::Action> = state_config
-        .map(|sc| {
-            sc.on_done
-                .iter()
-                .map(belt_core::action::Action::from)
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Set up worktree manager for cleanup after transition.
-    let belt_home = belt_home()?;
-    let worktree_base = belt_home.join("worktrees");
-    let repo_path = std::path::PathBuf::from(".");
-    let worktree_mgr = GitWorktreeManager::new(worktree_base, repo_path);
-
-    if on_done_actions.is_empty() {
-        db.update_phase(work_id, QueuePhase::Done)?;
-        // Cleanup worktree (matches daemon pattern: warn on failure, don't abort).
-        if let Err(e) = worktree_mgr.cleanup(work_id) {
-            tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue done, continuing");
-        }
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "success": true,
-                    "work_id": work_id,
-                    "phase": "done",
-                    "scripts_run": false
-                }))?
-            );
-        } else {
-            println!("Marked {work_id} as done.");
-        }
+    if json || format == "json" {
+        let mut value = serde_json::to_value(&item)?;
+        merge_json(
+            &mut value,
+            serde_json::json!({
+                "processing": processing.map(processing_name),
+                "transitions": transitions.iter().map(|t| serde_json::json!({
+                    "seq": t.seq,
+                    "kind": t.kind,
+                    "from_phase": t.from_phase,
+                    "to_phase": t.to_phase,
+                    "actor": t.actor,
+                    "reason": t.reason,
+                    "detail": t.detail,
+                    "created_at": t.created_at,
+                })).collect::<Vec<_>>(),
+            }),
+        );
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
 
-    // Set up execution environment.
-    let worktree_path = worktree_mgr.create_or_reuse(work_id)?;
-    let env = belt_daemon::executor::ActionEnv::new(work_id, &worktree_path);
-
-    // Build a minimal runtime registry for script execution.
-    let mut registry = belt_core::runtime::RuntimeRegistry::new("claude".to_string());
-    registry.register(std::sync::Arc::new(
-        belt_infra::runtimes::claude::ClaudeRuntime::new(None),
-    ));
-    registry.register(std::sync::Arc::new(
-        belt_infra::runtimes::gemini::GeminiRuntime::new(None),
-    ));
-    registry.register(std::sync::Arc::new(
-        belt_infra::runtimes::codex::CodexRuntime::new(None),
-    ));
-    let executor = belt_daemon::executor::ActionExecutor::new(std::sync::Arc::new(registry));
-
-    if !json {
-        println!("Running on_done scripts for '{work_id}'...");
+    println!("Work ID:      {}", item.work_id);
+    println!("Source ID:    {}", item.source_id);
+    println!("Workspace:    {}", item.workspace_id);
+    println!("State:        {}", item.state);
+    println!("Phase:        {}", item.phase());
+    if let Some(p) = processing {
+        println!("Processing:   {}", processing_name(p));
     }
-
-    let result = executor.execute_all(&on_done_actions, &env).await?;
-
-    match result {
-        Some(r) if r.success() => {
-            db.update_phase(work_id, QueuePhase::Done)?;
-            // Cleanup worktree (matches daemon pattern: warn on failure, don't abort).
-            if let Err(e) = worktree_mgr.cleanup(work_id) {
-                tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue done, continuing");
-            }
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": true,
-                        "work_id": work_id,
-                        "phase": "done",
-                        "scripts_run": true
-                    }))?
-                );
-            } else {
-                println!("on_done scripts succeeded. Marked '{work_id}' as done.");
-            }
-        }
-        Some(r) => {
-            db.update_phase(work_id, QueuePhase::Failed)?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": false,
-                        "work_id": work_id,
-                        "phase": "failed",
-                        "scripts_run": true,
-                        "exit_code": r.exit_code
-                    }))?
-                );
-            } else {
-                println!(
-                    "on_done scripts failed (exit code {}). Item '{work_id}' transitioned to failed.",
-                    r.exit_code
-                );
-            }
-        }
-        None => {
-            db.update_phase(work_id, QueuePhase::Done)?;
-            // Cleanup worktree (matches daemon pattern: warn on failure, don't abort).
-            if let Err(e) = worktree_mgr.cleanup(work_id) {
-                tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue done, continuing");
-            }
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": true,
-                        "work_id": work_id,
-                        "phase": "done",
-                        "scripts_run": false
-                    }))?
-                );
-            } else {
-                println!("Marked '{work_id}' as done.");
-            }
-        }
+    if let Some(title) = &item.title {
+        println!("Title:        {title}");
     }
-
-    Ok(())
-}
-
-/// `belt queue hitl` -- mark a queue item as HITL.
-fn cmd_queue_hitl(work_id: &str, reason: Option<&str>, json: bool) -> anyhow::Result<()> {
-    let db = open_db()?;
-    db.update_phase(work_id, QueuePhase::Hitl)?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "success": true,
-                "work_id": work_id,
-                "phase": "hitl",
-                "reason": reason
-            }))?
+    if let Some(origin) = &item.derived_from {
+        println!("Derived from: {origin}");
+    }
+    println!("Lineage root: {}", item.lineage_root);
+    println!("Created:      {}", item.created_at);
+    println!("Updated:      {}", item.updated_at);
+    println!("History:");
+    for t in &transitions {
+        let phases = match (&t.from_phase, &t.to_phase) {
+            (Some(from), Some(to)) => format!("{from} -> {to}"),
+            (None, Some(to)) => format!("-> {to}"),
+            (Some(from), None) => format!("{from} ->"),
+            (None, None) => String::new(),
+        };
+        let mut line = format!(
+            "  #{} {} {} {phases} [{}]",
+            t.seq, t.created_at, t.kind, t.actor
         );
-    } else if let Some(r) = reason {
-        println!("Marked {work_id} as HITL (reason: {r}).");
-    } else {
-        println!("Marked {work_id} as HITL.");
-    }
-    Ok(())
-}
-
-/// `belt queue skip` -- mark a queue item as Skipped.
-fn cmd_queue_skip(work_id: &str, json: bool) -> anyhow::Result<()> {
-    let db = open_db()?;
-    db.update_phase(work_id, QueuePhase::Skipped)?;
-
-    // Cleanup worktree (matches daemon pattern: warn on failure, don't abort).
-    let belt_home = belt_home()?;
-    let worktree_base = belt_home.join("worktrees");
-    let repo_path = std::path::PathBuf::from(".");
-    let worktree_mgr = GitWorktreeManager::new(worktree_base, repo_path);
-    if let Err(e) = worktree_mgr.cleanup(work_id) {
-        tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue skip, continuing");
-    }
-
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "success": true,
-                "work_id": work_id,
-                "phase": "skipped"
-            }))?
-        );
-    } else {
-        println!("Skipped {work_id}.");
-    }
-    Ok(())
-}
-
-/// `belt queue retry-script` -- re-run on_done script for a Failed item.
-async fn cmd_queue_retry_script(
-    work_id: &str,
-    timeout: Option<u64>,
-    json: bool,
-) -> anyhow::Result<()> {
-    let db = open_db()?;
-    let item = db.get_item(work_id)?;
-
-    if item.phase() != QueuePhase::Failed {
-        anyhow::bail!(
-            "item '{}' is in phase '{}', not 'failed'",
-            work_id,
-            item.phase()
-        );
-    }
-
-    // Load workspace config to find on_done scripts for this item's state.
-    let (_, config_path, _) = db.get_workspace(&item.workspace_id)?;
-    let config =
-        belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))?;
-
-    // Find the state config containing on_done scripts.
-    let state_config = config
-        .sources
-        .values()
-        .find_map(|source| source.states.get(&item.state))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no state config found for state '{}' in workspace '{}'",
-                item.state,
-                item.workspace_id
-            )
-        })?;
-
-    if state_config.on_done.is_empty() {
-        db.update_phase(work_id, QueuePhase::Done)?;
-        record_script_retry_event(&db, work_id, &item.source_id, QueuePhase::Done, None);
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "success": true,
-                    "work_id": work_id,
-                    "phase": "done",
-                    "scripts_run": false
-                }))?
-            );
-        } else {
-            println!(
-                "No on_done scripts configured for state '{}'. Transitioning to done.",
-                item.state
-            );
-            println!("Item '{work_id}' transitioned from failed to done.");
+        if let Some(reason) = &t.reason {
+            line.push_str(&format!(" reason={reason}"));
         }
-        return Ok(());
-    }
-
-    let on_done: Vec<belt_core::action::Action> = state_config
-        .on_done
-        .iter()
-        .map(belt_core::action::Action::from)
-        .collect();
-
-    // Set up execution environment.
-    let belt_home = belt_home()?;
-    let worktree_base = belt_home.join("worktrees");
-    let repo_path = std::path::PathBuf::from(".");
-    let worktree_mgr = belt_infra::worktree::GitWorktreeManager::new(worktree_base, repo_path);
-
-    let worktree_path = worktree_mgr.create_or_reuse(work_id)?;
-    let env = belt_daemon::executor::ActionEnv::new(work_id, &worktree_path);
-
-    // Build a minimal runtime registry for script execution.
-    let mut registry = belt_core::runtime::RuntimeRegistry::new("claude".to_string());
-    registry.register(std::sync::Arc::new(
-        belt_infra::runtimes::claude::ClaudeRuntime::new(None),
-    ));
-    registry.register(std::sync::Arc::new(
-        belt_infra::runtimes::gemini::GeminiRuntime::new(None),
-    ));
-    registry.register(std::sync::Arc::new(
-        belt_infra::runtimes::codex::CodexRuntime::new(None),
-    ));
-    let executor = belt_daemon::executor::ActionExecutor::new(std::sync::Arc::new(registry));
-
-    if !json {
-        println!("Re-running on_done scripts for '{work_id}'...");
-    }
-
-    let result = if let Some(secs) = timeout {
-        let duration = std::time::Duration::from_secs(secs);
-        match tokio::time::timeout(duration, executor.execute_all(&on_done, &env)).await {
-            Ok(r) => r?,
-            Err(_) => {
-                record_script_retry_event(
-                    &db,
-                    work_id,
-                    &item.source_id,
-                    QueuePhase::Failed,
-                    Some(format!("timeout after {secs}s")),
-                );
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "success": false,
-                            "work_id": work_id,
-                            "phase": "failed",
-                            "error": format!("timeout after {secs}s")
-                        }))?
-                    );
-                } else {
-                    println!("Script execution timed out after {secs}s. Item remains failed.");
-                }
-                return Ok(());
-            }
+        if let Some(detail) = &t.detail {
+            line.push_str(&format!(" detail={detail}"));
         }
-    } else {
-        executor.execute_all(&on_done, &env).await?
-    };
-
-    match result {
-        Some(r) if r.success() => {
-            db.update_phase(work_id, QueuePhase::Done)?;
-            record_script_retry_event(&db, work_id, &item.source_id, QueuePhase::Done, None);
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": true,
-                        "work_id": work_id,
-                        "phase": "done",
-                        "scripts_run": true
-                    }))?
-                );
-            } else {
-                println!(
-                    "on_done scripts succeeded. Item '{work_id}' transitioned from failed to done."
-                );
-            }
-        }
-        Some(r) => {
-            record_script_retry_event(
-                &db,
-                work_id,
-                &item.source_id,
-                QueuePhase::Failed,
-                Some(format!("exit code {}", r.exit_code)),
-            );
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": false,
-                        "work_id": work_id,
-                        "phase": "failed",
-                        "scripts_run": true,
-                        "exit_code": r.exit_code
-                    }))?
-                );
-            } else {
-                println!(
-                    "on_done scripts failed (exit code {}). Item '{work_id}' remains in failed phase.",
-                    r.exit_code
-                );
-            }
-        }
-        None => {
-            // No scripts produced a result (shouldn't happen since we checked on_done is non-empty).
-            db.update_phase(work_id, QueuePhase::Done)?;
-            record_script_retry_event(&db, work_id, &item.source_id, QueuePhase::Done, None);
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": true,
-                        "work_id": work_id,
-                        "phase": "done",
-                        "scripts_run": false
-                    }))?
-                );
-            } else {
-                println!("Item '{work_id}' transitioned from failed to done.");
-            }
-        }
+        println!("{line}");
     }
 
     Ok(())
 }
 
-/// Record a `script_retry` transition event for retry-script operations.
-fn record_script_retry_event(
+/// Exit code of a command whose request was refused by the contract.
+const EXIT_REFUSED: i32 = 1;
+
+fn exit_if_refused(code: i32) {
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+fn processing_name(processing: belt_core::transition::Processing) -> &'static str {
+    match processing {
+        belt_core::transition::Processing::Handler => "handler",
+        belt_core::transition::Processing::PostProcessing => "post_processing",
+    }
+}
+
+/// Whether the daemon owns the item right now: a handler is running, or a
+/// confirmed HITL request awaits post-processing.
+fn processing_of_item(
     db: &Database,
-    work_id: &str,
-    source_id: &str,
-    to_phase: QueuePhase,
-    detail: Option<String>,
-) {
-    let now = chrono::Utc::now();
-    let event = belt_infra::db::TransitionEvent {
-        id: format!("te-{}-{}", work_id, now.timestamp_millis()),
-        work_id: work_id.to_string(),
-        source_id: source_id.to_string(),
-        event_type: "script_retry".to_string(),
-        phase: Some(to_phase.as_str().to_string()),
-        from_phase: Some(QueuePhase::Failed.as_str().to_string()),
-        detail,
-        created_at: now.to_rfc3339(),
-    };
-    if let Err(e) = db.insert_transition_event(&event) {
-        tracing::warn!(
-            work_id = %work_id,
-            error = %e,
-            "failed to record script_retry transition event"
-        );
+    item: &belt_core::queue::QueueItem,
+) -> anyhow::Result<Option<belt_core::transition::Processing>> {
+    use belt_core::transition::Processing;
+    Ok(match item.phase() {
+        QueuePhase::Running => Some(Processing::Handler),
+        QueuePhase::Hitl => db
+            .pending_post_processing()?
+            .iter()
+            .any(|r| r.work_id == item.work_id)
+            .then_some(Processing::PostProcessing),
+        QueuePhase::Pending
+        | QueuePhase::Ready
+        | QueuePhase::Completed
+        | QueuePhase::Done
+        | QueuePhase::Failed
+        | QueuePhase::Skipped => None,
+    })
+}
+
+fn merge_json(base: &mut serde_json::Value, extra: serde_json::Value) {
+    if let (Some(base), serde_json::Value::Object(extra)) = (base.as_object_mut(), extra) {
+        base.extend(extra);
     }
+}
+
+/// A request refused as a value; rendered as `{"success":false,"reason":...}`
+/// with a non-zero exit code.
+struct Refusal {
+    reason: &'static str,
+    fields: serde_json::Value,
+    text: String,
+}
+
+impl Refusal {
+    fn new(reason: &'static str, fields: serde_json::Value, text: impl Into<String>) -> Self {
+        Self {
+            reason,
+            fields,
+            text: text.into(),
+        }
+    }
+
+    fn not_found() -> Self {
+        Self::new(
+            "not_found",
+            serde_json::json!({}),
+            "no such item or HITL request",
+        )
+    }
+
+    fn from_transition(outcome: belt_core::transition::TransitionOutcome) -> Self {
+        use belt_core::transition::TransitionOutcome;
+        match outcome {
+            TransitionOutcome::Busy { processing } => Self::new(
+                "busy",
+                serde_json::json!({ "processing": processing_name(processing) }),
+                format!(
+                    "busy: the item is being processed ({})",
+                    processing_name(processing)
+                ),
+            ),
+            TransitionOutcome::Conflict { current } => Self::new(
+                "conflict",
+                serde_json::json!({ "current": current.as_str() }),
+                format!("conflict: another path already moved the item (now {current})"),
+            ),
+            TransitionOutcome::InvalidAction { current } => Self::new(
+                "invalid_action",
+                serde_json::json!({ "current": current.as_str() }),
+                format!("invalid_action: not allowed while the item is {current}"),
+            ),
+            TransitionOutcome::Applied { .. } => {
+                unreachable!("an applied transition is not a refusal")
+            }
+        }
+    }
+}
+
+fn emit_refusal(work_id: &str, json: bool, refusal: Refusal) -> anyhow::Result<i32> {
+    if json {
+        let mut value = serde_json::json!({
+            "success": false,
+            "reason": refusal.reason,
+            "work_id": work_id,
+        });
+        merge_json(&mut value, refusal.fields);
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        eprintln!("{work_id}: {}", refusal.text);
+    }
+    Ok(EXIT_REFUSED)
+}
+
+fn emit_success(
+    work_id: &str,
+    json: bool,
+    result: &str,
+    fields: serde_json::Value,
+    text: String,
+) -> anyhow::Result<i32> {
+    if json {
+        let mut value = serde_json::json!({
+            "success": true,
+            "result": result,
+            "work_id": work_id,
+        });
+        merge_json(&mut value, fields);
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("{text}");
+    }
+    Ok(0)
+}
+
+/// The item, or `None` when `work_id` is unknown.
+fn find_item(db: &Database, work_id: &str) -> anyhow::Result<Option<belt_core::queue::QueueItem>> {
+    match db.get_item(work_id) {
+        Ok(item) => Ok(Some(item)),
+        Err(belt_core::error::BeltError::ItemNotFound(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// What happened to a manual request to move an item to a target phase.
+enum ManualOutcome {
+    Applied,
+    /// The request left Hitl, so it joined the HITL response race instead.
+    HitlResponse {
+        action: belt_core::hitl::HitlAction,
+        outcome: belt_core::hitl::RespondOutcome,
+    },
+    Refused(belt_core::transition::TransitionOutcome),
+}
+
+/// Request `item -> to` as the CLI.
+///
+/// A request that leaves Hitl is a HITL response when `hitl_response_for`
+/// maps its target, so it is decided there before `transition` is asked:
+/// `transition` reports `InvalidAction { Hitl }` for unmapped requests too.
+/// An item whose request is already confirmed is processing, so it goes to
+/// `transition` and is refused as `busy`.
+fn request_manual_transition(
+    db: &Database,
+    item: &belt_core::queue::QueueItem,
+    to: QueuePhase,
+    detail: Option<String>,
+) -> anyhow::Result<ManualOutcome> {
+    use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
+
+    if item.phase() == QueuePhase::Hitl
+        && let Some(action) = belt_core::transition::hitl_response_for(to)
+        && processing_of_item(db, item)?.is_none()
+    {
+        let resolution = belt_core::hitl::HitlResolution {
+            action,
+            by: std::env::var("USER").unwrap_or_else(|_| "cli".to_string()),
+            via: "cli".to_string(),
+            at: chrono::Utc::now().to_rfc3339(),
+            path: belt_core::hitl::ConfirmPath::Direct,
+        };
+        let outcome = db.resolve_hitl(
+            &belt_infra::db::HitlTarget::Item(item.work_id.clone()),
+            &resolution,
+            None,
+        )?;
+        return Ok(ManualOutcome::HitlResponse { action, outcome });
+    }
+
+    let outcome = db.transition(&TransitionRequest {
+        work_id: item.work_id.clone(),
+        expected_from: item.phase(),
+        to,
+        actor: Actor::Cli,
+        reason: TransitionReason::Manual,
+        detail,
+    })?;
+    Ok(match outcome {
+        TransitionOutcome::Applied { .. } => ManualOutcome::Applied,
+        refused => ManualOutcome::Refused(refused),
+    })
+}
+
+/// Render a [`ManualOutcome`]; `applied_fields` extends the applied JSON.
+fn emit_manual_outcome(
+    work_id: &str,
+    json: bool,
+    to: QueuePhase,
+    outcome: ManualOutcome,
+    applied_fields: serde_json::Value,
+    applied_text: String,
+) -> anyhow::Result<i32> {
+    use belt_core::hitl::RespondOutcome;
+
+    match outcome {
+        ManualOutcome::Applied => {
+            let mut fields = serde_json::json!({ "phase": to.as_str() });
+            merge_json(&mut fields, applied_fields);
+            emit_success(work_id, json, "applied", fields, applied_text)
+        }
+        ManualOutcome::Refused(refused) => {
+            emit_refusal(work_id, json, Refusal::from_transition(refused))
+        }
+        ManualOutcome::HitlResponse { action, outcome } => match outcome {
+            RespondOutcome::Won { hitl_id } => emit_success(
+                work_id,
+                json,
+                "hitl_response",
+                serde_json::json!({ "action": action.to_string(), "hitl_id": hitl_id.as_str() }),
+                format!("Recorded HITL response '{action}' for {work_id}; the daemon applies it."),
+            ),
+            RespondOutcome::AlreadyHandled(r) => emit_refusal(
+                work_id,
+                json,
+                Refusal::new(
+                    "already_handled",
+                    serde_json::json!({
+                        "by": r.by,
+                        "via": r.via,
+                        "action": r.action.to_string(),
+                        "at": r.at,
+                    }),
+                    format!(
+                        "already_handled: '{}' was chosen by {} via {} at {}",
+                        r.action, r.by, r.via, r.at
+                    ),
+                ),
+            ),
+            RespondOutcome::NotFound => emit_refusal(work_id, json, Refusal::not_found()),
+            RespondOutcome::InvalidAction => emit_refusal(
+                work_id,
+                json,
+                Refusal::new(
+                    "invalid_action",
+                    serde_json::json!({}),
+                    "invalid_action: the HITL request does not accept this response",
+                ),
+            ),
+            RespondOutcome::Unauthorized => emit_refusal(
+                work_id,
+                json,
+                Refusal::new("unauthorized", serde_json::json!({}), "unauthorized"),
+            ),
+        },
+    }
+}
+
+fn worktree_manager() -> anyhow::Result<GitWorktreeManager> {
+    let worktree_base = belt_home()?.join("worktrees");
+    Ok(GitWorktreeManager::new(
+        worktree_base,
+        std::path::PathBuf::from("."),
+    ))
+}
+
+/// Cleanup after a terminal transition (matches daemon pattern: warn on failure, don't abort).
+fn cleanup_worktree(mgr: &GitWorktreeManager, work_id: &str, command: &str) {
+    if let Err(e) = mgr.cleanup(work_id) {
+        tracing::warn!(work_id, error = %e, "worktree cleanup failed on {command}, continuing");
+    }
+}
+
+/// `belt queue done` -- finish a Completed item, running its on_done scripts first.
+///
+/// A Completed item whose scripts fail goes to Failed. Any other phase is
+/// decided by the transition contract without running scripts.
+async fn cmd_queue_done(work_id: &str, json: bool) -> anyhow::Result<i32> {
+    let db = open_db()?;
+    let Some(item) = find_item(&db, work_id)? else {
+        return emit_refusal(work_id, json, Refusal::not_found());
+    };
+    let worktree_mgr = worktree_manager()?;
+
+    let mut target = QueuePhase::Done;
+    let mut detail = None;
+    let mut scripts_run = false;
+    let mut script_exit = None;
+
+    if item.phase() == QueuePhase::Completed {
+        let (_, config_path, _) = db.get_workspace(&item.workspace_id)?;
+        let config = belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(
+            &config_path,
+        ))?;
+        let on_done_actions: Vec<belt_core::action::Action> = config
+            .sources
+            .values()
+            .find_map(|source| source.states.get(&item.state))
+            .map(|sc| {
+                sc.on_done
+                    .iter()
+                    .map(belt_core::action::Action::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !on_done_actions.is_empty() {
+            let worktree_path = worktree_mgr.create_or_reuse(work_id)?;
+            let env = belt_daemon::executor::ActionEnv::new(work_id, &worktree_path);
+
+            // Build a minimal runtime registry for script execution.
+            let mut registry = belt_core::runtime::RuntimeRegistry::new("claude".to_string());
+            registry.register(std::sync::Arc::new(
+                belt_infra::runtimes::claude::ClaudeRuntime::new(None),
+            ));
+            registry.register(std::sync::Arc::new(
+                belt_infra::runtimes::gemini::GeminiRuntime::new(None),
+            ));
+            registry.register(std::sync::Arc::new(
+                belt_infra::runtimes::codex::CodexRuntime::new(None),
+            ));
+            let executor =
+                belt_daemon::executor::ActionExecutor::new(std::sync::Arc::new(registry));
+
+            if !json {
+                println!("Running on_done scripts for '{work_id}'...");
+            }
+            scripts_run = true;
+            if let Some(r) = executor.execute_all(&on_done_actions, &env).await?
+                && !r.success()
+            {
+                target = QueuePhase::Failed;
+                detail = Some(format!("on_done failed with exit code {}", r.exit_code));
+                script_exit = Some(r.exit_code);
+            }
+        }
+    }
+
+    let outcome = request_manual_transition(&db, &item, target, detail)?;
+    if matches!(outcome, ManualOutcome::Applied) && target == QueuePhase::Done {
+        cleanup_worktree(&worktree_mgr, work_id, "queue done");
+    }
+    let mut fields = serde_json::json!({ "scripts_run": scripts_run });
+    if let Some(code) = script_exit {
+        merge_json(&mut fields, serde_json::json!({ "exit_code": code }));
+    }
+    let text = match script_exit {
+        Some(code) => {
+            format!(
+                "on_done scripts failed (exit code {code}). Item '{work_id}' transitioned to failed."
+            )
+        }
+        None => format!("Marked '{work_id}' as done."),
+    };
+    emit_manual_outcome(work_id, json, target, outcome, fields, text)
+}
+
+/// `belt queue hitl` -- move a Completed item to Hitl and open a HITL request.
+fn cmd_queue_hitl(work_id: &str, reason: Option<&str>, json: bool) -> anyhow::Result<i32> {
+    use belt_core::transition::{Actor, TransitionReason};
+    use belt_infra::db::{OpenHitlOutcome, OpenHitlRequest};
+
+    let db = open_db()?;
+    let Some(item) = find_item(&db, work_id)? else {
+        return emit_refusal(work_id, json, Refusal::not_found());
+    };
+    let opened = db.open_hitl(&OpenHitlRequest {
+        work_id: work_id.to_string(),
+        expected_from: item.phase(),
+        reason: belt_core::queue::HitlReason::ManualEscalation,
+        notes: reason.map(str::to_string),
+        actor: Actor::Cli,
+        transition_reason: TransitionReason::Manual,
+        timeout_at: None,
+        terminal_action: None,
+    })?;
+    match opened {
+        OpenHitlOutcome::Opened { hitl_id, .. } => {
+            let text = match reason {
+                Some(r) => format!("Marked {work_id} as HITL (reason: {r})."),
+                None => format!("Marked {work_id} as HITL."),
+            };
+            emit_success(
+                work_id,
+                json,
+                "applied",
+                serde_json::json!({
+                    "phase": "hitl",
+                    "hitl_id": hitl_id.as_str(),
+                    "notes": reason,
+                }),
+                text,
+            )
+        }
+        OpenHitlOutcome::Rejected(refused) => {
+            emit_refusal(work_id, json, Refusal::from_transition(refused))
+        }
+    }
+}
+
+/// `belt queue skip` -- skip an item through the transition contract.
+///
+/// A Running item is refused as `busy` until execution cancel exists.
+fn cmd_queue_skip(work_id: &str, json: bool) -> anyhow::Result<i32> {
+    let db = open_db()?;
+    let Some(item) = find_item(&db, work_id)? else {
+        return emit_refusal(work_id, json, Refusal::not_found());
+    };
+    let outcome = request_manual_transition(&db, &item, QueuePhase::Skipped, None)?;
+    if matches!(outcome, ManualOutcome::Applied) {
+        cleanup_worktree(&worktree_manager()?, work_id, "queue skip");
+    }
+    emit_manual_outcome(
+        work_id,
+        json,
+        QueuePhase::Skipped,
+        outcome,
+        serde_json::json!({}),
+        format!("Skipped {work_id}."),
+    )
 }
 
 /// `belt queue dependency add` -- add a dependency between queue items.
@@ -2105,6 +2159,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive("belt=info".parse()?),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -2411,28 +2466,25 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 cmd_queue_list(phase, workspace, &format)?;
             }
-            QueueCommands::Show { work_id, format } => {
-                cmd_queue_show(&work_id, &format)?;
+            QueueCommands::Show {
+                work_id,
+                format,
+                json,
+            } => {
+                cmd_queue_show(&work_id, &format, json)?;
             }
             QueueCommands::Done { work_id, json } => {
-                cmd_queue_done(&work_id, json).await?;
+                exit_if_refused(cmd_queue_done(&work_id, json).await?);
             }
             QueueCommands::Hitl {
                 work_id,
                 reason,
                 json,
             } => {
-                cmd_queue_hitl(&work_id, reason.as_deref(), json)?;
+                exit_if_refused(cmd_queue_hitl(&work_id, reason.as_deref(), json)?);
             }
             QueueCommands::Skip { work_id, json } => {
-                cmd_queue_skip(&work_id, json)?;
-            }
-            QueueCommands::RetryScript {
-                work_id,
-                timeout,
-                json,
-            } => {
-                cmd_queue_retry_script(&work_id, timeout, json).await?;
+                exit_if_refused(cmd_queue_skip(&work_id, json)?);
             }
             QueueCommands::Dependency(dep_cmd) => match dep_cmd {
                 DependencyCommands::Add {
@@ -3396,259 +3448,6 @@ sources:
         assert_eq!(final_item.phase(), QueuePhase::Skipped);
     }
 
-    // ---- cmd_queue_retry_script tests ----
-
-    /// retry_script: Failed item with on_done script that succeeds -> Done.
-    #[tokio::test]
-    async fn queue_retry_script_success_transitions_failed_to_done() {
-        let yaml = r#"
-name: test-ws
-sources:
-  github:
-    url: "https://github.com/test/repo"
-    escalation:
-      1: retry
-      2: retry_with_comment
-      3: hitl
-      terminal: skip
-    scan_interval_secs: 300
-    states:
-      implement:
-        trigger: {}
-        prompt: "implement"
-        on_done:
-          - script: "true"
-"#;
-        let (db, ws_id, _tmp) = setup_workspace_with_config(yaml);
-        let item = make_item("retry-ok-1", &ws_id, "implement", QueuePhase::Failed);
-        db.insert_item(&item).unwrap();
-
-        // Replicate cmd_queue_retry_script logic.
-        let stored = db.get_item("retry-ok-1").unwrap();
-        assert_eq!(stored.phase(), QueuePhase::Failed);
-
-        let (_, config_path, _) = db.get_workspace(&stored.workspace_id).unwrap();
-        let config =
-            belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))
-                .unwrap();
-
-        let state_config = config
-            .sources
-            .values()
-            .find_map(|s| s.states.get(&stored.state))
-            .unwrap();
-
-        let on_done: Vec<belt_core::action::Action> = state_config
-            .on_done
-            .iter()
-            .map(belt_core::action::Action::from)
-            .collect();
-        assert!(!on_done.is_empty());
-
-        let worktree_dir = tempfile::tempdir().unwrap();
-        let env = belt_daemon::executor::ActionEnv::new("retry-ok-1", worktree_dir.path());
-        let executor = build_executor();
-
-        let result = executor.execute_all(&on_done, &env).await.unwrap();
-        match result {
-            Some(r) if r.success() => {
-                db.update_phase("retry-ok-1", QueuePhase::Done).unwrap();
-            }
-            _ => panic!("expected on_done success for retry"),
-        }
-
-        let final_item = db.get_item("retry-ok-1").unwrap();
-        assert_eq!(final_item.phase(), QueuePhase::Done);
-
-        // Verify script_retry transition event was recorded.
-        record_script_retry_event(&db, "retry-ok-1", &item.source_id, QueuePhase::Done, None);
-        let events = db.list_transition_events("retry-ok-1").unwrap();
-        let retry_events: Vec<_> = events
-            .iter()
-            .filter(|e| e.event_type == "script_retry")
-            .collect();
-        assert!(
-            !retry_events.is_empty(),
-            "expected script_retry transition event"
-        );
-        assert_eq!(retry_events.last().unwrap().phase.as_deref(), Some("done"));
-    }
-
-    /// retry_script: Failed item with on_done script that fails -> remains Failed.
-    #[tokio::test]
-    async fn queue_retry_script_failure_remains_failed() {
-        let yaml = r#"
-name: test-ws
-sources:
-  github:
-    url: "https://github.com/test/repo"
-    escalation:
-      1: retry
-      2: retry_with_comment
-      3: hitl
-      terminal: skip
-    scan_interval_secs: 300
-    states:
-      implement:
-        trigger: {}
-        prompt: "implement"
-        on_done:
-          - script: "false"
-"#;
-        let (db, ws_id, _tmp) = setup_workspace_with_config(yaml);
-        let item = make_item("retry-fail-1", &ws_id, "implement", QueuePhase::Failed);
-        db.insert_item(&item).unwrap();
-
-        let stored = db.get_item("retry-fail-1").unwrap();
-        assert_eq!(stored.phase(), QueuePhase::Failed);
-
-        let (_, config_path, _) = db.get_workspace(&stored.workspace_id).unwrap();
-        let config =
-            belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))
-                .unwrap();
-
-        let state_config = config
-            .sources
-            .values()
-            .find_map(|s| s.states.get(&stored.state))
-            .unwrap();
-
-        let on_done: Vec<belt_core::action::Action> = state_config
-            .on_done
-            .iter()
-            .map(belt_core::action::Action::from)
-            .collect();
-
-        let worktree_dir = tempfile::tempdir().unwrap();
-        let env = belt_daemon::executor::ActionEnv::new("retry-fail-1", worktree_dir.path());
-        let executor = build_executor();
-
-        let result = executor.execute_all(&on_done, &env).await.unwrap();
-        match result {
-            Some(r) if r.success() => {
-                panic!("expected failure but script succeeded");
-            }
-            Some(_) => {
-                // Item remains Failed — no phase update (matches cmd_queue_retry_script behavior).
-            }
-            None => {
-                panic!("expected a result");
-            }
-        }
-
-        let final_item = db.get_item("retry-fail-1").unwrap();
-        assert_eq!(final_item.phase(), QueuePhase::Failed);
-
-        // Verify script_retry transition event was recorded for the failure case.
-        record_script_retry_event(
-            &db,
-            "retry-fail-1",
-            &item.source_id,
-            QueuePhase::Failed,
-            Some("exit code 1".to_string()),
-        );
-        let events = db.list_transition_events("retry-fail-1").unwrap();
-        let retry_events: Vec<_> = events
-            .iter()
-            .filter(|e| e.event_type == "script_retry")
-            .collect();
-        assert!(
-            !retry_events.is_empty(),
-            "expected script_retry transition event on failure"
-        );
-        assert_eq!(
-            retry_events.last().unwrap().phase.as_deref(),
-            Some("failed")
-        );
-        assert!(
-            retry_events
-                .last()
-                .unwrap()
-                .detail
-                .as_ref()
-                .unwrap()
-                .contains("exit code"),
-            "expected exit code detail"
-        );
-    }
-
-    /// retry_script: non-Failed item is rejected.
-    #[test]
-    fn queue_retry_script_rejects_non_failed_item() {
-        let db = belt_infra::db::Database::open_in_memory().unwrap();
-        db.add_workspace("test-ws", "/dev/null").unwrap();
-        let item = make_item(
-            "retry-reject-1",
-            "test-ws",
-            "implement",
-            QueuePhase::Running,
-        );
-        db.insert_item(&item).unwrap();
-
-        let stored = db.get_item("retry-reject-1").unwrap();
-        // cmd_queue_retry_script checks: if item.phase() != QueuePhase::Failed { bail! }
-        assert_ne!(stored.phase(), QueuePhase::Failed);
-    }
-
-    /// retry_script: timeout causes early return, item remains Failed.
-    #[tokio::test]
-    async fn queue_retry_script_timeout_remains_failed() {
-        let yaml = r#"
-name: test-ws
-sources:
-  github:
-    url: "https://github.com/test/repo"
-    escalation:
-      1: retry
-      2: retry_with_comment
-      3: hitl
-      terminal: skip
-    scan_interval_secs: 300
-    states:
-      implement:
-        trigger: {}
-        prompt: "implement"
-        on_done:
-          - script: "sleep 10"
-"#;
-        let (db, ws_id, _tmp) = setup_workspace_with_config(yaml);
-        let item = make_item("retry-timeout-1", &ws_id, "implement", QueuePhase::Failed);
-        db.insert_item(&item).unwrap();
-
-        let stored = db.get_item("retry-timeout-1").unwrap();
-        let (_, config_path, _) = db.get_workspace(&stored.workspace_id).unwrap();
-        let config =
-            belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))
-                .unwrap();
-
-        let state_config = config
-            .sources
-            .values()
-            .find_map(|s| s.states.get(&stored.state))
-            .unwrap();
-
-        let on_done: Vec<belt_core::action::Action> = state_config
-            .on_done
-            .iter()
-            .map(belt_core::action::Action::from)
-            .collect();
-
-        let worktree_dir = tempfile::tempdir().unwrap();
-        let env = belt_daemon::executor::ActionEnv::new("retry-timeout-1", worktree_dir.path());
-        let executor = build_executor();
-
-        // Apply timeout of 1 second (script sleeps 10).
-        let timeout_secs = 1u64;
-        let duration = std::time::Duration::from_secs(timeout_secs);
-        let timed_out = tokio::time::timeout(duration, executor.execute_all(&on_done, &env)).await;
-
-        assert!(timed_out.is_err(), "expected timeout");
-
-        // Item remains Failed since timeout prevents phase change.
-        let final_item = db.get_item("retry-timeout-1").unwrap();
-        assert_eq!(final_item.phase(), QueuePhase::Failed);
-    }
-
     // --- JSON flag parsing tests ---
 
     #[test]
@@ -3701,18 +3500,6 @@ sources:
                 command: QueueCommands::Skip { json, .. },
             } => assert!(json),
             _ => panic!("expected Queue Skip command"),
-        }
-    }
-
-    #[test]
-    fn queue_retry_script_json_flag() {
-        let cli =
-            Cli::try_parse_from(["belt", "queue", "retry-script", "item-1", "--json"]).unwrap();
-        match cli.command {
-            Commands::Queue {
-                command: QueueCommands::RetryScript { json, .. },
-            } => assert!(json),
-            _ => panic!("expected Queue RetryScript command"),
         }
     }
 

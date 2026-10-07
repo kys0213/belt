@@ -1989,7 +1989,11 @@ impl Database {
     /// that race: it reports `InvalidAction { current: Hitl }` and changes
     /// nothing; the caller maps its target phase with
     /// [`belt_core::transition::hitl_response_for`] and, when that yields an
-    /// action, answers through [`Database::resolve_hitl`].
+    /// action, answers through [`Database::resolve_hitl`]. The
+    /// `InvalidAction` result alone never justifies a HITL response: the caller
+    /// branches with `hitl_response_for` first, because the same value also
+    /// means a request with no matching response and a daemon post-processing
+    /// attempt without a confirmed request.
     ///
     /// A daemon post-processing transition leaves Hitl only while a confirmed
     /// request awaits post-processing; with only an open request it is

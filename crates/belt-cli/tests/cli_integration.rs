@@ -518,3 +518,358 @@ fn status_rich_has_no_spec_section() {
     assert_status_shows_seed(&stdout, "rich");
     assert_no_spec_section(&stdout, "rich");
 }
+
+// ---------------------------------------------------------------------------
+// queue done / skip / hitl / show: transition contract
+// ---------------------------------------------------------------------------
+
+use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
+use belt_infra::db::{
+    CollectOutcome, DeriveKind, DeriveOutcome, DeriveRequest, NewItem, OpenHitlOutcome,
+    OpenHitlRequest,
+};
+
+const WORKSPACE_YAML: &str = r#"
+name: queue-ws
+sources:
+  github:
+    url: "https://github.com/test/repo"
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
+    scan_interval_secs: 300
+    states:
+      implement:
+        trigger: {}
+        prompt: "implement"
+"#;
+
+/// Register a workspace so `queue done` can load the item's state config.
+fn register_workspace(tmp: &TempDir, db: &Database) {
+    let config_path = tmp.path().join("workspace.yaml");
+    std::fs::write(&config_path, WORKSPACE_YAML).expect("write workspace yaml");
+    db.add_workspace("ws-queue", config_path.to_str().unwrap())
+        .expect("add workspace");
+}
+
+fn daemon_move(db: &Database, work_id: &str, from: QueuePhase, to: QueuePhase) {
+    let outcome = db
+        .transition(&TransitionRequest {
+            work_id: work_id.to_string(),
+            expected_from: from,
+            to,
+            actor: Actor::Daemon,
+            reason: TransitionReason::Manual,
+            detail: None,
+        })
+        .expect("transition should not error");
+    assert!(
+        matches!(outcome, TransitionOutcome::Applied { .. }),
+        "{from:?} -> {to:?} should apply, got {outcome:?}"
+    );
+}
+
+/// Create an item through the contract and walk it to `phase`.
+/// A Hitl item gets an open HITL request.
+fn seed_item(db: &Database, source: &str, phase: QueuePhase) -> String {
+    use QueuePhase::*;
+    let created = db
+        .insert_collected(&NewItem {
+            source_id: format!("github:org/repo#{source}"),
+            workspace_id: "ws-queue".to_string(),
+            state: "implement".to_string(),
+            title: None,
+            actor: Actor::Daemon,
+        })
+        .expect("collect");
+    let CollectOutcome::Inserted { work_id } = created else {
+        panic!("expected a new item, got {created:?}");
+    };
+    let path: &[QueuePhase] = match phase {
+        Pending => &[],
+        Ready => &[Ready],
+        Running => &[Ready, Running],
+        Completed | Hitl => &[Ready, Running, Completed],
+        Done => &[Ready, Running, Completed, Done],
+        Failed => &[Ready, Running, Failed],
+        Skipped => &[Skipped],
+    };
+    let mut from = Pending;
+    for next in path {
+        daemon_move(db, &work_id, from, *next);
+        from = *next;
+    }
+    if phase == Hitl {
+        let opened = db
+            .open_hitl(&OpenHitlRequest {
+                work_id: work_id.clone(),
+                expected_from: Completed,
+                reason: belt_core::queue::HitlReason::EvaluateFailure,
+                notes: None,
+                actor: Actor::Daemon,
+                transition_reason: TransitionReason::Manual,
+                timeout_at: None,
+                terminal_action: None,
+            })
+            .expect("open hitl");
+        assert!(matches!(opened, OpenHitlOutcome::Opened { .. }));
+    }
+    work_id
+}
+
+fn stdout_json(output: &std::process::Output) -> serde_json::Value {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("stdout is not json ({e}): {stdout}"))
+}
+
+#[test]
+fn queue_skip_pending_is_applied() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Pending);
+
+    let out = run_belt(tmp.path(), &["queue", "skip", &id, "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    let v = stdout_json(&out);
+    assert_eq!(v["success"], true);
+    assert_eq!(v["result"], "applied");
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Skipped);
+}
+
+#[test]
+fn queue_skip_failed_is_applied() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Failed);
+
+    let out = run_belt(tmp.path(), &["queue", "skip", &id, "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Skipped);
+}
+
+#[test]
+fn queue_skip_running_is_busy() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Running);
+
+    let out = run_belt(tmp.path(), &["queue", "skip", &id, "--json"]);
+    assert!(!out.status.success());
+    let v = stdout_json(&out);
+    assert_eq!(v["success"], false);
+    assert_eq!(v["reason"], "busy");
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Running);
+}
+
+#[test]
+fn queue_skip_done_item_is_invalid_action() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Done);
+
+    let out = run_belt(tmp.path(), &["queue", "skip", &id, "--json"]);
+    assert!(!out.status.success());
+    assert_eq!(stdout_json(&out)["reason"], "invalid_action");
+}
+
+#[test]
+fn queue_done_done_item_is_invalid_action() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Done);
+
+    let out = run_belt(tmp.path(), &["queue", "done", &id, "--json"]);
+    assert!(!out.status.success());
+    assert_eq!(stdout_json(&out)["reason"], "invalid_action");
+}
+
+#[test]
+fn queue_done_failed_item_is_invalid_action() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Failed);
+
+    let out = run_belt(tmp.path(), &["queue", "done", &id, "--json"]);
+    assert!(!out.status.success());
+    assert_eq!(stdout_json(&out)["reason"], "invalid_action");
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Failed);
+}
+
+#[test]
+fn queue_done_running_item_is_busy() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Running);
+
+    let out = run_belt(tmp.path(), &["queue", "done", &id, "--json"]);
+    assert!(!out.status.success());
+    assert_eq!(stdout_json(&out)["reason"], "busy");
+}
+
+#[test]
+fn queue_done_unknown_item_is_not_found() {
+    let (tmp, _db) = setup_belt_home();
+
+    let out = run_belt(tmp.path(), &["queue", "done", "no-such-item", "--json"]);
+    assert!(!out.status.success());
+    assert_eq!(stdout_json(&out)["reason"], "not_found");
+}
+
+#[test]
+fn queue_done_completed_without_on_done_is_applied() {
+    let (tmp, db) = setup_belt_home();
+    register_workspace(&tmp, &db);
+    let id = seed_item(&db, "1", QueuePhase::Completed);
+
+    let out = run_belt(tmp.path(), &["queue", "done", &id, "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    let v = stdout_json(&out);
+    assert_eq!(v["result"], "applied");
+    assert_eq!(v["phase"], "done");
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Done);
+}
+
+#[test]
+fn queue_hitl_completed_opens_request() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Completed);
+
+    let out = run_belt(
+        tmp.path(),
+        &["queue", "hitl", &id, "--reason", "needs a look", "--json"],
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(stdout_json(&out)["result"], "applied");
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+
+    // A request is open now: a second one is invalid_action.
+    let again = run_belt(tmp.path(), &["queue", "hitl", &id, "--json"]);
+    assert!(!again.status.success());
+    assert_eq!(stdout_json(&again)["reason"], "invalid_action");
+}
+
+#[test]
+fn queue_hitl_running_item_is_busy() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Running);
+
+    let out = run_belt(tmp.path(), &["queue", "hitl", &id, "--json"]);
+    assert!(!out.status.success());
+    assert_eq!(stdout_json(&out)["reason"], "busy");
+}
+
+#[test]
+fn queue_skip_open_hitl_wins_response_race() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Hitl);
+
+    let out = run_belt(tmp.path(), &["queue", "skip", &id, "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    let v = stdout_json(&out);
+    assert_eq!(v["success"], true);
+    assert_eq!(v["result"], "hitl_response");
+    assert_eq!(v["action"], "skip");
+
+    // Confirmed, not applied: the item leaves Hitl only by daemon post-processing.
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+    assert_eq!(db.pending_post_processing().unwrap().len(), 1);
+}
+
+#[test]
+fn queue_done_open_hitl_wins_response_race() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Hitl);
+
+    let out = run_belt(tmp.path(), &["queue", "done", &id, "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(stdout_json(&out)["action"], "done");
+}
+
+#[test]
+fn queue_command_on_hitl_awaiting_post_processing_is_busy() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Hitl);
+    assert!(
+        run_belt(tmp.path(), &["queue", "skip", &id])
+            .status
+            .success()
+    );
+
+    let out = run_belt(tmp.path(), &["queue", "done", &id, "--json"]);
+    assert!(!out.status.success());
+    assert_eq!(stdout_json(&out)["reason"], "busy");
+}
+
+#[test]
+fn queue_retry_script_command_is_removed() {
+    let (tmp, _db) = setup_belt_home();
+    let out = run_belt(tmp.path(), &["queue", "retry-script", "some-id"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unrecognized subcommand"),
+        "stderr should be a clap error: {stderr}"
+    );
+}
+
+#[test]
+fn queue_show_json_has_transition_history_with_rejections() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Running);
+    // A refused CLI request is recorded in the history.
+    assert!(
+        !run_belt(tmp.path(), &["queue", "skip", &id])
+            .status
+            .success()
+    );
+
+    let out = run_belt(tmp.path(), &["queue", "show", &id, "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    let v = stdout_json(&out);
+    assert_eq!(v["work_id"], id.as_str());
+    assert_eq!(v["processing"], "handler");
+    let history = v["transitions"].as_array().expect("transitions array");
+    let kinds: Vec<&str> = history
+        .iter()
+        .map(|t| t["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds.first(), Some(&"item_created"));
+    assert_eq!(kinds.last(), Some(&"transition_rejected"));
+    let seqs: Vec<u64> = history.iter().map(|t| t["seq"].as_u64().unwrap()).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "oldest first: {seqs:?}"
+    );
+    let last = history.last().unwrap();
+    assert_eq!(last["actor"], "cli");
+    assert_eq!(last["to_phase"], "skipped");
+}
+
+#[test]
+fn queue_show_includes_derived_origin() {
+    let (tmp, db) = setup_belt_home();
+    let origin = seed_item(&db, "1", QueuePhase::Failed);
+    let derived = db
+        .derive(&DeriveRequest {
+            work_id: origin.clone(),
+            expected_from: QueuePhase::Failed,
+            kind: DeriveKind::Replan,
+            actor: Actor::Daemon,
+            reason: TransitionReason::Derived,
+            detail: None,
+        })
+        .expect("derive");
+    let DeriveOutcome::Derived { work_id: derived } = derived else {
+        panic!("expected a derived item");
+    };
+
+    let out = run_belt(tmp.path(), &["queue", "show", &derived, "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(stdout_json(&out)["derived_from"], origin.as_str());
+
+    let text = run_belt(tmp.path(), &["queue", "show", &derived]);
+    let stdout = String::from_utf8_lossy(&text.stdout);
+    assert!(
+        stdout.contains(&origin),
+        "text output names the origin: {stdout}"
+    );
+    assert!(
+        stdout.contains("item_created"),
+        "text output shows history: {stdout}"
+    );
+}
