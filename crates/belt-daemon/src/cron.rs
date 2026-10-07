@@ -922,9 +922,10 @@ impl CronHandler for DailyReportJob {
 
 /// Cleans up old worktrees that exceed the TTL (7 days).
 ///
-/// Scans terminal-phase items (Done, Skipped) and stalled items with
-/// preserved worktrees (Hitl, Failed), checking their `updated_at`
-/// timestamp. Worktrees older than the TTL are removed.
+/// Scans items whose worktree outlived its phase (Done, Skipped, Failed),
+/// checking their `updated_at` timestamp. Worktrees older than the TTL are
+/// removed. Hitl items are never scanned: their worktree is kept until the
+/// request is answered.
 ///
 /// A worktree is judged by its owner ([`Database::worktree_holder`]): an
 /// item whose worktree was handed to a derived item leaves it alone.
@@ -948,16 +949,15 @@ impl CronHandler for LogCleanupJob {
         let threshold = ctx.now - chrono::Duration::days(WORKTREE_TTL_DAYS);
         let mut cleaned_count = 0u32;
 
-        // Clean up worktrees for terminal-phase items and stalled items older than TTL.
+        // Hitl is deliberately absent: a request waiting for a human keeps its
+        // worktree however old it is, because a retry resumes on it.
         let done_items = self.db.list_items(Some(QueuePhase::Done), None)?;
         let skipped_items = self.db.list_items(Some(QueuePhase::Skipped), None)?;
-        let hitl_items = self.db.list_items(Some(QueuePhase::Hitl), None)?;
         let failed_items = self.db.list_items(Some(QueuePhase::Failed), None)?;
 
         let candidates = done_items
             .iter()
             .chain(skipped_items.iter())
-            .chain(hitl_items.iter())
             .chain(failed_items.iter());
 
         for item in candidates {
@@ -2631,6 +2631,42 @@ mod tests {
 
         // Worktree should still exist (not old enough).
         assert!(worktree_mgr.exists("w1"));
+    }
+
+    /// Runs log-cleanup over one item in `phase` whose worktree is 8 days old
+    /// and returns whether the worktree is still there.
+    fn worktree_survives_log_cleanup(phase: QueuePhase) -> bool {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
+            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
+        );
+        let mut item =
+            belt_core::queue::QueueItem::new("w1".into(), "s1".into(), "ws".into(), "st".into());
+        item.set_phase_unchecked(phase);
+        item.updated_at = (Utc::now() - chrono::Duration::days(8)).to_rfc3339();
+        db.insert_item(&item).unwrap();
+        worktree_mgr.create_or_reuse("w1").unwrap();
+
+        let job = LogCleanupJob::new(Arc::clone(&db), Arc::clone(&worktree_mgr));
+        job.execute(&CronContext { now: Utc::now() }).unwrap();
+
+        worktree_mgr.exists("w1")
+    }
+
+    #[test]
+    fn log_cleanup_never_removes_the_worktree_of_an_item_waiting_in_hitl() {
+        assert!(worktree_survives_log_cleanup(QueuePhase::Hitl));
+    }
+
+    #[test]
+    fn log_cleanup_removes_expired_worktrees_of_done_skipped_and_failed_items() {
+        for phase in [QueuePhase::Done, QueuePhase::Skipped, QueuePhase::Failed] {
+            assert!(
+                !worktree_survives_log_cleanup(phase),
+                "{phase:?} worktree past the TTL should be removed"
+            );
+        }
     }
 
     // -- seed_workspace_crons tests --
