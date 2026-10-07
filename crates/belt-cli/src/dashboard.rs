@@ -4799,11 +4799,8 @@ mod tests {
 
     /// Collect an item, move it to Running and open a HITL request for it.
     fn open_hitl_item(db: &Database, source: &str, notes: Option<&str>) -> HitlId {
-        use belt_core::queue::HitlReason;
-        use belt_core::transition::{
-            Actor, TransitionOutcome, TransitionReason, TransitionRequest,
-        };
-        use belt_infra::db::{CollectOutcome, NewItem, OpenHitlOutcome, OpenHitlRequest};
+        use belt_core::transition::Actor;
+        use belt_infra::db::{CollectOutcome, NewItem};
 
         let CollectOutcome::Inserted { work_id } = db
             .insert_collected(&NewItem {

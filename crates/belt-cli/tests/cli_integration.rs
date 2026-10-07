@@ -284,6 +284,35 @@ fn hitl_respond_wins_and_holds_the_item_in_hitl() {
 }
 
 #[test]
+fn hitl_respond_retry_wins_with_the_confirmed_action() {
+    let (tmp, db) = setup_belt_home();
+    let (id, _) = open_daemon_style_hitl(&db);
+
+    let out = run_belt(
+        tmp.path(),
+        &[
+            "hitl",
+            "respond",
+            &id,
+            "--action",
+            "retry",
+            "--respondent",
+            "irene",
+            "--json",
+        ],
+    );
+
+    assert!(out.status.success(), "{out:?}");
+    let v = stdout_json(&out);
+    assert_eq!(v["success"], true);
+    assert_eq!(v["action"], "retry");
+    assert_eq!(v["by"], "irene");
+    assert_eq!(v["via"], "cli");
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+    assert_eq!(db.pending_post_processing().unwrap().len(), 1);
+}
+
+#[test]
 fn hitl_respond_by_hitl_id_wins() {
     let (tmp, db) = setup_belt_home();
     let (id, hitl_id) = open_daemon_style_hitl(&db);
@@ -1064,6 +1093,7 @@ fn queue_done_with_failing_on_done_is_failed_and_refused() {
 #[test]
 fn queue_hitl_completed_opens_request() {
     let (tmp, db) = setup_belt_home();
+    register_workspace(&tmp, &db);
     let id = seed_item(&db, "1", QueuePhase::Completed);
 
     let out = run_belt(
@@ -1081,8 +1111,42 @@ fn queue_hitl_completed_opens_request() {
 }
 
 #[test]
+fn queue_hitl_request_expires_like_a_daemon_opened_one() {
+    let (tmp, db) = setup_belt_home();
+    register_workspace(&tmp, &db);
+    let id = seed_item(&db, "1", QueuePhase::Completed);
+
+    let out = run_belt(tmp.path(), &["queue", "hitl", &id, "--json"]);
+    assert!(out.status.success(), "{out:?}");
+
+    let request = db.open_hitl_requests().unwrap().remove(0);
+    assert_eq!(request.work_id, id);
+    assert_eq!(
+        request.terminal_action,
+        Some(belt_core::escalation::EscalationAction::Skip),
+        "the workspace terminal action"
+    );
+    let timeout_at = chrono::DateTime::parse_from_rfc3339(&request.timeout_at.unwrap()).unwrap();
+    let hours = (timeout_at.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_hours();
+    assert!((23..=24).contains(&hours), "timeout in {hours}h");
+}
+
+#[test]
+fn queue_hitl_without_a_readable_workspace_is_an_error() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Completed);
+
+    let out = run_belt(tmp.path(), &["queue", "hitl", &id, "--json"]);
+
+    assert!(!out.status.success(), "{out:?}");
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Completed);
+    assert!(db.open_hitl_requests().unwrap().is_empty());
+}
+
+#[test]
 fn queue_hitl_running_item_is_busy() {
     let (tmp, db) = setup_belt_home();
+    register_workspace(&tmp, &db);
     let id = seed_item(&db, "1", QueuePhase::Running);
 
     let out = run_belt(tmp.path(), &["queue", "hitl", &id, "--json"]);

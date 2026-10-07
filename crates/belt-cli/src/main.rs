@@ -1317,6 +1317,22 @@ fn cmd_queue_hitl(work_id: &str, reason: Option<&str>, json: bool) -> anyhow::Re
     let Some(item) = find_item(&db, work_id)? else {
         return emit_refusal(work_id, json, Refusal::not_found());
     };
+    // Same expiry terms as a request the daemon opens: the default timeout and
+    // the workspace's terminal action. An unreadable workspace is an error, not
+    // a request that never expires.
+    let (_, config_path, _) = db.get_workspace(&item.workspace_id)?;
+    let config =
+        belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))?;
+    let terminal_action = config
+        .sources
+        .values()
+        .next()
+        .and_then(|source| source.escalation.terminal_action().copied());
+    let expiry = belt_daemon::hitl::HitlExpiry::after_hours(
+        belt_core::queue::HITL_TIMEOUT_HOURS,
+        terminal_action,
+        chrono::Utc::now(),
+    );
     let opened = db.open_hitl(&OpenHitlRequest {
         work_id: work_id.to_string(),
         expected_from: item.phase(),
@@ -1324,8 +1340,8 @@ fn cmd_queue_hitl(work_id: &str, reason: Option<&str>, json: bool) -> anyhow::Re
         notes: reason.map(str::to_string),
         actor: Actor::Cli,
         transition_reason: TransitionReason::Manual,
-        timeout_at: None,
-        terminal_action: None,
+        timeout_at: expiry.timeout_at,
+        terminal_action: expiry.terminal_action,
     })?;
     match opened {
         OpenHitlOutcome::Opened { hitl_id, .. } => {
