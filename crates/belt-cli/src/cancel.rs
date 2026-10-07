@@ -3,7 +3,9 @@
 //!
 //! The request is recorded first; then either a live daemon is woken and
 //! given [`CANCEL_WAIT_LIMIT`] to close it, or -- when no daemon is there or
-//! it never accepts -- the request is carried out directly.
+//! it never accepts -- the request is carried out directly. A live daemon
+//! that cannot be woken is still waited for: the direct path is for a daemon
+//! that is absent or unresponsive, never for a failed notification alone.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -22,9 +24,15 @@ pub const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The link to a daemon that may be running.
 pub trait DaemonLink {
-    /// Wake the daemon to handle open cancel requests now. `false` when no
-    /// daemon is there to answer.
-    fn wake(&self) -> bool;
+    /// Whether a daemon process is there to answer.
+    fn is_alive(&self) -> bool;
+
+    /// Wake the daemon to handle open cancel requests now.
+    ///
+    /// # Errors
+    /// The signal could not be delivered. The daemon still polls for open
+    /// requests on its own tick.
+    fn wake(&self) -> anyhow::Result<()>;
 }
 
 /// The daemon of a `BELT_HOME`: alive when its pid file names a live process,
@@ -34,14 +42,15 @@ pub struct LocalDaemon {
 }
 
 impl DaemonLink for LocalDaemon {
-    fn wake(&self) -> bool {
-        let Some(pid) = std::fs::read_to_string(self.belt_home.join("daemon.pid"))
+    fn is_alive(&self) -> bool {
+        std::fs::read_to_string(self.belt_home.join("daemon.pid"))
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
-        else {
-            return false;
-        };
-        process_alive(pid) && notify_daemon(&self.belt_home, DaemonSignal::CancelRequested).is_ok()
+            .is_some_and(process_alive)
+    }
+
+    fn wake(&self) -> anyhow::Result<()> {
+        notify_daemon(&self.belt_home, DaemonSignal::CancelRequested)
     }
 }
 
@@ -119,7 +128,14 @@ impl CancelFlow<'_> {
             RequestCancelOutcome::Existing(record) => record.id,
         };
 
-        if self.daemon.wake() {
+        if self.daemon.is_alive() {
+            if let Err(e) = self.daemon.wake() {
+                tracing::warn!(
+                    work_id,
+                    error = %e,
+                    "could not wake the daemon; waiting for its next poll"
+                );
+            }
             let deadline = Instant::now() + self.wait_limit;
             let accepted = loop {
                 let accepted = match self.db.open_cancel_request(work_id)? {
@@ -190,8 +206,12 @@ pub(crate) mod testing {
     /// No daemon is there to wake.
     pub struct NoDaemon;
     impl DaemonLink for NoDaemon {
-        fn wake(&self) -> bool {
+        fn is_alive(&self) -> bool {
             false
+        }
+
+        fn wake(&self) -> anyhow::Result<()> {
+            bail!("no daemon")
         }
     }
 
@@ -290,7 +310,11 @@ mod tests {
     }
 
     impl DaemonLink for FakeDaemon {
-        fn wake(&self) -> bool {
+        fn is_alive(&self) -> bool {
+            true
+        }
+
+        fn wake(&self) -> anyhow::Result<()> {
             let db = Arc::clone(&self.db);
             let reaction = self.reaction;
             std::thread::spawn(move || {
@@ -323,7 +347,32 @@ mod tests {
                     }
                 }
             });
+            Ok(())
+        }
+    }
+
+    /// Alive, but the wake signal cannot be delivered; the daemon reacts on
+    /// its own poll instead.
+    struct UnreachableDaemon {
+        inner: FakeDaemon,
+    }
+
+    impl DaemonLink for UnreachableDaemon {
+        fn is_alive(&self) -> bool {
             true
+        }
+
+        fn wake(&self) -> anyhow::Result<()> {
+            // The daemon's own tick picks the request up a moment later.
+            let late = FakeDaemon {
+                db: Arc::clone(&self.inner.db),
+                reaction: self.inner.reaction,
+            };
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                late.wake().unwrap();
+            });
+            bail!("connection refused")
         }
     }
 
@@ -379,5 +428,15 @@ mod tests {
 
         assert_eq!(outcome, CancelOutcome::CanceledDirectly);
         assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Skipped);
+    }
+
+    #[test]
+    fn a_live_daemon_that_cannot_be_woken_is_still_waited_for() {
+        let (db, id, fake) = with_daemon(Reaction::Cancel);
+        let daemon = UnreachableDaemon { inner: fake };
+
+        let outcome = flow(&db, &daemon, &NoKill).cancel(&id).unwrap();
+
+        assert_eq!(outcome, CancelOutcome::Canceled);
     }
 }
