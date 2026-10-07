@@ -13,10 +13,13 @@
 //! - A comment without a `hitl_id` belongs to the single HITL request polled
 //!   for that issue; with several candidates it has no correlation clue.
 //! - `external_id` and [`MessageRef`] are the comment URL, stable across polls.
+//! - `gh` command lines hold checked tokens only (issue number, `owner/name`,
+//!   a fixed file name); comment bodies travel in a file (`--body-file`).
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -77,10 +80,30 @@ impl GitHubOriginChannel {
         (!number.is_empty() && number.chars().all(|c| c.is_ascii_digit())).then_some(number)
     }
 
-    async fn gh(&self, command: &str) -> Result<String> {
+    /// The configured repository, checked to be a plain `owner/name`.
+    ///
+    /// Only checked tokens reach the command line, so no quoting is needed on
+    /// any platform shell.
+    fn repo(&self) -> Result<&str> {
+        let repo = self.config.repo.as_str();
+        let valid_part = |part: &str| {
+            !part.is_empty()
+                && !part.starts_with('-')
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        };
+        match repo.split_once('/') {
+            Some((owner, name)) if valid_part(owner) && valid_part(name) => Ok(repo),
+            _ => bail!("GitHub repository must be `owner/name`: {repo:?}"),
+        }
+    }
+
+    /// Run `command` in `working_dir`; `command` must hold checked tokens only.
+    async fn gh(&self, command: &str, working_dir: &Path) -> Result<String> {
         let output = self
             .shell
-            .execute(command, Path::new("."), &HashMap::new())
+            .execute(command, working_dir, &HashMap::new())
             .await
             .context("failed to run gh")?;
         if !output.success() {
@@ -89,11 +112,59 @@ impl GitHubOriginChannel {
         }
         Ok(output.stdout)
     }
+
+    /// Post `body` as a comment. The body goes through a file, never through
+    /// the command line: platform shells interpret it differently (`cmd.exe`
+    /// treats `<`, `>`, `&` as operators even inside single quotes).
+    async fn post_comment(&self, number: &str, body: &str) -> Result<String> {
+        let repo = self.repo()?;
+        let dir = BodyDir::create(body)?;
+        let command = format!("gh issue comment {number} --repo {repo} --body-file {BODY_FILE}");
+        let result = self.gh(&command, dir.path()).await;
+        dir.remove();
+        result
+    }
 }
 
-/// Single-quote `s` for a POSIX shell.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
+/// File name of the comment body inside its [`BodyDir`].
+const BODY_FILE: &str = "body.md";
+
+/// A fresh private directory holding one comment body as [`BODY_FILE`].
+struct BodyDir(PathBuf);
+
+impl BodyDir {
+    fn create(body: &str) -> Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let name = format!(
+            "belt-gh-{}-{nanos}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = std::env::temp_dir().join(name);
+        // create_dir fails on an existing path, so a planted directory or
+        // link is never reused.
+        std::fs::create_dir(&path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
+        let dir = Self(path);
+        std::fs::write(dir.path().join(BODY_FILE), body)
+            .with_context(|| format!("failed to write the comment body in {}", dir.0.display()))?;
+        Ok(dir)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    /// Delete the directory; a failure only leaves a stray temp file behind.
+    fn remove(self) {
+        if let Err(e) = std::fs::remove_dir_all(&self.0) {
+            tracing::warn!(path = %self.0.display(), error = %e, "failed to remove the comment body directory");
+        }
+    }
 }
 
 fn comment_body(msg: &OutboundMessage) -> String {
@@ -119,12 +190,7 @@ impl NotificationChannel for GitHubOriginChannel {
                 self.config.repo, msg.work_id
             )
         })?;
-        let command = format!(
-            "gh issue comment {number} --repo {repo} --body {body}",
-            repo = shell_quote(&self.config.repo),
-            body = shell_quote(&comment_body(msg)),
-        );
-        let stdout = self.gh(&command).await?;
+        let stdout = self.post_comment(number, &comment_body(msg)).await?;
         let url = stdout.trim();
         Ok((!url.is_empty()).then(|| MessageRef(url.to_string())))
     }
@@ -198,11 +264,9 @@ impl ResponseInbox for GitHubOriginChannel {
 
         let mut responses = Vec::new();
         for (number, group) in by_issue {
-            let command = format!(
-                "gh issue view {number} --repo {repo} --json comments",
-                repo = shell_quote(&self.config.repo),
-            );
-            let stdout = self.gh(&command).await?;
+            let repo = self.repo()?;
+            let command = format!("gh issue view {number} --repo {repo} --json comments");
+            let stdout = self.gh(&command, Path::new(".")).await?;
             let issue: IssueComments = serde_json::from_str(&stdout)
                 .with_context(|| format!("unexpected gh output for issue #{number}"))?;
 
@@ -255,9 +319,12 @@ mod tests {
     use belt_core::platform::ShellOutput;
     use std::sync::Mutex;
 
-    /// Records every command and replies with one fixed output.
+    /// Records every command, the body file it was handed (if any) and its
+    /// working directory, and replies with one fixed output.
     struct RecordingShell {
         commands: Mutex<Vec<String>>,
+        body_files: Mutex<Vec<Option<String>>>,
+        working_dirs: Mutex<Vec<std::path::PathBuf>>,
         output: ShellOutput,
     }
 
@@ -273,12 +340,22 @@ mod tests {
         fn with(output: ShellOutput) -> Arc<Self> {
             Arc::new(Self {
                 commands: Mutex::new(Vec::new()),
+                body_files: Mutex::new(Vec::new()),
+                working_dirs: Mutex::new(Vec::new()),
                 output,
             })
         }
 
         fn commands(&self) -> Vec<String> {
             self.commands.lock().unwrap().clone()
+        }
+
+        fn body_files(&self) -> Vec<Option<String>> {
+            self.body_files.lock().unwrap().clone()
+        }
+
+        fn working_dirs(&self) -> Vec<std::path::PathBuf> {
+            self.working_dirs.lock().unwrap().clone()
         }
     }
 
@@ -287,10 +364,16 @@ mod tests {
         async fn execute(
             &self,
             command: &str,
-            _working_dir: &Path,
+            working_dir: &Path,
             _env_vars: &HashMap<String, String>,
         ) -> std::result::Result<ShellOutput, BeltError> {
             self.commands.lock().unwrap().push(command.to_string());
+            let body = std::fs::read_to_string(working_dir.join("body.md")).ok();
+            self.body_files.lock().unwrap().push(body);
+            self.working_dirs
+                .lock()
+                .unwrap()
+                .push(working_dir.to_path_buf());
             Ok(self.output.clone())
         }
     }
@@ -345,12 +428,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r, Some(MessageRef(url.to_string())));
-        let cmds = shell.commands();
-        assert_eq!(cmds.len(), 1);
-        assert!(cmds[0].starts_with("gh issue comment 42 --repo 'org/repo' --body '"));
-        assert!(cmds[0].contains(OWN_MARKER));
-        assert!(cmds[0].contains("<!-- belt:hitl_id=h-1 -->"));
-        assert!(cmds[0].contains("needs a human"));
+        assert_eq!(
+            shell.commands(),
+            vec!["gh issue comment 42 --repo org/repo --body-file body.md"]
+        );
+        assert_eq!(
+            shell.body_files(),
+            vec![Some(format!(
+                "{OWN_MARKER}\n<!-- belt:hitl_id=h-1 -->\nneeds a human"
+            ))]
+        );
     }
 
     #[tokio::test]
@@ -362,18 +449,54 @@ mod tests {
             .unwrap();
         assert_eq!(r, None);
         let cmd = &shell.commands()[0];
-        assert!(!cmd.contains("hitl_id="));
         assert!(!cmd.contains("--add-label") && !cmd.contains("issue edit"));
+        let body = shell.body_files()[0].clone().unwrap();
+        assert!(!body.contains("hitl_id="));
     }
 
     #[tokio::test]
-    async fn notify_quotes_single_quotes_in_text() {
+    async fn notify_passes_shell_metacharacters_through_a_file_untouched() {
+        let text = "it's `id` $(rm -rf ~) ; ls | cat & calc < in > out\nsecond line \"q\" %PATH% ^";
         let shell = RecordingShell::ok("u");
-        channel(&shell)
-            .notify(&msg(WID, None, "it's $(unsafe)"))
-            .await
-            .unwrap();
-        assert!(shell.commands()[0].contains(r"it'\''s $(unsafe)"));
+        channel(&shell).notify(&msg(WID, None, text)).await.unwrap();
+        assert_eq!(
+            shell.commands(),
+            vec!["gh issue comment 42 --repo org/repo --body-file body.md"]
+        );
+        assert_eq!(
+            shell.body_files(),
+            vec![Some(format!("{OWN_MARKER}\n{text}"))]
+        );
+    }
+
+    #[tokio::test]
+    async fn notify_removes_the_body_directory_afterwards() {
+        let shell = RecordingShell::ok("u");
+        channel(&shell).notify(&msg(WID, None, "t")).await.unwrap();
+        let dir = &shell.working_dirs()[0];
+        assert!(!dir.exists(), "{} still exists", dir.display());
+    }
+
+    #[tokio::test]
+    async fn notify_rejects_a_repo_that_is_not_owner_slash_name() {
+        for repo in [
+            "org/repo & calc",
+            "org",
+            "org/re po",
+            "'org/repo'",
+            "a/b/c",
+            "/repo",
+        ] {
+            let shell = RecordingShell::ok("");
+            let c = GitHubOriginChannel::new(GitHubChannelConfig::new(repo), shell.clone());
+            let wid = format!("github:{repo}#1:x");
+            assert!(c.notify(&msg(&wid, None, "t")).await.is_err(), "{repo}");
+            assert!(
+                c.poll(&[target("h-1", &wid, SINCE)]).await.is_err(),
+                "{repo}"
+            );
+            assert!(shell.commands().is_empty(), "{repo}");
+        }
     }
 
     #[tokio::test]
@@ -416,7 +539,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             shell.commands(),
-            vec!["gh issue view 42 --repo 'org/repo' --json comments"]
+            vec!["gh issue view 42 --repo org/repo --json comments"]
         );
         let tok = Some(HitlRef::Token(HitlId::new("h-1")));
         assert_eq!(rs.len(), 5);
