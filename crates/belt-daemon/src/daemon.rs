@@ -2494,11 +2494,17 @@ impl Daemon {
         tokio::sync::mpsc::UnboundedReceiver<belt_infra::ipc::DaemonSignal>,
     ) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let listener = belt_infra::ipc::IpcListener::bind(&self.belt_home)
-            .await
-            .ok();
-        let Some(listener) = listener else {
-            return (None, rx);
+        let listener = match belt_infra::ipc::IpcListener::bind(&self.belt_home).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                // The daemon still runs, but wakes reach it only at the next
+                // tick: a cancel caller gets no answer within its wait limit.
+                tracing::warn!(
+                    belt_home = %self.belt_home.display(),
+                    "IPC listener not started; wake signals are unavailable: {e}"
+                );
+                return (None, rx);
+            }
         };
         let db = Arc::clone(&self.db);
         let in_flight = Arc::clone(&self.in_flight);
