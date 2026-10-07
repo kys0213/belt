@@ -6,17 +6,7 @@
 
 ---
 
-## 설계 배경
-
-### 왜 LifecycleHook과 분리하는가
-
-| 순위 | 이유 | 내용 |
-|------|------|------|
-| 1 | 응답 수신(inbound) | 외부 응답의 수신·정규화·상관관계·중복 제거는 쓰기 전용인 LifecycleHook에도, 읽기 전용 수집인 DataSource에도 맞지 않는다. 수신 책임을 hook에 넣으면 hook의 의미("상태를 외부에 반영한다")가 무너진다 |
-| 2 | 다중 발송 | hook은 workspace당 하나만 선택된다. 같은 이벤트를 여러 채널로 보내려면 hook을 묶는 대신 채널 목록이 필요하다 |
-| 2 | 실패 의미 | hook의 on_enter/on_done 실패는 상태 전이에 영향을 주는 치명적 실패다. 알림 실패는 phase에 영향을 주면 안 된다 |
-
-### 경계
+## 경계
 
 | 구성요소 | 맡는 것 | 맡지 않는 것 |
 |----------|---------|--------------|
@@ -65,13 +55,18 @@ flowchart LR
 | Ready→Running (점유) | `on_enter` | `started` | 이 시점부터 처리 중(handler 실행) |
 | Running→Skipped (취소) | 없음 (그 실행의 hook·escalation 미실행) | `skipped` | daemon 경유든 CLI 직접이든 같다 |
 | Completed→Done (evaluate) | `on_done` | `done` | |
-| handler 실패 → escalation retry | `on_escalation(retry)` | — | 조용한 재시도 |
-| escalation retry_with_comment / skip | `on_escalation(action)` + `on_fail` | `failed` (skip이면 `skipped`도) | |
-| X→Hitl, 또는 Hitl로 생성 | `on_escalation(hitl/replan)` 또는 없음 (evaluate·충돌·spec 완료 경로) | `hitl_requested` | HITL 요청 전달 경로 |
+| handler 실패 → escalation retry | `on_escalation(retry)` (결과 전이 commit 뒤) | — | 원 아이템 Skipped(파생됨, `skipped` 없음), 파생 아이템 Pending. 조용한 재시도 |
+| escalation retry_with_comment | `on_escalation` + `on_fail` (결과 전이 commit 뒤) | `failed` | 원 아이템 Skipped(파생됨, `skipped` 없음) |
+| X→Hitl (escalation hitl, evaluate 사람 필요, `belt queue hitl`) | `on_escalation(hitl)` (escalation 경로만), 모든 경로에서 `on_hitl_opened` | `hitl_requested` | HITL 요청 전달 경로 |
 | HITL 판정 확정 (응답 / timeout) | — | — (내부 `hitl_resolved`) | 이 시점부터 처리 중(후처리) |
 | 후처리: Hitl→Done | `on_done` → `on_hitl_resolved` | `done` | on_done 실패 시 Hitl→Failed, `failed` |
-| 후처리: Hitl→Skipped / Pending | `on_hitl_resolved` | `skipped` / — | |
+| 후처리: Hitl→Skipped (skip 응답, terminal skip) | `on_hitl_resolved` | `skipped` | |
+| 후처리: Hitl→Skipped (replan 이내, 파생됨) | `on_hitl_resolved` | — | 파생 아이템 Pending |
+| 후처리: Hitl→Pending (retry) | `on_hitl_resolved` | — | 같은 아이템 |
+| 후처리: Hitl→Failed (replan 상한 초과) | `on_hitl_resolved` | `failed` | |
 | →Skipped, →Failed (그 밖의 경로) | 기존 규칙 | `skipped` / `failed` | |
+
+> 파생으로 끝난 원 아이템(escalation retry의 Running→Skipped, replan 이내의 Hitl→Skipped)은 `skipped`를 내지 않는다. 작업은 파생 아이템에서 이어지기 때문이다. `skipped`는 계열이 끝나는 Skipped에만 낸다: skip 응답, terminal skip, 실행 중 취소, Pending·Ready·Failed의 skip.
 
 > 처리 중, 후처리, 취소의 의미는 [QueuePhase 상태 머신](./queue-state-machine.md)과 [Daemon](./daemon.md)이 정한다.
 
@@ -85,8 +80,8 @@ flowchart LR
 |--------|------|-------------------|
 | `started` | 아이템이 Running으로 진입 | O |
 | `done` | 아이템이 Done으로 완료 | O |
-| `failed` | handler 실패가 escalation으로 이어짐, 또는 후처리 실패 | O |
-| `skipped` | 아이템이 Skipped로 종료 (취소 포함) | O |
+| `failed` | escalation으로 on_fail이 호출되는 실패(retry_with_comment, hitl), Completed·Hitl에서 Failed로 끝남 | O |
+| `skipped` | 아이템이 Skipped로 끝나고 계열이 이어지지 않음(skip, terminal skip, 취소). 파생으로 끝난 Skipped는 제외 | O |
 | `hitl_requested` | HITL 요청이 열림 | O |
 | `hitl_resolved` | HITL 판정이 확정됨 | X (내부 이벤트) |
 
@@ -115,6 +110,7 @@ flowchart TD
 | 추가 channel | `channels` 목록으로 fan-out한다. 이름은 workspace 안에서 고유하다 |
 | 이벤트 필터 | channel마다 선택한다. 필터에 없는 이벤트는 그 channel로 나가지 않는다 |
 | 응답 회신 | 확인 요청·`already_handled` 같은 회신은 이벤트 필터와 무관하게 응답을 보낸 channel로 간다 |
+| 설정 반영 | `notifications` 변경은 daemon 재시작 시 반영된다 |
 | Dashboard | 설정과 무관하게 항상 표시되고, TUI·CLI에서 응답할 수 있다 |
 | origin 구현 없음 | 해당 출처 시스템에 origin channel 구현이 없으면 dashboard only로 동작하고 경고를 남긴다 |
 
@@ -171,7 +167,7 @@ HITL 요청 전달 상태는 `belt hitl show`와 dashboard에서 channel별로 �
 |------|------|
 | allowlist | channel별 응답자 목록. 목록에 없는 응답자의 응답은 `unauthorized`로 기록하고 회신하지 않는다 |
 | Dashboard / CLI | allowlist를 적용하지 않는다. 로컬 사용자는 신뢰한다 |
-| 수신 방식 | tick마다 channel을 polling한다. daemon에 HTTP 서버가 없다 |
+| 수신 방식 | tick마다 channel을 polling한다. daemon에 HTTP 서버가 없다. daemon이 꺼진 동안 온 응답은 재시작 후 소급 수신한다. 그 사이 다른 경로가 확정했으면 `already_handled`다 |
 
 ### 정규화와 상관관계
 
@@ -227,6 +223,7 @@ sequenceDiagram
     participant U as 응답자
     participant C as channel
     participant D as daemon
+    participant DB as SQLite
     participant L as LLM
     participant H as HitlService
     U->>C: "이건 건너뛰어도 될 것 같아요"
@@ -234,7 +231,7 @@ sequenceDiagram
     D->>L: 액션 제안 요청 (허용 액션 목록 포함)
     L-->>D: skip 제안
     D->>C: "skip으로 처리할까요? 확인해 주세요" (같은 channel로 회신)
-    D->>D: pending 제안 기록
+    D->>DB: pending 제안 기록
     U->>C: 확인
     C->>D: 확인 응답
     D->>H: respond (skip, 확정 경로 자연어 확정)
@@ -251,8 +248,8 @@ sequenceDiagram
 | 제안 대상 | 허용된 액션(`done`, `retry`, `skip`, `replan`) 중 하나. 해석할 수 없으면 `invalid_action`으로 회신한다 |
 | 확인 전 | 제안은 경합에 참여하지 않는다. 확인 대기 중에도 다른 응답이 이길 수 있다 |
 | 패배 | 다른 응답이 이기면 pending 제안은 대체(superseded)된다. 이후 확인이 오면 `already_handled`로 회신한다 |
-| 만료 | 확인이 오기 전에 제안이 사라졌으면 `proposal_expired`로 회신한다 |
-| 기록 | 판정 이력에 확정 경로(직접 / 자연어 확정)를 남긴다 |
+| 대체 | 같은 응답자의 새 자연어 응답은 이전 pending 제안을 대체한다. 확인은 최신 제안에만 적용된다 |
+| 기록 | 제안은 DB에 남고 HITL이 확정되면 종결된다([Data Model](./data-model.md)). 판정 이력에 확정 경로(직접 / 자연어 확정)를 남긴다 |
 
 ---
 
@@ -265,7 +262,6 @@ sequenceDiagram
 | `unauthorized` | allowlist에 없는 응답자 | 회신하지 않는다 (스팸 증폭 방지). 이력에 기록 |
 | `not_found` | 대응하는 HITL 요청 없음 | 기록, 외부 channel에는 회신하지 않는다 |
 | `invalid_action` | 허용되지 않는 액션 또는 해석 불가 | 외부 channel은 best-effort 회신 |
-| `proposal_expired` | 자연어 제안이 사라진 뒤 확인이 옴 | 응답을 보낸 channel로 best-effort 회신 |
 
 | 구분 | 표시 방식 |
 |------|-----------|
@@ -287,13 +283,15 @@ sequenceDiagram
 - [ ] daemon 정지 중 일어난 전이의 진행 알림은 재시작 후에도 보내지 않는다
 - [ ] HITL 요청 전달은 다음 tick에 재시도되고 상한 횟수 뒤 `failed`로 표시된다. 중복 메시지는 허용된다
 - [ ] allowlist가 비어 있는 channel의 외부 응답은 받지 않는다
+- [ ] daemon이 꺼진 동안 온 외부 응답은 재시작 후 소급 수신되고, 그 사이 다른 경로가 확정했으면 `already_handled`다
+- [ ] 파생으로 끝난 Skipped는 `skipped` 이벤트를 내지 않는다
 - [ ] allowlist 밖 응답은 `unauthorized`로 기록되고 회신되지 않는다
 - [ ] 같은 `(channel, 외부 응답 id)`는 재시작 후에도 한 번만 처리된다
 - [ ] 동시 응답은 하나만 승리하고 나머지는 `already_handled`다. DB 에러로 끝나지 않는다
 - [ ] 승자 응답을 다시 polling해도 거절이 아니다
 - [ ] timeout과 사람 응답이 경합하면 하나만 이긴다
 - [ ] 자연어 응답은 확인 후에만 확정되고, 확인 대기 중 다른 응답이 이기면 `already_handled`다
-- [ ] 사라진 제안의 확인은 `proposal_expired`다
+- [ ] HITL 확정 뒤 온 자연어 확인은 `already_handled`다
 - [ ] 늦은 응답은 `already_handled { by, via, action, at }`로 응답을 보낸 channel에 회신된다
 - [ ] 같은 아이템이 HITL에 재진입해도 이전 요청에 대한 늦은 응답이 새 요청을 닫지 않는다
 
