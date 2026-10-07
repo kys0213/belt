@@ -14,12 +14,17 @@ flowchart TD
     P -- "SPINNING 또는 OSCILLATION" --> L["사고 전환: 패턴에 맞는 페르소나 선택 후 lateral plan 조합 (LLM 미호출)"]
     L --> E
     E --> C{"failure_count 기반 escalation"}
-    C -- "retry" --> R1["on_escalation 트리거, lateral plan 주입, 재시도 (worktree 보존)"]
-    C -- "retry_with_comment" --> R2["on_escalation + on_fail 트리거, lateral plan 주입, 재시도"]
-    C -- "hitl" --> H["on_escalation + on_fail 트리거, lateral 이력을 HITL 요청에 첨부, HITL 요청 열기"]
+    C -- "retry" --> R1["원 아이템 Skipped (파생됨), 파생 아이템 Pending (새 work_id), lateral plan 주입, worktree 인계"]
+    C -- "retry_with_comment" --> R2["원 아이템 Skipped (파생됨), 파생 아이템 Pending (새 work_id), lateral plan 주입, worktree 인계"]
+    C -- "hitl" --> H["lateral 이력을 HITL 요청에 첨부, 아이템 Hitl, HITL 요청 열기"]
+    R1 --> K1["결과 전이 뒤 on_escalation 트리거"]
+    R2 --> K2["결과 전이 뒤 on_escalation + on_fail 트리거"]
+    H --> K3["결과 전이 뒤 on_escalation + on_fail 트리거"]
 ```
 
 - 패턴은 같은 실패 반복(SPINNING)과 두 실패를 교대 반복(OSCILLATION)이다. 비교는 완전 일치·토큰 중복도·압축 유사도의 가중 합성 기준이다. 상세: [Stagnation Detection](../concerns/stagnation.md)
+- escalation retry는 원 아이템을 다시 쓰지 않는다. 원 아이템은 Skipped(파생됨)로 끝나고 새 `work_id`의 파생 아이템이 Pending으로 만들어진다. worktree는 정리되지 않고 파생 아이템에 인계된다. 파생 원본은 `belt queue show`와 `belt context`에서 볼 수 있다.
+- 파생으로 끝난 원 아이템은 `skipped` 알림을 내지 않는다. 작업이 파생 아이템에서 이어지기 때문이다.
 - 사람의 응답이 필요하면 HITL로 넘어가고, 응답은 done / retry / skip / replan 중 하나다. 응답이 없으면 timeout이 terminal 액션(skip 또는 replan)을 적용한다.
 
 > `retry`만 on_fail을 트리거하지 않는다. "조용한 재시도"로 외부 시스템에 노이즈를 주지 않는다. Daemon은 hook을 트리거만 하고, 실행 책임은 workspace의 LifecycleHook 구현이 가진다.
@@ -28,7 +33,7 @@ flowchart TD
 
 ## Lateral Plan 주입 예시
 
-retry로 생성된 새 아이템이 다시 Running에 진입하면, lateral plan이 handler prompt에 추가 컨텍스트로 주입된다. daemon은 선택된 페르소나의 고정 directive 문구로 아래 형태의 텍스트를 조립해 handler prompt 뒤에 붙인다(LLM을 호출해 맞춤 분석을 생성하지 않는다).
+escalation retry로 만들어진 파생 아이템이 Running에 진입하면, lateral plan이 handler prompt에 추가 컨텍스트로 주입된다. daemon은 선택된 페르소나의 고정 directive 문구로 아래 형태의 텍스트를 조립해 handler prompt 뒤에 붙인다(LLM을 호출해 맞춤 분석을 생성하지 않는다).
 
 ```
 원래 handler prompt:
@@ -68,6 +73,7 @@ stagnation:
 ```
 
 - escalation 레벨은 failure_count 기반이다
+- HITL retry 확정 또는 replan 파생 뒤 다음 실패는 1회차(retry)부터 다시 적용된다
 - stagnation + lateral은 패턴이 감지된 retry에 한해 lateral plan을 얹는 내장 레이어다
 - `stagnation.enabled: false`이면 stagnation 분석 자체를 건너뛰고 failure_count 기반 escalation만 적용된다
 
@@ -95,8 +101,7 @@ on_fail:
 |------|--------|
 | Escalation | handler/on_enter 실패 → failure_count=3 → hitl |
 | evaluate | handler 성공 → evaluate가 "사람이 봐야 한다" 판단 |
-| 스펙 완료 | 모든 linked issues Done → 최종 확인 요청 |
-| 충돌 | spec 충돌 감지 |
+| 수동 | `belt queue hitl`로 사람이 직접 요청 |
 
 ### HITL 진입 — 알림은 channel과 무관하다
 
@@ -106,7 +111,7 @@ HITL 요청이 열리면 다음이 일어난다.
 |------|------|
 | Dashboard (TUI/CLI) | 설정과 무관하게 **항상** 요청을 표시하고 응답을 받는다 |
 | origin channel, 추가 channel | `notifications` 설정에 따라 HITL 요청 메시지를 보낸다. 설정이 없으면 origin에만 보낸다 |
-| 출처 시스템 | LifecycleHook이 상태를 반영한다 (예: GitHub는 `belt:needs-human` 라벨 추가) |
+| 출처 시스템 | 모든 HITL 열기에서 LifecycleHook이 상태를 반영한다 (예: GitHub는 `belt:needs-human` 라벨 추가) |
 
 - 전달에 실패하면 daemon이 다음 tick에 다시 보내고, 상한 횟수를 넘으면 channel별 전달 상태를 `failed`로 두고 dashboard에 표시한다. 중복 메시지는 허용된다.
 - daemon이 꺼져 있는 동안 열린 요청의 알림은 재시작 후에 보낸다. 상세: [NotificationChannel](../concerns/notification.md#발송)
@@ -149,21 +154,6 @@ HITL에 진입하면 LLM이 상황(lateral report, 이력, HITL 경로)을 분�
    또는 직접 지시를 입력하세요"
 ```
 
-##### 예시: Spec 완료 HITL
-
-```
-"스펙 'JWT 인증 시스템'의 모든 이슈가 완료되었습니다.
-
- 완료된 이슈: #42 middleware, #43 token 발급, #44 refresh
- gap-detection: 추가 gap 미발견
- 테스트 커버리지: 87%
-
- 추천:
-   1. 스펙 완료 승인
-   2. 추가 검증 항목 지정하여 재검토
-   또는 직접 지시를 입력하세요"
-```
-
 ### 응답 처리
 
 #### 응답 경로
@@ -201,7 +191,7 @@ sequenceDiagram
 
 - 같은 응답을 polling이 다시 읽어도 한 번만 처리된다. 승자 응답을 재polling해도 거절이 아니다.
 - allowlist 밖 응답은 `unauthorized`로 이력에만 기록하고 회신하지 않는다.
-- 자연어 확인이 늦어 제안이 사라졌으면 `proposal_expired`, 다른 응답이 먼저 이겼으면 `already_handled`로 회신한다.
+- HITL이 이미 확정됐으면 자연어 확인은 `already_handled`로 회신한다. 같은 응답자가 다시 자연어로 응답하면 이전 제안은 대체된다.
 - 같은 아이템이 HITL에 다시 들어가면 새 요청이 생기고, 이전 요청에 대한 늦은 응답은 새 요청을 닫지 않는다.
 
 #### 해결됨 · 처리 중 → 결과 phase
@@ -214,14 +204,16 @@ flowchart TD
     A -- "done" --> D1["on_done 실행"]
     D1 -- "성공" --> DONE["Done, worktree 정리"]
     D1 -- "실패" --> FAIL["Failed, worktree 보존"]
-    A -- "retry" --> RT["사용자 지시를 lateral plan으로 주입, Pending으로 돌아가 재시도, worktree 보존"]
+    A -- "retry" --> RT["같은 아이템 Pending, 사용자 지시를 lateral plan으로 주입, failure_count 리셋, worktree 보존"]
     A -- "skip" --> SK["Skipped, worktree 정리"]
-    A -- "replan" --> RP["스펙 수정 제안 (아래 Replan 참조), 상한 이내면 Pending, 초과면 Failed"]
+    A -- "replan" --> RP{"계열 replan 3회 이내?"}
+    RP -- "이내" --> RP1["원 아이템 Skipped (worktree 정리), 파생 아이템 Pending (실패 맥락 주입, 새 worktree)"]
+    RP -- "초과" --> RP2["Failed, worktree 보존"]
 ```
 
 - done의 on_done이 실패하면 Failed다. 그 밖의 후처리 단계가 실패해도 결과 전이에는 도달하고, dashboard에 경고가 남는다.
 - 결과 전이가 계속 실패하면 연속 N회 뒤 Failed로 끝나 아이템이 영구히 처리 중으로 남지 않는다. 그동안 dashboard에 "후처리 재시도 중"이 표시된다.
-- 출처 시스템의 `belt:needs-human` 같은 표식은 응답 경로와 무관하게 후처리에서 제거된다.
+- 출처 시스템의 `belt:needs-human` 같은 표식은 응답 경로와 무관하게 후처리에서 제거된다. on_done 실패로 Failed가 될 때도 제거된다.
 - daemon이 꺼져 있는 동안 CLI로 응답해도 확정된다. 재시작 후 후처리가 이어진다.
 
 > **처리 중에는 다른 변경이 거절된다.** "해결됨 · 처리 중"인 아이템에 `belt queue skip` 등을 요청하면 `busy`로 거절된다. 반대로 open 상태의 HITL 아이템에 `belt queue skip` / `belt queue done`을 요청하면 직접 상태가 바뀌지 않고 HITL 응답으로 전환되어 위 경합에 참여한다.
@@ -230,10 +222,12 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    R["replan (사용자 응답 또는 hitl timeout)"] --> C{"replan 횟수 상한 (3회) 이내?"}
-    C -- "초과" --> X["Failed (사람의 replan 응답과 만료 경로 모두 동일)"]
-    C -- "이내" --> S["Agent가 실패 컨텍스트 + lateral report를 분석하여 스펙 수정 제안"]
-    S --> U["사용자가 /spec update로 스펙 수정 → 새 이슈 생성 → 파이프라인 재진입"]
+    R["replan (사람 응답 또는 timeout terminal replan)"] --> C{"계열 replan 3회 이내?"}
+    C -- "초과" --> X["Failed (worktree 보존)"]
+    C -- "이내" --> S["원 아이템 Skipped"]
+    S --> N["같은 출처로 새 work_id의 파생 아이템 생성, 파생 원본 기록"]
+    N --> I["실패 맥락 (이전 시도, lateral 이력, HITL 메모)을 주입하고 계획부터 다시 수행"]
+    I --> P["Pending, 파이프라인 재진입"]
 ```
 
 ### 타임아웃
@@ -245,8 +239,10 @@ flowchart TD
 | 만료 결과 | 조건 | 최종 phase | worktree |
 |-----------|------|-----------|----------|
 | terminal `skip` | 기본 | Skipped | 정리 |
-| terminal `replan` | replan 상한 이내 | Pending (replan 처리) | 정리 |
-| 기본값 | replan 상한 초과 또는 terminal 설정을 해석할 수 없음 | Failed | 정리 |
+| terminal `replan` | replan 상한 이내 | 원 아이템 Skipped + 파생 아이템 Pending | 원 아이템 정리, 파생 아이템은 새 worktree |
+| terminal `replan` | replan 상한 초과 | Failed | 보존 |
+
+terminal 값은 `skip` 또는 `replan`만 허용되며 그 밖의 값은 설정 로드 시 거부된다.
 
 > 만료 결과의 상세는 [LifecycleHook](../concerns/lifecycle-hook.md#on_hitl_resolved), 경합 규칙은 [Cron 엔진](../concerns/cron-engine.md)을 따른다.
 
@@ -317,7 +313,7 @@ sequenceDiagram
 
 | 아이템 상태 | `belt queue skip` 결과 |
 |-------------|----------------------|
-| Running | 취소 (`canceled` / `canceled_directly` / `too_late`) |
+| Running | 취소 (`canceled` / `canceled_directly` / `accepted` / `too_late`) |
 | Pending, Ready, Failed | Skipped |
 | Hitl (open) | HITL 응답 skip으로 전환, 첫 응답 승리 경합 |
 | Hitl (해결됨 · 처리 중) | `busy` |
@@ -341,17 +337,17 @@ flowchart TD
 
 | 시나리오 | 입력 | 기대 최종 phase | 기대 side effect |
 |---------|------|----------------|-----------------|
-| 1회 실패 | handler 실패 (failure_count=1) | 새 아이템 Pending | retry, on_fail 미실행, lateral plan 주입 |
-| 2회 실패 | handler 실패 (failure_count=2) | 새 아이템 Pending | retry_with_comment, on_fail 실행, lateral plan 주입 |
+| 1회 실패 | handler 실패 (failure_count=1) | 원 아이템 Skipped, 파생 아이템 Pending | retry, on_fail 미실행, lateral plan 주입, worktree 인계, `skipped` 알림 없음 |
+| 2회 실패 | handler 실패 (failure_count=2) | 원 아이템 Skipped, 파생 아이템 Pending | retry_with_comment, on_fail 실행, lateral plan 주입, worktree 인계, `skipped` 알림 없음 |
 | 3회 실패 | handler 실패 (failure_count=3) | HITL | hitl, on_fail 실행, lateral report 첨부 |
 | SPINNING 감지 | 동일 error 3회 연속 (유사도 ≥ 0.9, 인접 쌍 일치 2회) | escalation에 따름 | 페르소나 directive가 담긴 lateral plan 주입 |
 | OSCILLATION 감지 | 두 error가 교대로 2회 이상 반복 (유사도 ≥ 0.9) | escalation에 따름 | 페르소나 directive가 담긴 lateral plan 주입 |
 | HITL done 응답 | 사용자 done 선택 | "해결됨 · 처리 중" 뒤 Done | on_done 성공 후 Done, worktree 정리 |
 | HITL retry 응답 | 사용자 retry + 지시 | Pending (같은 아이템) | 사용자 지시를 lateral plan으로 주입, worktree 보존 |
 | HITL skip 응답 | 사용자 skip 선택 | Skipped (terminal) | worktree 정리 |
-| HITL replan 응답 | 사용자 replan 선택 (상한 3회 이내) | Pending (replan 처리) | 스펙 수정 제안 |
+| HITL replan 응답 | 사용자 replan 선택 (상한 3회 이내) | 원 아이템 Skipped + 파생 아이템 Pending | 실패 맥락 주입, 새 worktree, 원 아이템 worktree 정리 |
 | HITL replan 응답, 상한 초과 | 사용자 replan 선택 (이미 3회 replan) | Failed | worktree 보존 (Failed 규칙) |
-| HITL timeout | 24시간 무응답 | terminal 액션 적용 | skip→Skipped, replan→Pending, 상한 초과·해석 불가→Failed |
+| HITL timeout | 24시간 무응답 | terminal 액션 적용 | skip→Skipped, replan→원 아이템 Skipped + 파생 아이템 Pending, 상한 초과→Failed |
 | GitHub·CLI 동시 응답 | 두 경로가 거의 동시에 응답 | 먼저 확정된 응답의 결과 | 하나만 승리, 나머지는 `already_handled`, GitHub에는 "이미 처리됨" 회신, DB 에러 없음 |
 | allowlist 밖 응답 | 목록에 없는 응답자가 channel에서 응답 | 변화 없음 | `unauthorized`로 기록, 회신 없음 |
 | 자연어 확인 대기 중 CLI 응답 | 제안 확인 전에 CLI가 먼저 응답 | CLI 응답의 결과 | 이후 확인은 `already_handled`로 회신 |
@@ -366,6 +362,10 @@ flowchart TD
 | handler 직후 취소 | handler가 끝난 직후 `belt queue skip` | handler 결과를 따름 | `too_late`, phase 불변 |
 | graceful shutdown | SIGINT + Running 아이템 | 완료 시 정상 처리, 30초 초과 시 Pending | worktree 보존, cron engine 정지 |
 | on_enter 실패 | on_enter hook 에러 | escalation 경로 진입 | handler 건너뜀, failure_count 포함 |
+| HITL retry 뒤 재실패 | HITL retry 확정 뒤 handler 다시 실패 | 원 아이템 Skipped, 파생 아이템 Pending | escalation 1회차(retry)부터 다시 적용 |
+| evaluate HITL 열림 | evaluate가 사람 판단 필요로 분류 | HITL | 출처 시스템에 `belt:needs-human` 라벨 추가 |
+| 재시작 시 열린 취소 요청 | 취소 요청이 열린 채 daemon 재시작 | Skipped | 요청 `canceled`, Pending 롤백 없음 |
+| 취소 수락 뒤 지연 | daemon이 취소를 수락했으나 제한 시간 안에 종결되지 않음 | 종결 때까지 Running | CLI는 `accepted`(exit 0)로 끝나고 최종 결과는 `belt queue show`로 확인 |
 
 ---
 

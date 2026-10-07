@@ -1,6 +1,6 @@
 # Flow 5: 모니터링 — 칸반 보드 + 시각화
 
-> 사용자가 다수 workspace x 다수 스펙의 전체 진행 상황을 TUI, CLI, /agent 세션에서 일관되게 확인한다.
+> 사용자가 다수 workspace의 큐 전체 진행 상황을 TUI, CLI, /agent 세션에서 일관되게 확인한다.
 
 ---
 
@@ -12,7 +12,7 @@
 | CLI 출력 | `belt status --format rich` | 정적 스냅샷, 코어 CLI |
 | Agent 세션 | `belt agent` → "보드 보여줘" | 자연어, 읽기 전용 조회의 주 인터페이스 |
 
-> **Phase 구분**: `status`, `spec status` 등 코어 CLI는 Phase 1로 직접 구현. `board`, `decisions`, `logs` 등 읽기 전용 조회는 `/agent`가 흡수 (Phase 2, 필요 시 독립 CLI 추가).
+> **Phase 구분**: `status` 등 코어 CLI는 Phase 1로 직접 구현. `board`, `decisions`, `logs` 등 읽기 전용 조회는 `/agent`가 흡수 (Phase 2, 필요 시 독립 CLI 추가).
 
 ---
 
@@ -72,6 +72,7 @@ daemon이 처리 중인 아이템은 처리 종류를 함께 보여준다. 처�
 │ Phase: Done | Runtime: claude/sonnet         │
 │                                               │
 │ Timeline:                                     │
+│  원본  ○ Skipped (파생됨 → auth:implement:2) │
 │  14:00 ○ Pending  ← github 수집              │
 │  14:00 ○ Ready    ← auto                     │
 │  14:01 ○ Running                              │
@@ -84,6 +85,8 @@ daemon이 처리 중인 아이템은 처리 종류를 함께 보여준다. 처�
 │         └ worktree 정리                       │
 └───────────────────────────────────────────────┘
 ```
+
+> 같은 이력은 `belt queue show <work_id>`로도 볼 수 있다. 거절 기록과 파생 원본이 함께 나온다.
 
 ### 실패 + Lateral Thinking 타임라인
 
@@ -124,7 +127,6 @@ daemon이 처리 중인 아이템은 처리 종류를 함께 보여준다. 처�
 | Tab | AllWorkspaces ↔ PerWorkspace |
 | Enter | 상세 / 전이 타임라인 |
 | h | HITL 오버레이 (오버레이 안에서 응답 가능) |
-| s | Spec 상세 |
 | d | 판단 이력 |
 | R | 새로고침 |
 | x | 선택한 실행 중 아이템 취소 요청 |
@@ -176,7 +178,7 @@ sequenceDiagram
 | `json` | 구조화된 JSON (Agent 파싱용) |
 | `rich` | 색상 + 박스 + 진행률 바 (터미널용) |
 
-모든 CLI 서브커맨드(status, board, spec list, spec status, queue list 등)에 적용.
+모든 CLI 서브커맨드(status, board, queue list 등)에 적용.
 
 ### `belt status --format rich`
 
@@ -184,39 +186,14 @@ sequenceDiagram
 ● belt daemon (uptime 2h 15m)
 
 Workspaces:
-  auth-project  ● active   queue: 1P 1R 1C 2D 1F   specs: 2/3   stag: 0
-  backend-tasks ● active   queue: 0P 0R 0C 5D       specs: 1/1 ✓
+  auth-project  ● active   queue: 1P 1R 1C 2D 1F   stag: 0
+  backend-tasks ● active   queue: 0P 0R 0C 5D       stag: 0
 
 Runtime: claude/sonnet (45.2K tokens/1h)
 HITL: 1 pending ⚠
 Failed: 1 ⚠
 Stagnation: 0
 Next evaluate: 25s
-```
-
-### `belt spec status <id> --format rich`
-
-```
-auth-v2  Auth Module v2
-Status: Active | Runtime: claude/sonnet
-Progress: ████████░░░░ 60% (3/5)
-
-Issues:
-  ✅ #42 JWT middleware       Done        6m   1.2K tokens
-  ✅ #43 Token API            Done        8m   1.8K tokens
-  🔄 #44 Session adapter      Running     3m   ...
-  ⚠ #39 Auth refactor        Failed      —    on_done script 실패
-  ⏳ #45 Error handling        Pending     dep:#44
-  ⏳ #46 Missing tests         Pending
-
-Acceptance Criteria:
-  ✅ POST /auth/login → JWT 반환 (200)
-  ✅ 만료 토큰 → 401 반환
-  ⬜ POST /auth/refresh → 새 토큰 반환
-  ⬜ cargo test -p auth 전체 통과
-
-Dependencies:
-  #45 depends on #44 (shared: src/auth/session)
 ```
 
 ---
@@ -306,7 +283,6 @@ HITL 요청이 열리면 사용자에게 다음 경로로 알린다. 응답은 �
 
 - [DESIGN](../DESIGN.md) — 전체 구조와 상태 흐름
 - [Stagnation Detection](../concerns/stagnation.md) — 반복 패턴 감지 시각화
-- [스펙 생명주기](./02-spec-lifecycle.md) — 스펙 진행률
 - [실패 복구와 HITL](./04-failure-and-hitl.md) — HITL 응답, 실행 중 취소
 - [NotificationChannel](../concerns/notification.md) — 알림 channel과 응답 수신
 - [QueuePhase 상태 머신](../concerns/queue-state-machine.md) — 처리 중 잠금과 취소
