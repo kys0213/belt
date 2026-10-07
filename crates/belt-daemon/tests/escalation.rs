@@ -539,6 +539,10 @@ mod store_results {
         db: Arc<Database>,
         calls: Mutex<Vec<String>>,
         worktrees: Mutex<Vec<(String, PathBuf)>>,
+        /// `(work_id, queue.derived_from)` seen by on_enter.
+        derivations: Mutex<Vec<(String, Option<String>)>>,
+        /// `(work_id, worktree)` seen by on_done.
+        done_worktrees: Mutex<Vec<(String, PathBuf)>>,
         /// When set, on_enter moves the stored row to Skipped behind the
         /// daemon's back, so the result transition conflicts.
         skip_on_enter: bool,
@@ -558,6 +562,8 @@ mod store_results {
                 db,
                 calls: Mutex::new(Vec::new()),
                 worktrees: Mutex::new(Vec::new()),
+                derivations: Mutex::new(Vec::new()),
+                done_worktrees: Mutex::new(Vec::new()),
                 skip_on_enter,
             })
         }
@@ -573,6 +579,26 @@ mod store_results {
 
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn derived_from_of(&self, work_id: &str) -> Option<String> {
+            self.derivations
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(w, _)| w == work_id)
+                .map(|(_, d)| d.clone())
+                .unwrap_or_else(|| panic!("{work_id} never entered Running"))
+        }
+
+        fn done_worktree_of(&self, work_id: &str) -> PathBuf {
+            self.done_worktrees
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(w, _)| w == work_id)
+                .map(|(_, p)| p.clone())
+                .unwrap_or_else(|| panic!("{work_id} never reached on_done"))
         }
 
         fn worktree_of(&self, work_id: &str) -> PathBuf {
@@ -593,13 +619,21 @@ mod store_results {
                 .lock()
                 .unwrap()
                 .push((ctx.work_id.clone(), ctx.worktree.clone()));
+            self.derivations.lock().unwrap().push((
+                ctx.work_id.clone(),
+                ctx.item_context.queue.derived_from.clone(),
+            ));
             if self.skip_on_enter {
                 self.db.update_phase(&ctx.work_id, QueuePhase::Skipped)?;
             }
             Ok(())
         }
 
-        async fn on_done(&self, _ctx: &HookContext) -> anyhow::Result<()> {
+        async fn on_done(&self, ctx: &HookContext) -> anyhow::Result<()> {
+            self.done_worktrees
+                .lock()
+                .unwrap()
+                .push((ctx.work_id.clone(), ctx.worktree.clone()));
             Ok(())
         }
 
@@ -730,7 +764,9 @@ mod store_results {
     #[tokio::test]
     async fn lineage_failures_climb_the_ladder_to_one_open_hitl_request() {
         let tmp = TempDir::new().unwrap();
-        let mut daemon = failing_daemon(&tmp, vec![1, 1, 1], test_workspace_config());
+        let daemon = failing_daemon(&tmp, vec![1, 1, 1], test_workspace_config());
+        let hook = RecordingHook::new(Arc::clone(daemon.database()));
+        let mut daemon = daemon.with_hook(hook.clone());
 
         daemon.collect().await.unwrap();
         let ladder: Vec<EscalationAction> = [
@@ -778,6 +814,59 @@ mod store_results {
         assert_eq!(request.work_id, last);
         assert_eq!(request.reason, Some(HitlReason::RetryMaxExceeded));
         assert_eq!(daemon.items_in_phase(QueuePhase::Hitl).len(), 1);
+
+        // Every derived item works in the worktree handed down from the origin.
+        let origin_wt = hook.worktree_of(ORIGIN);
+        assert_eq!(hook.worktree_of(&derived(2)), origin_wt);
+        assert_eq!(hook.worktree_of(&last), origin_wt);
+
+        // The hook context carries the derivation.
+        assert_eq!(hook.derived_from_of(ORIGIN), None);
+        assert_eq!(hook.derived_from_of(&derived(2)).as_deref(), Some(ORIGIN));
+        assert_eq!(
+            hook.derived_from_of(&last).as_deref(),
+            Some(derived(2).as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn on_done_of_a_derived_item_runs_in_the_inherited_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let marker = tmp.path().join("on_done_worktree.txt");
+        let mut config = test_workspace_config();
+        let yaml = format!(
+            "- script: \"echo $WORKTREE > {}\"",
+            marker.to_str().unwrap()
+        );
+        config
+            .sources
+            .get_mut("github")
+            .unwrap()
+            .states
+            .get_mut("analyze")
+            .unwrap()
+            .on_done = serde_yaml::from_str(&yaml).unwrap();
+        let daemon = failing_daemon(&tmp, vec![1, 0], config);
+        let hook = RecordingHook::new(Arc::clone(daemon.database()));
+        let mut daemon = daemon.with_hook(hook.clone());
+
+        daemon.collect().await.unwrap();
+        run_once(&mut daemon).await;
+        let outcome = run_once(&mut daemon).await;
+        assert!(
+            matches!(outcome, ItemOutcome::Completed(_)),
+            "got {outcome:?}"
+        );
+        let origin_wt = hook.worktree_of(ORIGIN);
+
+        let mut item = daemon.get_item(&derived(2)).cloned().unwrap();
+        assert!(daemon.execute_on_done(&mut item).await.unwrap());
+        let ran_in = std::fs::read_to_string(&marker).unwrap();
+        assert_eq!(ran_in.trim(), origin_wt.to_str().unwrap());
+
+        daemon.mark_done(&derived(2)).unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(hook.done_worktree_of(&derived(2)), origin_wt);
     }
 
     #[tokio::test]

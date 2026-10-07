@@ -1364,7 +1364,7 @@ impl Daemon {
         }
 
         // Lifecycle hook: on_done — fire and forget, log only on failure.
-        let worktree_path = self.worktree_mgr.path(&item.work_id);
+        let worktree_path = Self::owner_worktree_path(&self.db, &*self.worktree_mgr, &item.work_id);
         let hook_ctx = Self::build_hook_context_static(item, &worktree_path, &self.config.name);
         let hook = self.resolve_hook(&self.config.name);
         Self::spawn_hook(async move {
@@ -1379,6 +1379,25 @@ impl Daemon {
         self.cleanup_owned_worktree(work_id);
 
         Ok(())
+    }
+
+    /// Path of the worktree `work_id` works in (its owner's, see
+    /// [`Database::worktree_key`]).
+    ///
+    /// Hooks only observe the path, so an unreadable owner is logged and the
+    /// item's own key is used instead of failing the transition.
+    fn owner_worktree_path(
+        db: &Database,
+        worktree_mgr: &dyn WorktreeManager,
+        work_id: &str,
+    ) -> PathBuf {
+        match db.worktree_key(work_id) {
+            Ok(key) => worktree_mgr.path(&key),
+            Err(e) => {
+                tracing::warn!(work_id, error = %e, "worktree owner lookup failed for hook context");
+                worktree_mgr.path(work_id)
+            }
+        }
     }
 
     /// Clean up the worktree a finished (Done or lineage-ending Skipped) item owns.
@@ -1648,7 +1667,7 @@ impl Daemon {
         let attempt = self
             .history_events
             .iter()
-            .filter(|h| h.source_id == source_id && h.state == state)
+            .filter(|h| h.source_id == source_id && h.state == state && h.status == "failed")
             .count() as u32
             + 1;
 
@@ -1699,7 +1718,8 @@ impl Daemon {
             return Ok(true);
         }
 
-        let worktree = self.worktree_mgr.create_or_reuse(&item.work_id)?;
+        let key = self.db.worktree_key(&item.work_id)?;
+        let worktree = self.worktree_mgr.create_or_reuse(&key)?;
         let env = ActionEnv::new(&item.work_id, &worktree);
         let on_done: Vec<Action> = state_config.on_done.iter().map(Action::from).collect();
         let result = self.executor.execute_all(&on_done, &env).await?;
@@ -1860,7 +1880,12 @@ impl Daemon {
         let eval_result = {
             // Use the first completed item's worktree for the evaluate env.
             let eval_env = if let Some(work_id) = completed.first() {
-                self.worktree_mgr.create_or_reuse(work_id).ok().map(|wt| {
+                let worktree = self
+                    .db
+                    .worktree_key(work_id)
+                    .and_then(|key| self.worktree_mgr.create_or_reuse(&key))
+                    .ok();
+                worktree.map(|wt| {
                     ActionEnv::new(work_id, &wt)
                         .with_var("WORKSPACE", &self.config.name)
                         .with_var("BELT_HOME", &self.belt_home.to_string_lossy())
@@ -2688,9 +2713,9 @@ impl Daemon {
         worktree: Option<&PathBuf>,
         failure_count: u32,
     ) -> HookContext {
-        let worktree_path = worktree
-            .cloned()
-            .unwrap_or_else(|| self.worktree_mgr.path(&item.work_id));
+        let worktree_path = worktree.cloned().unwrap_or_else(|| {
+            Self::owner_worktree_path(&self.db, &*self.worktree_mgr, &item.work_id)
+        });
         HookContext {
             work_id: item.work_id.clone(),
             worktree: worktree_path,
@@ -3199,6 +3224,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("github:org/repo#1", "analyze");
+        Daemon::ensure_row(&daemon.db, &item);
         item.set_phase_unchecked(QueuePhase::Completed);
 
         let success = daemon.execute_on_done(&mut item).await.unwrap();
@@ -3771,6 +3797,31 @@ sources:
         assert_eq!(events[2].attempt, 3);
     }
 
+    #[test]
+    fn mark_failed_attempt_counts_only_failed_events() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let done = test_item("s1", "analyze");
+        daemon.record_history_event(&done, "done", None);
+
+        let mut item = test_item("s1", "analyze");
+        item.work_id = "s1:analyze-1".to_string();
+        item.set_phase_unchecked(QueuePhase::Running);
+        daemon.push_item(item);
+        daemon
+            .mark_failed("s1:analyze-1", "boom".to_string())
+            .unwrap();
+
+        let last = daemon.history_events().last().unwrap();
+        assert_eq!(last.status, "failed");
+        assert_eq!(
+            last.attempt, 1,
+            "a prior done event is not an attempt failure"
+        );
+    }
+
     // ---------------------------------------------------------------
     // Deduplication in collect tests
     // ---------------------------------------------------------------
@@ -4124,6 +4175,7 @@ sources:
             .register_preserved("github:org/repo#1", wt_path);
 
         let mut item = test_item("github:org/repo#1", "analyze");
+        Daemon::ensure_row(&daemon.db, &item);
         item.set_phase_unchecked(QueuePhase::Completed);
 
         let success = daemon.execute_on_done(&mut item).await.unwrap();
@@ -4498,6 +4550,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         let mut item = test_item("github:org/repo#1", "analyze");
+        Daemon::ensure_row(&daemon.db, &item);
         item.set_phase_unchecked(QueuePhase::Completed);
 
         assert_eq!(daemon.history().len(), 0);
