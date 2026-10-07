@@ -436,24 +436,66 @@ enum DependencyCommands {
     },
 }
 
+/// The workspace sources the daemon treats as GitHub sources, by name.
+fn github_sources(
+    config: &belt_core::workspace::WorkspaceConfig,
+) -> Vec<(&String, &belt_core::workspace::SourceConfig)> {
+    let mut sources: Vec<_> = config
+        .sources
+        .iter()
+        .filter(|(name, source)| name.as_str() == "github" || source.url.contains("github.com"))
+        .collect();
+    sources.sort_by_key(|(name, _)| name.as_str());
+    sources
+}
+
+/// The only GitHub source of the workspace, if any.
+///
+/// # Errors
+/// More than one GitHub source: the origin channel posts to a single
+/// repository, so a second source's items would have no address.
+fn single_github_source(
+    config: &belt_core::workspace::WorkspaceConfig,
+) -> anyhow::Result<Option<&belt_core::workspace::SourceConfig>> {
+    let sources = github_sources(config);
+    if sources.len() > 1 {
+        let names: Vec<&str> = sources.iter().map(|(name, _)| name.as_str()).collect();
+        anyhow::bail!(
+            "the workspace has {} GitHub sources ({}), but belt supports exactly one: \
+             the origin channel notifies a single repository",
+            sources.len(),
+            names.join(", ")
+        );
+    }
+    Ok(sources.first().map(|(_, source)| *source))
+}
+
+/// A fresh empty directory for the natural-language interpreter's runtime;
+/// removed when the returned guard is dropped.
+fn new_nl_sandbox() -> anyhow::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix("belt-nl-")
+        .tempdir()
+        .map_err(|e| anyhow::anyhow!("failed to create the interpreter sandbox: {e}"))
+}
+
 /// Build the notifier from the workspace's `notifications` section.
 ///
 /// The origin channel talks to the repository of the GitHub source. A
 /// workspace without one has no origin implementation: progress and HITL
-/// requests then show on the dashboard only.
+/// requests then show on the dashboard only. The interpreter's runtime runs
+/// in `nl_sandbox`, an empty directory.
 fn build_notifier(
     config: &belt_core::workspace::WorkspaceConfig,
     db: Arc<Database>,
     runtime: Arc<dyn belt_core::runtime::AgentRuntime>,
+    nl_sandbox: &std::path::Path,
 ) -> anyhow::Result<belt_daemon::notify::Notifier> {
     use belt_core::notification::NotificationChannel;
 
     let mut channels: Vec<Arc<dyn NotificationChannel>> = Vec::new();
-    let github_repo = config
-        .sources
-        .iter()
-        .find(|(name, source)| name.as_str() == "github" || source.url.contains("github.com"))
-        .and_then(|(_, source)| GitHubDataSource::extract_repo_name(&source.url));
+    let github_repo = single_github_source(config)?
+        .and_then(|source| GitHubDataSource::extract_repo_name(&source.url));
     match github_repo {
         Some(repo) => {
             let shell: Arc<dyn belt_core::platform::ShellExecutor> =
@@ -467,7 +509,7 @@ fn build_notifier(
             "no GitHub source: notifications are shown on the dashboard only (no origin channel)"
         ),
     }
-    let interpreter = belt_daemon::notify::NlInterpreter::new(runtime, PathBuf::from("."));
+    let interpreter = belt_daemon::notify::NlInterpreter::new(runtime, nl_sandbox.to_path_buf());
     belt_daemon::notify::Notifier::new(db, config.notifications.clone(), channels, interpreter)
 }
 
@@ -484,14 +526,12 @@ async fn start_daemon(
 
     // Build DataSources from workspace config.
     let mut sources: Vec<Box<dyn belt_core::source::DataSource>> = Vec::new();
-    for (name, source_config) in &config.sources {
-        if name == "github" || source_config.url.contains("github.com") {
-            sources.push(Box::new(GitHubDataSource::new(&source_config.url)));
-        }
+    if let Some(github) = single_github_source(&config)? {
+        sources.push(Box::new(GitHubDataSource::new(&github.url)));
     }
 
-    // Runtime registry with Claude as default.
-    let mut registry = RuntimeRegistry::new("claude".to_string());
+    // Runtime registry with the workspace's default runtime.
+    let mut registry = RuntimeRegistry::new(config.runtime.default.clone());
     registry.register(Arc::new(ClaudeRuntime::new(None)));
     registry.register(Arc::new(GeminiRuntime::new(None)));
     registry.register(Arc::new(CodexRuntime::new(None)));
@@ -528,10 +568,12 @@ async fn start_daemon(
         db,
     )
     .with_belt_home(belt_home);
+    let nl_sandbox = new_nl_sandbox()?;
     let notifier = build_notifier(
         &config_for_notifier,
         Arc::clone(daemon.database()),
         default_runtime,
+        nl_sandbox.path(),
     )?;
     let mut daemon = daemon.with_notifier(notifier);
 
@@ -3171,6 +3213,20 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nl_sandbox_is_an_empty_directory_apart_from_the_working_directory() {
+        let sandbox = new_nl_sandbox().unwrap();
+        assert!(sandbox.path().is_dir());
+        assert_eq!(std::fs::read_dir(sandbox.path()).unwrap().count(), 0);
+        assert_ne!(
+            sandbox.path().canonicalize().unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
+        );
+        let path = sandbox.path().to_path_buf();
+        drop(sandbox);
+        assert!(!path.exists());
+    }
 
     #[test]
     fn already_handled_refusal_reports_who_how_what_and_when() {

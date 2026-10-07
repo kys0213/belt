@@ -1567,3 +1567,48 @@ fn queue_show_includes_derived_origin() {
         "text output shows history: {stdout}"
     );
 }
+
+#[test]
+fn start_refuses_more_than_one_github_source() {
+    let tmp = TempDir::new().unwrap();
+    let config = tmp.path().join("workspace.yaml");
+    let source = |url: &str| {
+        format!("    url: {url}\n    escalation:\n      1: retry\n      terminal: skip\n")
+    };
+    std::fs::write(
+        &config,
+        format!(
+            "name: p\nsources:\n  github:\n{}  mirror:\n{}",
+            source("https://github.com/org/repo"),
+            source("https://github.com/org/other")
+        ),
+    )
+    .unwrap();
+
+    let out = run_belt(tmp.path(), &["start", "--config", config.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("2 GitHub sources") && stderr.contains("github, mirror"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn start_refuses_a_default_runtime_that_is_not_registered() {
+    let tmp = TempDir::new().unwrap();
+    let config = tmp.path().join("workspace.yaml");
+    std::fs::write(
+        &config,
+        "name: p\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\nruntime:\n  default: nonexistent\n",
+    )
+    .unwrap();
+
+    let out = run_belt(tmp.path(), &["start", "--config", config.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("default runtime `nonexistent` is not registered"),
+        "{stderr}"
+    );
+}
