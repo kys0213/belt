@@ -969,11 +969,13 @@ mod store_results {
     async fn failures_past_the_highest_level_reuse_it() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_workspace_config();
-        config.sources.get_mut("github").unwrap().escalation =
-            EscalationPolicy::new(BTreeMap::from([
+        config.sources.get_mut("github").unwrap().escalation = EscalationPolicy::with_terminal(
+            BTreeMap::from([
                 (1, EscalationAction::Retry),
                 (2, EscalationAction::RetryWithComment),
-            ]));
+            ]),
+            EscalationAction::Skip,
+        );
         let mut daemon = failing_daemon(&tmp, vec![1, 1, 1], config);
 
         daemon.collect().await.unwrap();
@@ -992,8 +994,10 @@ mod store_results {
     async fn skip_escalation_moves_running_to_skipped() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_workspace_config();
-        config.sources.get_mut("github").unwrap().escalation =
-            EscalationPolicy::new(BTreeMap::from([(1, EscalationAction::Skip)]));
+        config.sources.get_mut("github").unwrap().escalation = EscalationPolicy::with_terminal(
+            BTreeMap::from([(1, EscalationAction::Skip)]),
+            EscalationAction::Skip,
+        );
         let mut daemon = failing_daemon(&tmp, vec![1], config);
 
         daemon.collect().await.unwrap();
@@ -1018,8 +1022,10 @@ mod store_results {
     async fn skip_escalation_cleans_up_the_worktree_it_owned() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_workspace_config();
-        config.sources.get_mut("github").unwrap().escalation =
-            EscalationPolicy::new(BTreeMap::from([(1, EscalationAction::Skip)]));
+        config.sources.get_mut("github").unwrap().escalation = EscalationPolicy::with_terminal(
+            BTreeMap::from([(1, EscalationAction::Skip)]),
+            EscalationAction::Skip,
+        );
         let daemon = failing_daemon(&tmp, vec![1], config);
         let hook = RecordingHook::new(Arc::clone(daemon.database()));
         let mut daemon = daemon.with_hook(hook.clone());

@@ -2302,18 +2302,21 @@ impl Daemon {
     ///
     /// Past the highest configured level the highest level is reused
     /// ([`belt_core::escalation::EscalationPolicy::resolve`]).
+    ///
+    /// A workspace without sources has no policy to consult; the item goes to
+    /// a human instead of being retried without bound.
     fn resolve_escalation(&self, failure_count: u32) -> EscalationAction {
-        self.escalation_policy().resolve(failure_count)
+        match self.escalation_policy() {
+            Some(policy) => policy.resolve(failure_count),
+            None => {
+                tracing::warn!("no source defines an escalation policy; escalating to HITL");
+                EscalationAction::Hitl
+            }
+        }
     }
 
-    fn escalation_policy(&self) -> EscalationPolicy {
-        self.config
-            .sources
-            .values()
-            .next()
-            .map(|s| &s.escalation)
-            .cloned()
-            .unwrap_or_default()
+    fn escalation_policy(&self) -> Option<&EscalationPolicy> {
+        self.config.sources.values().next().map(|s| &s.escalation)
     }
 
     /// Expiry terms of a HITL request opened now: the default HITL timeout
@@ -2321,7 +2324,9 @@ impl Daemon {
     fn hitl_expiry(&self) -> HitlExpiry {
         HitlExpiry::after_hours(
             HITL_TIMEOUT_HOURS,
-            self.escalation_policy().terminal_action().copied(),
+            self.escalation_policy()
+                .and_then(EscalationPolicy::terminal_action)
+                .copied(),
             Utc::now(),
         )
     }
@@ -2736,7 +2741,9 @@ impl Daemon {
         let attempt = self
             .history_events
             .iter()
-            .filter(|h| h.source_id == item.source_id && h.state == item.state)
+            .filter(|h| {
+                h.source_id == item.source_id && h.state == item.state && h.status == "failed"
+            })
             .count() as u32
             + 1;
         let event = HistoryEvent {
@@ -2950,6 +2957,25 @@ sources:
             4,
             Database::open_in_memory().unwrap(),
         )
+    }
+
+    #[test]
+    fn escalation_without_any_source_goes_to_hitl() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_workspace_config();
+        config.sources.clear();
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(MockRuntime::new("mock", vec![])));
+        let daemon = Daemon::new(
+            config,
+            vec![Box::new(MockDataSource::new("github"))],
+            Arc::new(registry),
+            Box::new(MockWorktreeManager::new(tmp.path().to_path_buf())),
+            4,
+            Database::open_in_memory().unwrap(),
+        );
+
+        assert_eq!(daemon.resolve_escalation(1), EscalationAction::Hitl);
     }
 
     // --- Safe state transition tests ---
@@ -3777,6 +3803,21 @@ sources:
             last.attempt, 1,
             "a prior done event is not an attempt failure"
         );
+    }
+
+    #[test]
+    fn record_history_event_attempt_counts_only_failed_events() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+        let item = test_item("s1", "analyze");
+
+        daemon.record_history_event(&item, "completed", None);
+        daemon.record_history_event(&item, "failed", Some("first".to_string()));
+        daemon.record_history_event(&item, "failed", Some("second".to_string()));
+
+        let attempts: Vec<u32> = daemon.history_events().iter().map(|e| e.attempt).collect();
+        assert_eq!(attempts, vec![1, 1, 2]);
     }
 
     // ---------------------------------------------------------------

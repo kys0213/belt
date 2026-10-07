@@ -71,7 +71,7 @@ impl EscalationAction {
 ///
 /// failure_count → EscalationAction 매핑.
 /// `terminal` 키는 HITL timeout 시 적용되는 별도 액션.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EscalationPolicy {
     rules: BTreeMap<u32, EscalationAction>,
     terminal: Option<EscalationAction>,
@@ -144,15 +144,7 @@ impl<'de> Deserialize<'de> for EscalationPolicy {
 }
 
 impl EscalationPolicy {
-    /// 숫자 키 규칙만으로 생성한다.
-    pub fn new(rules: BTreeMap<u32, EscalationAction>) -> Self {
-        Self {
-            rules,
-            terminal: None,
-        }
-    }
-
-    /// 숫자 키 규칙과 terminal 액션을 함께 지정하여 생성한다.
+    /// 숫자 키 규칙과 terminal 액션을 함께 지정하여 생성한다. 설정에서 terminal은 필수다.
     pub fn with_terminal(
         rules: BTreeMap<u32, EscalationAction>,
         terminal: EscalationAction,
@@ -228,11 +220,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_policy_returns_retry() {
-        let policy = EscalationPolicy::default();
+    fn terminal_only_policy_returns_retry() {
+        let policy: EscalationPolicy = serde_json::from_str(r#"{"terminal": "skip"}"#).unwrap();
         assert!(policy.is_empty());
         assert_eq!(policy.resolve(1), EscalationAction::Retry);
-        assert_eq!(policy.terminal_action(), None);
+        assert_eq!(policy.terminal_action(), Some(&EscalationAction::Skip));
     }
 
     #[test]
@@ -377,12 +369,12 @@ mod tests {
         let mut rules = BTreeMap::new();
         rules.insert(1, EscalationAction::Retry);
         rules.insert(5, EscalationAction::Skip);
-        let policy = EscalationPolicy::new(rules);
+        let policy = EscalationPolicy::with_terminal(rules, EscalationAction::Replan);
 
         assert_eq!(policy.resolve(1), EscalationAction::Retry);
         assert_eq!(policy.resolve(2), EscalationAction::Retry);
         assert_eq!(policy.resolve(5), EscalationAction::Skip);
         assert_eq!(policy.resolve(10), EscalationAction::Skip);
-        assert_eq!(policy.terminal_action(), None);
+        assert_eq!(policy.terminal_action(), Some(&EscalationAction::Replan));
     }
 }
