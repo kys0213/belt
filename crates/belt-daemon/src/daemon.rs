@@ -114,6 +114,9 @@ pub struct Daemon {
     /// Running copy stays in `queue` meanwhile. Shared with the IPC wake
     /// task, which accepts cancels and stops handlers while a tick is busy.
     in_flight: Arc<InFlight>,
+    /// The work_id of every handler task in `handlers`, so a task that dies
+    /// without a result (a panic) can still be matched to its item.
+    handler_tasks: HashMap<tokio::task::Id, String>,
     /// Stops handler process groups (cancel, shutdown, leftovers at start).
     killer: Arc<dyn ProcessKiller>,
 }
@@ -240,6 +243,7 @@ impl Daemon {
             hook_loader: None,
             handlers: JoinSet::new(),
             in_flight: Arc::new(InFlight::default()),
+            handler_tasks: HashMap::new(),
             killer: Arc::from(belt_infra::platform::default_process_killer()),
         }
     }
@@ -835,13 +839,14 @@ impl Daemon {
             hook: Self::resolve_hook_static(&self.hook, &self.hook_loader, &ws_name),
             control,
         };
-        self.handlers.spawn(async move {
+        let task = self.handlers.spawn(async move {
             let control = Arc::clone(&deps.control);
             let result =
                 Self::execute_item_parallel(item, state_config, worktree_key, ws_name, deps).await;
             control.finish();
             result
         });
+        self.handler_tasks.insert(task.id(), work_id.to_string());
     }
 
     /// Wait until every handler in flight ends and apply each result.
@@ -877,13 +882,59 @@ impl Daemon {
     ) -> Option<ItemOutcome> {
         match joined {
             Ok(exec_result) => Some(self.apply_execution_result(exec_result).await),
-            Err(e) => {
-                // The item stays Running in the store with no handler; a
-                // restart rolls it back.
-                tracing::error!("handler task did not finish: {e}");
-                None
-            }
+            Err(e) => match self.handler_tasks.remove(&e.id()) {
+                Some(work_id) => {
+                    tracing::error!(work_id, "handler task did not finish: {e}");
+                    self.recover_lost_execution(&work_id, format!("handler task died: {e}"))
+                        .await
+                }
+                None => {
+                    tracing::error!("unknown handler task did not finish: {e}");
+                    None
+                }
+            },
         }
+    }
+
+    /// End an execution whose task died without a result (a panic).
+    ///
+    /// Its process is killed and its slot returned. An accepted or still
+    /// open cancel request wins: the item ends Skipped (`canceled`).
+    /// Otherwise the death counts as a failed attempt and goes through the
+    /// escalation policy, so a handler that panics every time ends in HITL
+    /// or skip instead of being claimed again forever. No on_fail script
+    /// runs: the execution's worktree is not known here.
+    async fn recover_lost_execution(
+        &mut self,
+        work_id: &str,
+        error: String,
+    ) -> Option<ItemOutcome> {
+        let control = self.in_flight.remove(work_id);
+        let stop = control.as_ref().and_then(|c| c.stop_reason());
+        if let Some(control) = &control {
+            control.abandon();
+        }
+        let idx = self.queue.iter().position(|i| i.work_id == work_id)?;
+        let item = self.queue.remove(idx).expect("index from position");
+        let ws_name = self.config.name.clone();
+        match stop {
+            Some(StopReason::Cancel { request_id }) => {
+                return Some(self.finish_canceled(item, request_id));
+            }
+            Some(StopReason::Superseded) => return Some(self.follow_superseded(item, &ws_name)),
+            Some(StopReason::Shutdown) | None => {}
+        }
+        match self.db.open_cancel_request(work_id) {
+            Ok(Some(request)) if self.accept(&request) => {
+                return Some(self.finish_canceled(item, request.id));
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(work_id, "cancel requests unreadable: {e}"),
+        }
+        Some(
+            self.apply_failure(item, ws_name, error, None, Vec::new(), None)
+                .await,
+        )
     }
 
     fn log_outcomes(outcomes: &[ItemOutcome]) {
@@ -1163,6 +1214,7 @@ impl Daemon {
         // The Running copy waited in the queue while the handler ran; the
         // result decides where the item goes next.
         self.queue.retain(|i| i.work_id != item.work_id);
+        self.handler_tasks.retain(|_, w| *w != item.work_id);
         let control = self.in_flight.remove(&item.work_id);
         let stop = control.as_ref().and_then(|c| c.stop_reason());
 
@@ -2630,6 +2682,7 @@ impl Daemon {
         self.in_flight.stop_all(StopReason::Shutdown);
         self.handlers.abort_all();
         while self.handlers.join_next().await.is_some() {}
+        self.handler_tasks.clear();
 
         let canceled: Vec<(String, i64)> = self
             .in_flight

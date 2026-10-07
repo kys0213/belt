@@ -140,6 +140,16 @@ impl HandlerControl {
         state.pid = None;
     }
 
+    /// The execution's task died without returning (a panic): kill the
+    /// process it was running, if any, and refuse any later stop.
+    pub(crate) fn abandon(&self) {
+        let mut state = self.lock();
+        if let Some(pid) = state.pid.take() {
+            self.kill(pid);
+        }
+        state.finished = true;
+    }
+
     fn kill(&self, pid: u32) {
         match self.killer.kill_group(pid) {
             Ok(()) => tracing::info!(work_id = %self.work_id, pid, "handler process group killed"),

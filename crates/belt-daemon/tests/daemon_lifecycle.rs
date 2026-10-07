@@ -1962,6 +1962,87 @@ sources:
         assert_eq!(h.daemon.handlers_in_flight(), 0);
     }
 
+    /// A handler task that panics is a failed attempt: its slot is returned
+    /// and the escalation policy decides what comes next.
+    #[tokio::test]
+    async fn a_panicked_handler_frees_its_slot_and_counts_as_a_failure() {
+        let runtime = Arc::new(ScriptedRuntime::default());
+        let mut h = harness_with(
+            &[
+                ("github:org/repo#1", "panic"),
+                ("github:org/repo#2", "fast"),
+            ],
+            1,
+            Database::open_in_memory().unwrap(),
+            Arc::clone(&runtime),
+        );
+        let panicked = "github:org/repo#1:panic";
+        h.daemon.collect().await.unwrap();
+        h.daemon.advance();
+        assert_eq!(phase(&h.daemon, panicked), QueuePhase::Running);
+        h.daemon.spawn_running();
+
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), h.daemon.join_handlers())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [ItemOutcome::Failed {
+                    escalation: EscalationAction::Retry,
+                    ..
+                }]
+            ),
+            "got {outcomes:?}"
+        );
+        assert_ne!(phase(&h.daemon, panicked), QueuePhase::Running);
+        assert_eq!(h.daemon.db().failure_count(panicked).unwrap(), 1);
+        assert_eq!(h.daemon.handlers_in_flight(), 0);
+        assert_eq!(h.daemon.running_count(), 0);
+
+        h.daemon.advance();
+        assert_eq!(
+            h.daemon.running_count(),
+            1,
+            "the panicked execution returned its concurrency slot"
+        );
+        h.daemon.execute_running().await;
+    }
+
+    #[tokio::test]
+    async fn a_panicked_handler_with_an_open_cancel_ends_skipped_canceled() {
+        let runtime = Arc::new(ScriptedRuntime::default());
+        let mut h = harness_with(
+            &[("github:org/repo#1", "panic")],
+            2,
+            Database::open_in_memory().unwrap(),
+            Arc::clone(&runtime),
+        );
+        let work_id = "github:org/repo#1:panic";
+        h.daemon.collect().await.unwrap();
+        h.daemon.advance();
+        h.daemon.spawn_running();
+        request(h.daemon.db(), work_id);
+
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), h.daemon.join_handlers())
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(outcomes.as_slice(), [ItemOutcome::Canceled(_)]),
+            "got {outcomes:?}"
+        );
+        assert_eq!(phase(&h.daemon, work_id), QueuePhase::Skipped);
+        assert_eq!(
+            closed_result(h.daemon.db(), work_id).as_deref(),
+            Some("canceled")
+        );
+        assert_eq!(h.daemon.db().failure_count(work_id).unwrap(), 0);
+        assert_eq!(h.daemon.handlers_in_flight(), 0);
+        assert_eq!(h.daemon.running_count(), 0);
+    }
+
     #[tokio::test]
     async fn other_items_keep_moving_while_a_handler_runs() {
         let mut h = harness(
