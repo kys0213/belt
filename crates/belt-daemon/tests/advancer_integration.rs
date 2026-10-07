@@ -10,9 +10,10 @@ use std::sync::Arc;
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::queue::testing::test_item;
+use belt_core::transition::{Actor, TransitionReason};
 use belt_daemon::advancer::Advancer;
 use belt_daemon::concurrency::ConcurrencyTracker;
-use belt_infra::db::Database;
+use belt_infra::db::{Database, DeriveKind, DeriveOutcome, DeriveRequest};
 
 /// Helper: create a VecDeque from a Vec of QueueItems.
 fn make_queue(items: Vec<QueueItem>) -> VecDeque<QueueItem> {
@@ -224,6 +225,95 @@ fn queue_dependency_gate_passes_when_dep_done_in_memory() {
         QueuePhase::Running,
         "item should advance to Running when dep is Done in memory"
     );
+}
+
+/// Helper: a dependency item that escalation retry derived into a successor.
+/// Returns the successor's work_id; the original ends Skipped(derived).
+fn derive_dependency(db: &Database) -> String {
+    let mut dep_item = test_item("dep-src", "analyze");
+    dep_item.work_id = "dep-work".to_string();
+    insert_item_to_db(db, &dep_item);
+    db.update_phase("dep-work", QueuePhase::Ready).unwrap();
+    db.update_phase("dep-work", QueuePhase::Running).unwrap();
+    let outcome = db
+        .derive(&DeriveRequest {
+            work_id: "dep-work".to_string(),
+            expected_from: QueuePhase::Running,
+            kind: DeriveKind::EscalationRetry,
+            actor: Actor::Daemon,
+            reason: TransitionReason::Derived,
+            detail: None,
+        })
+        .unwrap();
+    match outcome {
+        DeriveOutcome::Derived { work_id } => work_id,
+        other => panic!("expected Derived, got {other:?}"),
+    }
+}
+
+/// Helper: a Pending dependent item waiting on `dep-work`, alone in the queue.
+fn dependent_on_dep_work(db: &Database) -> VecDeque<QueueItem> {
+    let mut item = test_item("my-src", "implement");
+    item.work_id = "my-work".to_string();
+    insert_item_to_db(db, &item);
+    db.add_queue_dependency("my-work", "dep-work").unwrap();
+    make_queue(vec![item])
+}
+
+/// The dependency was derived and its successor is not Done: the dependent
+/// waits on the lineage head, not on the original's Skipped.
+#[test]
+fn queue_dependency_gate_waits_while_derived_successor_is_pending() {
+    let (db, db_opt) = setup_db();
+    let successor = derive_dependency(&db);
+    assert_eq!(
+        db.get_item("dep-work").unwrap().phase(),
+        QueuePhase::Skipped
+    );
+    assert_eq!(
+        db.get_item(&successor).unwrap().phase(),
+        QueuePhase::Pending
+    );
+    let mut queue = dependent_on_dep_work(&db);
+    let mut tracker = ConcurrencyTracker::new(4);
+
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 4);
+    advancer.run();
+
+    assert_eq!(queue[0].phase(), QueuePhase::Ready);
+}
+
+/// Once the derived successor is Done the dependent proceeds.
+#[test]
+fn queue_dependency_gate_passes_when_derived_successor_is_done() {
+    let (db, db_opt) = setup_db();
+    let successor = derive_dependency(&db);
+    db.update_phase(&successor, QueuePhase::Ready).unwrap();
+    db.update_phase(&successor, QueuePhase::Running).unwrap();
+    db.update_phase(&successor, QueuePhase::Done).unwrap();
+    let mut queue = dependent_on_dep_work(&db);
+    let mut tracker = ConcurrencyTracker::new(4);
+
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 4);
+    advancer.run();
+
+    assert_eq!(queue[0].phase(), QueuePhase::Running);
+}
+
+/// A lineage that ends in Skipped keeps blocking the dependent (spec: Skipped
+/// dependency blocks until released manually).
+#[test]
+fn queue_dependency_gate_blocks_when_lineage_ends_skipped() {
+    let (db, db_opt) = setup_db();
+    let successor = derive_dependency(&db);
+    db.update_phase(&successor, QueuePhase::Skipped).unwrap();
+    let mut queue = dependent_on_dep_work(&db);
+    let mut tracker = ConcurrencyTracker::new(4);
+
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 4);
+    advancer.run();
+
+    assert_eq!(queue[0].phase(), QueuePhase::Ready);
 }
 
 // ---------------------------------------------------------------------------

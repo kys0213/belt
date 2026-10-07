@@ -292,51 +292,31 @@ impl<'a> Advancer<'a> {
         }
 
         for dep_id in &dep_work_ids {
-            let dep_phase = self
-                .queue
-                .iter()
-                .find(|item| item.work_id == *dep_id)
-                .map(|item| item.phase());
-
-            match dep_phase {
-                Some(QueuePhase::Done) => {}
-                Some(phase) => {
+            // The dependency may have been derived (escalation retry, replan);
+            // the gate judges the head of its lineage, not the original.
+            match db.latest_in_lineage(dep_id) {
+                Ok(item) if item.phase() == QueuePhase::Done => {}
+                Ok(item) => {
                     tracing::trace!(
                         work_id = %work_id,
                         dependency = %dep_id,
-                        dependency_phase = %phase.as_str(),
+                        lineage_head = %item.work_id,
+                        dependency_phase = %item.phase().as_str(),
                         "queue dependency not done"
                     );
                     return false;
                 }
-                None => {
-                    // Dependency not found in in-memory queue — fall back to DB
-                    // to handle system restart scenarios where the dependency
-                    // was completed in a previous session.
-                    match db.get_item(dep_id) {
-                        Ok(item) if item.phase() == QueuePhase::Done => {}
-                        Ok(item) => {
-                            tracing::trace!(
-                                work_id = %work_id,
-                                dependency = %dep_id,
-                                dependency_phase = %item.phase().as_str(),
-                                "queue dependency not done (DB lookup)"
-                            );
-                            return false;
-                        }
-                        Err(belt_core::error::BeltError::ItemNotFound(_)) => {
-                            // Not in DB either — gate open (original behavior).
-                        }
-                        Err(err) => {
-                            // DB error — gate open for stability (safe default).
-                            tracing::warn!(
-                                work_id = %work_id,
-                                dependency = %dep_id,
-                                error = %err,
-                                "DB lookup failed for dependency; keeping gate open"
-                            );
-                        }
-                    }
+                Err(belt_core::error::BeltError::ItemNotFound(_)) => {
+                    // Not in DB — orphan dependency, gate open.
+                }
+                Err(err) => {
+                    // DB error — gate open for stability (safe default).
+                    tracing::warn!(
+                        work_id = %work_id,
+                        dependency = %dep_id,
+                        error = %err,
+                        "DB lookup failed for dependency; keeping gate open"
+                    );
                 }
             }
         }
