@@ -14,13 +14,22 @@
 //! the [`ProcessSink`] the handler reports its pid to, and the switch a
 //! cancel or a shutdown flips. Both go through one lock, so a stop that
 //! arrives before the pid is reported kills the process as soon as it is.
+//!
+//! The controls live in [`InFlight`], shared with the IPC wake task: a
+//! cancel wake is accepted and its handler stopped by
+//! [`accept_in_flight_cancels`] even while a tick is busy (an evaluator
+//! call, a hook). The item's result transition stays with the tick loop,
+//! which applies the stopped execution when its handler returns.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use belt_core::error::BeltError;
 use belt_core::platform::{ProcessKiller, ProcessSink};
 use belt_core::transition::Actor;
-use belt_infra::db::{Database, DirectCancelOutcome, HandlerProcess};
+use belt_infra::db::{
+    CancelRequestRecord, CancelStatus, Database, DirectCancelOutcome, HandlerProcess,
+};
 use belt_infra::platform::{HandlerProbe, probe_handler};
 
 /// Why a running execution is being stopped.
@@ -75,6 +84,27 @@ impl HandlerControl {
             return false;
         }
         state.stop = Some(reason);
+        if let Some(pid) = state.pid {
+            self.kill(pid);
+        }
+        true
+    }
+
+    /// Accept `request` for this execution and stop it, as one step under
+    /// the control's lock: a finishing execution either sees the stop or
+    /// refuses the accept, so an accepted request always ends `canceled`.
+    ///
+    /// Returns `false`, accepting nothing, when the execution already
+    /// returned or is stopping for another reason, or when the request can
+    /// no longer be accepted (closed meanwhile, or the store failed).
+    pub(crate) fn cancel(&self, request: &CancelRequestRecord) -> bool {
+        let mut state = self.lock();
+        if state.finished || state.stop.is_some() || !accept_request(&self.db, request) {
+            return false;
+        }
+        state.stop = Some(StopReason::Cancel {
+            request_id: request.id,
+        });
         if let Some(pid) = state.pid {
             self.kill(pid);
         }
@@ -143,6 +173,101 @@ impl ProcessSink for HandlerControl {
             tracing::error!(work_id = %self.work_id, pid, "exited handler pid not cleared: {e}");
         }
     }
+}
+
+/// Mark `request` accepted by the daemon. `false` when it can no longer be
+/// acted on (closed meanwhile, or the store failed).
+pub(crate) fn accept_request(db: &Database, request: &CancelRequestRecord) -> bool {
+    match request.status {
+        CancelStatus::Accepted => return true,
+        CancelStatus::Closed => return false,
+        CancelStatus::Requested => {}
+    }
+    match db.accept_cancel(request.id, &Actor::Daemon) {
+        Ok(accepted) => accepted,
+        Err(e) => {
+            tracing::error!(work_id = %request.work_id, "cancel request not accepted: {e}");
+            false
+        }
+    }
+}
+
+/// The controls of the executions in flight, by work_id.
+///
+/// Owned by the daemon and shared with the IPC wake task; every method
+/// takes the lock for its own duration only.
+#[derive(Default)]
+pub(crate) struct InFlight {
+    controls: Mutex<HashMap<String, Arc<HandlerControl>>>,
+}
+
+impl InFlight {
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, Arc<HandlerControl>>> {
+        // The map holds plain handles; a panic elsewhere leaves it usable.
+        self.controls.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(crate) fn insert(&self, work_id: &str, control: Arc<HandlerControl>) {
+        self.lock().insert(work_id.to_string(), control);
+    }
+
+    pub(crate) fn remove(&self, work_id: &str) -> Option<Arc<HandlerControl>> {
+        self.lock().remove(work_id)
+    }
+
+    pub(crate) fn get(&self, work_id: &str) -> Option<Arc<HandlerControl>> {
+        self.lock().get(work_id).cloned()
+    }
+
+    pub(crate) fn contains(&self, work_id: &str) -> bool {
+        self.lock().contains_key(work_id)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.lock().len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    /// Stop every execution in flight.
+    pub(crate) fn stop_all(&self, reason: StopReason) {
+        for control in self.lock().values() {
+            control.stop(reason);
+        }
+    }
+
+    /// Take every control out.
+    pub(crate) fn drain(&self) -> Vec<(String, Arc<HandlerControl>)> {
+        self.lock().drain().collect()
+    }
+}
+
+/// Accept the open cancel requests of the executions in `in_flight` and
+/// stop their handlers, without waiting for a tick.
+///
+/// Requests for anything else (an item not Running, a Running item with no
+/// handler in flight) are left to the next tick's cancel step. Returns how
+/// many executions were stopped.
+///
+/// # Errors
+/// When the open requests cannot be listed.
+pub(crate) fn accept_in_flight_cancels(
+    db: &Database,
+    in_flight: &InFlight,
+) -> Result<usize, BeltError> {
+    let mut stopped = 0;
+    for request in db.open_cancel_requests()? {
+        let Some(control) = in_flight.get(&request.work_id) else {
+            continue;
+        };
+        if control.canceled_request().is_none() && control.cancel(&request) {
+            tracing::info!(work_id = %request.work_id, request_id = request.id, "cancel accepted, handler stopped");
+            stopped += 1;
+        }
+    }
+    Ok(stopped)
 }
 
 /// What happened to a handler process a previous daemon left behind.

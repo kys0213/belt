@@ -1403,14 +1403,17 @@ mod cancel {
     use std::time::Duration;
 
     use belt_core::lifecycle::{HookContext, LifecycleHook};
+    use belt_core::runtime::{AgentRuntime, RuntimeCapabilities, RuntimeRequest, RuntimeResponse};
     use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
     use belt_daemon::cancel::cancel_directly;
     use belt_infra::db::{CollectOutcome, DirectCancelOutcome, NewItem, RequestCancelOutcome};
+    use belt_infra::ipc::{DaemonSignal, notify_daemon};
 
     use super::*;
 
     /// `slow` runs a real process until it is killed, `short` one that ends
-    /// after a second, `fast` the mock runtime.
+    /// after a second, `fast` the runtime once; `hang`, `panic` and the
+    /// second step of `two_steps` need a [`ScriptedRuntime`].
     fn cancel_config(concurrency: u32) -> WorkspaceConfig {
         let yaml = format!(
             r#"
@@ -1437,6 +1440,22 @@ sources:
           label: "belt:fast"
         handlers:
           - prompt: "do it"
+      hang:
+        trigger:
+          label: "belt:hang"
+        handlers:
+          - prompt: "hang"
+      panic:
+        trigger:
+          label: "belt:panic"
+        handlers:
+          - prompt: "panic"
+      two_steps:
+        trigger:
+          label: "belt:two_steps"
+        handlers:
+          - script: "sleep 1"
+          - prompt: "next step"
     escalation:
       1: retry
       2: hitl
@@ -1477,22 +1496,86 @@ sources:
         }
     }
 
-    struct Harness {
+    /// A runtime driven by the prompt: the evaluate prompt waits until
+    /// [`ScriptedRuntime::release_evaluate`], `hang` never returns, `panic`
+    /// panics, anything else succeeds at once. It spawns no process.
+    #[derive(Default)]
+    struct ScriptedRuntime {
+        evaluating: std::sync::atomic::AtomicBool,
+        release: tokio::sync::Notify,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ScriptedRuntime {
+        fn is_evaluating(&self) -> bool {
+            self.evaluating.load(Ordering::SeqCst)
+        }
+
+        fn release_evaluate(&self) {
+            self.release.notify_one();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentRuntime for ScriptedRuntime {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn invoke(&self, request: RuntimeRequest) -> RuntimeResponse {
+            self.calls.lock().unwrap().push(request.prompt.clone());
+            if request.prompt.contains("belt queue done") {
+                self.evaluating.store(true, Ordering::SeqCst);
+                self.release.notified().await;
+            } else if request.prompt == "hang" {
+                std::future::pending::<()>().await;
+            } else if request.prompt == "panic" {
+                panic!("scripted handler panic");
+            }
+            RuntimeResponse {
+                exit_code: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+                duration: Duration::ZERO,
+                token_usage: None,
+                session_id: None,
+            }
+        }
+
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities::default()
+        }
+    }
+
+    struct Harness<R = MockRuntime> {
         daemon: Daemon,
-        runtime: Arc<MockRuntime>,
+        runtime: Arc<R>,
         hook: Arc<Reactions>,
-        _tmp: TempDir,
+        tmp: TempDir,
     }
 
     fn harness(items: &[(&str, &str)], concurrency: u32, db: Database) -> Harness {
+        harness_with(
+            items,
+            concurrency,
+            db,
+            Arc::new(MockRuntime::new("mock", vec![0, 0, 0, 0])),
+        )
+    }
+
+    fn harness_with<R: AgentRuntime + 'static>(
+        items: &[(&str, &str)],
+        concurrency: u32,
+        db: Database,
+        runtime: Arc<R>,
+    ) -> Harness<R> {
         let tmp = TempDir::new().unwrap();
         let mut source = MockDataSource::new("github");
         for (source_id, state) in items {
             source.add_item(test_item(source_id, state));
         }
-        let runtime = Arc::new(MockRuntime::new("mock", vec![0, 0, 0, 0]));
         let mut registry = RuntimeRegistry::new("mock".to_string());
-        registry.register(Arc::clone(&runtime) as Arc<dyn belt_core::runtime::AgentRuntime>);
+        registry.register(Arc::clone(&runtime) as Arc<dyn AgentRuntime>);
         let hook = Arc::new(Reactions::default());
         let daemon = Daemon::new(
             cancel_config(concurrency),
@@ -1502,12 +1585,13 @@ sources:
             4,
             db,
         )
-        .with_hook(Arc::clone(&hook) as Arc<dyn LifecycleHook>);
+        .with_hook(Arc::clone(&hook) as Arc<dyn LifecycleHook>)
+        .with_belt_home(tmp.path().to_path_buf());
         Harness {
             daemon,
             runtime,
             hook,
-            _tmp: tmp,
+            tmp,
         }
     }
 
@@ -1738,6 +1822,73 @@ sources:
             Some("too_late")
         );
         assert_eq!(phase(&h.daemon, work_id), QueuePhase::Hitl);
+    }
+
+    /// While a tick awaits the evaluator, a cancel wake is still accepted
+    /// and the handler stopped at once; the item ends Skipped once the tick
+    /// loop is free again.
+    #[tokio::test]
+    async fn a_cancel_wake_is_accepted_while_a_tick_awaits_the_evaluator() {
+        let runtime = Arc::new(ScriptedRuntime::default());
+        let mut h = harness_with(
+            &[("github:org/repo#1", "fast"), ("github:org/repo#2", "slow")],
+            2,
+            Database::open_in_memory().unwrap(),
+            Arc::clone(&runtime),
+        );
+        let slow = "github:org/repo#2:slow";
+        let db = Arc::clone(h.daemon.database());
+        let belt_home = h.tmp.path().to_path_buf();
+
+        let body = async {
+            eventually("the evaluator to start", || runtime.is_evaluating()).await;
+            let pid = {
+                let mut pid = None;
+                eventually("the slow handler pid", || {
+                    pid = db.handler_process(slow).unwrap();
+                    pid.is_some()
+                })
+                .await;
+                pid.unwrap()
+            };
+            eventually("the IPC listener", || belt_home.join("daemon.ipc").exists()).await;
+
+            request(&db, slow);
+            notify_daemon(&belt_home, DaemonSignal::CancelRequested).unwrap();
+
+            let accepted = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let open = db.open_cancel_requests().unwrap();
+                    if open
+                        .iter()
+                        .all(|r| r.status == belt_infra::db::CancelStatus::Accepted)
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            assert!(
+                accepted.is_ok(),
+                "the request must be accepted while the evaluator still runs"
+            );
+            eventually("the handler to die", || !process_alive(pid)).await;
+            assert!(runtime.is_evaluating());
+
+            runtime.release_evaluate();
+            eventually("the canceled item to end Skipped", || {
+                db.get_item(slow).unwrap().phase() == QueuePhase::Skipped
+            })
+            .await;
+            assert_eq!(closed_result(&db, slow).as_deref(), Some("canceled"));
+        };
+
+        tokio::select! {
+            result = h.daemon.run(1) => panic!("the daemon stopped: {result:?}"),
+            () = body => {}
+        }
+        assert_eq!(h.hook.on_fail.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -23,13 +23,13 @@ use belt_core::stagnation::{
 use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
 use belt_core::workspace::{StateConfig, WorkspaceConfig};
 use belt_infra::db::{
-    CancelRequestRecord, CancelResult, CancelStatus, CollectOutcome, Database, NewItem,
-    OpenHitlOutcome, OpenHitlRequest, TransitionEvent,
+    CancelRequestRecord, CancelResult, CollectOutcome, Database, NewItem, OpenHitlOutcome,
+    OpenHitlRequest, TransitionEvent,
 };
 use belt_infra::worktree::WorktreeManager;
 use tokio::task::JoinSet;
 
-use crate::cancel::{HandlerControl, StopReason};
+use crate::cancel::{HandlerControl, InFlight, StopReason, accept_in_flight_cancels};
 
 use crate::concurrency::ConcurrencyTracker;
 use crate::cron::{
@@ -111,8 +111,9 @@ pub struct Daemon {
     /// tick and the wake signals, so a running handler never blocks a tick.
     handlers: JoinSet<ExecutionResult>,
     /// The control of every in-flight execution, by work_id. The item's
-    /// Running copy stays in `queue` meanwhile.
-    in_flight: HashMap<String, Arc<HandlerControl>>,
+    /// Running copy stays in `queue` meanwhile. Shared with the IPC wake
+    /// task, which accepts cancels and stops handlers while a tick is busy.
+    in_flight: Arc<InFlight>,
     /// Stops handler process groups (cancel, shutdown, leftovers at start).
     killer: Arc<dyn ProcessKiller>,
 }
@@ -181,6 +182,16 @@ enum ExecutionOutcome {
     Stopped,
 }
 
+/// Aborts its task when dropped, so a background task never outlives the
+/// loop that started it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// What a spawned execution needs besides its item.
 struct ExecutionDeps {
     executor: Arc<ActionExecutor>,
@@ -228,7 +239,7 @@ impl Daemon {
             hook: Arc::new(NoopLifecycleHook),
             hook_loader: None,
             handlers: JoinSet::new(),
-            in_flight: HashMap::new(),
+            in_flight: Arc::new(InFlight::default()),
             killer: Arc::from(belt_infra::platform::default_process_killer()),
         }
     }
@@ -649,7 +660,7 @@ impl Daemon {
         if copy_phase == row.phase() {
             return;
         }
-        if self.in_flight.contains_key(&row.work_id) {
+        if self.in_flight.contains(&row.work_id) {
             // The handler's result commit meets the stored phase as a
             // conflict and reconciles the copy then.
             return;
@@ -766,7 +777,7 @@ impl Daemon {
             .queue
             .iter()
             .filter(|item| {
-                item.phase() == QueuePhase::Running && !self.in_flight.contains_key(&item.work_id)
+                item.phase() == QueuePhase::Running && !self.in_flight.contains(&item.work_id)
             })
             .map(|item| item.work_id.clone())
             .collect();
@@ -808,8 +819,7 @@ impl Daemon {
             Arc::clone(&self.db),
             Arc::clone(&self.killer),
         ));
-        self.in_flight
-            .insert(work_id.to_string(), Arc::clone(&control));
+        self.in_flight.insert(work_id, Arc::clone(&control));
         let deps = ExecutionDeps {
             executor: Arc::clone(&self.executor),
             worktree_mgr: Arc::clone(&self.worktree_mgr),
@@ -1536,11 +1546,9 @@ impl Daemon {
                     continue;
                 }
             }
-            if let Some(control) = self.in_flight.get(&request.work_id).cloned() {
-                if control.canceled_request().is_none() && self.accept(&request) {
-                    control.stop(StopReason::Cancel {
-                        request_id: request.id,
-                    });
+            if let Some(control) = self.in_flight.get(&request.work_id) {
+                if control.canceled_request().is_none() {
+                    control.cancel(&request);
                 }
                 continue;
             }
@@ -1564,18 +1572,7 @@ impl Daemon {
     /// Mark `request` accepted by the daemon. `false` when it can no longer
     /// be acted on (closed meanwhile, or the store failed).
     fn accept(&self, request: &CancelRequestRecord) -> bool {
-        match request.status {
-            CancelStatus::Accepted => return true,
-            CancelStatus::Closed => return false,
-            CancelStatus::Requested => {}
-        }
-        match self.db.accept_cancel(request.id, &Actor::Daemon) {
-            Ok(accepted) => accepted,
-            Err(e) => {
-                tracing::error!(work_id = %request.work_id, "cancel request not accepted: {e}");
-                false
-            }
-        }
+        crate::cancel::accept_request(&self.db, request)
     }
 
     fn close_request(&self, request_id: i64, result: CancelResult) {
@@ -2401,9 +2398,53 @@ impl Daemon {
         }
     }
 
-    /// Act on an IPC wake signal. A cancel wake runs a tick at once, whose
-    /// first step handles the open cancel requests; it is kept apart from a
-    /// cron sync so it never waits for one.
+    /// Start the IPC listener on a task of its own and return the wake
+    /// signals it forwards.
+    ///
+    /// The task acts on a cancel wake itself before forwarding it: it
+    /// accepts the requests of executions in flight and stops their
+    /// handlers ([`accept_in_flight_cancels`]), so a cancel never waits for
+    /// a busy tick. Without a listener the receiver never yields.
+    async fn start_ipc_wakes(
+        &self,
+    ) -> (
+        Option<AbortOnDrop>,
+        tokio::sync::mpsc::UnboundedReceiver<belt_infra::ipc::DaemonSignal>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = belt_infra::ipc::IpcListener::bind(&self.belt_home)
+            .await
+            .ok();
+        let Some(listener) = listener else {
+            return (None, rx);
+        };
+        let db = Arc::clone(&self.db);
+        let in_flight = Arc::clone(&self.in_flight);
+        let task = tokio::spawn(async move {
+            loop {
+                let Some(signal) = listener.recv().await else {
+                    continue;
+                };
+                match signal {
+                    belt_infra::ipc::DaemonSignal::CancelRequested => {
+                        if let Err(e) = accept_in_flight_cancels(&db, &in_flight) {
+                            tracing::error!("cancel requests not read on a wake: {e}");
+                        }
+                    }
+                    belt_infra::ipc::DaemonSignal::CronSync => {}
+                }
+                if tx.send(signal).is_err() {
+                    break;
+                }
+            }
+        });
+        (Some(AbortOnDrop(task)), rx)
+    }
+
+    /// Act on an IPC wake signal forwarded by the listener task. A cancel
+    /// wake (whose in-flight handlers that task already stopped) runs a tick
+    /// at once, whose first step handles the remaining open cancel requests;
+    /// it is kept apart from a cron sync so it never waits for one.
     async fn handle_ipc_signal(&mut self, signal: belt_infra::ipc::DaemonSignal) {
         match signal {
             belt_infra::ipc::DaemonSignal::CronSync => {
@@ -2430,9 +2471,7 @@ impl Daemon {
 
         // Also start the IPC listener so that the TCP-based notification
         // path works on Unix too (useful for testing and uniformity).
-        let ipc = belt_infra::ipc::IpcListener::bind(&self.belt_home)
-            .await
-            .ok();
+        let (_ipc_task, mut wakes) = self.start_ipc_wakes().await;
 
         loop {
             tokio::select! {
@@ -2448,12 +2487,7 @@ impl Daemon {
                 _ = sigusr1.recv() => {
                     self.handle_cron_trigger_signal("SIGUSR1").await;
                 }
-                Some(signal) = async {
-                    match &ipc {
-                        Some(l) => l.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
+                Some(signal) = wakes.recv() => {
                     self.handle_ipc_signal(signal).await;
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -2468,9 +2502,7 @@ impl Daemon {
     /// Select loop with IPC support (non-unix).
     #[cfg(not(unix))]
     async fn run_select_loop(&mut self, tick: &mut tokio::time::Interval) {
-        let ipc = belt_infra::ipc::IpcListener::bind(&self.belt_home)
-            .await
-            .ok();
+        let (_ipc_task, mut wakes) = self.start_ipc_wakes().await;
 
         loop {
             tokio::select! {
@@ -2483,12 +2515,7 @@ impl Daemon {
                         tracing::error!("tick error: {e}");
                     }
                 }
-                Some(signal) = async {
-                    match &ipc {
-                        Some(l) => l.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
+                Some(signal) = wakes.recv() => {
                     self.handle_ipc_signal(signal).await;
                 }
                 _ = tokio::signal::ctrl_c() => {
@@ -2570,15 +2597,14 @@ impl Daemon {
     /// The results are discarded; an execution canceled by request still
     /// ends Skipped (`canceled`), the others stay Running for the caller.
     async fn stop_all_handlers(&mut self) {
-        for control in self.in_flight.values() {
-            control.stop(StopReason::Shutdown);
-        }
+        self.in_flight.stop_all(StopReason::Shutdown);
         self.handlers.abort_all();
         while self.handlers.join_next().await.is_some() {}
 
         let canceled: Vec<(String, i64)> = self
             .in_flight
             .drain()
+            .into_iter()
             .filter_map(|(work_id, control)| {
                 control
                     .canceled_request()
