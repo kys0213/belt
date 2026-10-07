@@ -147,7 +147,7 @@ async fn full_lifecycle_multiple_items_respects_concurrency() {
 ///
 /// After tick(), items go through collect -> advance -> execute -> evaluate.
 /// The evaluate step may remove Completed items from the queue (on success
-/// they transition to Done via execute_on_done and are removed, or on failure
+/// they transition to Done after on_done and are removed, or on failure
 /// they remain in Completed for retry). Either way, the queue state reflects
 /// the completed lifecycle.
 #[tokio::test]
@@ -1294,7 +1294,7 @@ mod store_owned {
     }
 
     #[tokio::test]
-    async fn memory_only_hitl_exit_does_not_overwrite_the_store() {
+    async fn a_hitl_response_from_another_process_is_applied_on_the_next_tick() {
         let tmp = TempDir::new().unwrap();
         let path = db_path(&tmp);
         let source = SharedSource::default();
@@ -1342,26 +1342,33 @@ mod store_owned {
             belt_infra::db::OpenHitlOutcome::Opened { .. }
         ));
         daemon.restore_from_store().unwrap();
-        let before = db.transitions_of(id).unwrap().len();
 
-        // Leaving Hitl is memory-only until the HITL contract owns it (P5).
-        daemon.retry_from_hitl(id).unwrap();
-        assert_eq!(daemon.get_item(id).unwrap().phase(), QueuePhase::Pending);
+        // `belt hitl respond` in another process; the item stays Hitl until
+        // the daemon post-processes the confirmed response.
+        let cli = belt_daemon::hitl::HitlService::new(Arc::new(Database::open(&path).unwrap()));
+        let outcome = cli
+            .respond(&belt_daemon::hitl::HitlResponse {
+                target: belt_infra::db::HitlTarget::Item(id.to_string()),
+                action: belt_core::hitl::HitlAction::Skip,
+                by: "bob".to_string(),
+                via: "cli".to_string(),
+                path: belt_core::hitl::ConfirmPath::Direct,
+                notes: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            belt_core::hitl::RespondOutcome::Won { .. }
+        ));
+        assert_eq!(db.get_item(id).unwrap().phase(), QueuePhase::Hitl);
 
         daemon.tick().await.unwrap();
-        daemon.tick().await.unwrap();
 
-        assert_eq!(
-            db.get_item(id).unwrap().phase(),
-            QueuePhase::Hitl,
-            "store wins"
-        );
-        assert_eq!(daemon.get_item(id).unwrap().phase(), QueuePhase::Hitl);
-        assert_eq!(
-            db.transitions_of(id).unwrap().len(),
-            before,
-            "no store writes"
-        );
+        assert_eq!(db.get_item(id).unwrap().phase(), QueuePhase::Skipped);
+        assert!(daemon.get_item(id).is_none(), "the copy follows the store");
+        let last = db.transitions_of(id).unwrap().pop().unwrap();
+        assert_eq!(last.reason.as_deref(), Some("post_processing:skip"));
+        assert_eq!(last.actor, "daemon");
     }
 
     #[tokio::test]

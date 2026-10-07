@@ -12,9 +12,7 @@ use belt_core::error::BeltError;
 use belt_core::escalation::{EscalationAction, EscalationPolicy};
 use belt_core::lifecycle::{HookContext, LifecycleHook, NoopLifecycleHook};
 use belt_core::phase::QueuePhase;
-use belt_core::queue::{
-    HITL_TIMEOUT_HOURS, HistoryEvent, HitlReason, HitlRespondAction, QueueItem,
-};
+use belt_core::queue::{HITL_TIMEOUT_HOURS, HistoryEvent, HitlReason, QueueItem};
 use belt_core::runtime::RuntimeRegistry;
 use belt_core::source::DataSource;
 use belt_core::stagnation::{
@@ -573,17 +571,6 @@ impl Daemon {
             if row.workspace_id != self.config.name {
                 continue;
             }
-            self.follow_row(row);
-        }
-
-        // The memory-only Hitl exits ([`Daemon::mark_skipped`],
-        // [`Daemon::retry_from_hitl`], [`Daemon::respond_hitl`]) write no log
-        // entry, so the cursor cannot see them. Re-checking the open Hitl rows
-        // lets the store win until the HITL contract owns those exits.
-        for row in self
-            .db
-            .list_items(Some(QueuePhase::Hitl), Some(&self.config.name))?
-        {
             self.follow_row(row);
         }
 
@@ -1473,173 +1460,6 @@ impl Daemon {
         }
     }
 
-    /// Mark a Hitl item as Skipped.
-    ///
-    /// Applied to the in-memory item only: leaving Hitl belongs to the HITL
-    /// contract, which the store enforces for the daemon only as post-processing.
-    /// Until that flow owns this exit the store keeps Hitl and wins: the next
-    /// tick's observation replaces this copy with the stored Hitl row.
-    pub fn mark_skipped(&mut self, work_id: &str) -> Result<(), BeltError> {
-        let item = self
-            .queue
-            .iter_mut()
-            .find(|it| it.work_id == work_id)
-            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-        transit(item, QueuePhase::Skipped)?;
-        Ok(())
-    }
-
-    /// Retry a Hitl item by sending it back to Pending.
-    ///
-    /// Applied to the in-memory item only: leaving Hitl belongs to the HITL
-    /// contract, which the store enforces for the daemon only as post-processing.
-    /// Until that flow owns this exit the store keeps Hitl and wins: the next
-    /// tick's observation replaces this copy with the stored Hitl row.
-    pub fn retry_from_hitl(&mut self, work_id: &str) -> Result<(), BeltError> {
-        let item = self
-            .queue
-            .iter_mut()
-            .find(|it| it.work_id == work_id)
-            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-        transit(item, QueuePhase::Pending)?;
-        Ok(())
-    }
-
-    /// Maximum number of replan attempts before failing permanently.
-    const MAX_REPLAN_COUNT: u32 = 3;
-
-    /// Respond to a HITL item with a user action.
-    ///
-    /// Applied to the in-memory queue only; the store-side HITL response flow
-    /// replaces this path. Until then the store keeps Hitl and wins over the
-    /// copy (see [`Daemon::retry_from_hitl`]).
-    ///
-    /// Applies the given [`HitlRespondAction`] and records the respondent.
-    ///
-    /// For `Replan`, the item is rolled back to Pending with an incremented
-    /// `replan_count`, and a new HITL item is created to delegate spec
-    /// modification to the Claw agent. If `replan_count` exceeds
-    /// [`Self::MAX_REPLAN_COUNT`], the item transitions to Failed instead.
-    pub async fn respond_hitl(
-        &mut self,
-        work_id: &str,
-        action: HitlRespondAction,
-        respondent: Option<String>,
-        notes: Option<String>,
-    ) -> Result<(), BeltError> {
-        let idx = self
-            .queue
-            .iter()
-            .position(|it| it.work_id == work_id)
-            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-
-        {
-            let item = &self.queue[idx];
-            if item.phase() != QueuePhase::Hitl {
-                return Err(BeltError::InvalidTransition {
-                    from: item.phase(),
-                    to: QueuePhase::Done, // placeholder
-                });
-            }
-        }
-
-        let item = &mut self.queue[idx];
-        item.hitl_respondent = respondent;
-        if let Some(n) = notes {
-            item.hitl_notes = Some(n);
-        }
-
-        match action {
-            HitlRespondAction::Done => {
-                // Remove item from queue to call execute_on_done (which needs
-                // &mut self + &mut QueueItem without borrow conflict).
-                let mut item = self.queue.remove(idx).unwrap();
-
-                // Execute on_done scripts; transitions to Done on success,
-                // Failed on script failure.
-                match self.execute_on_done(&mut item).await {
-                    Ok(true) => {}
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::error!(
-                            work_id,
-                            "on_done execution error during hitl respond: {e}"
-                        );
-                        let _ = transit(&mut item, QueuePhase::Failed);
-                    }
-                }
-
-                // Put item back into queue so callers can inspect final state.
-                self.queue.push_back(item);
-                Ok(())
-            }
-            HitlRespondAction::Retry => {
-                transit(item, QueuePhase::Pending)?;
-                Ok(())
-            }
-            HitlRespondAction::Skip => {
-                transit(item, QueuePhase::Skipped)?;
-                Ok(())
-            }
-            HitlRespondAction::Replan => {
-                let new_replan_count = item.replan_count + 1;
-
-                if new_replan_count > Self::MAX_REPLAN_COUNT {
-                    tracing::warn!(
-                        work_id,
-                        replan_count = new_replan_count,
-                        max = Self::MAX_REPLAN_COUNT,
-                        "replan limit exceeded, transitioning to Failed"
-                    );
-                    item.replan_count = new_replan_count;
-                    transit(item, QueuePhase::Failed)?;
-                    return Ok(());
-                }
-
-                // Capture metadata before mutating the item for the new HITL item.
-                let failure_reason = item
-                    .hitl_notes
-                    .clone()
-                    .unwrap_or_else(|| "unknown failure".to_string());
-                let source_id = item.source_id.clone();
-                let workspace_id = item.workspace_id.clone();
-                let state = item.state.clone();
-
-                // Roll back item to Pending with incremented replan_count.
-                item.replan_count = new_replan_count;
-                transit(item, QueuePhase::Pending)?;
-
-                // Create a new HITL item for spec modification proposal.
-                let replan_work_id = format!("{work_id}:replan-{new_replan_count}");
-                let mut replan_item =
-                    QueueItem::new(replan_work_id, source_id, workspace_id, state);
-                // The replan item starts at Pending and moves to Hitl to await
-                // human review of the Claw agent's spec modification proposal.
-                transit(&mut replan_item, QueuePhase::Ready)?;
-                transit(&mut replan_item, QueuePhase::Running)?;
-                transit(&mut replan_item, QueuePhase::Completed)?;
-                transit(&mut replan_item, QueuePhase::Hitl)?;
-                replan_item.hitl_created_at = Some(Utc::now().to_rfc3339());
-                replan_item.hitl_reason = Some(HitlReason::SpecModificationProposed);
-                replan_item.hitl_notes = Some(format!(
-                    "Claw replan delegation (attempt {new_replan_count}): {failure_reason}"
-                ));
-                replan_item.title = Some(format!(
-                    "spec-modification-proposed (replan #{new_replan_count})"
-                ));
-                self.queue.push_back(replan_item);
-
-                tracing::info!(
-                    work_id,
-                    replan_count = new_replan_count,
-                    "replan: item rolled back to Pending, spec modification HITL item created"
-                );
-
-                Ok(())
-            }
-        }
-    }
-
     /// Mark a Running item as Failed and record a HistoryEvent.
     ///
     /// Also marks the worktree as preserved so it remains available for debugging.
@@ -1702,23 +1522,6 @@ impl Daemon {
     // ---------------------------------------------------------------
     // on_done / tick / run (async execution loop)
     // ---------------------------------------------------------------
-
-    /// Execute on_done scripts. Transition to Done on success, Failed on failure.
-    ///
-    /// The transition is applied to the in-memory item only. It serves the
-    /// HITL response path, whose store transition belongs to the HITL contract;
-    /// the evaluation path uses [`Self::finish_completed`].
-    pub async fn execute_on_done(&mut self, item: &mut QueueItem) -> Result<bool> {
-        let succeeded = self.run_on_done_scripts(item).await?;
-        let to = if succeeded {
-            QueuePhase::Done
-        } else {
-            QueuePhase::Failed
-        };
-        let _ = transit(item, to);
-        self.settle_on_done(item, succeeded);
-        Ok(succeeded)
-    }
 
     /// Run the on_done scripts of the item's state.
     ///
@@ -1895,11 +1698,21 @@ impl Daemon {
         let eval_result = {
             // Use the first completed item's worktree for the evaluate env.
             let eval_env = if let Some(work_id) = completed.first() {
-                let worktree = self
+                let worktree = match self
                     .db
                     .worktree_key(work_id)
                     .and_then(|key| self.worktree_mgr.create_or_reuse(&key))
-                    .ok();
+                {
+                    Ok(worktree) => Some(worktree),
+                    Err(e) => {
+                        tracing::warn!(
+                            work_id = %work_id,
+                            error = %e,
+                            "evaluate worktree unavailable; falling back to the subprocess evaluator"
+                        );
+                        None
+                    }
+                };
                 worktree.map(|wt| {
                     ActionEnv::new(work_id, &wt)
                         .with_var("WORKSPACE", &self.config.name)
@@ -2113,20 +1926,28 @@ impl Daemon {
         self.tracker.release_evaluate();
     }
 
-    /// Daemon tick: observe store -> collect -> advance -> execute -> evaluate.
+    /// Daemon tick: observe store -> collect -> HITL post-processing ->
+    /// HITL opened hooks -> advance -> execute -> evaluate.
     ///
     /// shutdown이 요청되면 collect/advance를 건너뛰고 실행 중인
     /// 아이템의 완료 처리만 수행한다.
     pub async fn tick(&mut self) -> Result<()> {
         self.observe_store()?;
-        self.observe_hitl_opened().await?;
 
         if !self.shutdown_requested {
             let collected = self.collect().await?;
             if collected > 0 {
                 tracing::info!("collected {collected} items");
             }
+        }
 
+        let post_processed = self.run_post_processing().await?;
+        if post_processed > 0 {
+            tracing::info!("post-processed {post_processed} HITL requests");
+        }
+        self.observe_hitl_opened().await?;
+
+        if !self.shutdown_requested {
             let advanced = self.advance();
             if advanced > 0 {
                 tracing::debug!("advanced {advanced} items");
@@ -2553,6 +2374,60 @@ impl Daemon {
             }
         }
         Ok(claimed.len())
+    }
+
+    /// Apply every confirmed HITL request of this workspace (tick step 3):
+    /// the only way an item leaves Hitl. See [`crate::post_processing`].
+    ///
+    /// Returns how many requests were finished (result transition
+    /// committed, including those given up to Failed); the in-memory queue
+    /// follows each of them.
+    ///
+    /// # Errors
+    /// An error when the pending requests cannot be listed. A failure of one
+    /// request is counted on that request and retried on the next call.
+    pub async fn run_post_processing(&mut self) -> Result<usize> {
+        let db = Arc::clone(&self.db);
+        let applied = crate::post_processing::run(&db, self).await?;
+        for result in &applied {
+            match result {
+                crate::post_processing::Applied::Left {
+                    work_id,
+                    lateral_plan,
+                    ..
+                } => {
+                    self.follow_stored(work_id);
+                    if let Some(plan) = lateral_plan
+                        && let Some(copy) = self.queue.iter_mut().find(|i| i.work_id == *work_id)
+                    {
+                        copy.lateral_plan = Some(plan.clone());
+                    }
+                }
+                crate::post_processing::Applied::Derived {
+                    work_id,
+                    derived,
+                    lateral_plan,
+                } => {
+                    self.follow_stored(work_id);
+                    self.enqueue_derived(derived, lateral_plan.clone());
+                }
+            }
+        }
+        Ok(applied.len())
+    }
+
+    /// Let the stored row of `work_id` win over the in-memory copy now.
+    ///
+    /// An unreadable row is left to the next store observation.
+    fn follow_stored(&mut self, work_id: &str) {
+        match self.db.get_item(work_id) {
+            Ok(row) => self.follow_row(row),
+            Err(e) => tracing::warn!(
+                work_id,
+                error = %e,
+                "stored row unreadable; the next observation follows it"
+            ),
+        }
     }
 
     /// Detect stagnation from failure history and generate a lateral plan directive.
@@ -2994,6 +2869,39 @@ impl Daemon {
     }
 }
 
+#[async_trait::async_trait]
+impl crate::post_processing::PostProcessingEffects for Daemon {
+    fn owns(&self, item: &QueueItem) -> bool {
+        item.workspace_id == self.config.name
+    }
+
+    async fn run_on_done(&mut self, item: &QueueItem) -> Result<bool> {
+        self.run_on_done_scripts(item).await
+    }
+
+    async fn on_hitl_resolved(
+        &self,
+        item: &QueueItem,
+        action: belt_core::hitl::HitlAction,
+    ) -> Result<()> {
+        let failure_count = self.db.failure_count(&item.work_id).unwrap_or_else(|e| {
+            tracing::warn!(work_id = %item.work_id, "failure count unreadable for hook context: {e}");
+            0
+        });
+        let ctx = self.build_hook_context(item, None, failure_count);
+        self.resolve_hook(&item.workspace_id)
+            .on_hitl_resolved(&ctx, action)
+            .await
+    }
+
+    fn cleanup_worktree(&self, item: &QueueItem) -> Result<(), BeltError> {
+        let key = self.db.worktree_key(&item.work_id)?;
+        self.worktree_mgr.cleanup(&key)?;
+        self.worktree_mgr.clear_preserved(&item.source_id);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3120,8 +3028,8 @@ sources:
         );
     }
 
-    #[test]
-    fn complete_to_hitl_and_retry() {
+    #[tokio::test]
+    async fn complete_to_hitl_and_retry() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
@@ -3147,7 +3055,29 @@ sources:
             QueuePhase::Hitl
         );
 
-        assert!(daemon.retry_from_hitl("s1:analyze").is_ok());
+        // Leaving Hitl goes through the HITL contract: respond, then post-process.
+        let outcome = daemon
+            .hitl()
+            .respond(&crate::hitl::HitlResponse {
+                target: belt_infra::db::HitlTarget::Item("s1:analyze".into()),
+                action: belt_core::hitl::HitlAction::Retry,
+                by: "reviewer".into(),
+                via: "cli".into(),
+                path: belt_core::hitl::ConfirmPath::Direct,
+                notes: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            belt_core::hitl::RespondOutcome::Won { .. }
+        ));
+        assert_eq!(
+            daemon.get_item("s1:analyze").unwrap().phase(),
+            QueuePhase::Hitl,
+            "a response alone does not leave Hitl"
+        );
+
+        assert_eq!(daemon.run_post_processing().await.unwrap(), 1);
         assert_eq!(
             daemon.get_item("s1:analyze").unwrap().phase(),
             QueuePhase::Pending
@@ -3292,12 +3222,10 @@ sources:
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
-        let mut item = test_item("github:org/repo#1", "analyze");
-        Daemon::ensure_row(&daemon.db, &item);
-        item.set_phase_unchecked(QueuePhase::Completed);
+        let mut item = completed_in_store(&daemon, test_item("github:org/repo#1", "analyze"));
 
-        let success = daemon.execute_on_done(&mut item).await.unwrap();
-        assert!(success);
+        let outcome = daemon.finish_completed(&mut item).await.unwrap();
+        assert!(matches!(outcome, OnDoneOutcome::Done));
         assert_eq!(item.phase(), QueuePhase::Done);
     }
 
@@ -3777,37 +3705,6 @@ sources:
     }
 
     // ---------------------------------------------------------------
-    // mark_skipped tests
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn mark_skipped_transitions_hitl_to_skipped() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        daemon.push_item(item);
-
-        assert!(daemon.mark_skipped("s1:analyze").is_ok());
-        assert_eq!(
-            daemon.get_item("s1:analyze").unwrap().phase(),
-            QueuePhase::Skipped
-        );
-    }
-
-    #[test]
-    fn mark_skipped_returns_error_for_unknown_id() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let result = daemon.mark_skipped("does-not-exist");
-        assert!(result.is_err());
-    }
-
-    // ---------------------------------------------------------------
     // mark_failed error path tests
     // ---------------------------------------------------------------
 
@@ -4036,32 +3933,6 @@ sources:
     }
 
     // ---------------------------------------------------------------
-    // retry_from_hitl tests
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn retry_from_hitl_returns_error_for_unknown_id() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let result = daemon.retry_from_hitl("nonexistent");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn retry_from_hitl_invalid_phase_returns_error() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        // Pending → Pending (retry_from_hitl) is invalid since only Hitl → Pending is valid.
-        daemon.push_item(test_item("s1", "analyze"));
-        let result = daemon.retry_from_hitl("s1:analyze");
-        assert!(result.is_err());
-    }
-
-    // ---------------------------------------------------------------
     // mark_hitl error paths
     // ---------------------------------------------------------------
 
@@ -4243,12 +4114,10 @@ sources:
             .worktree_mgr
             .register_preserved("github:org/repo#1", wt_path);
 
-        let mut item = test_item("github:org/repo#1", "analyze");
-        Daemon::ensure_row(&daemon.db, &item);
-        item.set_phase_unchecked(QueuePhase::Completed);
+        let mut item = completed_in_store(&daemon, test_item("github:org/repo#1", "analyze"));
 
-        let success = daemon.execute_on_done(&mut item).await.unwrap();
-        assert!(success);
+        let outcome = daemon.finish_completed(&mut item).await.unwrap();
+        assert!(matches!(outcome, OnDoneOutcome::Done));
 
         // Preserved mapping should be cleared after Done.
         assert!(
@@ -4256,153 +4125,6 @@ sources:
                 .worktree_mgr
                 .lookup_preserved("github:org/repo#1")
                 .is_none()
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // respond_hitl replan tests
-    // ---------------------------------------------------------------
-
-    #[tokio::test]
-    async fn respond_hitl_replan_rolls_back_to_pending_and_creates_hitl_item() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_notes = Some("original failure reason".into());
-        daemon.push_item(item);
-
-        let result = daemon
-            .respond_hitl(
-                "s1:analyze",
-                HitlRespondAction::Replan,
-                Some("reviewer".into()),
-                None,
-            )
-            .await;
-        assert!(result.is_ok());
-
-        // Original item should be rolled back to Pending with replan_count = 1.
-        let original = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(original.phase(), QueuePhase::Pending);
-        assert_eq!(original.replan_count, 1);
-
-        // A new HITL item should have been created for spec modification.
-        let replan_item = daemon.get_item("s1:analyze:replan-1").unwrap();
-        assert_eq!(replan_item.phase(), QueuePhase::Hitl);
-        assert_eq!(
-            replan_item.hitl_reason,
-            Some(HitlReason::SpecModificationProposed)
-        );
-        assert!(
-            replan_item
-                .hitl_notes
-                .as_ref()
-                .unwrap()
-                .contains("original failure reason")
-        );
-        assert!(
-            replan_item
-                .title
-                .as_ref()
-                .unwrap()
-                .contains("spec-modification-proposed")
-        );
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_replan_increments_count_on_successive_replans() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.replan_count = 1; // Already replanned once.
-        daemon.push_item(item);
-
-        let result = daemon
-            .respond_hitl(
-                "s1:analyze",
-                HitlRespondAction::Replan,
-                None,
-                Some("second failure".into()),
-            )
-            .await;
-        assert!(result.is_ok());
-
-        let original = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(original.phase(), QueuePhase::Pending);
-        assert_eq!(original.replan_count, 2);
-
-        let replan_item = daemon.get_item("s1:analyze:replan-2").unwrap();
-        assert_eq!(replan_item.phase(), QueuePhase::Hitl);
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_replan_exceeds_limit_transitions_to_failed() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.replan_count = 3; // Already at max.
-        daemon.push_item(item);
-
-        let result = daemon
-            .respond_hitl("s1:analyze", HitlRespondAction::Replan, None, None)
-            .await;
-        assert!(result.is_ok());
-
-        // Should transition to Failed, not Pending.
-        let original = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(original.phase(), QueuePhase::Failed);
-        assert_eq!(original.replan_count, 4);
-
-        // No replan HITL item should be created.
-        assert!(daemon.get_item("s1:analyze:replan-4").is_none());
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_replan_requires_hitl_phase() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        // Item is in Pending, not Hitl.
-        daemon.push_item(test_item("s1", "analyze"));
-
-        let result = daemon
-            .respond_hitl("s1:analyze", HitlRespondAction::Replan, None, None)
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_done_still_works() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        daemon.push_item(item);
-
-        let result = daemon
-            .respond_hitl(
-                "s1:analyze",
-                HitlRespondAction::Done,
-                Some("reviewer".into()),
-                None,
-            )
-            .await;
-        assert!(result.is_ok());
-        assert_eq!(
-            daemon.get_item("s1:analyze").unwrap().phase(),
-            QueuePhase::Done
         );
     }
 
@@ -4549,26 +4271,32 @@ sources:
     }
 
     // ---------------------------------------------------------------
-    // execute_on_done() additional tests
+    // finish_completed() on_done tests
     // ---------------------------------------------------------------
 
+    /// Store `item` at Completed and return it, ready for `finish_completed`.
+    fn completed_in_store(daemon: &Daemon, mut item: QueueItem) -> QueueItem {
+        item.set_phase_unchecked(QueuePhase::Completed);
+        Daemon::ensure_row(&daemon.db, &item);
+        item
+    }
+
     #[tokio::test]
-    async fn execute_on_done_transitions_to_done_when_no_state_config() {
+    async fn finish_completed_is_done_when_no_state_config() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         // Use a state that has no matching state config.
-        let mut item = test_item("github:org/repo#1", "unknown_state");
-        item.set_phase_unchecked(QueuePhase::Completed);
+        let mut item = completed_in_store(&daemon, test_item("github:org/repo#1", "unknown_state"));
 
-        let success = daemon.execute_on_done(&mut item).await.unwrap();
-        assert!(success);
+        let outcome = daemon.finish_completed(&mut item).await.unwrap();
+        assert!(matches!(outcome, OnDoneOutcome::Done));
         assert_eq!(item.phase(), QueuePhase::Done);
     }
 
     #[tokio::test]
-    async fn execute_on_done_with_empty_on_done_transitions_to_done() {
+    async fn finish_completed_with_empty_on_done_is_done() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
 
@@ -4604,28 +4332,25 @@ sources:
             Database::open_in_memory().unwrap(),
         );
 
-        let mut item = test_item("github:org/repo#1", "no_done");
-        item.set_phase_unchecked(QueuePhase::Completed);
+        let mut item = completed_in_store(&daemon, test_item("github:org/repo#1", "no_done"));
 
-        let success = daemon.execute_on_done(&mut item).await.unwrap();
-        assert!(success);
+        let outcome = daemon.finish_completed(&mut item).await.unwrap();
+        assert!(matches!(outcome, OnDoneOutcome::Done));
         assert_eq!(item.phase(), QueuePhase::Done);
     }
 
     #[tokio::test]
-    async fn execute_on_done_records_history_entry() {
+    async fn finish_completed_records_history_entry() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
-        let mut item = test_item("github:org/repo#1", "analyze");
-        Daemon::ensure_row(&daemon.db, &item);
-        item.set_phase_unchecked(QueuePhase::Completed);
+        let mut item = completed_in_store(&daemon, test_item("github:org/repo#1", "analyze"));
 
         assert_eq!(daemon.history().len(), 0);
 
-        let success = daemon.execute_on_done(&mut item).await.unwrap();
-        assert!(success);
+        let outcome = daemon.finish_completed(&mut item).await.unwrap();
+        assert!(matches!(outcome, OnDoneOutcome::Done));
 
         // History should have a "done" entry.
         assert!(
@@ -5366,146 +5091,6 @@ sources:
         assert_eq!(item.phase(), QueuePhase::Hitl);
         assert_eq!(item.hitl_reason, Some(HitlReason::Timeout));
         assert!(item.hitl_notes.is_none());
-    }
-
-    // ---------------------------------------------------------------
-    // retry_from_hitl: transition detail tests
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn retry_from_hitl_resets_phase_to_pending() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_reason = Some(HitlReason::RetryMaxExceeded);
-        item.hitl_notes = Some("needs review".into());
-        item.hitl_created_at = Some(Utc::now().to_rfc3339());
-        daemon.push_item(item);
-
-        daemon.retry_from_hitl("s1:analyze").unwrap();
-
-        let item = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(item.phase(), QueuePhase::Pending);
-    }
-
-    // ---------------------------------------------------------------
-    // respond_hitl: Retry and Skip action tests
-    // ---------------------------------------------------------------
-
-    #[tokio::test]
-    async fn respond_hitl_retry_transitions_to_pending() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        daemon.push_item(item);
-
-        let result = daemon
-            .respond_hitl(
-                "s1:analyze",
-                HitlRespondAction::Retry,
-                Some("reviewer".into()),
-                Some("retrying after fix".into()),
-            )
-            .await;
-        assert!(result.is_ok());
-
-        let item = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(item.phase(), QueuePhase::Pending);
-        assert_eq!(item.hitl_respondent.as_deref(), Some("reviewer"));
-        assert_eq!(item.hitl_notes.as_deref(), Some("retrying after fix"));
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_skip_transitions_to_skipped() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        daemon.push_item(item);
-
-        let result = daemon
-            .respond_hitl(
-                "s1:analyze",
-                HitlRespondAction::Skip,
-                Some("admin".into()),
-                None,
-            )
-            .await;
-        assert!(result.is_ok());
-
-        let item = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(item.phase(), QueuePhase::Skipped);
-        assert_eq!(item.hitl_respondent.as_deref(), Some("admin"));
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_returns_error_for_unknown_id() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let result = daemon
-            .respond_hitl("nonexistent", HitlRespondAction::Done, None, None)
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_updates_notes_when_provided() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_notes = Some("original notes".into());
-        daemon.push_item(item);
-
-        daemon
-            .respond_hitl(
-                "s1:analyze",
-                HitlRespondAction::Done,
-                None,
-                Some("updated notes".into()),
-            )
-            .await
-            .unwrap();
-
-        let item = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(item.hitl_notes.as_deref(), Some("updated notes"));
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_preserves_notes_when_not_provided() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_notes = Some("original notes".into());
-        daemon.push_item(item);
-
-        daemon
-            .respond_hitl(
-                "s1:analyze",
-                HitlRespondAction::Done,
-                Some("reviewer".into()),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let item = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(item.hitl_notes.as_deref(), Some("original notes"));
     }
 
     // ---------------------------------------------------------------

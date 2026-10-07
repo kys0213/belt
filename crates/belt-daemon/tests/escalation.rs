@@ -6,14 +6,16 @@
 use std::sync::Arc;
 
 use belt_core::escalation::EscalationAction;
+use belt_core::hitl::{ConfirmPath, HitlAction, RespondOutcome};
 use belt_core::phase::QueuePhase;
+use belt_core::queue::HitlReason;
 use belt_core::queue::testing::test_item;
-use belt_core::queue::{HitlReason, HitlRespondAction};
 use belt_core::runtime::RuntimeRegistry;
 use belt_core::workspace::WorkspaceConfig;
 use belt_daemon::daemon::{Daemon, ItemOutcome};
 use belt_daemon::evaluator::{DEFAULT_MAX_EVAL_FAILURES, EvalDecision, Evaluator};
-use belt_infra::db::Database;
+use belt_daemon::hitl::HitlResponse;
+use belt_infra::db::{Database, HitlTarget};
 use belt_infra::runtimes::mock::MockRuntime;
 use belt_infra::sources::mock::MockDataSource;
 use belt_infra::worktree::MockWorktreeManager;
@@ -59,6 +61,29 @@ fn setup_daemon(tmp: &TempDir, source: MockDataSource, exit_codes: Vec<i32>) -> 
         4,
         Database::open_in_memory().unwrap(),
     )
+}
+
+/// Answer the item's HITL request through the HITL contract, then let the
+/// daemon post-process it: the only way out of Hitl.
+async fn respond_and_post_process(
+    daemon: &mut Daemon,
+    work_id: &str,
+    action: HitlAction,
+    notes: Option<&str>,
+) {
+    let outcome = daemon
+        .hitl()
+        .respond(&HitlResponse {
+            target: HitlTarget::Item(work_id.to_string()),
+            action,
+            by: "human".to_string(),
+            via: "cli".to_string(),
+            path: ConfirmPath::Direct,
+            notes: notes.map(str::to_string),
+        })
+        .unwrap();
+    assert!(matches!(outcome, RespondOutcome::Won { .. }), "{outcome:?}");
+    assert_eq!(daemon.run_post_processing().await.unwrap(), 1);
 }
 
 /// First failure -> EscalationAction::Retry (silent retry, no on_fail).
@@ -187,20 +212,26 @@ async fn hitl_respond_done() {
         )
         .unwrap();
 
-    // Respond with Done.
-    daemon
-        .respond_hitl(
-            "github:org/repo#1:analyze",
-            HitlRespondAction::Done,
-            Some("human".to_string()),
-            None,
-        )
-        .await
-        .unwrap();
+    respond_and_post_process(
+        &mut daemon,
+        "github:org/repo#1:analyze",
+        HitlAction::Done,
+        None,
+    )
+    .await;
 
-    let item = daemon.get_item("github:org/repo#1:analyze").unwrap();
-    assert_eq!(item.phase(), QueuePhase::Done);
-    assert_eq!(item.hitl_respondent.as_deref(), Some("human"));
+    assert_eq!(
+        daemon
+            .db()
+            .get_item("github:org/repo#1:analyze")
+            .unwrap()
+            .phase(),
+        QueuePhase::Done
+    );
+    assert!(
+        daemon.get_item("github:org/repo#1:analyze").is_none(),
+        "a Done item leaves the queue"
+    );
 }
 
 /// HITL item can be resolved with Retry action (goes back to Pending).
@@ -224,15 +255,13 @@ async fn hitl_respond_retry() {
         )
         .unwrap();
 
-    daemon
-        .respond_hitl(
-            "github:org/repo#1:analyze",
-            HitlRespondAction::Retry,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    respond_and_post_process(
+        &mut daemon,
+        "github:org/repo#1:analyze",
+        HitlAction::Retry,
+        None,
+    )
+    .await;
 
     let item = daemon.get_item("github:org/repo#1:analyze").unwrap();
     assert_eq!(item.phase(), QueuePhase::Pending);
@@ -259,18 +288,23 @@ async fn hitl_respond_skip() {
         )
         .unwrap();
 
-    daemon
-        .respond_hitl(
-            "github:org/repo#1:analyze",
-            HitlRespondAction::Skip,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+    respond_and_post_process(
+        &mut daemon,
+        "github:org/repo#1:analyze",
+        HitlAction::Skip,
+        None,
+    )
+    .await;
 
-    let item = daemon.get_item("github:org/repo#1:analyze").unwrap();
-    assert_eq!(item.phase(), QueuePhase::Skipped);
+    assert_eq!(
+        daemon
+            .db()
+            .get_item("github:org/repo#1:analyze")
+            .unwrap()
+            .phase(),
+        QueuePhase::Skipped
+    );
+    assert!(daemon.get_item("github:org/repo#1:analyze").is_none());
 }
 
 /// Failed items have worktree_preserved flag set.
@@ -387,12 +421,10 @@ async fn failure_records_history_event() {
     assert_eq!(daemon.history_events()[0].status, "failed");
 }
 
-/// Spec conflict HITL with Replan: delegate to Claw for spec modification.
-///
-/// When the user requests replan on a spec conflict, the item is rolled back
-/// to Pending and a new HITL item is created for spec modification proposal.
+/// HITL replan ends the item as Skipped and continues the work in a derived
+/// Pending item that counts one lineage replan.
 #[tokio::test]
-async fn spec_conflict_hitl_replan_creates_modification_item() {
+async fn hitl_replan_derives_a_new_item() {
     let tmp = TempDir::new().unwrap();
     let source = MockDataSource::new("github");
     let mut daemon = setup_daemon(&tmp, source, vec![]);
@@ -406,30 +438,35 @@ async fn spec_conflict_hitl_replan_creates_modification_item() {
     daemon
         .mark_hitl(
             "github:org/repo#1:implement",
-            HitlReason::SpecConflict,
-            Some("spec-conflict: overlap with [spec-2]".to_string()),
+            HitlReason::EvaluateFailure,
+            Some("overlap with another change".to_string()),
         )
         .unwrap();
 
-    daemon
-        .respond_hitl(
-            "github:org/repo#1:implement",
-            HitlRespondAction::Replan,
-            Some("reviewer".to_string()),
-            Some("remove overlapping entry_points from spec-2".to_string()),
-        )
-        .await
-        .unwrap();
+    respond_and_post_process(
+        &mut daemon,
+        "github:org/repo#1:implement",
+        HitlAction::Replan,
+        Some("split the change"),
+    )
+    .await;
 
-    let item = daemon.get_item("github:org/repo#1:implement").unwrap();
-    assert_eq!(item.phase(), QueuePhase::Pending);
-    assert_eq!(item.replan_count, 1);
-
-    let hitl_items = daemon.items_in_phase(QueuePhase::Hitl);
-    assert_eq!(hitl_items.len(), 1);
     assert_eq!(
-        hitl_items[0].hitl_reason,
-        Some(HitlReason::SpecModificationProposed)
+        daemon
+            .db()
+            .get_item("github:org/repo#1:implement")
+            .unwrap()
+            .phase(),
+        QueuePhase::Skipped
+    );
+    let derived = daemon
+        .get_item("github:org/repo#1:implement:2")
+        .expect("the derived item is queued");
+    assert_eq!(derived.phase(), QueuePhase::Pending);
+    assert_eq!(derived.replan_count, 1);
+    assert_eq!(
+        derived.derived_from.as_deref(),
+        Some("github:org/repo#1:implement")
     );
 }
 
@@ -859,10 +896,31 @@ mod store_results {
         );
         let origin_wt = hook.worktree_of(ORIGIN);
 
-        let mut item = daemon.get_item(&derived(2)).cloned().unwrap();
-        assert!(daemon.execute_on_done(&mut item).await.unwrap());
+        // A human confirms Done; post-processing runs on_done.
+        daemon
+            .mark_hitl(&derived(2), HitlReason::EvaluateFailure, None)
+            .unwrap();
+        respond_and_post_process(&mut daemon, &derived(2), HitlAction::Done, None).await;
+
         let ran_in = std::fs::read_to_string(&marker).unwrap();
         assert_eq!(ran_in.trim(), origin_wt.to_str().unwrap());
+        assert_eq!(
+            daemon.db().get_item(&derived(2)).unwrap().phase(),
+            QueuePhase::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn on_done_hook_of_a_derived_item_sees_the_inherited_worktree() {
+        let tmp = TempDir::new().unwrap();
+        let daemon = failing_daemon(&tmp, vec![1, 0], test_workspace_config());
+        let hook = RecordingHook::new(Arc::clone(daemon.database()));
+        let mut daemon = daemon.with_hook(hook.clone());
+
+        daemon.collect().await.unwrap();
+        run_once(&mut daemon).await;
+        run_once(&mut daemon).await;
+        let origin_wt = hook.worktree_of(ORIGIN);
 
         daemon.mark_done(&derived(2)).unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
