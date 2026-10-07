@@ -1,7 +1,6 @@
 # Belt Spec
 
 > **구조**: 설계 개요 + 관심사별 상세 스펙 + 사용자 플로우
-> 버전 마이그레이션 배경과 변경 이력은 [plans/2026-04-v6-migration.md](../plans/2026-04-v6-migration.md) 참고.
 
 ## 설계 문서
 
@@ -22,11 +21,11 @@
 | [DataSource](./concerns/datasource.md) | 외부 시스템 추상화 trait + **source_data** + 워크플로우 yaml |
 | [AgentRuntime](./concerns/agent-runtime.md) | LLM 실행 추상화 trait + Registry |
 | [Agent 워크스페이스](./concerns/agent-workspace.md) | 대화형 에이전트 + **per-item evaluate** + slash command |
-| [Cron 엔진](./concerns/cron-engine.md) | 주기 실행 + 품질 루프 (evaluate는 Daemon tick으로 이동) |
+| [Cron 엔진](./concerns/cron-engine.md) | 주기 작업 (evaluate는 Daemon tick으로 이동) |
 | [CLI 레퍼런스](./concerns/cli-reference.md) | 3-layer SSOT + `belt context` + 전체 커맨드 트리 |
 | [Cross-Platform](./concerns/cross-platform.md) | OS 추상화 (ShellExecutor, DaemonNotifier) |
 | [Distribution](./concerns/distribution.md) | 배포 전략 |
-| [Data Model](./concerns/data-model.md) | SQLite 스키마, **StagnationPattern enum**, **EscalationAction FromStr**, **source_data** |
+| [Data Model](./concerns/data-model.md) | 전이 이력, HITL 요청, 취소 요청, 파생 아이템, 도메인 어휘 |
 
 ## 사용자 플로우 (flows/)
 
@@ -35,7 +34,6 @@
 | # | Flow | 설명 |
 |---|------|------|
 | 01 | [온보딩](./flows/01-setup.md) | workspace 등록 → 컨벤션 부트스트랩 |
-| 02 | [스펙 생명주기](./flows/02-spec-lifecycle.md) | 스펙 등록 → 이슈 분해 → 완료 판정 |
 | 03 | [이슈 파이프라인](./flows/03-issue-pipeline.md) | handlers 실행 → **stagnation detection** → evaluate → hook.on_done |
 | 04 | [실패 복구와 HITL](./flows/04-failure-and-hitl.md) | **stagnation + lateral thinking** → escalation → hook 트리거 → 사람 개입 |
 | 05 | [모니터링](./flows/05-monitoring.md) | TUI + CLI + /agent 시각화 + **stagnation 표시** |

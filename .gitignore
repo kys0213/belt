@@ -6,3 +6,5 @@ Cargo.lock
 .DS_Store
 .env
 .claude/worktrees/
+/.orchestrator/
+/crates/belt-daemon/.belt/

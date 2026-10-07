@@ -36,7 +36,7 @@ Stagnation 분석 (같은 source_id + state에서 실패 이력이 있으면 항
 
 현재 실제로 감지되는 패턴은 **SPINNING**(A→A→A, 동일/유사 출력 반복)과 **OSCILLATION**(A→B→A→B, 두 출력 사이를 교대로 반복)이다. 예: 같은 컴파일 에러가 반복되면 SPINNING, 서로 다른 두 수정안을 번갈아 시도하면 OSCILLATION.
 
-패턴 유형 전체 정의(enum)는 [Data Model](./data-model.md#stagnationpattern) 참조. SPINNING·OSCILLATION 외 패턴(NO_DRIFT, DIMINISHING_RETURNS)의 확장 로드맵은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
+패턴 유형 전체 정의(enum)는 [Data Model](./data-model.md#stagnation-패턴과-페르소나) 참조. SPINNING·OSCILLATION 외 패턴(NO_DRIFT, DIMINISHING_RETURNS)의 확장 로드맵은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
 
 ---
 
@@ -186,7 +186,7 @@ LLM이 실패 분석·대안 접근·실행 계획을 직접 생성하는 방식
 
 ### HITL에 lateral 이력 첨부
 
-failure_count가 hitl에 도달하면, 현재 lateral_plan과 해당 work_id의 `stagnation` 이벤트 이력이 `hitl_notes`에 첨부된다.
+failure_count가 hitl에 도달하면, 현재 lateral_plan과 **계열**(파생 원본으로 이어진 아이템들)의 `stagnation` 이벤트 이력이 HITL 메모에 첨부된다.
 
 ```
 ## Lateral Thinking History

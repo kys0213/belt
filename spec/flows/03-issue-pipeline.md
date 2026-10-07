@@ -26,7 +26,7 @@ DataSource.collect(): trigger 조건 매칭 (예: belt:analyze 라벨)
     ▼
   Pending → Ready → Running (자동 전이, concurrency 제한)
     │
-    │  ① worktree 생성 (인프라, 또는 retry 시 기존 보존분 재사용)
+    │  ① worktree 생성 (인프라, 또는 인계받은 worktree·롤백 보존분 재사용)
     │  ② hook.on_enter() 트리거 (workspace의 LifecycleHook)
     │  ③ handlers 순차 실행:
     │       prompt → AgentRuntime.invoke() (worktree 안에서)
@@ -86,19 +86,8 @@ Daemon이 주입하는 환경변수는 `WORK_ID`와 `WORKTREE`뿐. 이슈 번호
 
 ```
 DataSource.collect()가 changes-requested 감지
-  → 새 아이템 생성 → handlers 실행 → 수정 반영
+  → 새 아이템 생성 (같은 state의 다음 순번 work_id로 시작하는 새 계열) → handlers 실행 → 수정 반영
 ```
-
-### /spec update
-
-```
-스펙 변경 → on_spec_active → Cron(gap-detection) 재평가
-  → gap 발견 시 새 이슈 생성 → 파이프라인 재진입
-```
-
-### 핵심 원칙
-
-**스펙 = 계약**. 계약이 바뀌어야 하면 `/spec update`. 계약 범위 내 작업이면 이슈 등록.
 
 ---
 
@@ -146,7 +135,7 @@ circuit breaker는 source 단위로 동작한다. 한 source의 인프라 오류
 | handler 전부 성공 + evaluate Done | handler 성공 | Done | hook.on_done() 트리거, worktree 정리 |
 | handler 성공 + evaluate HITL | handler 성공, LLM 불확실 | HITL | HITL 이벤트 생성, worktree 보존 |
 | hook.on_done() 실패 | on_done script exit 1 | Failed | on_fail은 실행하지 않음 (handler 실패가 아니므로) |
-| changes-requested | PR 리뷰 코멘트 | 새 아이템 Pending | DataSource.collect()가 감지, 수정 반영 |
+| changes-requested | PR 리뷰 코멘트 | 새 아이템 Pending (같은 state의 다음 순번 work_id로 시작하는 새 계열) | DataSource.collect()가 감지, 수정 반영 |
 | circuit breaker open | 3회 연속 인프라 오류 | 해당 source 일시 중단 | dashboard에 circuit open 표시 |
 | circuit breaker 복구 | half-open에서 1건 성공 | closed (정상 복귀) | 해당 source 재개 |
 

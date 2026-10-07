@@ -88,7 +88,7 @@ workspace는 하나의 외부 레포와 1:1로 대응한다. GitHub 기준으로
 2. workspace 디렉토리 생성 (~/.belt/workspaces/auth-project/)
 3. DataSource 인스턴스 생성 + Daemon에 등록
 4. AgentRuntime 바인딩 (RuntimeRegistry 구성)
-5. per-workspace cron seed (evaluate, gap-detection, knowledge-extract)
+5. per-workspace cron seed (knowledge-extract)
 6. Agent 워크스페이스 초기화 확인
 ```
 
