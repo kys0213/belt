@@ -10,12 +10,11 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use chrono::Utc;
-
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_core::state_machine;
-use belt_infra::db::{Database, TransitionEvent};
+use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
+use belt_infra::db::Database;
 
 use crate::concurrency::ConcurrencyTracker;
 
@@ -29,42 +28,6 @@ fn transit(
     to: QueuePhase,
 ) -> Result<QueuePhase, belt_core::error::BeltError> {
     item.transit(to)
-}
-
-/// Record a phase transition event to the database.
-///
-/// Silently logs a warning on failure — transition recording must not
-/// block the state machine.
-fn record_transition(
-    db: &Option<Arc<Database>>,
-    work_id: &str,
-    source_id: &str,
-    from: QueuePhase,
-    to: QueuePhase,
-    event_type: &str,
-    detail: Option<String>,
-) {
-    let Some(db) = db.as_ref() else {
-        return;
-    };
-    let now = Utc::now();
-    let event = TransitionEvent {
-        id: format!("te-{}-{}", work_id, now.timestamp_millis()),
-        work_id: work_id.to_string(),
-        source_id: source_id.to_string(),
-        event_type: event_type.to_string(),
-        phase: Some(to.as_str().to_string()),
-        from_phase: Some(from.as_str().to_string()),
-        detail,
-        created_at: now.to_rfc3339(),
-    };
-    if let Err(e) = db.insert_transition_event(&event) {
-        tracing::warn!(
-            work_id = %work_id,
-            error = %e,
-            "failed to record transition event"
-        );
-    }
 }
 
 /// Drives queue items through the advance phase of the daemon lifecycle.
@@ -102,11 +65,19 @@ impl<'a> Advancer<'a> {
 
     /// Auto-transition Pending -> Ready -> Running (respecting concurrency).
     ///
+    /// Every transition goes through [`Database::transition`]. An item whose
+    /// stored phase differs (another process moved it) is not advanced and
+    /// its in-memory phase follows the stored one.
+    ///
     /// Returns the number of items that were successfully transitioned.
+    ///
+    /// # Panics
+    /// When no database is configured. `Daemon::tick` rejects that case with
+    /// an error before reaching here.
     pub fn run(&mut self) -> usize {
+        self.require_db();
         let mut advanced = 0;
 
-        // Pending -> Ready (uses safe transit)
         let pending_indices: Vec<usize> = self
             .queue
             .iter()
@@ -116,21 +87,8 @@ impl<'a> Advancer<'a> {
             .collect();
 
         for idx in pending_indices {
-            if state_machine::transit(QueuePhase::Pending, QueuePhase::Ready).is_err() {
-                continue;
-            }
-
-            if transit(&mut self.queue[idx], QueuePhase::Ready).is_ok() {
+            if self.claim(idx, QueuePhase::Ready) {
                 advanced += 1;
-                record_transition(
-                    self.db,
-                    &self.queue[idx].work_id,
-                    &self.queue[idx].source_id,
-                    QueuePhase::Pending,
-                    QueuePhase::Ready,
-                    "phase_enter",
-                    None,
-                );
             }
         }
 
@@ -160,16 +118,7 @@ impl<'a> Advancer<'a> {
                 continue;
             }
 
-            if transit(&mut self.queue[idx], QueuePhase::Running).is_ok() {
-                record_transition(
-                    self.db,
-                    &self.queue[idx].work_id,
-                    &self.queue[idx].source_id,
-                    QueuePhase::Ready,
-                    QueuePhase::Running,
-                    "phase_enter",
-                    None,
-                );
+            if self.claim(idx, QueuePhase::Running) {
                 self.tracker.track(self.ws_name);
                 advanced += 1;
             }
@@ -179,10 +128,82 @@ impl<'a> Advancer<'a> {
     }
 
     /// Advance Pending items to Ready.
+    ///
+    /// # Panics
+    /// When no database is configured.
     pub fn advance_pending_to_ready(&mut self) {
-        for item in self.queue.iter_mut() {
-            if item.phase() == QueuePhase::Pending {
-                let _ = transit(item, QueuePhase::Ready);
+        self.require_db();
+        let pending_indices: Vec<usize> = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.phase() == QueuePhase::Pending)
+            .map(|(i, _)| i)
+            .collect();
+
+        for idx in pending_indices {
+            self.claim(idx, QueuePhase::Ready);
+        }
+    }
+
+    fn require_db(&self) -> &Database {
+        self.db
+            .as_deref()
+            .expect("Advancer requires a database: queue state is owned by SQLite")
+    }
+
+    /// Move the item at `idx` to `to` through the store and mirror the result.
+    ///
+    /// Returns `true` only when the store applied the transition. On a
+    /// conflict the stored phase wins: the in-memory phase follows it and the
+    /// caller must not start any work for the item.
+    fn claim(&mut self, idx: usize, to: QueuePhase) -> bool {
+        let db = self.require_db();
+        let item = &self.queue[idx];
+        let from = item.phase();
+        if state_machine::transit(from, to).is_err() {
+            tracing::error!(work_id = %item.work_id, ?from, ?to, "undefined transition skipped");
+            return false;
+        }
+        let request = TransitionRequest {
+            work_id: item.work_id.clone(),
+            expected_from: from,
+            to,
+            actor: Actor::Daemon,
+            reason: TransitionReason::Manual,
+            detail: Some("advance".to_string()),
+        };
+        match db.transition(&request) {
+            Ok(TransitionOutcome::Applied { .. }) => {
+                if let Err(e) = transit(&mut self.queue[idx], to) {
+                    tracing::error!(
+                        work_id = %request.work_id,
+                        "in-memory transit after applied claim failed: {e}"
+                    );
+                    return false;
+                }
+                true
+            }
+            Ok(TransitionOutcome::Conflict { current }) => {
+                tracing::info!(
+                    work_id = %request.work_id,
+                    expected = ?from,
+                    current = ?current,
+                    "claim lost to another writer; following stored phase"
+                );
+                self.queue[idx].set_phase_unchecked(current);
+                false
+            }
+            Ok(
+                outcome
+                @ (TransitionOutcome::Busy { .. } | TransitionOutcome::InvalidAction { .. }),
+            ) => {
+                tracing::error!(work_id = %request.work_id, ?outcome, "claim transition rejected");
+                false
+            }
+            Err(e) => {
+                tracing::error!(work_id = %request.work_id, "claim transition failed: {e}");
+                false
             }
         }
     }
@@ -191,11 +212,15 @@ impl<'a> Advancer<'a> {
     ///
     /// `ws_concurrency_limits` maps workspace IDs to their concurrency limits.
     /// Workspaces not present in the map use `default_concurrency` (falls back to 1).
+    ///
+    /// # Panics
+    /// When no database is configured.
     pub fn advance_ready_to_running(
         &mut self,
         ws_concurrency_limits: &HashMap<String, u32>,
         default_concurrency: u32,
     ) {
+        self.require_db();
         let ready_indices: Vec<usize> = self
             .queue
             .iter()
@@ -219,7 +244,7 @@ impl<'a> Advancer<'a> {
                 continue;
             }
 
-            if transit(&mut self.queue[idx], QueuePhase::Running).is_ok() {
+            if self.claim(idx, QueuePhase::Running) {
                 self.tracker.track(&ws);
             }
         }
@@ -304,11 +329,20 @@ mod tests {
         items.into_iter().collect()
     }
 
+    /// In-memory store holding a row for every queued item.
+    fn db_with(queue: &VecDeque<QueueItem>) -> Option<Arc<Database>> {
+        let db = Database::open_in_memory().expect("in-memory DB");
+        for item in queue {
+            db.insert_item(item).expect("insert_item");
+        }
+        Some(Arc::new(db))
+    }
+
     #[test]
     fn run_advances_pending_through_ready_to_running() {
         let mut queue = make_queue(vec![test_item("w1", "analyze")]);
         let mut tracker = ConcurrencyTracker::new(4);
-        let db: Option<Arc<Database>> = None;
+        let db = db_with(&queue);
 
         let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2);
 
@@ -326,7 +360,7 @@ mod tests {
         ];
         let mut queue = make_queue(items);
         let mut tracker = ConcurrencyTracker::new(4);
-        let db: Option<Arc<Database>> = None;
+        let db = db_with(&queue);
 
         // ws_concurrency = 1, so only one item should reach Running
         let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 1);
@@ -347,7 +381,7 @@ mod tests {
             test_item("w2", "implement"),
         ]);
         let mut tracker = ConcurrencyTracker::new(4);
-        let db: Option<Arc<Database>> = None;
+        let db = db_with(&queue);
 
         let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2);
 
@@ -368,7 +402,7 @@ mod tests {
         queue[1].workspace_id = "ws-b".to_string();
 
         let mut tracker = ConcurrencyTracker::new(4);
-        let db: Option<Arc<Database>> = None;
+        let db = db_with(&queue);
 
         let mut limits = HashMap::new();
         limits.insert("ws-a".to_string(), 1);
@@ -385,7 +419,7 @@ mod tests {
     fn run_empty_queue_is_noop() {
         let mut queue: VecDeque<QueueItem> = VecDeque::new();
         let mut tracker = ConcurrencyTracker::new(4);
-        let db: Option<Arc<Database>> = None;
+        let db = db_with(&queue);
 
         let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2);
 

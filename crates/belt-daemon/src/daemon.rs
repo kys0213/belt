@@ -389,6 +389,7 @@ impl Daemon {
                             );
                         }
                     }
+                    Self::ensure_row(&self.db, &item);
                     self.queue.push_back(item);
                 }
             }
@@ -1659,6 +1660,10 @@ impl Daemon {
     /// shutdown이 요청되면 collect/advance를 건너뛰고 실행 중인
     /// 아이템의 완료 처리만 수행한다.
     pub async fn tick(&mut self) -> Result<()> {
+        if self.db.is_none() {
+            anyhow::bail!("daemon requires a database: queue state is owned by SQLite");
+        }
+
         if !self.shutdown_requested {
             let collected = self.collect().await?;
             if collected > 0 {
@@ -1712,6 +1717,11 @@ impl Daemon {
     /// 3. timeout 초과 시 Running -> Pending 롤백 (worktree 보존).
     /// 4. drain 중 두 번째 SIGINT 시 즉시 종료 (Running -> Failed 강제 전이).
     pub async fn run(&mut self, tick_interval_secs: u64) {
+        if self.db.is_none() {
+            tracing::error!("daemon requires a database: queue state is owned by SQLite");
+            return;
+        }
+
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs));
         tracing::info!("belt daemon started (tick={}s)", tick_interval_secs);
 
@@ -2434,7 +2444,26 @@ impl Daemon {
 
     /// Push an item onto the queue.
     pub fn push_item(&mut self, item: QueueItem) {
+        Self::ensure_row(&self.db, &item);
         self.queue.push_back(item);
+    }
+
+    /// Make sure the store has a row for `item`, so claim transitions find it.
+    fn ensure_row(db: &Option<Arc<Database>>, item: &QueueItem) {
+        let Some(db) = db else {
+            return;
+        };
+        match db.get_item(&item.work_id) {
+            Ok(_) => {}
+            Err(belt_core::error::BeltError::ItemNotFound(_)) => {
+                if let Err(e) = db.insert_item(item) {
+                    tracing::error!(work_id = %item.work_id, "failed to persist queue item: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::error!(work_id = %item.work_id, "failed to look up queue item: {e}");
+            }
+        }
     }
 
     /// Look up a queue item by work_id.
@@ -2517,6 +2546,7 @@ sources:
             Box::new(worktree_mgr),
             4,
         )
+        .with_db(Database::open_in_memory().unwrap())
     }
 
     // --- Safe state transition tests ---
@@ -4825,7 +4855,7 @@ sources:
 
         let mut item = test_item("github:org/repo#99", "analyze");
         item.set_phase_unchecked(QueuePhase::Running);
-        daemon.push_item(item);
+        daemon.queue.push_back(item);
 
         // Item is NOT in the DB yet (only in-memory queue).
         assert!(
@@ -5657,7 +5687,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![0]);
 
         // No DB configured — should fall back to in-memory history_events.
-        assert!(daemon.db.is_none());
+        daemon.db = None;
 
         let item = test_item("src:1", "implement");
         for _ in 0..3 {

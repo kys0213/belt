@@ -13,6 +13,7 @@ use belt_core::runtime::RuntimeRegistry;
 use belt_core::workspace::WorkspaceConfig;
 use belt_daemon::daemon::{Daemon, ItemOutcome};
 use belt_daemon::evaluator::{DEFAULT_MAX_EVAL_FAILURES, EvalDecision, Evaluator};
+use belt_infra::db::Database;
 use belt_infra::runtimes::mock::MockRuntime;
 use belt_infra::sources::mock::MockDataSource;
 use belt_infra::worktree::MockWorktreeManager;
@@ -57,6 +58,7 @@ fn setup_daemon(tmp: &TempDir, source: MockDataSource, exit_codes: Vec<i32>) -> 
         Box::new(worktree_mgr),
         4,
     )
+    .with_db(Database::open_in_memory().unwrap())
 }
 
 /// First failure -> EscalationAction::Retry (silent retry, no on_fail).

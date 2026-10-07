@@ -64,6 +64,7 @@ fn setup_daemon(tmp: &TempDir, source: MockDataSource, exit_codes: Vec<i32>) -> 
         Box::new(worktree_mgr),
         4,
     )
+    .with_db(Database::open_in_memory().unwrap())
 }
 
 /// Full lifecycle: collect -> advance -> execute -> complete.
@@ -552,4 +553,158 @@ async fn tick_evaluates_completed_without_cron_trigger() {
 
     assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
     assert_eq!(daemon.items_in_phase(QueuePhase::Completed).len(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// DB-owned claim transitions (Pending -> Ready -> Running)
+// ---------------------------------------------------------------------------
+
+mod claim {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use belt_core::lifecycle::{HookContext, LifecycleHook};
+    use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
+
+    use super::*;
+
+    struct CountingHook {
+        on_enter: AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl LifecycleHook for CountingHook {
+        async fn on_enter(&self, _ctx: &HookContext) -> anyhow::Result<()> {
+            self.on_enter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn on_done(&self, _ctx: &HookContext) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn on_fail(&self, _ctx: &HookContext) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn on_escalation(
+            &self,
+            _ctx: &HookContext,
+            _action: EscalationAction,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn daemon_without_db(tmp: &TempDir, source: MockDataSource) -> Daemon {
+        let config = test_workspace_config();
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(MockRuntime::new("mock", vec![0])));
+        let worktree_mgr = MockWorktreeManager::new(tmp.path().to_path_buf());
+        Daemon::new(
+            config,
+            vec![Box::new(source)],
+            Arc::new(registry),
+            Box::new(worktree_mgr),
+            4,
+        )
+    }
+
+    #[tokio::test]
+    async fn tick_without_database_fails_fast() {
+        let tmp = TempDir::new().unwrap();
+        let mut daemon = daemon_without_db(&tmp, MockDataSource::new("github"));
+
+        let err = daemon
+            .tick()
+            .await
+            .expect_err("tick must require a database");
+
+        assert!(
+            err.to_string().to_lowercase().contains("database"),
+            "error should name the missing database: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn advance_records_claim_in_transition_log() {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+        let mut daemon = setup_daemon(&tmp, source, vec![0]);
+
+        daemon.collect().await.unwrap();
+        daemon.advance();
+
+        let work_id = daemon.queue_items()[0].work_id.clone();
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 1);
+        let log = daemon.db().unwrap().transitions_of(&work_id).unwrap();
+        let enters: Vec<_> = log
+            .iter()
+            .filter(|e| e.kind == "phase_enter")
+            .map(|e| {
+                (
+                    e.from_phase.as_deref().unwrap(),
+                    e.to_phase.as_deref().unwrap(),
+                    e.actor.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            enters,
+            vec![
+                ("pending", "ready", "daemon"),
+                ("ready", "running", "daemon")
+            ]
+        );
+        let stored = daemon.db().unwrap().get_item(&work_id).unwrap();
+        assert_eq!(stored.phase(), QueuePhase::Running);
+    }
+
+    #[tokio::test]
+    async fn claim_conflict_skips_handler_and_hooks() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("belt.db");
+        let db_path = db_path.to_str().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+        let hook = Arc::new(CountingHook {
+            on_enter: AtomicU32::new(0),
+        });
+        let mut daemon = daemon_without_db(&tmp, source)
+            .with_db(Database::open(db_path).unwrap())
+            .with_hook(Arc::clone(&hook) as Arc<dyn LifecycleHook>);
+
+        daemon.collect().await.unwrap();
+        daemon.advance_pending_to_ready();
+        let work_id = daemon.queue_items()[0].work_id.clone();
+
+        // Another process skips the item right before the claim.
+        let other = Database::open(db_path).unwrap();
+        let outcome = other
+            .transition(&TransitionRequest {
+                work_id: work_id.clone(),
+                expected_from: QueuePhase::Ready,
+                to: QueuePhase::Skipped,
+                actor: Actor::Cli,
+                reason: TransitionReason::Manual,
+                detail: None,
+            })
+            .unwrap();
+        assert!(matches!(outcome, TransitionOutcome::Applied { .. }));
+
+        daemon.advance_ready_to_running(&HashMap::new(), 1);
+        let outcomes = daemon.execute_running().await;
+
+        assert!(outcomes.is_empty(), "no handler may run: {outcomes:?}");
+        assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
+        assert_eq!(hook.on_enter.load(Ordering::SeqCst), 0);
+        let log = other.transitions_of(&work_id).unwrap();
+        assert!(
+            log.iter()
+                .any(|e| e.kind == "transition_conflict" && e.actor == "daemon"),
+            "daemon conflict must be logged: {log:?}"
+        );
+        assert_eq!(
+            other.get_item(&work_id).unwrap().phase(),
+            QueuePhase::Skipped
+        );
+    }
 }

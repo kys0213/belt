@@ -62,17 +62,13 @@ fn advance_cycle_records_transition_events() {
 
     // Verify at least one transition event was recorded.
     let work_id = &queue[0].work_id;
-    let events = db
-        .list_transition_events(work_id)
-        .expect("list_transition_events");
-    assert!(
-        !events.is_empty(),
-        "at least one transition event should be recorded"
-    );
+    let events = db.transitions_of(work_id).expect("transitions_of");
+    assert_eq!(events.len(), 2, "one log row per transition");
     // The first recorded event should be Pending -> Ready.
     assert_eq!(events[0].from_phase.as_deref(), Some("pending"));
-    assert_eq!(events[0].phase.as_deref(), Some("ready"));
-    assert_eq!(events[0].event_type, "phase_enter");
+    assert_eq!(events[0].to_phase.as_deref(), Some("ready"));
+    assert_eq!(events[0].kind, "phase_enter");
+    assert_eq!(events[0].actor, "daemon");
 }
 
 /// Multiple items advance through the full cycle; each records events.
@@ -95,11 +91,8 @@ fn advance_multiple_items_records_events_per_item() {
 
     for item in queue.iter() {
         assert_eq!(item.phase(), QueuePhase::Running);
-        let events = db.list_transition_events(&item.work_id).unwrap();
-        assert!(
-            !events.is_empty(),
-            "each item should have at least one transition event"
-        );
+        let events = db.transitions_of(&item.work_id).unwrap();
+        assert_eq!(events.len(), 2, "each item logs both claim transitions");
     }
 }
 
