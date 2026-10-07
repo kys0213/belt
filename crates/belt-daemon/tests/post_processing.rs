@@ -763,6 +763,39 @@ async fn a_failing_result_transition_is_retried_and_gives_up_to_failed_after_the
     assert_eq!(daemon.run_post_processing().await.unwrap(), 0);
 }
 
+#[tokio::test]
+async fn giving_up_calls_on_hitl_resolved_even_when_no_attempt_reached_it() {
+    let tmp = TempDir::new().unwrap();
+    let (mut daemon, hook) = with_hook(daemon(&tmp, "echo done"), false);
+    let (work_id, hitl_id) = hitl_item(&mut daemon, None);
+    respond(daemon.hitl(), &hitl_id, HitlAction::Done, None);
+    // The checkout cannot be created: every attempt fails before on_hitl_resolved.
+    let base = tmp.path().join("worktrees");
+    std::fs::remove_dir_all(&base).unwrap();
+    std::fs::write(&base, "not a directory").unwrap();
+
+    for _ in 1..POST_PROCESSING_FAILURE_LIMIT {
+        daemon.run_post_processing().await.unwrap();
+    }
+    assert!(hook.calls().is_empty(), "no attempt reached the hook");
+
+    daemon.run_post_processing().await.unwrap();
+
+    assert_eq!(stored_phase(&daemon, &work_id), QueuePhase::Failed);
+    let calls = hook.calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "giving up resolves the HITL once: {calls:?}"
+    );
+    assert_eq!(calls[0].action, HitlAction::Done);
+    assert_eq!(
+        calls[0].stored_phase,
+        QueuePhase::Hitl,
+        "it runs before the give-up transition"
+    );
+}
+
 // ---- at-least-once ---------------------------------------------------------
 
 #[tokio::test]

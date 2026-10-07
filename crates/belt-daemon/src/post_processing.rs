@@ -28,8 +28,9 @@
 //! Hook and cleanup failures are non-fatal and recorded (`hook`,
 //! `post_processing_error`). A failed result transition, or an on_done that
 //! could not start because the store or checkout failed, is retried on the
-//! next tick; after [`POST_PROCESSING_FAILURE_LIMIT`] failures the item
-//! leaves Hitl for Failed with a `post_processing_failed` record.
+//! next tick; after [`POST_PROCESSING_FAILURE_LIMIT`] failures
+//! `on_hitl_resolved` runs (again, if an attempt already ran it) and the
+//! item leaves Hitl for Failed with a `post_processing_failed` record.
 
 use async_trait::async_trait;
 use belt_core::error::BeltError;
@@ -125,7 +126,7 @@ pub(crate) async fn run<E: PostProcessingEffects>(
         let item = match db.get_item(&request.work_id) {
             Ok(item) => item,
             Err(e) => {
-                fail_attempt(db, &request, None, &format!("item unreadable: {e}"));
+                fail_attempt(db, &request, &format!("item unreadable: {e}"));
                 continue;
             }
         };
@@ -133,12 +134,7 @@ pub(crate) async fn run<E: PostProcessingEffects>(
             continue;
         }
         let Some(resolution) = request.resolution.as_ref() else {
-            fail_attempt(
-                db,
-                &request,
-                None,
-                "confirmed request carries no resolution",
-            );
+            fail_attempt(db, &request, "confirmed request carries no resolution");
             continue;
         };
         let action = resolution.action;
@@ -151,7 +147,17 @@ pub(crate) async fn run<E: PostProcessingEffects>(
             }
             Ok(Attempt::NotPending) => {}
             Err(error) => {
-                if let Some(gave_up) = fail_attempt(db, &request, Some((&item, action)), &error) {
+                let Some(failures) = count_failure(db, &request, &error) else {
+                    continue;
+                };
+                // The verdict is final even when its steps keep failing:
+                // resolve the HITL (e.g. drop its labels) before leaving it.
+                // The hook is idempotent, so a call an attempt already made
+                // may repeat.
+                resolved(db, effects, &item, action).await;
+                if let Some(gave_up) =
+                    give_up(db, &request.hitl_id, &item, action, failures, &error)
+                {
                     effects.record_attempt(&item, "failed", Some(&error));
                     applied.push(gave_up);
                 }
@@ -327,17 +333,18 @@ fn complete(
     }
 }
 
-/// Count a failed attempt; at the limit, move the item to Failed.
+/// Count a failed attempt of a request whose item or verdict is unknown.
 ///
-/// `target` is `None` when the item or verdict is unknown: then the
-/// attempt is only counted, since a give-up transition needs both.
-/// Returns the give-up transition when it was committed.
-fn fail_attempt(
-    db: &Database,
-    request: &HitlRequest,
-    target: Option<(&QueueItem, HitlAction)>,
-    error: &str,
-) -> Option<Applied> {
+/// A give-up transition needs both, so the attempt is only counted.
+fn fail_attempt(db: &Database, request: &HitlRequest, error: &str) {
+    if let Some(failures) = count_failure(db, request, error) {
+        tracing::error!(hitl_id = %request.hitl_id, failures, "post-processing cannot give up without its item and verdict: {error}");
+    }
+}
+
+/// Count a failed attempt. Returns the failure count once it reached
+/// [`POST_PROCESSING_FAILURE_LIMIT`]: the caller then gives up.
+fn count_failure(db: &Database, request: &HitlRequest, error: &str) -> Option<u32> {
     let hitl_id = &request.hitl_id;
     let failures = match db.record_post_processing_failure(hitl_id) {
         Ok(n) => n,
@@ -356,11 +363,7 @@ fn fail_attempt(
         );
         return None;
     }
-    let Some((item, action)) = target else {
-        tracing::error!(%hitl_id, failures, "post-processing cannot give up without its item and verdict: {error}");
-        return None;
-    };
-    give_up(db, hitl_id, item, action, failures, error)
+    Some(failures)
 }
 
 /// Leave Hitl for Failed after repeated failures, and record why.
