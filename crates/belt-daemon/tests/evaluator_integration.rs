@@ -440,4 +440,143 @@ mod store_judgement {
         assert_eq!(daemon.items_in_phase(QueuePhase::Completed).len(), 0);
         assert_eq!(daemon.items_in_phase(QueuePhase::Failed).len(), 1);
     }
+
+    /// A runtime whose second invocation (the evaluate step; the first is the
+    /// handler) moves the item through another connection, so the move lands
+    /// after the tick's observation and before the judgement commit.
+    struct RacingRuntime {
+        calls: std::sync::atomic::AtomicUsize,
+        db_path: String,
+        work_id: String,
+        evaluate_exit_code: i32,
+    }
+
+    #[async_trait::async_trait]
+    impl belt_core::runtime::AgentRuntime for RacingRuntime {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn invoke(
+            &self,
+            _request: belt_core::runtime::RuntimeRequest,
+        ) -> belt_core::runtime::RuntimeResponse {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let exit_code = if call == 1 {
+                let other = Database::open(&self.db_path).unwrap();
+                let outcome = other
+                    .transition(&TransitionRequest {
+                        work_id: self.work_id.clone(),
+                        expected_from: QueuePhase::Completed,
+                        to: QueuePhase::Failed,
+                        actor: Actor::Cli,
+                        reason: TransitionReason::Manual,
+                        detail: None,
+                    })
+                    .unwrap();
+                assert!(matches!(outcome, TransitionOutcome::Applied { .. }));
+                self.evaluate_exit_code
+            } else {
+                0
+            };
+            belt_core::runtime::RuntimeResponse {
+                exit_code,
+                stdout: String::new(),
+                stderr: String::new(),
+                duration: std::time::Duration::from_millis(1),
+                token_usage: None,
+                session_id: None,
+            }
+        }
+
+        fn capabilities(&self) -> belt_core::runtime::RuntimeCapabilities {
+            belt_core::runtime::RuntimeCapabilities {
+                supports_tool_use: true,
+                supports_structured_output: false,
+                supports_session: false,
+            }
+        }
+    }
+
+    const RACE_WORK_ID: &str = "github:org/repo#1:analyze";
+
+    fn racing_daemon(tmp: &TempDir, evaluate_exit_code: i32) -> (Daemon, String) {
+        let db_path = tmp.path().join("belt.db").to_str().unwrap().to_string();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(RacingRuntime {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            db_path: db_path.clone(),
+            work_id: RACE_WORK_ID.to_string(),
+            evaluate_exit_code,
+        }));
+        let daemon = Daemon::new(
+            test_workspace_config(),
+            vec![Box::new(source)],
+            Arc::new(registry),
+            Box::new(MockWorktreeManager::new(tmp.path().to_path_buf())),
+            4,
+            Database::open(&db_path).unwrap(),
+        );
+        (daemon, db_path)
+    }
+
+    fn daemon_conflicts(daemon: &Daemon) -> usize {
+        daemon
+            .db()
+            .transitions_of(RACE_WORK_ID)
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == "transition_conflict" && e.actor == "daemon")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn done_judgement_loses_to_a_move_made_during_evaluation() {
+        let tmp = TempDir::new().unwrap();
+        let (mut daemon, _) = racing_daemon(&tmp, 0);
+
+        daemon.tick().await.unwrap();
+
+        assert_eq!(
+            daemon.db().get_item(RACE_WORK_ID).unwrap().phase(),
+            QueuePhase::Failed,
+            "the stored phase wins"
+        );
+        assert!(
+            !phase_enters(&daemon, RACE_WORK_ID)
+                .iter()
+                .any(|(_, to, _)| to == "done"),
+            "the discarded judgement must not appear as Done"
+        );
+        assert_eq!(daemon_conflicts(&daemon), 1);
+    }
+
+    #[tokio::test]
+    async fn hitl_escalation_loses_to_a_move_made_during_evaluation() {
+        let tmp = TempDir::new().unwrap();
+        let (daemon, db_path) = racing_daemon(&tmp, 1);
+        let mut daemon = daemon.with_max_eval_failures(1);
+
+        daemon.tick().await.unwrap();
+
+        assert_eq!(
+            daemon.db().get_item(RACE_WORK_ID).unwrap().phase(),
+            QueuePhase::Failed,
+            "the stored phase wins"
+        );
+        assert!(
+            !phase_enters(&daemon, RACE_WORK_ID)
+                .iter()
+                .any(|(_, to, _)| to == "hitl"),
+            "the discarded escalation must not enter Hitl"
+        );
+        let requests: i64 = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM hitl_requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(requests, 0, "no HITL request is created");
+        assert_eq!(daemon_conflicts(&daemon), 1);
+    }
 }
