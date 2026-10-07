@@ -294,6 +294,9 @@ struct DashboardState {
     status_filter: StatusFilter,
     /// Result of the last HITL response, shown in the HITL overlay.
     toast: Option<String>,
+    /// Running item whose cancel waits for the next frame, so the "canceling"
+    /// toast is on screen while the flow blocks.
+    pending_cancel: Option<String>,
 }
 
 impl DashboardState {
@@ -323,6 +326,7 @@ impl DashboardState {
             per_ws_kanban_row: 0,
             status_filter: StatusFilter::All,
             toast: None,
+            pending_cancel: None,
         }
     }
 
@@ -616,6 +620,8 @@ fn run_loop(
             }
         })?;
 
+        finish_pending_cancel(&mut state, &cancel_flow);
+
         // Poll for keyboard events with 1 second timeout.
         if event::poll(Duration::from_secs(1))?
             && let Event::Key(key) = event::read()?
@@ -650,7 +656,8 @@ fn run_loop(
                         &board_columns,
                         &per_ws_kanban_columns,
                     );
-                    handle_cancel_key(&mut state, selected.as_deref(), db, &cancel_flow);
+                    handle_cancel_key(&mut state, selected.as_deref(), db);
+                    continue;
                 }
                 KeyCode::Char('h') => {
                     state.toast = None;
@@ -1182,39 +1189,54 @@ fn describe_cancel(work_id: &str, outcome: &CancelOutcome) -> String {
 
 /// Handle the cancel key: cancel the selected item when it is Running.
 ///
-/// An item in Hitl whose confirmed response awaits post-processing is
-/// refused as `busy`; any other phase has nothing running to cancel. The
-/// result is shown as the toast.
-fn handle_cancel_key(
-    state: &mut DashboardState,
-    selected: Option<&str>,
-    db: &Database,
-    flow: &CancelFlow<'_>,
-) {
+/// A Running item gets the "canceling" toast and is queued in
+/// `pending_cancel`; [`finish_pending_cancel`] carries it out once the toast
+/// has been drawn. An item in Hitl whose confirmed response awaits
+/// post-processing is refused as `busy`; any other phase has nothing running
+/// to cancel.
+fn handle_cancel_key(state: &mut DashboardState, selected: Option<&str>, db: &Database) {
     let Some(work_id) = selected else {
         return;
     };
-    state.toast = Some(match cancel_selected(work_id, db, flow) {
-        Ok(text) => text,
+    match refuse_or_accept_cancel(work_id, db) {
+        Ok(None) => {
+            state.toast = Some(format!("canceling: {work_id}..."));
+            state.pending_cancel = Some(work_id.to_string());
+        }
+        Ok(Some(text)) => state.toast = Some(text),
+        Err(e) => state.toast = Some(format!("error: {work_id}: {e}")),
+    }
+}
+
+/// Carry out the queued cancel and replace the "canceling" toast with its
+/// result.
+fn finish_pending_cancel(state: &mut DashboardState, flow: &CancelFlow<'_>) {
+    let Some(work_id) = state.pending_cancel.take() else {
+        return;
+    };
+    state.toast = Some(match flow.cancel(&work_id) {
+        Ok(outcome) => describe_cancel(&work_id, &outcome),
         Err(e) => format!("error: {work_id}: {e}"),
     });
 }
 
-fn cancel_selected(work_id: &str, db: &Database, flow: &CancelFlow<'_>) -> anyhow::Result<String> {
+/// `None` when `work_id` is Running and can be canceled; otherwise the toast
+/// that says why not.
+fn refuse_or_accept_cancel(work_id: &str, db: &Database) -> anyhow::Result<Option<String>> {
     let item = db.get_item(work_id)?;
     match item.phase() {
-        QueuePhase::Running => Ok(describe_cancel(work_id, &flow.cancel(work_id)?)),
+        QueuePhase::Running => Ok(None),
         QueuePhase::Hitl
             if db
                 .pending_post_processing()?
                 .iter()
                 .any(|r| r.work_id == work_id) =>
         {
-            Ok(format!(
+            Ok(Some(format!(
                 "busy: {work_id} is being processed (post_processing)"
-            ))
+            )))
         }
-        phase => Ok(format!("not running: {work_id} is {phase}")),
+        phase => Ok(Some(format!("not running: {work_id} is {phase}"))),
     }
 }
 
@@ -5025,7 +5047,18 @@ mod tests {
         let work_id = crate::cancel::testing::running_item(&db);
         let mut state = DashboardState::new();
 
-        handle_cancel_key(&mut state, Some(&work_id), &db, &tui_flow(&db));
+        handle_cancel_key(&mut state, Some(&work_id), &db);
+        let toast_before_wait = state.toast.clone().unwrap();
+        assert!(
+            toast_before_wait.contains("canceling"),
+            "{toast_before_wait}"
+        );
+        assert_eq!(
+            db.get_item(&work_id).unwrap().phase(),
+            QueuePhase::Running,
+            "nothing is canceled until the toast has been drawn"
+        );
+        finish_pending_cancel(&mut state, &tui_flow(&db));
 
         let toast = state.toast.unwrap();
         assert!(toast.contains("canceled_directly"), "{toast}");
@@ -5058,7 +5091,7 @@ mod tests {
             .unwrap();
         let mut state = DashboardState::new();
 
-        handle_cancel_key(&mut state, Some(&work_id), &db, &tui_flow(&db));
+        handle_cancel_key(&mut state, Some(&work_id), &db);
 
         let toast = state.toast.unwrap();
         assert!(toast.contains("busy"), "{toast}");
@@ -5073,7 +5106,7 @@ mod tests {
         db.insert_item(&item).unwrap();
         let mut state = DashboardState::new();
 
-        handle_cancel_key(&mut state, Some("w-pending"), &db, &tui_flow(&db));
+        handle_cancel_key(&mut state, Some("w-pending"), &db);
 
         assert!(state.toast.unwrap().contains("not running"));
         assert_eq!(
@@ -5087,7 +5120,7 @@ mod tests {
         let db = make_db();
         let mut state = DashboardState::new();
 
-        handle_cancel_key(&mut state, None, &db, &tui_flow(&db));
+        handle_cancel_key(&mut state, None, &db);
 
         assert!(state.toast.is_none());
     }
