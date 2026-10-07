@@ -20,6 +20,8 @@ use belt_infra::db::{
     Database, DeriveKind, DeriveOutcome, DeriveRequest, OpenHitlOutcome, OpenHitlRequest,
 };
 
+use crate::hitl::{HitlExpiry, HitlService};
+
 /// Phase an escalated execution leaves: escalation decides the fate of a failed run.
 const ESCALATION_FROM: QueuePhase = QueuePhase::Running;
 
@@ -47,17 +49,20 @@ pub(crate) enum Committed {
 
 /// Commit the result transition that realizes `action` for the Running `work_id`.
 ///
-/// `hitl_notes` is recorded on the HITL request when `action` opens one.
+/// `hitl_notes` and `expiry` are recorded on the HITL request when `action`
+/// opens one.
 ///
 /// # Errors
 /// `BeltError` when the store fails (I/O, unknown `work_id`, another open
 /// item of the same `(source_id, state)`).
 pub(crate) fn commit(
-    db: &Database,
+    hitl: &HitlService,
     work_id: &str,
     action: EscalationAction,
     hitl_notes: Option<String>,
+    expiry: &HitlExpiry,
 ) -> Result<EscalationCommit, BeltError> {
+    let db = hitl.database();
     let reason = TransitionReason::Escalation(action);
     match action {
         EscalationAction::Retry | EscalationAction::RetryWithComment => {
@@ -77,15 +82,15 @@ pub(crate) fn commit(
             }
         }
         EscalationAction::Hitl | EscalationAction::Replan => {
-            let outcome = db.open_hitl(&OpenHitlRequest {
+            let outcome = hitl.open(&OpenHitlRequest {
                 work_id: work_id.to_string(),
                 expected_from: ESCALATION_FROM,
                 reason: HitlReason::RetryMaxExceeded,
                 notes: hitl_notes,
                 actor: Actor::Daemon,
                 transition_reason: reason,
-                timeout_at: None,
-                terminal_action: None,
+                timeout_at: expiry.timeout_at.clone(),
+                terminal_action: expiry.terminal_action,
             })?;
             match outcome {
                 OpenHitlOutcome::Opened { .. } => Ok(EscalationCommit::Applied(Committed::Hitl)),
@@ -209,6 +214,22 @@ pub(crate) fn lineage_hitl_notes(
 mod tests {
     use super::*;
     use belt_infra::db::{CollectOutcome, NewItem, TransitionEvent};
+    use std::sync::Arc;
+
+    fn commit_on(
+        db: &Arc<Database>,
+        work_id: &str,
+        action: EscalationAction,
+        hitl_notes: Option<String>,
+    ) -> Result<EscalationCommit, BeltError> {
+        commit(
+            &HitlService::new(Arc::clone(db)),
+            work_id,
+            action,
+            hitl_notes,
+            &HitlExpiry::default(),
+        )
+    }
 
     const SOURCE: &str = "src:1";
     const STATE: &str = "implement";
@@ -271,11 +292,11 @@ mod tests {
 
     #[test]
     fn retry_derives_a_pending_item_from_the_running_one() {
-        let db = Database::open_in_memory().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
         let first = collect(&db);
         run(&db, &first);
 
-        let commit = commit(&db, &first, EscalationAction::RetryWithComment, None).unwrap();
+        let commit = commit_on(&db, &first, EscalationAction::RetryWithComment, None).unwrap();
 
         let EscalationCommit::Applied(Committed::Derived { work_id }) = commit else {
             panic!("expected a derived item, got {commit:?}");
@@ -289,12 +310,12 @@ mod tests {
 
     #[test]
     fn retry_on_a_moved_row_is_a_conflict() {
-        let db = Database::open_in_memory().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
         let first = collect(&db);
         run(&db, &first);
         db.update_phase(&first, QueuePhase::Skipped).unwrap();
 
-        let commit = commit(&db, &first, EscalationAction::Retry, None).unwrap();
+        let commit = commit_on(&db, &first, EscalationAction::Retry, None).unwrap();
 
         assert_eq!(
             commit,
@@ -306,12 +327,12 @@ mod tests {
 
     #[test]
     fn retry_on_a_hitl_row_follows_the_stored_phase() {
-        let db = Database::open_in_memory().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
         let first = collect(&db);
         run(&db, &first);
         db.update_phase(&first, QueuePhase::Hitl).unwrap();
 
-        let commit = commit(&db, &first, EscalationAction::Retry, None).unwrap();
+        let commit = commit_on(&db, &first, EscalationAction::Retry, None).unwrap();
 
         assert_eq!(
             commit,
@@ -323,11 +344,11 @@ mod tests {
 
     #[test]
     fn hitl_opens_a_request_with_the_notes() {
-        let db = Database::open_in_memory().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
         let first = collect(&db);
         run(&db, &first);
 
-        let commit = commit(
+        let commit = commit_on(
             &db,
             &first,
             EscalationAction::Hitl,
@@ -357,7 +378,7 @@ mod tests {
 
     #[test]
     fn notes_are_none_without_plan_or_events() {
-        let db = Database::open_in_memory().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
         let first = collect(&db);
         let item = db.get_item(&first).unwrap();
 
@@ -366,7 +387,7 @@ mod tests {
 
     #[test]
     fn notes_include_the_plan() {
-        let db = Database::open_in_memory().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
         let first = collect(&db);
         let item = db.get_item(&first).unwrap();
 
@@ -380,12 +401,12 @@ mod tests {
 
     #[test]
     fn notes_cover_the_stagnation_events_of_the_whole_lineage() {
-        let db = Database::open_in_memory().unwrap();
+        let db = Arc::new(Database::open_in_memory().unwrap());
         let first = collect(&db);
         run(&db, &first);
         stagnation(&db, &first, "spinning");
         let EscalationCommit::Applied(Committed::Derived { work_id: second }) =
-            commit(&db, &first, EscalationAction::Retry, None).unwrap()
+            commit_on(&db, &first, EscalationAction::Retry, None).unwrap()
         else {
             panic!("expected a derived item");
         };

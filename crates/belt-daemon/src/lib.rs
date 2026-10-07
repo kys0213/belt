@@ -12,4 +12,5 @@ mod escalation_path;
 pub mod evaluation_stages;
 pub mod evaluator;
 pub mod executor;
+pub mod hitl;
 pub mod hook_cache;

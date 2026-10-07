@@ -9,10 +9,12 @@ use chrono::Utc;
 use belt_core::action::Action;
 use belt_core::context::{HistoryEntry, ItemContext, QueueContext, SourceContext};
 use belt_core::error::BeltError;
-use belt_core::escalation::EscalationAction;
+use belt_core::escalation::{EscalationAction, EscalationPolicy};
 use belt_core::lifecycle::{HookContext, LifecycleHook, NoopLifecycleHook};
 use belt_core::phase::QueuePhase;
-use belt_core::queue::{HistoryEvent, HitlReason, HitlRespondAction, QueueItem};
+use belt_core::queue::{
+    HITL_TIMEOUT_HOURS, HistoryEvent, HitlReason, HitlRespondAction, QueueItem,
+};
 use belt_core::runtime::RuntimeRegistry;
 use belt_core::source::DataSource;
 use belt_core::stagnation::{
@@ -32,6 +34,7 @@ use crate::cron::{
 };
 use crate::evaluator::Evaluator;
 use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
+use crate::hitl::{HitlExpiry, HitlService};
 use crate::hook_cache::DynamicHookLoader;
 
 /// Safely transition a [`QueueItem`] to a new phase.
@@ -75,6 +78,8 @@ pub struct Daemon {
     queue: VecDeque<QueueItem>,
     history: Vec<HistoryEntry>,
     db: Arc<Database>,
+    /// The HITL contract over `db`: every HITL request the daemon opens goes through it.
+    hitl: HitlService,
     /// Highest transition-log sequence the in-memory copy has been matched to.
     store_cursor: u64,
     /// History events with full lineage information for failure tracking.
@@ -174,6 +179,7 @@ impl Daemon {
     ) -> Self {
         let evaluator = Evaluator::new(&config.name);
         let db = Arc::new(db);
+        let hitl = HitlService::new(Arc::clone(&db));
         let worktree_mgr: Arc<dyn WorktreeManager> = worktree_mgr.into();
         let belt_home =
             PathBuf::from(std::env::var("BELT_HOME").unwrap_or_else(|_| ".belt".to_string()));
@@ -187,6 +193,7 @@ impl Daemon {
             queue: VecDeque::new(),
             history: Vec::new(),
             db,
+            hitl,
             store_cursor: 0,
             history_events: Vec::new(),
             evaluator,
@@ -238,6 +245,11 @@ impl Daemon {
     /// Return a reference to the database that owns the queue state.
     pub fn database(&self) -> &Arc<Database> {
         &self.db
+    }
+
+    /// The HITL service over the daemon's store.
+    pub fn hitl(&self) -> &HitlService {
+        &self.hitl
     }
 
     /// Set the belt home directory for evaluator scripts.
@@ -1143,10 +1155,11 @@ impl Daemon {
 
         use crate::escalation_path::{Committed, EscalationCommit};
         let committed = match crate::escalation_path::commit(
-            &self.db,
+            &self.hitl,
             &item.work_id,
             escalation,
             hitl_notes.clone(),
+            &self.hitl_expiry(),
         ) {
             Ok(EscalationCommit::Applied(committed)) => committed,
             Ok(EscalationCommit::Conflict { current }) => {
@@ -1426,21 +1439,22 @@ impl Daemon {
         reason: HitlReason,
         notes: Option<String>,
     ) -> Result<(), BeltError> {
+        let expiry = self.hitl_expiry();
         let item = self
             .queue
             .iter_mut()
             .find(|it| it.work_id == work_id)
             .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
         let from = item.phase();
-        let outcome = self.db.open_hitl(&OpenHitlRequest {
+        let outcome = self.hitl.open(&OpenHitlRequest {
             work_id: work_id.to_string(),
             expected_from: from,
             reason,
             notes: notes.clone(),
             actor: Actor::Daemon,
             transition_reason: TransitionReason::Advance,
-            timeout_at: None,
-            terminal_action: None,
+            timeout_at: expiry.timeout_at,
+            terminal_action: expiry.terminal_action,
         })?;
         match outcome {
             OpenHitlOutcome::Opened { .. } => {
@@ -1787,17 +1801,18 @@ impl Daemon {
         let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id) else {
             return;
         };
+        let expiry = self.hitl_expiry();
         let item = &mut self.queue[idx];
         let from = item.phase();
-        let outcome = self.db.open_hitl(&OpenHitlRequest {
+        let outcome = self.hitl.open(&OpenHitlRequest {
             work_id: work_id.to_string(),
             expected_from: from,
             reason: HitlReason::EvaluateFailure,
             notes: Some(notes.clone()),
             actor: Actor::Daemon,
             transition_reason: TransitionReason::Advance,
-            timeout_at: None,
-            terminal_action: None,
+            timeout_at: expiry.timeout_at,
+            terminal_action: expiry.terminal_action,
         });
         match outcome {
             Ok(OpenHitlOutcome::Opened { .. }) => {
@@ -2104,6 +2119,7 @@ impl Daemon {
     /// 아이템의 완료 처리만 수행한다.
     pub async fn tick(&mut self) -> Result<()> {
         self.observe_store()?;
+        self.observe_hitl_opened().await?;
 
         if !self.shutdown_requested {
             let collected = self.collect().await?;
@@ -2475,15 +2491,68 @@ impl Daemon {
     /// Past the highest configured level the highest level is reused
     /// ([`belt_core::escalation::EscalationPolicy::resolve`]).
     fn resolve_escalation(&self, failure_count: u32) -> EscalationAction {
-        let policy = self
-            .config
+        self.escalation_policy().resolve(failure_count)
+    }
+
+    fn escalation_policy(&self) -> EscalationPolicy {
+        self.config
             .sources
             .values()
             .next()
             .map(|s| &s.escalation)
             .cloned()
-            .unwrap_or_default();
-        policy.resolve(failure_count)
+            .unwrap_or_default()
+    }
+
+    /// Expiry terms of a HITL request opened now: the default HITL timeout
+    /// and the workspace's `terminal` action.
+    fn hitl_expiry(&self) -> HitlExpiry {
+        HitlExpiry::after_hours(
+            HITL_TIMEOUT_HOURS,
+            self.escalation_policy().terminal_action().copied(),
+            Utc::now(),
+        )
+    }
+
+    /// Call `on_hitl_opened` once for every open HITL request not yet
+    /// observed, whichever path opened it. Returns how many were observed.
+    ///
+    /// The request is claimed in the store before the hook runs, so a hook
+    /// failure is logged and never retried, and a request confirmed before
+    /// observation is skipped. The item's phase is never touched.
+    ///
+    /// # Errors
+    /// An error when the store cannot be read; requests claimed before the
+    /// failure stay claimed.
+    pub async fn observe_hitl_opened(&mut self) -> Result<usize> {
+        let claimed = self.hitl.claim_opened()?;
+        for request in &claimed {
+            let item = match self.db.get_item(&request.work_id) {
+                Ok(item) => item,
+                Err(e) => {
+                    tracing::warn!(
+                        work_id = %request.work_id,
+                        hitl_id = %request.hitl_id,
+                        "on_hitl_opened skipped, item unreadable: {e}"
+                    );
+                    continue;
+                }
+            };
+            let failure_count = self.db.failure_count(&item.work_id).unwrap_or_else(|e| {
+                tracing::warn!(work_id = %item.work_id, "failure count unreadable for hook context: {e}");
+                0
+            });
+            let ctx = self.build_hook_context(&item, None, failure_count);
+            let hook = self.resolve_hook(&item.workspace_id);
+            if let Err(e) = hook.on_hitl_opened(&ctx).await {
+                tracing::warn!(
+                    work_id = %item.work_id,
+                    hitl_id = %request.hitl_id,
+                    "lifecycle hook on_hitl_opened error (ignored, not retried): {e}"
+                );
+            }
+        }
+        Ok(claimed.len())
     }
 
     /// Detect stagnation from failure history and generate a lateral plan directive.
@@ -6027,8 +6096,14 @@ sources:
         let work_id = running_daemon_item(&mut daemon);
         let crate::escalation_path::EscalationCommit::Applied(
             crate::escalation_path::Committed::Derived { work_id: derived },
-        ) = crate::escalation_path::commit(&daemon.db, &work_id, EscalationAction::Retry, None)
-            .unwrap()
+        ) = crate::escalation_path::commit(
+            &daemon.hitl,
+            &work_id,
+            EscalationAction::Retry,
+            None,
+            &HitlExpiry::default(),
+        )
+        .unwrap()
         else {
             panic!("expected a derived item");
         };
