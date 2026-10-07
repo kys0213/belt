@@ -1,10 +1,11 @@
 //! `GitHubLifecycleHook` — GitHub-specific lifecycle hook implementation.
 //!
-//! Reacts to phase transitions by executing `gh` CLI commands:
-//! - `on_enter`: post a "work started" comment
-//! - `on_done`: post a "completed" comment, remove trigger label
-//! - `on_fail`: post a failure comment with error details
-//! - `on_escalation`: add HITL label, post escalation comments
+//! The hook only reflects HITL state on the origin system, through the
+//! HITL label. Messages to people (progress, HITL requests) belong to the
+//! origin `NotificationChannel`, so no callback posts a comment.
+//! - `on_hitl_opened`: add the HITL label
+//! - `on_hitl_resolved`: remove the HITL label (idempotent)
+//! - every other callback: no `gh` call
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -14,6 +15,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use belt_core::escalation::EscalationAction;
+use belt_core::hitl::HitlAction;
 use belt_core::lifecycle::{HookContext, LifecycleHook};
 use belt_core::platform::ShellExecutor;
 
@@ -25,11 +27,7 @@ use belt_core::platform::ShellExecutor;
 pub struct GitHubHookConfig {
     /// Repository in `owner/repo` format.
     pub repo: String,
-    /// Whether to post comments on phase transitions.
-    pub comment_on_done: bool,
-    /// Whether to post comments on failure.
-    pub comment_on_fail: bool,
-    /// Label to add when HITL escalation occurs.
+    /// Label present while a HITL request is open.
     pub hitl_label: String,
 }
 
@@ -38,8 +36,6 @@ impl GitHubHookConfig {
     pub fn new(repo: &str) -> Self {
         Self {
             repo: repo.to_string(),
-            comment_on_done: false,
-            comment_on_fail: true,
             hitl_label: "belt:needs-human".to_string(),
         }
     }
@@ -92,6 +88,24 @@ impl GitHubLifecycleHook {
         env
     }
 
+    /// Add or remove the HITL label on the issue/PR of `ctx`. An item that
+    /// is not a GitHub issue/PR is skipped.
+    async fn edit_label(&self, ctx: &HookContext, flag: &str) -> Result<()> {
+        let Some(number) = Self::extract_number(&ctx.work_id) else {
+            tracing::debug!(
+                work_id = %ctx.work_id,
+                "skipping HITL label edit: could not extract issue number"
+            );
+            return Ok(());
+        };
+        let cmd = format!(
+            "gh issue edit {number} --repo {repo} {flag} {label}",
+            repo = self.config.repo,
+            label = self.config.hitl_label,
+        );
+        self.run_gh(&cmd, &ctx.worktree, ctx).await
+    }
+
     /// Execute a gh CLI command in the worktree directory.
     async fn run_gh(&self, command: &str, worktree: &Path, ctx: &HookContext) -> Result<()> {
         let env = Self::build_env(ctx);
@@ -106,103 +120,28 @@ impl GitHubLifecycleHook {
 
 #[async_trait]
 impl LifecycleHook for GitHubLifecycleHook {
-    async fn on_enter(&self, ctx: &HookContext) -> Result<()> {
-        let Some(number) = Self::extract_number(&ctx.work_id) else {
-            tracing::debug!(
-                work_id = %ctx.work_id,
-                "skipping on_enter: could not extract issue number"
-            );
-            return Ok(());
-        };
-
-        let cmd = format!(
-            "gh issue comment {number} --repo {repo} --body 'Belt: started processing (state: {state})'",
-            repo = self.config.repo,
-            state = ctx.item.state,
-        );
-        self.run_gh(&cmd, &ctx.worktree, ctx).await
-    }
-
-    async fn on_done(&self, ctx: &HookContext) -> Result<()> {
-        if !self.config.comment_on_done {
-            return Ok(());
-        }
-
-        let Some(number) = Self::extract_number(&ctx.work_id) else {
-            return Ok(());
-        };
-
-        let cmd = format!(
-            "gh issue comment {number} --repo {repo} --body 'Belt: completed (state: {state})'",
-            repo = self.config.repo,
-            state = ctx.item.state,
-        );
-        self.run_gh(&cmd, &ctx.worktree, ctx).await
-    }
-
-    async fn on_fail(&self, ctx: &HookContext) -> Result<()> {
-        if !self.config.comment_on_fail {
-            return Ok(());
-        }
-
-        let Some(number) = Self::extract_number(&ctx.work_id) else {
-            return Ok(());
-        };
-
-        let cmd = format!(
-            "gh issue comment {number} --repo {repo} --body 'Belt: failed (state: {state}, failures: {count})'",
-            repo = self.config.repo,
-            state = ctx.item.state,
-            count = ctx.failure_count,
-        );
-        self.run_gh(&cmd, &ctx.worktree, ctx).await
-    }
-
-    async fn on_escalation(&self, ctx: &HookContext, action: EscalationAction) -> Result<()> {
-        let Some(number) = Self::extract_number(&ctx.work_id) else {
-            return Ok(());
-        };
-
-        match action {
-            EscalationAction::Hitl | EscalationAction::Replan => {
-                // Add HITL label to the issue.
-                let label_cmd = format!(
-                    "gh issue edit {number} --repo {repo} --add-label {label}",
-                    repo = self.config.repo,
-                    label = self.config.hitl_label,
-                );
-                self.run_gh(&label_cmd, &ctx.worktree, ctx).await?;
-
-                // Post escalation comment.
-                let action_str = action.to_string();
-                let comment_cmd = format!(
-                    "gh issue comment {number} --repo {repo} --body 'Belt: escalation ({action_str}) — human intervention requested'",
-                    repo = self.config.repo,
-                );
-                self.run_gh(&comment_cmd, &ctx.worktree, ctx).await?;
-            }
-            EscalationAction::RetryWithComment => {
-                let comment_cmd = format!(
-                    "gh issue comment {number} --repo {repo} --body 'Belt: retrying after failure (attempt {count})'",
-                    repo = self.config.repo,
-                    count = ctx.failure_count + 1,
-                );
-                self.run_gh(&comment_cmd, &ctx.worktree, ctx).await?;
-            }
-            EscalationAction::Retry => {
-                // Silent retry — no GitHub interaction.
-            }
-            EscalationAction::Skip => {
-                let comment_cmd = format!(
-                    "gh issue comment {number} --repo {repo} --body 'Belt: skipping item after {count} failures'",
-                    repo = self.config.repo,
-                    count = ctx.failure_count,
-                );
-                self.run_gh(&comment_cmd, &ctx.worktree, ctx).await?;
-            }
-        }
-
+    async fn on_enter(&self, _ctx: &HookContext) -> Result<()> {
         Ok(())
+    }
+
+    async fn on_done(&self, _ctx: &HookContext) -> Result<()> {
+        Ok(())
+    }
+
+    async fn on_fail(&self, _ctx: &HookContext) -> Result<()> {
+        Ok(())
+    }
+
+    async fn on_escalation(&self, _ctx: &HookContext, _action: EscalationAction) -> Result<()> {
+        Ok(())
+    }
+
+    async fn on_hitl_opened(&self, ctx: &HookContext) -> Result<()> {
+        self.edit_label(ctx, "--add-label").await
+    }
+
+    async fn on_hitl_resolved(&self, ctx: &HookContext, _action: HitlAction) -> Result<()> {
+        self.edit_label(ctx, "--remove-label").await
     }
 }
 
@@ -211,6 +150,7 @@ mod tests {
     use super::*;
     use belt_core::context::{ItemContext, QueueContext, SourceContext};
     use belt_core::error::BeltError;
+    use belt_core::hitl::HitlAction;
     use belt_core::platform::ShellOutput;
     use belt_core::queue::testing::test_item;
     use std::path::PathBuf;
@@ -312,118 +252,79 @@ mod tests {
         );
     }
 
+    /// `gh issue comment`처럼 사람 대상 메시지를 남기는 호출이 있는지.
+    fn comments(cmds: &[String]) -> Vec<&String> {
+        cmds.iter().filter(|c| c.contains("comment")).collect()
+    }
+
     #[tokio::test]
-    async fn on_enter_posts_comment() {
+    async fn progress_and_escalation_callbacks_run_no_gh_command() {
         let shell = Arc::new(RecordingShell::new(true));
         let hook = make_hook(shell.clone());
         let ctx = make_hook_context("implement");
 
         hook.on_enter(&ctx).await.unwrap();
-
-        let cmds = shell.commands();
-        assert_eq!(cmds.len(), 1);
-        assert!(cmds[0].contains("gh issue comment 42"));
-        assert!(cmds[0].contains("started processing"));
-    }
-
-    #[tokio::test]
-    async fn on_done_skips_when_comment_disabled() {
-        let shell = Arc::new(RecordingShell::new(true));
-        // Default config has comment_on_done = false
-        let hook = make_hook(shell.clone());
-        let ctx = make_hook_context("implement");
-
         hook.on_done(&ctx).await.unwrap();
-
-        assert!(shell.commands().is_empty());
-    }
-
-    #[tokio::test]
-    async fn on_done_posts_comment_when_enabled() {
-        let shell = Arc::new(RecordingShell::new(true));
-        let mut config = GitHubHookConfig::new("org/repo");
-        config.comment_on_done = true;
-        let hook = GitHubLifecycleHook::new(config, shell.clone());
-        let ctx = make_hook_context("implement");
-
-        hook.on_done(&ctx).await.unwrap();
-
-        let cmds = shell.commands();
-        assert_eq!(cmds.len(), 1);
-        assert!(cmds[0].contains("completed"));
-    }
-
-    #[tokio::test]
-    async fn on_fail_posts_comment() {
-        let shell = Arc::new(RecordingShell::new(true));
-        let hook = make_hook(shell.clone());
-        let ctx = make_hook_context("implement");
-
         hook.on_fail(&ctx).await.unwrap();
+        for action in [
+            EscalationAction::Retry,
+            EscalationAction::RetryWithComment,
+            EscalationAction::Hitl,
+            EscalationAction::Skip,
+            EscalationAction::Replan,
+        ] {
+            hook.on_escalation(&ctx, action).await.unwrap();
+        }
 
-        let cmds = shell.commands();
-        assert_eq!(cmds.len(), 1);
-        assert!(cmds[0].contains("failed"));
-        assert!(cmds[0].contains("failures: 0"));
+        assert!(shell.commands().is_empty(), "{:?}", shell.commands());
     }
 
     #[tokio::test]
-    async fn on_escalation_hitl_adds_label_and_comment() {
+    async fn on_hitl_opened_adds_only_the_label() {
         let shell = Arc::new(RecordingShell::new(true));
         let hook = make_hook(shell.clone());
-        let ctx = make_hook_context("implement");
 
-        hook.on_escalation(&ctx, EscalationAction::Hitl)
+        hook.on_hitl_opened(&make_hook_context("implement"))
             .await
             .unwrap();
+
+        let cmds = shell.commands();
+        assert_eq!(cmds.len(), 1);
+        assert!(cmds[0].contains("gh issue edit 42"));
+        assert!(cmds[0].contains("--repo org/repo"));
+        assert!(cmds[0].contains("--add-label belt:needs-human"));
+        assert!(comments(&cmds).is_empty());
+    }
+
+    #[tokio::test]
+    async fn on_hitl_opened_uses_custom_label() {
+        let shell = Arc::new(RecordingShell::new(true));
+        let config = GitHubHookConfig::new("org/repo").with_hitl_label("custom:help");
+        let hook = GitHubLifecycleHook::new(config, shell.clone());
+
+        hook.on_hitl_opened(&make_hook_context("implement"))
+            .await
+            .unwrap();
+
+        assert!(shell.commands()[0].contains("--add-label custom:help"));
+    }
+
+    #[tokio::test]
+    async fn on_hitl_resolved_removes_the_label_and_is_repeatable() {
+        let shell = Arc::new(RecordingShell::new(true));
+        let hook = make_hook(shell.clone());
+        let ctx = make_hook_context("implement");
+
+        hook.on_hitl_resolved(&ctx, HitlAction::Done).await.unwrap();
+        hook.on_hitl_resolved(&ctx, HitlAction::Done).await.unwrap();
 
         let cmds = shell.commands();
         assert_eq!(cmds.len(), 2);
-        assert!(cmds[0].contains("--add-label belt:needs-human"));
-        assert!(cmds[1].contains("human intervention requested"));
-    }
-
-    #[tokio::test]
-    async fn on_escalation_retry_is_silent() {
-        let shell = Arc::new(RecordingShell::new(true));
-        let hook = make_hook(shell.clone());
-        let ctx = make_hook_context("implement");
-
-        hook.on_escalation(&ctx, EscalationAction::Retry)
-            .await
-            .unwrap();
-
-        assert!(shell.commands().is_empty());
-    }
-
-    #[tokio::test]
-    async fn on_escalation_retry_with_comment_posts() {
-        let shell = Arc::new(RecordingShell::new(true));
-        let hook = make_hook(shell.clone());
-        let ctx = make_hook_context("implement");
-
-        hook.on_escalation(&ctx, EscalationAction::RetryWithComment)
-            .await
-            .unwrap();
-
-        let cmds = shell.commands();
-        assert_eq!(cmds.len(), 1);
-        assert!(cmds[0].contains("retrying"));
-    }
-
-    #[tokio::test]
-    async fn on_escalation_skip_posts_comment() {
-        let shell = Arc::new(RecordingShell::new(true));
-        let hook = make_hook(shell.clone());
-        let ctx = make_hook_context("implement");
-
-        hook.on_escalation(&ctx, EscalationAction::Skip)
-            .await
-            .unwrap();
-
-        let cmds = shell.commands();
-        assert_eq!(cmds.len(), 1);
-        assert!(cmds[0].contains("skipping"));
+        for cmd in &cmds {
+            assert!(cmd.contains("gh issue edit 42"));
+            assert!(cmd.contains("--remove-label belt:needs-human"));
+        }
+        assert!(comments(&cmds).is_empty());
     }
 
     #[tokio::test]
@@ -432,8 +333,8 @@ mod tests {
         let hook = make_hook(shell);
         let ctx = make_hook_context("implement");
 
-        let result = hook.on_enter(&ctx).await;
-        assert!(result.is_err());
+        assert!(hook.on_hitl_opened(&ctx).await.is_err());
+        assert!(hook.on_hitl_resolved(&ctx, HitlAction::Skip).await.is_err());
     }
 
     #[tokio::test]
@@ -470,7 +371,8 @@ mod tests {
         };
 
         // Should not error, just skip.
-        hook.on_enter(&ctx).await.unwrap();
+        hook.on_hitl_opened(&ctx).await.unwrap();
+        hook.on_hitl_resolved(&ctx, HitlAction::Done).await.unwrap();
         assert!(shell.commands().is_empty());
     }
 
@@ -518,7 +420,7 @@ mod tests {
         let hook = GitHubLifecycleHook::new(config, shell.clone());
         let ctx = make_hook_context("implement");
 
-        hook.on_enter(&ctx).await.unwrap();
+        hook.on_hitl_opened(&ctx).await.unwrap();
 
         let captured = shell.env_vars.lock().unwrap();
         assert_eq!(captured.len(), 1);
