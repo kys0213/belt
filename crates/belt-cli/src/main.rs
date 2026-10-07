@@ -8,10 +8,11 @@ use belt_infra::db::Database;
 
 mod agent;
 mod bootstrap;
+mod cancel;
 mod dashboard;
 mod status;
 
-use belt_core::runtime::{AgentRuntime, RuntimeRegistry};
+use belt_core::runtime::RuntimeRegistry;
 use belt_daemon::daemon::Daemon;
 use belt_infra::runtimes::claude::ClaudeRuntime;
 use belt_infra::runtimes::codex::CodexRuntime;
@@ -96,11 +97,6 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         command: AgentCommands,
-    },
-    /// Spec lifecycle management.
-    Spec {
-        #[command(subcommand)]
-        command: SpecCommands,
     },
     /// Human-in-the-loop operations.
     Hitl {
@@ -225,14 +221,18 @@ enum AgentCommands {
 
 #[derive(Subcommand)]
 enum HitlCommands {
-    /// Respond to a HITL item.
+    /// Respond to a HITL request (the item's current request, or one by id).
     Respond {
         /// Queue item work_id.
-        item_id: String,
+        #[arg(required_unless_present = "hitl_id", conflicts_with = "hitl_id")]
+        item_id: Option<String>,
+        /// Address one specific (for example past) request instead of an item.
+        #[arg(long)]
+        hitl_id: Option<String>,
         /// Action to take: done, retry, skip, replan.
         #[arg(long)]
         action: String,
-        /// Respondent name.
+        /// Respondent name (defaults to the OS user).
         #[arg(long)]
         respondent: Option<String>,
         /// Additional notes.
@@ -278,8 +278,8 @@ enum HitlTimeoutCommands {
         /// Timeout duration in seconds.
         #[arg(long)]
         duration: u64,
-        /// Terminal action when timeout fires: skip, failed, replan.
-        #[arg(long)]
+        /// Terminal action when timeout fires.
+        #[arg(long, value_parser = ["skip", "replan"])]
         action: Option<String>,
         /// Output as JSON.
         #[arg(long)]
@@ -369,6 +369,9 @@ enum QueueCommands {
         /// Output format.
         #[arg(long, default_value = "text")]
         format: String,
+        /// Output as JSON (same as `--format json`).
+        #[arg(long)]
+        json: bool,
     },
     /// Mark item as done (called by evaluate).
     Done {
@@ -390,17 +393,6 @@ enum QueueCommands {
     /// Skip an item.
     Skip {
         work_id: String,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Re-run on_done script for a Failed item.
-    RetryScript {
-        /// Queue item work_id.
-        work_id: String,
-        /// Script execution timeout in seconds.
-        #[arg(long)]
-        timeout: Option<u64>,
         /// Output as JSON.
         #[arg(long)]
         json: bool,
@@ -444,155 +436,81 @@ enum DependencyCommands {
     },
 }
 
-#[derive(Subcommand)]
-enum SpecCommands {
-    /// Show workspace status (item counts by phase).
-    Status {
-        /// Workspace name.
-        name: String,
-        /// Output format (text, json, rich).
-        #[arg(long, default_value = "text")]
-        format: String,
-    },
-    /// Add a new spec.
-    Add {
-        /// Workspace ID.
-        #[arg(long)]
-        workspace: String,
-        /// Spec name.
-        #[arg(long)]
-        name: String,
-        /// Spec content / description.
-        #[arg(long)]
-        content: String,
-        /// Optional priority (lower is higher).
-        #[arg(long)]
-        priority: Option<i32>,
-        /// Optional comma-separated labels.
-        #[arg(long)]
-        labels: Option<String>,
-        /// Optional comma-separated spec IDs this depends on.
-        #[arg(long)]
-        depends_on: Option<String>,
-        /// Optional comma-separated file/module paths this spec touches.
-        #[arg(long)]
-        entry_point: Option<String>,
-        /// Decompose spec into child issues based on acceptance criteria.
-        #[arg(long)]
-        decompose: bool,
-        /// Skip interactive confirmation when decomposing (auto-approve).
-        #[arg(long)]
-        yes: bool,
-        /// Skip required-section validation for spec content.
-        #[arg(long)]
-        skip_validation: bool,
-    },
-    /// List specs.
-    List {
-        /// Filter by workspace.
-        #[arg(long)]
-        workspace: Option<String>,
-        /// Filter by status.
-        #[arg(long)]
-        status: Option<String>,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show spec details.
-    Show {
-        /// Spec ID.
-        id: String,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Update spec fields.
-    Update {
-        /// Spec ID.
-        id: String,
-        /// New name.
-        #[arg(long)]
-        name: Option<String>,
-        /// New content.
-        #[arg(long)]
-        content: Option<String>,
-        /// New priority.
-        #[arg(long)]
-        priority: Option<i32>,
-        /// New labels.
-        #[arg(long)]
-        labels: Option<String>,
-        /// New depends_on.
-        #[arg(long)]
-        depends_on: Option<String>,
-        /// New entry_point (comma-separated file/module paths).
-        #[arg(long)]
-        entry_point: Option<String>,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Pause an active spec.
-    Pause {
-        /// Spec ID.
-        id: String,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Resume a paused spec.
-    Resume {
-        /// Spec ID.
-        id: String,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Complete an active spec.
-    Complete {
-        /// Spec ID.
-        id: String,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Remove a spec.
-    Remove {
-        /// Spec ID.
-        id: String,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Link a spec to an external resource (URL or issue reference).
-    Link {
-        /// Spec ID.
-        id: String,
-        /// Target URL or issue reference (e.g. `https://...` or `owner/repo#123`).
-        target: String,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Unlink a spec from an external resource.
-    Unlink {
-        /// Spec ID.
-        id: String,
-        /// Target URL or issue reference to remove.
-        target: String,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-    },
-    /// Verify all links for a spec (check reachability).
-    Verify {
-        /// Spec ID.
-        id: String,
-        /// Output as JSON.
-        #[arg(long)]
-        json: bool,
-    },
+/// The workspace sources the daemon treats as GitHub sources, by name.
+fn github_sources(
+    config: &belt_core::workspace::WorkspaceConfig,
+) -> Vec<(&String, &belt_core::workspace::SourceConfig)> {
+    let mut sources: Vec<_> = config
+        .sources
+        .iter()
+        .filter(|(name, source)| name.as_str() == "github" || source.url.contains("github.com"))
+        .collect();
+    sources.sort_by_key(|(name, _)| name.as_str());
+    sources
+}
+
+/// The only GitHub source of the workspace, if any.
+///
+/// # Errors
+/// More than one GitHub source: the origin channel posts to a single
+/// repository, so a second source's items would have no address.
+fn single_github_source(
+    config: &belt_core::workspace::WorkspaceConfig,
+) -> anyhow::Result<Option<&belt_core::workspace::SourceConfig>> {
+    let sources = github_sources(config);
+    if sources.len() > 1 {
+        let names: Vec<&str> = sources.iter().map(|(name, _)| name.as_str()).collect();
+        anyhow::bail!(
+            "the workspace has {} GitHub sources ({}), but belt supports exactly one: \
+             the origin channel notifies a single repository",
+            sources.len(),
+            names.join(", ")
+        );
+    }
+    Ok(sources.first().map(|(_, source)| *source))
+}
+
+/// A fresh empty directory for the natural-language interpreter's runtime;
+/// removed when the returned guard is dropped.
+fn new_nl_sandbox() -> anyhow::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix("belt-nl-")
+        .tempdir()
+        .map_err(|e| anyhow::anyhow!("failed to create the interpreter sandbox: {e}"))
+}
+
+/// Build the notifier from the workspace's `notifications` section.
+///
+/// The origin channel talks to the repository of the GitHub source. A
+/// workspace without one has no origin implementation: progress and HITL
+/// requests then show on the dashboard only. The interpreter's runtime runs
+/// in `nl_sandbox`, an empty directory.
+fn build_notifier(
+    config: &belt_core::workspace::WorkspaceConfig,
+    db: Arc<Database>,
+    runtime: Arc<dyn belt_core::runtime::AgentRuntime>,
+    nl_sandbox: &std::path::Path,
+) -> anyhow::Result<belt_daemon::notify::Notifier> {
+    use belt_core::notification::NotificationChannel;
+
+    let mut channels: Vec<Arc<dyn NotificationChannel>> = Vec::new();
+    let github_repo = single_github_source(config)?
+        .and_then(|source| GitHubDataSource::extract_repo_name(&source.url));
+    match github_repo {
+        Some(repo) => {
+            let shell: Arc<dyn belt_core::platform::ShellExecutor> =
+                Arc::from(belt_infra::platform::default_shell_executor());
+            channels.push(Arc::new(belt_infra::channels::GitHubOriginChannel::new(
+                belt_infra::channels::GitHubChannelConfig::new(&repo),
+                shell,
+            )));
+        }
+        None => tracing::warn!(
+            "no GitHub source: notifications are shown on the dashboard only (no origin channel)"
+        ),
+    }
+    let interpreter = belt_daemon::notify::NlInterpreter::new(runtime, nl_sandbox.to_path_buf());
+    belt_daemon::notify::Notifier::new(db, config.notifications.clone(), channels, interpreter)
 }
 
 /// Load workspace config and start the daemon loop.
@@ -601,26 +519,29 @@ async fn start_daemon(
     tick_interval_secs: u64,
     max_concurrent: u32,
 ) -> anyhow::Result<()> {
-    let config_content = std::fs::read_to_string(config_path)
-        .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {}", config_path, e))?;
-    let config: belt_core::workspace::WorkspaceConfig = serde_yaml::from_str(&config_content)
-        .map_err(|e| anyhow::anyhow!("failed to parse config file '{}': {}", config_path, e))?;
+    let config =
+        belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(config_path))?;
 
     let belt_home = belt_home()?;
 
     // Build DataSources from workspace config.
     let mut sources: Vec<Box<dyn belt_core::source::DataSource>> = Vec::new();
-    for (name, source_config) in &config.sources {
-        if name == "github" || source_config.url.contains("github.com") {
-            sources.push(Box::new(GitHubDataSource::new(&source_config.url)));
-        }
+    if let Some(github) = single_github_source(&config)? {
+        sources.push(Box::new(GitHubDataSource::new(&github.url)));
     }
 
-    // Runtime registry with Claude as default.
-    let mut registry = RuntimeRegistry::new("claude".to_string());
+    // Runtime registry with the workspace's default runtime.
+    let mut registry = RuntimeRegistry::new(config.runtime.default.clone());
     registry.register(Arc::new(ClaudeRuntime::new(None)));
     registry.register(Arc::new(GeminiRuntime::new(None)));
     registry.register(Arc::new(CodexRuntime::new(None)));
+
+    let default_runtime = registry.default_runtime().ok_or_else(|| {
+        anyhow::anyhow!(
+            "default runtime `{}` is not registered",
+            registry.default_name()
+        )
+    })?;
 
     // Worktree manager.
     let worktree_base = belt_home.join("worktrees");
@@ -637,15 +558,24 @@ async fn start_daemon(
     // Capture PID file path before belt_home is moved into the daemon.
     let pid_path = belt_home.join("daemon.pid");
 
-    let mut daemon = Daemon::new(
+    let config_for_notifier = config.clone();
+    let daemon = Daemon::new(
         config,
         sources,
         Arc::new(registry),
         Box::new(worktree_mgr),
         max_concurrent,
+        db,
     )
-    .with_db(db)
     .with_belt_home(belt_home);
+    let nl_sandbox = new_nl_sandbox()?;
+    let notifier = build_notifier(
+        &config_for_notifier,
+        Arc::clone(daemon.database()),
+        default_runtime,
+        nl_sandbox.path(),
+    )?;
+    let mut daemon = daemon.with_notifier(notifier);
 
     // Write PID file so `belt stop` can find the daemon process.
     std::fs::write(&pid_path, std::process::id().to_string())
@@ -657,14 +587,14 @@ async fn start_daemon(
         max_concurrent,
         std::process::id()
     );
-    daemon.run(tick_interval_secs).await;
+    let result = daemon.run(tick_interval_secs).await;
 
-    // Clean up PID file on graceful shutdown.
+    // Clean up PID file on graceful shutdown and on a failed start.
     if let Err(e) = std::fs::remove_file(&pid_path) {
         tracing::warn!("failed to remove PID file: {e}");
     }
 
-    Ok(())
+    result.map_err(|e| anyhow::anyhow!("daemon failed to start: {e}"))
 }
 
 #[derive(Subcommand)]
@@ -974,441 +904,650 @@ fn cmd_queue_list(
     Ok(())
 }
 
-/// `belt queue show` -- show a single queue item.
-fn cmd_queue_show(work_id: &str, format: &str) -> anyhow::Result<()> {
+/// `belt queue show` -- show a queue item with its transition history.
+fn cmd_queue_show(work_id: &str, format: &str, json: bool) -> anyhow::Result<()> {
     let db = open_db()?;
     let item = db.get_item(work_id)?;
+    let transitions = db.transitions_of(work_id)?;
+    let processing = processing_of_item(&db, &item)?;
 
-    match format {
-        "json" => {
-            println!("{}", serde_json::to_string_pretty(&item)?);
-        }
-        _ => {
-            println!("Work ID:      {}", item.work_id);
-            println!("Source ID:    {}", item.source_id);
-            println!("Workspace:    {}", item.workspace_id);
-            println!("State:        {}", item.state);
-            println!("Phase:        {}", item.phase());
-            if let Some(title) = &item.title {
-                println!("Title:        {title}");
-            }
-            println!("Created:      {}", item.created_at);
-            println!("Updated:      {}", item.updated_at);
-        }
-    }
-
-    Ok(())
-}
-
-/// `belt queue done` -- mark a queue item as Done, running on_done scripts if configured.
-async fn cmd_queue_done(work_id: &str, json: bool) -> anyhow::Result<()> {
-    let db = open_db()?;
-    let item = db.get_item(work_id)?;
-
-    // Load workspace config to find on_done scripts for this item's state.
-    let (_, config_path, _) = db.get_workspace(&item.workspace_id)?;
-    let config =
-        belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))?;
-
-    // Find the state config containing on_done scripts.
-    let state_config = config
-        .sources
-        .values()
-        .find_map(|source| source.states.get(&item.state));
-
-    let on_done_actions: Vec<belt_core::action::Action> = state_config
-        .map(|sc| {
-            sc.on_done
-                .iter()
-                .map(belt_core::action::Action::from)
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Set up worktree manager for cleanup after transition.
-    let belt_home = belt_home()?;
-    let worktree_base = belt_home.join("worktrees");
-    let repo_path = std::path::PathBuf::from(".");
-    let worktree_mgr = GitWorktreeManager::new(worktree_base, repo_path);
-
-    if on_done_actions.is_empty() {
-        db.update_phase(work_id, QueuePhase::Done)?;
-        // Cleanup worktree (matches daemon pattern: warn on failure, don't abort).
-        if let Err(e) = worktree_mgr.cleanup(work_id) {
-            tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue done, continuing");
-        }
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "success": true,
-                    "work_id": work_id,
-                    "phase": "done",
-                    "scripts_run": false
-                }))?
-            );
-        } else {
-            println!("Marked {work_id} as done.");
-        }
+    if json || format == "json" {
+        let mut value = serde_json::to_value(&item)?;
+        merge_json(
+            &mut value,
+            serde_json::json!({
+                "processing": processing.map(processing_name),
+                "transitions": transitions.iter().map(|t| serde_json::json!({
+                    "seq": t.seq,
+                    "kind": t.kind,
+                    "from_phase": t.from_phase,
+                    "to_phase": t.to_phase,
+                    "actor": t.actor,
+                    "reason": t.reason,
+                    "detail": t.detail,
+                    "created_at": t.created_at,
+                })).collect::<Vec<_>>(),
+            }),
+        );
+        println!("{}", serde_json::to_string_pretty(&value)?);
         return Ok(());
     }
 
-    // Set up execution environment.
-    let worktree_path = worktree_mgr.create_or_reuse(work_id)?;
-    let env = belt_daemon::executor::ActionEnv::new(work_id, &worktree_path);
-
-    // Build a minimal runtime registry for script execution.
-    let mut registry = belt_core::runtime::RuntimeRegistry::new("claude".to_string());
-    registry.register(std::sync::Arc::new(
-        belt_infra::runtimes::claude::ClaudeRuntime::new(None),
-    ));
-    registry.register(std::sync::Arc::new(
-        belt_infra::runtimes::gemini::GeminiRuntime::new(None),
-    ));
-    registry.register(std::sync::Arc::new(
-        belt_infra::runtimes::codex::CodexRuntime::new(None),
-    ));
-    let executor = belt_daemon::executor::ActionExecutor::new(std::sync::Arc::new(registry));
-
-    if !json {
-        println!("Running on_done scripts for '{work_id}'...");
+    println!("Work ID:      {}", item.work_id);
+    println!("Source ID:    {}", item.source_id);
+    println!("Workspace:    {}", item.workspace_id);
+    println!("State:        {}", item.state);
+    println!("Phase:        {}", item.phase());
+    if let Some(p) = processing {
+        println!("Processing:   {}", processing_name(p));
     }
-
-    let result = executor.execute_all(&on_done_actions, &env).await?;
-
-    match result {
-        Some(r) if r.success() => {
-            db.update_phase(work_id, QueuePhase::Done)?;
-            // Cleanup worktree (matches daemon pattern: warn on failure, don't abort).
-            if let Err(e) = worktree_mgr.cleanup(work_id) {
-                tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue done, continuing");
-            }
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": true,
-                        "work_id": work_id,
-                        "phase": "done",
-                        "scripts_run": true
-                    }))?
-                );
-            } else {
-                println!("on_done scripts succeeded. Marked '{work_id}' as done.");
-            }
-        }
-        Some(r) => {
-            db.update_phase(work_id, QueuePhase::Failed)?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": false,
-                        "work_id": work_id,
-                        "phase": "failed",
-                        "scripts_run": true,
-                        "exit_code": r.exit_code
-                    }))?
-                );
-            } else {
-                println!(
-                    "on_done scripts failed (exit code {}). Item '{work_id}' transitioned to failed.",
-                    r.exit_code
-                );
-            }
-        }
-        None => {
-            db.update_phase(work_id, QueuePhase::Done)?;
-            // Cleanup worktree (matches daemon pattern: warn on failure, don't abort).
-            if let Err(e) = worktree_mgr.cleanup(work_id) {
-                tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue done, continuing");
-            }
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": true,
-                        "work_id": work_id,
-                        "phase": "done",
-                        "scripts_run": false
-                    }))?
-                );
-            } else {
-                println!("Marked '{work_id}' as done.");
-            }
-        }
+    if let Some(title) = &item.title {
+        println!("Title:        {title}");
     }
-
-    Ok(())
-}
-
-/// `belt queue hitl` -- mark a queue item as HITL.
-fn cmd_queue_hitl(work_id: &str, reason: Option<&str>, json: bool) -> anyhow::Result<()> {
-    let db = open_db()?;
-    db.update_phase(work_id, QueuePhase::Hitl)?;
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "success": true,
-                "work_id": work_id,
-                "phase": "hitl",
-                "reason": reason
-            }))?
+    if let Some(origin) = &item.derived_from {
+        println!("Derived from: {origin}");
+    }
+    println!("Lineage root: {}", item.lineage_root);
+    println!("Created:      {}", item.created_at);
+    println!("Updated:      {}", item.updated_at);
+    println!("History:");
+    for t in &transitions {
+        let phases = match (&t.from_phase, &t.to_phase) {
+            (Some(from), Some(to)) => format!("{from} -> {to}"),
+            (None, Some(to)) => format!("-> {to}"),
+            (Some(from), None) => format!("{from} ->"),
+            (None, None) => String::new(),
+        };
+        let mut line = format!(
+            "  #{} {} {} {phases} [{}]",
+            t.seq, t.created_at, t.kind, t.actor
         );
-    } else if let Some(r) = reason {
-        println!("Marked {work_id} as HITL (reason: {r}).");
-    } else {
-        println!("Marked {work_id} as HITL.");
-    }
-    Ok(())
-}
-
-/// `belt queue skip` -- mark a queue item as Skipped.
-fn cmd_queue_skip(work_id: &str, json: bool) -> anyhow::Result<()> {
-    let db = open_db()?;
-    db.update_phase(work_id, QueuePhase::Skipped)?;
-
-    // Cleanup worktree (matches daemon pattern: warn on failure, don't abort).
-    let belt_home = belt_home()?;
-    let worktree_base = belt_home.join("worktrees");
-    let repo_path = std::path::PathBuf::from(".");
-    let worktree_mgr = GitWorktreeManager::new(worktree_base, repo_path);
-    if let Err(e) = worktree_mgr.cleanup(work_id) {
-        tracing::warn!(work_id, error = %e, "worktree cleanup failed on queue skip, continuing");
-    }
-
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "success": true,
-                "work_id": work_id,
-                "phase": "skipped"
-            }))?
-        );
-    } else {
-        println!("Skipped {work_id}.");
-    }
-    Ok(())
-}
-
-/// `belt queue retry-script` -- re-run on_done script for a Failed item.
-async fn cmd_queue_retry_script(
-    work_id: &str,
-    timeout: Option<u64>,
-    json: bool,
-) -> anyhow::Result<()> {
-    let db = open_db()?;
-    let item = db.get_item(work_id)?;
-
-    if item.phase() != QueuePhase::Failed {
-        anyhow::bail!(
-            "item '{}' is in phase '{}', not 'failed'",
-            work_id,
-            item.phase()
-        );
-    }
-
-    // Load workspace config to find on_done scripts for this item's state.
-    let (_, config_path, _) = db.get_workspace(&item.workspace_id)?;
-    let config =
-        belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))?;
-
-    // Find the state config containing on_done scripts.
-    let state_config = config
-        .sources
-        .values()
-        .find_map(|source| source.states.get(&item.state))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no state config found for state '{}' in workspace '{}'",
-                item.state,
-                item.workspace_id
-            )
-        })?;
-
-    if state_config.on_done.is_empty() {
-        db.update_phase(work_id, QueuePhase::Done)?;
-        record_script_retry_event(&db, work_id, &item.source_id, QueuePhase::Done, None);
-        if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({
-                    "success": true,
-                    "work_id": work_id,
-                    "phase": "done",
-                    "scripts_run": false
-                }))?
-            );
-        } else {
-            println!(
-                "No on_done scripts configured for state '{}'. Transitioning to done.",
-                item.state
-            );
-            println!("Item '{work_id}' transitioned from failed to done.");
+        if let Some(reason) = &t.reason {
+            line.push_str(&format!(" reason={reason}"));
         }
-        return Ok(());
-    }
-
-    let on_done: Vec<belt_core::action::Action> = state_config
-        .on_done
-        .iter()
-        .map(belt_core::action::Action::from)
-        .collect();
-
-    // Set up execution environment.
-    let belt_home = belt_home()?;
-    let worktree_base = belt_home.join("worktrees");
-    let repo_path = std::path::PathBuf::from(".");
-    let worktree_mgr = belt_infra::worktree::GitWorktreeManager::new(worktree_base, repo_path);
-
-    let worktree_path = worktree_mgr.create_or_reuse(work_id)?;
-    let env = belt_daemon::executor::ActionEnv::new(work_id, &worktree_path);
-
-    // Build a minimal runtime registry for script execution.
-    let mut registry = belt_core::runtime::RuntimeRegistry::new("claude".to_string());
-    registry.register(std::sync::Arc::new(
-        belt_infra::runtimes::claude::ClaudeRuntime::new(None),
-    ));
-    registry.register(std::sync::Arc::new(
-        belt_infra::runtimes::gemini::GeminiRuntime::new(None),
-    ));
-    registry.register(std::sync::Arc::new(
-        belt_infra::runtimes::codex::CodexRuntime::new(None),
-    ));
-    let executor = belt_daemon::executor::ActionExecutor::new(std::sync::Arc::new(registry));
-
-    if !json {
-        println!("Re-running on_done scripts for '{work_id}'...");
-    }
-
-    let result = if let Some(secs) = timeout {
-        let duration = std::time::Duration::from_secs(secs);
-        match tokio::time::timeout(duration, executor.execute_all(&on_done, &env)).await {
-            Ok(r) => r?,
-            Err(_) => {
-                record_script_retry_event(
-                    &db,
-                    work_id,
-                    &item.source_id,
-                    QueuePhase::Failed,
-                    Some(format!("timeout after {secs}s")),
-                );
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "success": false,
-                            "work_id": work_id,
-                            "phase": "failed",
-                            "error": format!("timeout after {secs}s")
-                        }))?
-                    );
-                } else {
-                    println!("Script execution timed out after {secs}s. Item remains failed.");
-                }
-                return Ok(());
-            }
+        if let Some(detail) = &t.detail {
+            line.push_str(&format!(" detail={detail}"));
         }
-    } else {
-        executor.execute_all(&on_done, &env).await?
-    };
-
-    match result {
-        Some(r) if r.success() => {
-            db.update_phase(work_id, QueuePhase::Done)?;
-            record_script_retry_event(&db, work_id, &item.source_id, QueuePhase::Done, None);
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": true,
-                        "work_id": work_id,
-                        "phase": "done",
-                        "scripts_run": true
-                    }))?
-                );
-            } else {
-                println!(
-                    "on_done scripts succeeded. Item '{work_id}' transitioned from failed to done."
-                );
-            }
-        }
-        Some(r) => {
-            record_script_retry_event(
-                &db,
-                work_id,
-                &item.source_id,
-                QueuePhase::Failed,
-                Some(format!("exit code {}", r.exit_code)),
-            );
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": false,
-                        "work_id": work_id,
-                        "phase": "failed",
-                        "scripts_run": true,
-                        "exit_code": r.exit_code
-                    }))?
-                );
-            } else {
-                println!(
-                    "on_done scripts failed (exit code {}). Item '{work_id}' remains in failed phase.",
-                    r.exit_code
-                );
-            }
-        }
-        None => {
-            // No scripts produced a result (shouldn't happen since we checked on_done is non-empty).
-            db.update_phase(work_id, QueuePhase::Done)?;
-            record_script_retry_event(&db, work_id, &item.source_id, QueuePhase::Done, None);
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "success": true,
-                        "work_id": work_id,
-                        "phase": "done",
-                        "scripts_run": false
-                    }))?
-                );
-            } else {
-                println!("Item '{work_id}' transitioned from failed to done.");
-            }
-        }
+        println!("{line}");
     }
 
     Ok(())
 }
 
-/// Record a `script_retry` transition event for retry-script operations.
-fn record_script_retry_event(
+/// Exit code of a command whose request was refused by the contract.
+const EXIT_REFUSED: i32 = 1;
+
+fn exit_if_refused(code: i32) {
+    if code != 0 {
+        std::process::exit(code);
+    }
+}
+
+fn processing_name(processing: belt_core::transition::Processing) -> &'static str {
+    match processing {
+        belt_core::transition::Processing::Handler => "handler",
+        belt_core::transition::Processing::PostProcessing => "post_processing",
+    }
+}
+
+/// Whether the daemon owns the item right now: a handler is running, or a
+/// confirmed HITL request awaits post-processing.
+fn processing_of_item(
     db: &Database,
-    work_id: &str,
-    source_id: &str,
-    to_phase: QueuePhase,
-    detail: Option<String>,
-) {
-    let now = chrono::Utc::now();
-    let event = belt_infra::db::TransitionEvent {
-        id: format!("te-{}-{}", work_id, now.timestamp_millis()),
-        work_id: work_id.to_string(),
-        source_id: source_id.to_string(),
-        event_type: "script_retry".to_string(),
-        phase: Some(to_phase.as_str().to_string()),
-        from_phase: Some(QueuePhase::Failed.as_str().to_string()),
-        detail,
-        created_at: now.to_rfc3339(),
-    };
-    if let Err(e) = db.insert_transition_event(&event) {
-        tracing::warn!(
-            work_id = %work_id,
-            error = %e,
-            "failed to record script_retry transition event"
+    item: &belt_core::queue::QueueItem,
+) -> anyhow::Result<Option<belt_core::transition::Processing>> {
+    use belt_core::transition::Processing;
+    Ok(match item.phase() {
+        QueuePhase::Running => Some(Processing::Handler),
+        QueuePhase::Hitl => db
+            .pending_post_processing()?
+            .iter()
+            .any(|r| r.work_id == item.work_id)
+            .then_some(Processing::PostProcessing),
+        QueuePhase::Pending
+        | QueuePhase::Ready
+        | QueuePhase::Completed
+        | QueuePhase::Done
+        | QueuePhase::Failed
+        | QueuePhase::Skipped => None,
+    })
+}
+
+fn merge_json(base: &mut serde_json::Value, extra: serde_json::Value) {
+    if let (Some(base), serde_json::Value::Object(extra)) = (base.as_object_mut(), extra) {
+        base.extend(extra);
+    }
+}
+
+/// A request refused as a value; rendered as `{"success":false,"reason":...}`
+/// with a non-zero exit code.
+struct Refusal {
+    reason: &'static str,
+    fields: serde_json::Value,
+    text: String,
+}
+
+impl Refusal {
+    fn new(reason: &'static str, fields: serde_json::Value, text: impl Into<String>) -> Self {
+        Self {
+            reason,
+            fields,
+            text: text.into(),
+        }
+    }
+
+    fn not_found() -> Self {
+        Self::new(
+            "not_found",
+            serde_json::json!({}),
+            "no such item or HITL request",
+        )
+    }
+
+    fn from_transition(outcome: belt_core::transition::TransitionOutcome) -> Self {
+        use belt_core::transition::TransitionOutcome;
+        match outcome {
+            TransitionOutcome::Busy { processing } => Self::new(
+                "busy",
+                serde_json::json!({ "processing": processing_name(processing) }),
+                format!(
+                    "busy: the item is being processed ({})",
+                    processing_name(processing)
+                ),
+            ),
+            TransitionOutcome::Conflict { current } => Self::new(
+                "conflict",
+                serde_json::json!({ "current": current.as_str() }),
+                format!("conflict: another path already moved the item (now {current})"),
+            ),
+            TransitionOutcome::InvalidAction { current } => Self::new(
+                "invalid_action",
+                serde_json::json!({ "current": current.as_str() }),
+                format!("invalid_action: not allowed while the item is {current}"),
+            ),
+            TransitionOutcome::Applied { .. } => {
+                unreachable!("an applied transition is not a refusal")
+            }
+        }
+    }
+}
+
+/// The `--json` body of a refusal.
+fn refusal_value(work_id: &str, refusal: &Refusal) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "success": false,
+        "reason": refusal.reason,
+        "work_id": work_id,
+    });
+    merge_json(&mut value, refusal.fields.clone());
+    value
+}
+
+fn emit_refusal(work_id: &str, json: bool, refusal: Refusal) -> anyhow::Result<i32> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&refusal_value(work_id, &refusal))?
         );
+    } else {
+        eprintln!("{work_id}: {}", refusal.text);
+    }
+    Ok(EXIT_REFUSED)
+}
+
+fn emit_success(
+    work_id: &str,
+    json: bool,
+    result: &str,
+    fields: serde_json::Value,
+    text: String,
+) -> anyhow::Result<i32> {
+    if json {
+        let mut value = serde_json::json!({
+            "success": true,
+            "result": result,
+            "work_id": work_id,
+        });
+        merge_json(&mut value, fields);
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else {
+        println!("{text}");
+    }
+    Ok(0)
+}
+
+/// The item, or `None` when `work_id` is unknown.
+fn find_item(db: &Database, work_id: &str) -> anyhow::Result<Option<belt_core::queue::QueueItem>> {
+    match db.get_item(work_id) {
+        Ok(item) => Ok(Some(item)),
+        Err(belt_core::error::BeltError::ItemNotFound(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// What happened to a manual request to move an item to a target phase.
+enum ManualOutcome {
+    Applied,
+    /// The request left Hitl, so it joined the HITL response race instead.
+    HitlResponse {
+        action: belt_core::hitl::HitlAction,
+        /// Respondent the response was recorded for.
+        by: String,
+        outcome: belt_core::hitl::RespondOutcome,
+    },
+    Refused(belt_core::transition::TransitionOutcome),
+}
+
+/// The respondent recorded for CLI responses: the OS user, else `cli`.
+fn cli_respondent() -> String {
+    std::env::var("USER").unwrap_or_else(|_| "cli".to_string())
+}
+
+/// Answer a HITL request as the CLI. Local users are trusted, so no
+/// allowlist applies.
+fn respond_as_cli(
+    hitl: &belt_daemon::hitl::HitlService,
+    target: belt_infra::db::HitlTarget,
+    action: belt_core::hitl::HitlAction,
+    by: String,
+    notes: Option<String>,
+) -> anyhow::Result<belt_core::hitl::RespondOutcome> {
+    Ok(hitl.respond(&belt_daemon::hitl::HitlResponse {
+        target,
+        action,
+        by,
+        via: "cli".to_string(),
+        path: belt_core::hitl::ConfirmPath::Direct,
+        notes,
+    })?)
+}
+
+/// Request `item -> to` as the CLI.
+///
+/// A request that leaves Hitl is a HITL response when `hitl_response_for`
+/// maps its target, so it is decided there before `transition` is asked:
+/// `transition` reports `InvalidAction { Hitl }` for unmapped requests too.
+/// An item whose request is already confirmed is processing, so it goes to
+/// `transition` and is refused as `busy`.
+fn request_manual_transition(
+    hitl: &belt_daemon::hitl::HitlService,
+    item: &belt_core::queue::QueueItem,
+    to: QueuePhase,
+    detail: Option<String>,
+) -> anyhow::Result<ManualOutcome> {
+    use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
+
+    let db = hitl.database();
+    if item.phase() == QueuePhase::Hitl
+        && let Some(action) = belt_core::transition::hitl_response_for(to)
+        && processing_of_item(db, item)?.is_none()
+    {
+        let by = cli_respondent();
+        let outcome = respond_as_cli(
+            hitl,
+            belt_infra::db::HitlTarget::Item(item.work_id.clone()),
+            action,
+            by.clone(),
+            None,
+        )?;
+        return Ok(ManualOutcome::HitlResponse {
+            action,
+            by,
+            outcome,
+        });
+    }
+
+    let outcome = db.transition(&TransitionRequest {
+        work_id: item.work_id.clone(),
+        expected_from: item.phase(),
+        to,
+        actor: Actor::Cli,
+        reason: TransitionReason::Manual,
+        detail,
+    })?;
+    Ok(match outcome {
+        TransitionOutcome::Applied { .. } => ManualOutcome::Applied,
+        refused => ManualOutcome::Refused(refused),
+    })
+}
+
+/// The refusal for a HITL response that lost the race to `resolution`.
+fn already_handled_refusal(resolution: &belt_core::hitl::HitlResolution) -> Refusal {
+    Refusal::new(
+        "already_handled",
+        serde_json::json!({
+            "by": resolution.by,
+            "via": resolution.via,
+            "action": resolution.action.to_string(),
+            "at": resolution.at,
+        }),
+        format!(
+            "already_handled: '{}' was chosen by {} via {} at {}",
+            resolution.action, resolution.by, resolution.via, resolution.at
+        ),
+    )
+}
+
+/// Render a [`ManualOutcome`]; `applied_fields` extends the applied JSON.
+fn emit_manual_outcome(
+    work_id: &str,
+    json: bool,
+    to: QueuePhase,
+    outcome: ManualOutcome,
+    applied_fields: serde_json::Value,
+    applied_text: String,
+) -> anyhow::Result<i32> {
+    use belt_core::hitl::RespondOutcome;
+
+    match outcome {
+        ManualOutcome::Applied => {
+            let mut fields = serde_json::json!({ "phase": to.as_str() });
+            merge_json(&mut fields, applied_fields);
+            if to == QueuePhase::Failed {
+                // The item did move, but the request (`queue done`) failed:
+                // callers such as the evaluator judge the exit code.
+                return emit_refusal(
+                    work_id,
+                    json,
+                    Refusal::new("on_done_failed", fields, applied_text),
+                );
+            }
+            emit_success(work_id, json, "applied", fields, applied_text)
+        }
+        ManualOutcome::Refused(refused) => {
+            emit_refusal(work_id, json, Refusal::from_transition(refused))
+        }
+        ManualOutcome::HitlResponse {
+            action,
+            by,
+            outcome,
+        } => match outcome {
+            RespondOutcome::Won { hitl_id } => emit_success(
+                work_id,
+                json,
+                "hitl_response",
+                serde_json::json!({
+                    "action": action.to_string(),
+                    "hitl_id": hitl_id.as_str(),
+                    "by": by,
+                    "via": "cli",
+                }),
+                format!(
+                    "Recorded HITL response '{action}' by {by} via cli for {work_id}; the daemon applies it."
+                ),
+            ),
+            RespondOutcome::AlreadyHandled(r) => {
+                emit_refusal(work_id, json, already_handled_refusal(&r))
+            }
+            RespondOutcome::NotFound => emit_refusal(work_id, json, Refusal::not_found()),
+            RespondOutcome::InvalidAction => emit_refusal(
+                work_id,
+                json,
+                Refusal::new(
+                    "invalid_action",
+                    serde_json::json!({}),
+                    "invalid_action: the HITL request does not accept this response",
+                ),
+            ),
+            RespondOutcome::Unauthorized => emit_refusal(
+                work_id,
+                json,
+                Refusal::new("unauthorized", serde_json::json!({}), "unauthorized"),
+            ),
+        },
+    }
+}
+
+fn worktree_manager() -> anyhow::Result<GitWorktreeManager> {
+    let worktree_base = belt_home()?.join("worktrees");
+    Ok(GitWorktreeManager::new(
+        worktree_base,
+        std::path::PathBuf::from("."),
+    ))
+}
+
+/// Cleanup after a terminal transition (matches daemon pattern: warn on failure, don't abort).
+fn cleanup_worktree(mgr: &GitWorktreeManager, work_id: &str, command: &str) {
+    if let Err(e) = mgr.cleanup(work_id) {
+        tracing::warn!(work_id, error = %e, "worktree cleanup failed on {command}, continuing");
+    }
+}
+
+/// `belt queue done` -- finish a Completed item, running its on_done scripts first.
+///
+/// A Completed item whose scripts fail goes to Failed. Any other phase is
+/// decided by the transition contract without running scripts.
+async fn cmd_queue_done(work_id: &str, json: bool) -> anyhow::Result<i32> {
+    let db = Arc::new(open_db()?);
+    let hitl = belt_daemon::hitl::HitlService::new(Arc::clone(&db));
+    let Some(item) = find_item(&db, work_id)? else {
+        return emit_refusal(work_id, json, Refusal::not_found());
+    };
+    let worktree_mgr = worktree_manager()?;
+
+    let mut target = QueuePhase::Done;
+    let mut detail = None;
+    let mut scripts_run = false;
+    let mut script_exit = None;
+
+    if item.phase() == QueuePhase::Completed {
+        let (_, config_path, _) = db.get_workspace(&item.workspace_id)?;
+        let config = belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(
+            &config_path,
+        ))?;
+        let on_done_actions: Vec<belt_core::action::Action> = config
+            .sources
+            .values()
+            .find_map(|source| source.states.get(&item.state))
+            .map(|sc| {
+                sc.on_done
+                    .iter()
+                    .map(belt_core::action::Action::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if !on_done_actions.is_empty() {
+            let worktree_path = worktree_mgr.create_or_reuse(work_id)?;
+            let env = belt_daemon::executor::ActionEnv::new(work_id, &worktree_path);
+
+            // Build a minimal runtime registry for script execution.
+            let mut registry = belt_core::runtime::RuntimeRegistry::new("claude".to_string());
+            registry.register(std::sync::Arc::new(
+                belt_infra::runtimes::claude::ClaudeRuntime::new(None),
+            ));
+            registry.register(std::sync::Arc::new(
+                belt_infra::runtimes::gemini::GeminiRuntime::new(None),
+            ));
+            registry.register(std::sync::Arc::new(
+                belt_infra::runtimes::codex::CodexRuntime::new(None),
+            ));
+            let executor =
+                belt_daemon::executor::ActionExecutor::new(std::sync::Arc::new(registry));
+
+            if !json {
+                println!("Running on_done scripts for '{work_id}'...");
+            }
+            scripts_run = true;
+            if let Some(r) = executor.execute_all(&on_done_actions, &env).await?
+                && !r.success()
+            {
+                target = QueuePhase::Failed;
+                detail = Some(format!("on_done failed with exit code {}", r.exit_code));
+                script_exit = Some(r.exit_code);
+            }
+        }
+    }
+
+    let outcome = request_manual_transition(&hitl, &item, target, detail)?;
+    if matches!(outcome, ManualOutcome::Applied) && target == QueuePhase::Done {
+        cleanup_worktree(&worktree_mgr, work_id, "queue done");
+    }
+    let mut fields = serde_json::json!({ "scripts_run": scripts_run });
+    if let Some(code) = script_exit {
+        merge_json(&mut fields, serde_json::json!({ "exit_code": code }));
+    }
+    let text = match script_exit {
+        Some(code) => {
+            format!(
+                "on_done scripts failed (exit code {code}). Item '{work_id}' transitioned to failed."
+            )
+        }
+        None => format!("Marked '{work_id}' as done."),
+    };
+    emit_manual_outcome(work_id, json, target, outcome, fields, text)
+}
+
+/// `belt queue hitl` -- move a Completed item to Hitl and open a HITL request.
+fn cmd_queue_hitl(work_id: &str, reason: Option<&str>, json: bool) -> anyhow::Result<i32> {
+    use belt_core::transition::{Actor, TransitionReason};
+    use belt_infra::db::{OpenHitlOutcome, OpenHitlRequest};
+
+    let db = open_db()?;
+    let Some(item) = find_item(&db, work_id)? else {
+        return emit_refusal(work_id, json, Refusal::not_found());
+    };
+    // Same expiry terms as a request the daemon opens: the default timeout and
+    // the workspace's terminal action. An unreadable workspace is an error, not
+    // a request that never expires.
+    let (_, config_path, _) = db.get_workspace(&item.workspace_id)?;
+    let config =
+        belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))?;
+    let terminal_action = config
+        .sources
+        .values()
+        .next()
+        .and_then(|source| source.escalation.terminal_action().copied());
+    let expiry = belt_daemon::hitl::HitlExpiry::after_hours(
+        belt_core::queue::HITL_TIMEOUT_HOURS,
+        terminal_action,
+        chrono::Utc::now(),
+    );
+    let opened = db.open_hitl(&OpenHitlRequest {
+        work_id: work_id.to_string(),
+        expected_from: item.phase(),
+        reason: belt_core::queue::HitlReason::ManualEscalation,
+        notes: reason.map(str::to_string),
+        actor: Actor::Cli,
+        transition_reason: TransitionReason::Manual,
+        timeout_at: expiry.timeout_at,
+        terminal_action: expiry.terminal_action,
+    })?;
+    match opened {
+        OpenHitlOutcome::Opened { hitl_id, .. } => {
+            let text = match reason {
+                Some(r) => format!("Marked {work_id} as HITL (reason: {r})."),
+                None => format!("Marked {work_id} as HITL."),
+            };
+            emit_success(
+                work_id,
+                json,
+                "applied",
+                serde_json::json!({
+                    "phase": "hitl",
+                    "hitl_id": hitl_id.as_str(),
+                    "notes": reason,
+                }),
+                text,
+            )
+        }
+        OpenHitlOutcome::Rejected(refused) => {
+            emit_refusal(work_id, json, Refusal::from_transition(refused))
+        }
+    }
+}
+
+/// `belt queue skip` -- skip an item through the transition contract.
+///
+/// A Running item is canceled through [`cancel::CancelFlow`]. A Ready item
+/// that lost the race to the daemon's claim is judged once more, so it is
+/// canceled when it turned Running.
+fn cmd_queue_skip(work_id: &str, json: bool) -> anyhow::Result<i32> {
+    use belt_core::transition::TransitionOutcome;
+
+    let db = Arc::new(open_db()?);
+    let hitl = belt_daemon::hitl::HitlService::new(Arc::clone(&db));
+    let Some(item) = find_item(&db, work_id)? else {
+        return emit_refusal(work_id, json, Refusal::not_found());
+    };
+    if item.phase() == QueuePhase::Running {
+        return cancel_running_item(&db, work_id, json);
+    }
+    let outcome = request_manual_transition(&hitl, &item, QueuePhase::Skipped, None)?;
+    if matches!(
+        outcome,
+        ManualOutcome::Refused(TransitionOutcome::Conflict { .. })
+    ) && find_item(&db, work_id)?.is_some_and(|i| i.phase() == QueuePhase::Running)
+    {
+        return cancel_running_item(&db, work_id, json);
+    }
+    if matches!(outcome, ManualOutcome::Applied) {
+        cleanup_worktree(&worktree_manager()?, work_id, "queue skip");
+    }
+    emit_manual_outcome(
+        work_id,
+        json,
+        QueuePhase::Skipped,
+        outcome,
+        serde_json::json!({}),
+        format!("Skipped {work_id}."),
+    )
+}
+
+/// Cancel a Running item as the CLI and render the result.
+fn cancel_running_item(db: &Database, work_id: &str, json: bool) -> anyhow::Result<i32> {
+    use cancel::CancelOutcome;
+
+    let belt_home = belt_home()?;
+    let killer = belt_infra::platform::default_process_killer();
+    let outcome = cancel::CancelFlow {
+        db,
+        daemon: &cancel::LocalDaemon {
+            belt_home: belt_home.clone(),
+        },
+        killer: killer.as_ref(),
+        actor: belt_core::transition::Actor::Cli,
+        requester: cli_respondent(),
+        wait_limit: cancel::CANCEL_WAIT_LIMIT,
+        poll_interval: cancel::CANCEL_POLL_INTERVAL,
+    }
+    .cancel(work_id)?;
+    match outcome {
+        CancelOutcome::Canceled => emit_success(
+            work_id,
+            json,
+            outcome.result(),
+            serde_json::json!({ "phase": "skipped" }),
+            format!("Canceled {work_id}."),
+        ),
+        CancelOutcome::CanceledDirectly => {
+            cleanup_worktree(&worktree_manager()?, work_id, "queue skip");
+            emit_success(
+                work_id,
+                json,
+                outcome.result(),
+                serde_json::json!({ "phase": "skipped" }),
+                format!("Canceled {work_id} directly: no daemon answered."),
+            )
+        }
+        CancelOutcome::Accepted => emit_success(
+            work_id,
+            json,
+            outcome.result(),
+            serde_json::json!({}),
+            format!(
+                "The daemon accepted the cancel of {work_id}; check `belt queue show {work_id}` for the result."
+            ),
+        ),
+        CancelOutcome::TooLate { current } => emit_refusal(
+            work_id,
+            json,
+            Refusal::new(
+                "too_late",
+                serde_json::json!({ "current": current.as_str() }),
+                format!("too_late: the item already left Running (now {current})"),
+            ),
+        ),
     }
 }
 
@@ -1846,7 +1985,7 @@ fn signal_daemon() -> anyhow::Result<()> {
 /// Determine a recommended action based on the HITL reason.
 ///
 /// Returns a tuple of `(action, explanation)` where `action` is the
-/// suggested `HitlRespondAction` string and `explanation` describes why.
+/// suggested `HitlAction` string and `explanation` describes why.
 fn recommended_action(
     reason: Option<&belt_core::queue::HitlReason>,
 ) -> (&'static str, &'static str) {
@@ -1868,18 +2007,6 @@ fn recommended_action(
             "done",
             "Manually escalated; review the item and mark done if the issue is resolved.",
         ),
-        Some(HitlReason::SpecConflict) => (
-            "replan",
-            "Spec conflict detected; replan to resolve overlapping specifications.",
-        ),
-        Some(HitlReason::SpecCompletionReview) => (
-            "done",
-            "Spec completion review; approve to mark as done if the spec is satisfactory.",
-        ),
-        Some(HitlReason::SpecModificationProposed) => (
-            "done",
-            "Spec modification proposed; review changes and approve or skip.",
-        ),
         Some(HitlReason::StagnationDetected) => (
             "replan",
             "Stagnation detected; replan with a lateral approach to break the loop.",
@@ -1891,9 +2018,174 @@ fn recommended_action(
     }
 }
 
-/// `belt hitl show` -- show HITL item details.
-fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Result<()> {
+/// The request an item is currently held by: its open request, else a
+/// confirmed one the daemon has not post-processed yet.
+fn current_request_of(
+    db: &Database,
+    work_id: &str,
+) -> anyhow::Result<Option<belt_infra::db::HitlRequest>> {
+    if let Some(open) = open_request_of(db, work_id)? {
+        return Ok(Some(open));
+    }
+    Ok(db
+        .pending_post_processing()?
+        .into_iter()
+        .find(|r| r.work_id == work_id))
+}
+
+/// The open request of an item (at most one per item).
+fn open_request_of(
+    db: &Database,
+    work_id: &str,
+) -> anyhow::Result<Option<belt_infra::db::HitlRequest>> {
+    Ok(db
+        .open_hitl_requests()?
+        .into_iter()
+        .find(|r| r.work_id == work_id))
+}
+
+/// Where a request is in its life: open, confirmed and waiting for the
+/// daemon, or fully processed.
+fn processing_label(request: &belt_infra::db::HitlRequest) -> &'static str {
+    use belt_core::hitl::HitlStatus;
+    match (request.status, &request.post_processed_at) {
+        (HitlStatus::Open, _) => "open",
+        (HitlStatus::Resolved | HitlStatus::Expired, None) => "awaiting_post_processing",
+        (HitlStatus::Resolved | HitlStatus::Expired, Some(_)) => "post_processed",
+    }
+}
+
+fn hitl_request_json(request: &belt_infra::db::HitlRequest) -> serde_json::Value {
+    serde_json::json!({
+        "hitl_id": request.hitl_id.as_str(),
+        "work_id": request.work_id,
+        "status": request.status,
+        "processing": processing_label(request),
+        "reason": request.reason.map(|r| r.to_string()),
+        "notes": request.notes,
+        "opened_at": request.opened_at,
+        "timeout_at": request.timeout_at,
+        "terminal_action": request.terminal_action.map(|a| a.to_string()),
+        "resolution": request.resolution,
+        "resolution_notes": request.resolution_notes,
+        "post_processed_at": request.post_processed_at,
+    })
+}
+
+/// `belt hitl respond` -- answer a HITL request through the shared contract.
+fn cmd_hitl_respond(
+    item_id: Option<String>,
+    hitl_id: Option<String>,
+    action: &str,
+    respondent: Option<String>,
+    notes: Option<String>,
+    json: bool,
+) -> anyhow::Result<i32> {
+    use belt_infra::db::HitlTarget;
+
+    let db = Arc::new(open_db()?);
+    let hitl = belt_daemon::hitl::HitlService::new(Arc::clone(&db));
+
+    let (target, work_id) = match (item_id, hitl_id) {
+        (Some(work_id), None) => (HitlTarget::Item(work_id.clone()), work_id),
+        (None, Some(id)) => {
+            let id = belt_core::hitl::HitlId::new(id);
+            let Some(request) = db.hitl_request(&id)? else {
+                return emit_refusal(id.as_str(), json, Refusal::not_found());
+            };
+            (HitlTarget::Id(id), request.work_id)
+        }
+        (Some(_), Some(_)) | (None, None) => {
+            anyhow::bail!("give either a work_id or --hitl-id")
+        }
+    };
+
+    let action: belt_core::hitl::HitlAction = match action.parse() {
+        Ok(action) => action,
+        Err(e) => {
+            return emit_refusal(
+                &work_id,
+                json,
+                Refusal::new("invalid_action", serde_json::json!({}), e),
+            );
+        }
+    };
+    let by = respondent.unwrap_or_else(cli_respondent);
+    let outcome = respond_as_cli(&hitl, target, action, by.clone(), notes)?;
+    emit_manual_outcome(
+        &work_id,
+        json,
+        QueuePhase::Hitl,
+        ManualOutcome::HitlResponse {
+            action,
+            by,
+            outcome,
+        },
+        serde_json::json!({}),
+        String::new(),
+    )
+}
+
+/// `belt hitl list` -- open HITL requests.
+fn cmd_hitl_list(workspace: Option<&str>, format: &str) -> anyhow::Result<()> {
     let db = open_db()?;
+    let mut rows = Vec::new();
+    for request in db.open_hitl_requests()? {
+        let item = db.get_item(&request.work_id)?;
+        if workspace.is_some_and(|w| w != item.workspace_id) {
+            continue;
+        }
+        rows.push((request, item));
+    }
+
+    if format == "json" {
+        let values: Vec<serde_json::Value> = rows
+            .iter()
+            .map(|(request, item)| {
+                let mut value = hitl_request_json(request);
+                merge_json(
+                    &mut value,
+                    serde_json::json!({
+                        "workspace_id": item.workspace_id,
+                        "state": item.state,
+                        "title": item.title,
+                    }),
+                );
+                value
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&values)?);
+    } else if rows.is_empty() {
+        println!("No items awaiting human review.");
+    } else {
+        println!(
+            "{:<40} {:<20} {:<12} {:<24} TITLE",
+            "WORK_ID", "WORKSPACE", "STATE", "REASON"
+        );
+        println!("{}", "-".repeat(104));
+        for (request, item) in &rows {
+            let reason = request
+                .reason
+                .map(|r| r.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "{:<40} {:<20} {:<12} {:<24} {}",
+                item.work_id,
+                item.workspace_id,
+                item.state,
+                reason,
+                item.title.as_deref().unwrap_or("-"),
+            );
+        }
+        println!("\n{} item(s) awaiting review.", rows.len());
+    }
+    Ok(())
+}
+
+/// `belt hitl show` -- show the HITL request an item is held by.
+fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Result<i32> {
+    let db = Arc::new(open_db()?);
+    let hitl = belt_daemon::hitl::HitlService::new(Arc::clone(&db));
     let item = db.get_item(item_id)?;
 
     if item.phase() != QueuePhase::Hitl {
@@ -1903,25 +2195,27 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
             item.phase()
         );
     }
+    let Some(request) = current_request_of(&db, item_id)? else {
+        anyhow::bail!("item '{item_id}' has no HITL request");
+    };
 
-    let (rec_action, rec_explanation) = recommended_action(item.hitl_reason.as_ref());
+    let (rec_action, rec_explanation) = recommended_action(request.reason.as_ref());
+    let deliveries = db.deliveries_of(&request.hitl_id)?;
 
     match format {
         "json" => {
-            // Build an enriched JSON output that includes the recommended action.
             let mut value = serde_json::to_value(&item)?;
-            if let serde_json::Value::Object(ref mut map) = value {
-                let mut rec = serde_json::Map::new();
-                rec.insert(
-                    "action".to_string(),
-                    serde_json::Value::String(rec_action.to_string()),
-                );
-                rec.insert(
-                    "explanation".to_string(),
-                    serde_json::Value::String(rec_explanation.to_string()),
-                );
-                map.insert("recommended".to_string(), serde_json::Value::Object(rec));
-            }
+            merge_json(
+                &mut value,
+                serde_json::json!({
+                    "hitl_request": hitl_request_json(&request),
+                    "deliveries": deliveries.iter().map(delivery_json).collect::<Vec<_>>(),
+                    "recommended": {
+                        "action": rec_action,
+                        "explanation": rec_explanation,
+                    },
+                }),
+            );
             println!("{}", serde_json::to_string_pretty(&value)?);
         }
         _ => {
@@ -1935,23 +2229,32 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
             }
             println!("Created:      {}", item.created_at);
             println!("Updated:      {}", item.updated_at);
-            if let Some(hitl_at) = &item.hitl_created_at {
-                println!("HITL Since:   {hitl_at}");
-            }
-            if let Some(reason) = &item.hitl_reason {
+            println!("HITL ID:      {}", request.hitl_id);
+            println!("Request:      {}", processing_label(&request));
+            println!("HITL Since:   {}", request.opened_at);
+            if let Some(reason) = &request.reason {
                 println!("HITL Reason:  {reason}");
             }
-            if let Some(respondent) = &item.hitl_respondent {
-                println!("Respondent:   {respondent}");
-            }
-            if let Some(notes) = &item.hitl_notes {
+            if let Some(notes) = &request.notes {
                 println!("Notes:        {notes}");
             }
-            if let Some(timeout_at) = &item.hitl_timeout_at {
+            if let Some(timeout_at) = &request.timeout_at {
                 println!("Timeout At:   {timeout_at}");
             }
-            if let Some(action) = &item.hitl_terminal_action {
+            if let Some(action) = &request.terminal_action {
                 println!("Timeout Act:  {action}");
+            }
+            if let Some(r) = &request.resolution {
+                println!(
+                    "Resolved:     {} by {} via {} at {} ({:?})",
+                    r.action, r.by, r.via, r.at, r.path
+                );
+            }
+            if let Some(notes) = &request.resolution_notes {
+                println!("Resp. Notes:  {notes}");
+            }
+            for d in &deliveries {
+                println!("Delivery:     {}", delivery_line(d));
             }
             println!();
             println!("Recommended:  {rec_action}");
@@ -1959,114 +2262,84 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
         }
     }
 
-    if interactive {
-        println!();
-        println!("Available actions: done, retry, skip, replan");
-        print!("Enter action [{}]: ", rec_action);
-        // Flush stdout so the prompt appears before reading.
-        use std::io::Write;
-        std::io::stdout().flush()?;
-
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input)?;
-        let input = input.trim();
-
-        // Use the recommended action as default when the user presses Enter.
-        let chosen = if input.is_empty() { rec_action } else { input };
-
-        let action: belt_core::queue::HitlRespondAction =
-            chosen.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-
-        print!("Notes (optional): ");
-        std::io::stdout().flush()?;
-        let mut notes_input = String::new();
-        std::io::stdin().read_line(&mut notes_input)?;
-        let notes = notes_input.trim();
-        let notes = if notes.is_empty() {
-            None
-        } else {
-            Some(notes.to_string())
-        };
-
-        // Apply the response action.
-        match action {
-            belt_core::queue::HitlRespondAction::Replan => {
-                let max_replan = 3u32;
-                let new_count = item.replan_count + 1;
-                if new_count > max_replan {
-                    db.update_phase(item_id, QueuePhase::Failed)?;
-                    println!(
-                        "Item '{}' replan limit exceeded ({}/{}), transitioned to failed.",
-                        item_id, new_count, max_replan
-                    );
-                } else {
-                    db.update_phase(item_id, QueuePhase::Pending)?;
-                    let failure_reason = item.hitl_notes.as_deref().unwrap_or("unknown failure");
-                    let replan_work_id = format!("{item_id}:replan-{new_count}");
-                    let mut replan_item = belt_core::queue::QueueItem::new(
-                        replan_work_id.clone(),
-                        item.source_id.clone(),
-                        item.workspace_id.clone(),
-                        item.state.clone(),
-                    );
-                    replan_item.set_phase_unchecked(QueuePhase::Hitl);
-                    replan_item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
-                    replan_item.hitl_reason =
-                        Some(belt_core::queue::HitlReason::SpecModificationProposed);
-                    replan_item.hitl_notes = Some(format!(
-                        "Claw replan delegation (attempt {new_count}): {failure_reason}"
-                    ));
-                    replan_item.title =
-                        Some(format!("spec-modification-proposed (replan #{new_count})"));
-                    replan_item.replan_count = new_count;
-                    if let Some(n) = &notes {
-                        replan_item.hitl_notes = Some(n.clone());
-                    }
-                    db.insert_item(&replan_item)?;
-                    println!(
-                        "Item '{}' rolled back to pending (replan {}/{}). \
-                         Created HITL item '{}' for spec modification review.",
-                        item_id, new_count, max_replan, replan_work_id
-                    );
-                }
-            }
-            _ => {
-                let target_phase = match action {
-                    belt_core::queue::HitlRespondAction::Done => QueuePhase::Done,
-                    belt_core::queue::HitlRespondAction::Retry => QueuePhase::Pending,
-                    belt_core::queue::HitlRespondAction::Skip => QueuePhase::Skipped,
-                    belt_core::queue::HitlRespondAction::Replan => unreachable!(),
-                };
-                db.update_phase(item_id, target_phase)?;
-
-                // Cleanup worktree on Done/Skipped (matches daemon pattern).
-                if matches!(target_phase, QueuePhase::Done | QueuePhase::Skipped)
-                    && let Ok(home) = belt_home()
-                {
-                    let wt_base = home.join("worktrees");
-                    let repo_path = std::path::PathBuf::from(".");
-                    let wt_mgr = GitWorktreeManager::new(wt_base, repo_path);
-                    if let Err(e) = wt_mgr.cleanup(item_id) {
-                        tracing::warn!(
-                            work_id = item_id,
-                            error = %e,
-                            "worktree cleanup failed on hitl respond, continuing"
-                        );
-                    }
-                }
-
-                if let Some(n) = &notes {
-                    println!("Notes recorded: {n}");
-                }
-                println!(
-                    "Item '{}' transitioned from hitl to {} (action: {}).",
-                    item_id, target_phase, action
-                );
-            }
-        }
+    if !interactive {
+        return Ok(0);
     }
 
-    Ok(())
+    println!();
+    println!("Available actions: done, retry, skip, replan");
+    print!("Enter action [{}]: ", rec_action);
+    // Flush stdout so the prompt appears before reading.
+    use std::io::Write;
+    std::io::stdout().flush()?;
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+
+    // Use the recommended action as default when the user presses Enter.
+    let chosen = if input.is_empty() { rec_action } else { input };
+    let action: belt_core::hitl::HitlAction =
+        chosen.parse().map_err(|e: String| anyhow::anyhow!(e))?;
+
+    print!("Notes (optional): ");
+    std::io::stdout().flush()?;
+    let mut notes_input = String::new();
+    std::io::stdin().read_line(&mut notes_input)?;
+    let notes = notes_input.trim();
+    let notes = (!notes.is_empty()).then(|| notes.to_string());
+
+    let by = cli_respondent();
+    let outcome = respond_as_cli(
+        &hitl,
+        belt_infra::db::HitlTarget::Id(request.hitl_id.clone()),
+        action,
+        by.clone(),
+        notes,
+    )?;
+    emit_manual_outcome(
+        item_id,
+        false,
+        QueuePhase::Hitl,
+        ManualOutcome::HitlResponse {
+            action,
+            by,
+            outcome,
+        },
+        serde_json::json!({}),
+        String::new(),
+    )
+}
+
+fn delivery_status_label(status: belt_infra::db::DeliveryStatus) -> &'static str {
+    use belt_infra::db::DeliveryStatus;
+    match status {
+        DeliveryStatus::Pending => "pending",
+        DeliveryStatus::Sent => "sent",
+        DeliveryStatus::Failed => "failed",
+    }
+}
+
+fn delivery_json(d: &belt_infra::db::Delivery) -> serde_json::Value {
+    serde_json::json!({
+        "channel": d.channel,
+        "status": delivery_status_label(d.status),
+        "attempts": d.attempts,
+        "message_ref": d.message_ref,
+        "last_error": d.last_error,
+        "updated_at": d.updated_at,
+    })
+}
+
+fn delivery_line(d: &belt_infra::db::Delivery) -> String {
+    let mut line = format!("{} {}", d.channel, delivery_status_label(d.status));
+    if d.attempts > 0 {
+        line.push_str(&format!(" (failed attempts: {})", d.attempts));
+    }
+    if let Some(error) = &d.last_error {
+        line.push_str(&format!(" - {error}"));
+    }
+    line
 }
 
 /// `belt hitl timeout set|ls` -- manage HITL timeouts.
@@ -2079,94 +2352,89 @@ fn cmd_hitl_timeout(command: HitlTimeoutCommands) -> anyhow::Result<()> {
             action,
             json,
         } => {
-            // Validate that the item exists and is in HITL phase.
-            let item = db.get_item(&item_id)?;
-            if item.phase() != QueuePhase::Hitl {
+            let Some(request) = open_request_of(&db, &item_id)? else {
+                anyhow::bail!("item '{item_id}' has no open HITL request");
+            };
+            let terminal = action
+                .as_deref()
+                .map(|a| a.parse::<belt_core::escalation::EscalationAction>())
+                .transpose()
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let seconds = i64::try_from(duration)
+                .map_err(|_| anyhow::anyhow!("duration {duration}s is too large"))?;
+            let timeout_at = chrono::Duration::try_seconds(seconds)
+                .and_then(|d| chrono::Utc::now().checked_add_signed(d))
+                .ok_or_else(|| anyhow::anyhow!("duration {duration}s is too large"))?
+                .to_rfc3339();
+            if !db.set_hitl_expiry(&request.hitl_id, &timeout_at, terminal)? {
                 anyhow::bail!(
-                    "item '{}' is in phase '{}', expected 'hitl'",
-                    item_id,
-                    item.phase()
+                    "HITL request {} is no longer open; its timeout was not changed",
+                    request.hitl_id
                 );
             }
-
-            // Validate terminal action if provided by parsing via EscalationAction.
-            let parsed_action = action
-                .as_deref()
-                .map(|a| {
-                    a.parse::<belt_core::escalation::EscalationAction>()
-                        .map_err(|e| anyhow::anyhow!("{e}"))
-                })
-                .transpose()?;
-
-            // Compute absolute timeout timestamp.
-            let timeout_at =
-                (chrono::Utc::now() + chrono::Duration::seconds(duration as i64)).to_rfc3339();
-
-            db.set_hitl_timeout(&item_id, &timeout_at, parsed_action.as_ref())?;
-
+            let action = terminal.map(|a| a.to_string());
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "success": true,
-                        "work_id": item_id,
+                        "work_id": request.work_id,
+                        "hitl_id": request.hitl_id.as_str(),
                         "timeout_at": timeout_at,
-                        "duration_secs": duration,
-                        "action": action.as_deref().unwrap_or("skip")
+                        "action": action,
                     }))?
                 );
             } else {
-                println!("Timeout set for item '{item_id}':");
-                println!("  expires at: {timeout_at}");
-                println!("  duration:   {} seconds", duration);
-                if let Some(a) = &action {
-                    println!("  action:     {a}");
-                } else {
-                    println!("  action:     skip (default)");
-                }
+                println!(
+                    "Timeout of {} set to {timeout_at} (action: {}).",
+                    request.work_id,
+                    action.as_deref().unwrap_or("workspace default"),
+                );
             }
         }
         HitlTimeoutCommands::Ls { json } => {
-            let items = db.list_hitl_items_with_timeout()?;
+            let mut rows = Vec::new();
+            for request in db.open_hitl_requests()? {
+                if request.timeout_at.is_none() {
+                    continue;
+                }
+                let item = db.get_item(&request.work_id)?;
+                rows.push((request, item));
+            }
             if json {
-                let entries: Vec<serde_json::Value> = items
+                let entries: Vec<serde_json::Value> = rows
                     .iter()
-                    .map(|item| {
+                    .map(|(request, item)| {
                         serde_json::json!({
-                            "work_id": item.work_id,
-                            "timeout_at": item.hitl_timeout_at,
-                            "action": item.hitl_terminal_action.as_ref().map(|a| a.to_string()).unwrap_or_else(|| "skip".to_string()),
+                            "work_id": request.work_id,
+                            "hitl_id": request.hitl_id.as_str(),
+                            "timeout_at": request.timeout_at,
+                            "action": request.terminal_action.map(|a| a.to_string()),
                             "workspace": item.workspace_id,
                         })
                     })
                     .collect();
                 println!("{}", serde_json::to_string_pretty(&entries)?);
-            } else if items.is_empty() {
+            } else if rows.is_empty() {
                 println!("No HITL items with active timeouts.");
             } else {
                 println!(
                     "{:<40} {:<28} {:<10} {:<20}",
                     "WORK_ID", "TIMEOUT_AT", "ACTION", "WORKSPACE"
                 );
-                for item in &items {
-                    let timeout_at = item.hitl_timeout_at.as_deref().unwrap_or("-");
-                    let action_str;
-                    let action = match &item.hitl_terminal_action {
-                        Some(a) => {
-                            action_str = a.to_string();
-                            action_str.as_str()
-                        }
-                        None => "skip",
-                    };
+                for (request, item) in &rows {
+                    let action = request
+                        .terminal_action
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|| "-".to_string());
                     println!(
                         "{:<40} {:<28} {:<10} {:<20}",
-                        truncate(&item.work_id, 40),
-                        timeout_at,
+                        truncate(&request.work_id, 40),
+                        request.timeout_at.as_deref().unwrap_or("-"),
                         action,
                         &item.workspace_id,
                     );
                 }
-                println!("\n{} item(s) with timeout", items.len());
+                println!("\n{} item(s) with timeout", rows.len());
             }
         }
     }
@@ -2181,394 +2449,6 @@ fn truncate(s: &str, max: usize) -> String {
         format!("{}...", &s[..max - 3])
     } else {
         s[..max].to_string()
-    }
-}
-
-/// Verify a link target by checking reachability.
-///
-/// For GitHub issue references (e.g. `owner/repo#123`), uses `gh issue view`.
-/// For HTTP(S) URLs, uses `curl --head`.
-/// Returns `(is_valid, detail_message)`.
-fn verify_link_target(target: &str) -> (bool, String) {
-    // Detect GitHub issue reference: owner/repo#number
-    if let Some((repo, number)) = parse_github_issue_ref(target) {
-        let output = std::process::Command::new("gh")
-            .args(["issue", "view", &number, "--repo", &repo, "--json", "state"])
-            .output();
-        match output {
-            Ok(out) if out.status.success() => {
-                let stdout = String::from_utf8_lossy(&out.stdout);
-                (true, format!("issue exists: {}", stdout.trim()))
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                (false, format!("gh issue view failed: {}", stderr.trim()))
-            }
-            Err(e) => (false, format!("could not run gh: {e}")),
-        }
-    } else if target.starts_with("http://") || target.starts_with("https://") {
-        let output = std::process::Command::new("curl")
-            .args([
-                "--head",
-                "--silent",
-                "--output",
-                "/dev/null",
-                "--write-out",
-                "%{http_code}",
-                "--max-time",
-                "10",
-                "--location",
-                target,
-            ])
-            .output();
-        match output {
-            Ok(out) if out.status.success() => {
-                let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let code_num: u16 = code.parse().unwrap_or(0);
-                if (200..400).contains(&code_num) {
-                    (true, format!("HTTP {code}"))
-                } else {
-                    (false, format!("HTTP {code}"))
-                }
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                (false, format!("curl failed: {}", stderr.trim()))
-            }
-            Err(e) => (false, format!("could not run curl: {e}")),
-        }
-    } else {
-        (false, format!("unsupported target format: {target}"))
-    }
-}
-
-/// Parse a GitHub issue reference like `owner/repo#123` into `(owner/repo, 123)`.
-fn parse_github_issue_ref(target: &str) -> Option<(String, String)> {
-    // Match patterns: owner/repo#123
-    let parts: Vec<&str> = target.splitn(2, '#').collect();
-    if parts.len() == 2 {
-        let repo = parts[0];
-        let number = parts[1];
-        // Validate: repo should contain exactly one '/', number should be digits
-        if repo.matches('/').count() == 1
-            && !repo.starts_with('/')
-            && !repo.ends_with('/')
-            && number.chars().all(|c| c.is_ascii_digit())
-            && !number.is_empty()
-        {
-            return Some((repo.to_string(), number.to_string()));
-        }
-    }
-    None
-}
-
-/// Prompt the user to confirm decomposition of acceptance criteria into issues.
-///
-/// Reads a single line from stdin and returns `true` if the user enters `y` or
-/// `yes` (case-insensitive). An empty input defaults to yes.
-fn confirm_decomposition() -> bool {
-    use std::io::Write;
-    print!("Create these issues? [Y/n]: ");
-    let _ = std::io::stdout().flush();
-    let mut input = String::new();
-    if std::io::stdin().read_line(&mut input).is_err() {
-        return false;
-    }
-    let trimmed = input.trim().to_lowercase();
-    trimmed.is_empty() || trimmed == "y" || trimmed == "yes"
-}
-
-/// Attempt to refine acceptance criteria using an LLM runtime.
-///
-/// For each criterion, asks the LLM to produce a more detailed, actionable
-/// description suitable for a GitHub issue body. Returns `None` if the LLM is
-/// not available or fails, allowing the caller to fall back to the raw criteria.
-async fn refine_criteria_with_llm(
-    criteria: &[String],
-    spec_name: &str,
-    spec_content: &str,
-) -> Option<Vec<String>> {
-    // Build a minimal runtime to invoke the LLM.
-    let runtime = belt_infra::runtimes::claude::ClaudeRuntime::new(None);
-
-    // Check that the runtime is reachable (ANTHROPIC_API_KEY set, etc.) by
-    // verifying its name. If the environment is not configured the invocation
-    // will fail gracefully below.
-
-    let numbered_criteria: String = criteria
-        .iter()
-        .enumerate()
-        .map(|(i, c)| format!("{}. {}", i + 1, c))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let prompt = format!(
-        "You are a technical project manager. Given the following spec and its acceptance criteria, \
-         produce a detailed, actionable issue description for each criterion. \
-         Each description should include context, implementation hints, and verification steps.\n\n\
-         Spec: {spec_name}\n\n\
-         Spec content (abbreviated):\n{spec_summary}\n\n\
-         Acceptance criteria:\n{numbered_criteria}\n\n\
-         Output ONLY a JSON array of strings, one per criterion, in the same order. \
-         Each string is the detailed issue body in markdown. No wrapping object, just the array.",
-        spec_summary = &spec_content[..spec_content.len().min(2000)],
-    );
-
-    let request = belt_core::runtime::RuntimeRequest {
-        working_dir: std::env::current_dir().unwrap_or_default(),
-        prompt,
-        model: None,
-        system_prompt: None,
-        session_id: None,
-        structured_output: None,
-    };
-
-    let response = runtime.invoke(request).await;
-    if !response.success() {
-        eprintln!("info: LLM refinement unavailable, using raw criteria");
-        return None;
-    }
-
-    // Parse the LLM output as a JSON array of strings.
-    let stdout = response.stdout.trim();
-    // The LLM might wrap the array in a markdown code block; strip it.
-    let json_str = stdout
-        .strip_prefix("```json")
-        .or_else(|| stdout.strip_prefix("```"))
-        .unwrap_or(stdout)
-        .strip_suffix("```")
-        .unwrap_or(stdout)
-        .trim();
-
-    match serde_json::from_str::<Vec<String>>(json_str) {
-        Ok(refined) if refined.len() == criteria.len() => {
-            eprintln!("info: LLM refined {} criteria", refined.len());
-            Some(refined)
-        }
-        Ok(_) => {
-            eprintln!("info: LLM returned mismatched count, using raw criteria");
-            None
-        }
-        Err(e) => {
-            eprintln!("info: could not parse LLM output ({e}), using raw criteria");
-            None
-        }
-    }
-}
-
-/// Decompose a spec into independent sub-issues using an LLM.
-///
-/// Sends the spec content and acceptance criteria to the LLM and asks it to
-/// produce structured JSON output with title, description, and acceptance
-/// criteria for each proposed sub-issue. Falls back to `None` if the LLM is
-/// unavailable or returns unparseable output, allowing the caller to use the
-/// simpler `build_decomposed_issues` path.
-async fn decompose_spec_with_llm(
-    criteria: &[String],
-    spec_name: &str,
-    spec_content: &str,
-) -> Option<Vec<belt_core::spec::LlmDecomposedIssue>> {
-    let runtime = belt_infra::runtimes::claude::ClaudeRuntime::new(None);
-
-    let numbered_criteria: String = criteria
-        .iter()
-        .enumerate()
-        .map(|(i, c)| format!("{}. {}", i + 1, c))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let prompt = format!(
-        "You are a technical project manager decomposing a spec into independent GitHub issues.\n\n\
-         Spec name: {spec_name}\n\n\
-         Spec content:\n{spec_summary}\n\n\
-         Acceptance criteria:\n{numbered_criteria}\n\n\
-         Decompose this spec into independent, implementable GitHub issues. \
-         Each issue should be self-contained and map to one or more acceptance criteria.\n\n\
-         Output ONLY a JSON array of objects with these fields:\n\
-         - \"title\": concise issue title (string)\n\
-         - \"description\": detailed markdown body with context, implementation hints, \
-           affected files/modules, and verification steps (string)\n\
-         - \"acceptance_criteria\": specific testable acceptance criteria for this sub-issue \
-           (array of strings)\n\n\
-         Rules:\n\
-         - Every original acceptance criterion must be covered by at least one sub-issue\n\
-         - Each sub-issue should be independently implementable\n\
-         - Keep titles under 80 characters\n\
-         - Include enough detail in descriptions for a developer to start working immediately\n\n\
-         Output ONLY the JSON array, no wrapping object or markdown fences.",
-        spec_summary = &spec_content[..spec_content.len().min(3000)],
-    );
-
-    let request = belt_core::runtime::RuntimeRequest {
-        working_dir: std::env::current_dir().unwrap_or_default(),
-        prompt,
-        model: None,
-        system_prompt: None,
-        session_id: None,
-        structured_output: None,
-    };
-
-    let response = runtime.invoke(request).await;
-    if !response.success() {
-        eprintln!(
-            "info: LLM decomposition unavailable, falling back to criteria-based decomposition"
-        );
-        return None;
-    }
-
-    let stdout = response.stdout.trim();
-    let json_str = stdout
-        .strip_prefix("```json")
-        .or_else(|| stdout.strip_prefix("```"))
-        .unwrap_or(stdout)
-        .strip_suffix("```")
-        .unwrap_or(stdout)
-        .trim();
-
-    match serde_json::from_str::<Vec<belt_core::spec::LlmDecomposedIssue>>(json_str) {
-        Ok(issues) if !issues.is_empty() => {
-            eprintln!("info: LLM decomposed spec into {} sub-issues", issues.len());
-            Some(issues)
-        }
-        Ok(_) => {
-            eprintln!("info: LLM returned empty decomposition, falling back");
-            None
-        }
-        Err(e) => {
-            eprintln!("info: could not parse LLM decomposition ({e}), falling back");
-            None
-        }
-    }
-}
-
-/// Ensure the given GitHub labels exist in the repository.
-///
-/// For each label, runs `gh label create` which is a no-op if the label
-/// already exists. This prevents `gh issue create --label` from failing
-/// when a label has not been created yet.
-fn ensure_github_labels(labels: &[&str]) {
-    for label in labels {
-        let output = std::process::Command::new("gh")
-            .args(["label", "create", label, "--force"])
-            .output();
-        match output {
-            Ok(o) if o.status.success() => {
-                tracing::debug!(label = %label, "ensured GitHub label exists");
-            }
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                eprintln!(
-                    "warning: failed to ensure label '{}': {}",
-                    label,
-                    stderr.trim()
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "warning: could not run `gh` to ensure label '{}': {e}",
-                    label
-                );
-            }
-        }
-    }
-}
-
-/// Create a GitHub issue via the `gh` CLI and return the issue URL on success.
-///
-/// Attaches both the workspace trigger label and the standard `autopilot:trigger`
-/// marker label so that `DataSource.collect()` can detect the issue regardless
-/// of which label it scans for.
-fn create_github_issue(title: &str, body: &str, trigger_label: &str) -> Option<String> {
-    let labels: Vec<&str> = if trigger_label == "autopilot:trigger" {
-        vec![trigger_label]
-    } else {
-        vec![trigger_label, "autopilot:trigger"]
-    };
-    create_github_issue_with_labels(title, body, &labels)
-}
-
-/// Resolve the trigger label from the workspace configuration.
-///
-/// Iterates over all sources and their states to find the first `trigger.label`
-/// value. Returns `"autopilot:ready"` as a fallback when no trigger label is
-/// configured.
-fn resolve_trigger_label(config: &belt_core::workspace::WorkspaceConfig) -> String {
-    for source in config.sources.values() {
-        for state in source.states.values() {
-            if let Some(ref label) = state.trigger.label {
-                return label.clone();
-            }
-        }
-    }
-    "autopilot:ready".to_string()
-}
-
-/// Create a GitHub issue with the given title, body, and labels via the `gh` CLI.
-///
-/// Ensures all labels exist in the repository before creating the issue so
-/// that `gh issue create --label` does not fail for missing labels. Returns
-/// the URL of the created issue on success.
-fn create_github_issue_with_labels(title: &str, body: &str, labels: &[&str]) -> Option<String> {
-    // Ensure all labels exist before issue creation to prevent silent failures.
-    ensure_github_labels(labels);
-
-    let mut gh_cmd = std::process::Command::new("gh");
-    gh_cmd.args(["issue", "create"]);
-    gh_cmd.args(["--title", title]);
-    gh_cmd.args(["--body", body]);
-    for label in labels {
-        gh_cmd.args(["--label", label]);
-    }
-    match gh_cmd.output() {
-        Ok(output) => {
-            if output.status.success() {
-                let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                println!("GitHub issue created: {url}");
-                Some(url)
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                eprintln!("warning: failed to create GitHub issue: {}", stderr.trim());
-                None
-            }
-        }
-        Err(e) => {
-            eprintln!("warning: could not run `gh` CLI: {e}");
-            None
-        }
-    }
-}
-
-/// Extract the issue number from a GitHub issue URL.
-///
-/// For example, `https://github.com/owner/repo/issues/42` returns `Some("42")`.
-fn extract_issue_number(url: &str) -> Option<String> {
-    url.rsplit('/').next().and_then(|s| {
-        if s.chars().all(|c| c.is_ascii_digit()) && !s.is_empty() {
-            Some(s.to_string())
-        } else {
-            None
-        }
-    })
-}
-
-/// Update the body of an existing GitHub issue via the `gh` CLI.
-fn update_github_issue_body(issue_number: &str, body: &str) {
-    let mut gh_cmd = std::process::Command::new("gh");
-    gh_cmd.args(["issue", "edit", issue_number]);
-    gh_cmd.args(["--body", body]);
-    match gh_cmd.output() {
-        Ok(output) => {
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                eprintln!(
-                    "warning: failed to update parent issue body: {}",
-                    stderr.trim()
-                );
-            }
-        }
-        Err(e) => {
-            eprintln!("warning: could not run `gh` for issue update: {e}");
-        }
     }
 }
 
@@ -2649,6 +2529,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env().add_directive("belt=info".parse()?),
         )
+        .with_writer(std::io::stderr)
         .init();
 
     let cli = Cli::parse();
@@ -2955,28 +2836,25 @@ async fn main() -> anyhow::Result<()> {
             } => {
                 cmd_queue_list(phase, workspace, &format)?;
             }
-            QueueCommands::Show { work_id, format } => {
-                cmd_queue_show(&work_id, &format)?;
+            QueueCommands::Show {
+                work_id,
+                format,
+                json,
+            } => {
+                cmd_queue_show(&work_id, &format, json)?;
             }
             QueueCommands::Done { work_id, json } => {
-                cmd_queue_done(&work_id, json).await?;
+                exit_if_refused(cmd_queue_done(&work_id, json).await?);
             }
             QueueCommands::Hitl {
                 work_id,
                 reason,
                 json,
             } => {
-                cmd_queue_hitl(&work_id, reason.as_deref(), json)?;
+                exit_if_refused(cmd_queue_hitl(&work_id, reason.as_deref(), json)?);
             }
             QueueCommands::Skip { work_id, json } => {
-                cmd_queue_skip(&work_id, json)?;
-            }
-            QueueCommands::RetryScript {
-                work_id,
-                timeout,
-                json,
-            } => {
-                cmd_queue_retry_script(&work_id, timeout, json).await?;
+                exit_if_refused(cmd_queue_skip(&work_id, json)?);
             }
             QueueCommands::Dependency(dep_cmd) => match dep_cmd {
                 DependencyCommands::Add {
@@ -3086,6 +2964,7 @@ async fn main() -> anyhow::Result<()> {
                             phase: item.phase().as_str().to_string(),
                             state: item.state.clone(),
                             source_id: item.source_id.clone(),
+                            derived_from: item.derived_from.clone(),
                         },
                         source: belt_core::context::SourceContext {
                             source_type: "unknown".to_string(),
@@ -3137,659 +3016,6 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Agent { command } | Commands::Claw { command } => {
             run_agent_command(command).await?;
-        }
-        Commands::Spec { command } => {
-            let belt_home = belt_home()?;
-            let db_path = belt_home.join("belt.db");
-            let db = belt_infra::db::Database::open(
-                db_path
-                    .to_str()
-                    .ok_or_else(|| anyhow::anyhow!("invalid db path"))?,
-            )?;
-
-            match command {
-                SpecCommands::Status { name, format } => {
-                    let spec_status = status::gather_spec_status(&db, &name)?;
-                    status::print_spec_status(&spec_status, &format)?;
-                }
-                SpecCommands::Add {
-                    workspace,
-                    name,
-                    content,
-                    priority,
-                    labels,
-                    depends_on,
-                    entry_point,
-                    decompose,
-                    yes,
-                    skip_validation,
-                } => {
-                    // Validate required sections unless skipped
-                    if !skip_validation
-                        && let Err(missing) = belt_core::spec::validate_required_sections(&content)
-                    {
-                        anyhow::bail!(
-                            "spec content is missing required sections: {}. \
-                             Use --skip-validation to bypass this check.",
-                            missing.join(", ")
-                        );
-                    }
-
-                    let id = format!("spec-{}", chrono::Utc::now().timestamp_millis());
-                    let mut spec =
-                        belt_core::spec::Spec::new(id.clone(), workspace.clone(), name, content);
-                    spec.priority = priority;
-                    spec.labels = labels;
-                    spec.depends_on = depends_on;
-                    spec.entry_point = entry_point;
-
-                    // Detect conflicts with existing specs in the same workspace
-                    // and resolve them: auto-register dependencies for module
-                    // overlaps, escalate file overlaps to HITL.
-                    let mut has_hitl_conflicts = false;
-                    let has_conflicts = if spec.entry_point.is_some() {
-                        let existing_specs = db.list_specs(Some(&workspace), None)?;
-                        let conflicts =
-                            belt_core::spec::ConflictDetector::detect(&spec, &existing_specs);
-                        if !conflicts.is_empty() {
-                            let resolutions = belt_core::dependency::resolve_conflicts(&conflicts);
-
-                            let mut auto_dep_ids: Vec<String> = Vec::new();
-
-                            for resolution in &resolutions {
-                                match &resolution.action {
-                                    belt_core::dependency::ConflictAction::AutoDependency {
-                                        dependency_spec_id,
-                                    } => {
-                                        eprintln!(
-                                            "info: auto-registering dependency on spec '{}' ({}) \
-                                             due to module overlap at '{}'",
-                                            resolution.conflict.existing_spec_name,
-                                            dependency_spec_id,
-                                            resolution.conflict.path,
-                                        );
-                                        auto_dep_ids.push(dependency_spec_id.clone());
-                                    }
-                                    belt_core::dependency::ConflictAction::Hitl { reason } => {
-                                        eprintln!("warning: HITL required - {reason}");
-                                        has_hitl_conflicts = true;
-                                    }
-                                }
-                            }
-
-                            // Append auto-dependencies to the spec
-                            if !auto_dep_ids.is_empty() {
-                                let dep_refs: Vec<&str> =
-                                    auto_dep_ids.iter().map(|s| s.as_str()).collect();
-                                spec.depends_on = belt_core::dependency::append_dependencies(
-                                    spec.depends_on.as_deref(),
-                                    &dep_refs,
-                                );
-                            }
-
-                            let conflicts_json = serde_json::to_string(&conflicts)?;
-                            eprintln!("conflicts_json: {conflicts_json}");
-                            Some(conflicts_json)
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    db.insert_spec(&spec)?;
-
-                    // If file-level conflicts require HITL, print a notice.
-                    // The spec remains in Draft (Pending) status so it won't
-                    // be acted upon until the conflict is resolved by a human.
-                    if has_hitl_conflicts {
-                        eprintln!(
-                            "notice: spec '{}' has file-level conflicts requiring human review. \
-                             Spec stays in draft status until conflicts are resolved.",
-                            id,
-                        );
-                    }
-
-                    println!("spec created: {id}");
-
-                    // Generate HITL item when spec conflicts are detected.
-                    // The spec stays in Draft until a human resolves the conflict.
-                    if let Some(conflicts_json) = has_conflicts {
-                        let work_id = format!("spec-conflict:{id}:review");
-                        let source_id = format!("spec:{id}");
-                        let mut hitl_item = belt_core::queue::QueueItem::new(
-                            work_id,
-                            source_id,
-                            workspace.clone(),
-                            "review".to_string(),
-                        );
-                        hitl_item.set_phase_unchecked(QueuePhase::Hitl);
-                        hitl_item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
-                        hitl_item.hitl_reason = Some(belt_core::queue::HitlReason::SpecConflict);
-                        hitl_item.hitl_notes =
-                            Some(format!("spec-conflict-detected: {conflicts_json}"));
-                        hitl_item.title =
-                            Some(format!("Spec conflict detected for '{}'", spec.name));
-                        db.insert_item(&hitl_item)?;
-                        eprintln!(
-                            "hitl item created: {} (reason: spec-conflict-detected)",
-                            hitl_item.work_id
-                        );
-                    }
-
-                    // Auto-transition Draft -> Active when no HITL conflicts.
-                    if !has_hitl_conflicts {
-                        spec.transition_to(belt_core::spec::SpecStatus::Active)
-                            .map_err(|e| anyhow::anyhow!("{e}"))?;
-                        db.update_spec_status(&spec.id, spec.status)?;
-                        eprintln!("spec '{}' auto-transitioned to active", id);
-                    }
-
-                    // Extract acceptance criteria for decomposition.
-                    let criteria = belt_core::spec::extract_acceptance_criteria(&spec.content);
-
-                    // Resolve trigger label from workspace config (fall back to
-                    // "autopilot:ready" when unavailable).
-                    let trigger_label = match db.get_workspace(&workspace) {
-                        Ok((_name, config_path, _created_at)) => {
-                            match belt_infra::workspace_loader::load_workspace_config(
-                                std::path::Path::new(&config_path),
-                            ) {
-                                Ok(config) => resolve_trigger_label(&config),
-                                Err(e) => {
-                                    eprintln!(
-                                        "warning: could not load workspace config: {e}, \
-                                         using default label"
-                                    );
-                                    "autopilot:ready".to_string()
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "warning: could not find workspace '{}': {e}, \
-                                 using default label",
-                                workspace
-                            );
-                            "autopilot:ready".to_string()
-                        }
-                    };
-
-                    // Auto-create GitHub parent issue with trigger label from config.
-                    let parent_body = if decompose && !criteria.is_empty() {
-                        // Append a placeholder for child issue links that will be
-                        // filled in after child issues are created.
-                        format!(
-                            "{}\n\n## Sub-issues\n_Creating child issues..._",
-                            spec.content
-                        )
-                    } else {
-                        spec.content.clone()
-                    };
-
-                    let parent_url = create_github_issue(&spec.name, &parent_body, &trigger_label);
-
-                    // Store parent issue URL as a spec link for traceability.
-                    if let Some(ref url) = parent_url {
-                        let link_id = format!("link-{}-parent", id);
-                        let link = belt_core::spec::SpecLink::new(link_id, id.clone(), url.clone());
-                        if let Err(e) = db.insert_spec_link(&link) {
-                            eprintln!("warning: failed to store parent spec link: {e}");
-                        }
-                    }
-
-                    if decompose
-                        && !criteria.is_empty()
-                        && let Some(ref parent) = parent_url
-                    {
-                        let parent_number = extract_issue_number(parent);
-
-                        // Step 2: LLM-based structured decomposition.
-                        // First try full structured decomposition (title + description +
-                        // acceptance_criteria). If unavailable, fall back to simple
-                        // criteria refinement.
-                        let llm_decomposed =
-                            decompose_spec_with_llm(&criteria, &spec.name, &spec.content).await;
-
-                        let proposed_issues = if let Some(ref llm_issues) = llm_decomposed {
-                            belt_core::spec::build_decomposed_issues_from_llm(
-                                llm_issues,
-                                parent_number.as_deref(),
-                            )
-                        } else {
-                            // Fallback: refine criteria text only.
-                            let refined =
-                                refine_criteria_with_llm(&criteria, &spec.name, &spec.content)
-                                    .await;
-                            belt_core::spec::build_decomposed_issues(
-                                &criteria,
-                                refined.as_deref(),
-                                parent_number.as_deref(),
-                            )
-                        };
-
-                        // Step 3: User confirmation (unless --yes).
-                        let confirmed = if yes {
-                            true
-                        } else {
-                            let preview =
-                                belt_core::spec::format_decomposition_preview(&proposed_issues);
-                            println!("{preview}");
-                            confirm_decomposition()
-                        };
-
-                        if !confirmed {
-                            println!("decomposition cancelled by user");
-                        } else {
-                            // Step 4: Create child issues on GitHub.
-                            let mut child_urls: Vec<String> = Vec::new();
-                            let mut child_numbers: Vec<String> = Vec::new();
-
-                            for issue in &proposed_issues {
-                                if let Some(url) = create_github_issue_with_labels(
-                                    &issue.title,
-                                    &issue.body,
-                                    &[&trigger_label, "autopilot:trigger"],
-                                ) {
-                                    println!("  child issue created: {url}");
-                                    if let Some(num) = extract_issue_number(&url) {
-                                        child_numbers.push(num);
-                                    }
-                                    child_urls.push(url);
-                                }
-                            }
-
-                            // Update parent issue body with child issue links.
-                            if !child_urls.is_empty()
-                                && let Some(ref num) = parent_number
-                            {
-                                let links = child_urls
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, url)| format!("- [ ] AC{}: {}", i + 1, url))
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                let updated_body =
-                                    format!("{}\n\n## Sub-issues\n{}", spec.content, links);
-                                update_github_issue_body(num, &updated_body);
-                            }
-
-                            // Step 5: Store child issue URLs as spec links.
-                            for url in &child_urls {
-                                let link_id = format!(
-                                    "link-{}-{}",
-                                    id,
-                                    chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-                                );
-                                let link = belt_core::spec::SpecLink::new(
-                                    link_id,
-                                    id.clone(),
-                                    url.clone(),
-                                );
-                                if let Err(e) = db.insert_spec_link(&link) {
-                                    eprintln!("warning: failed to store spec link for {url}: {e}");
-                                }
-                            }
-
-                            // Store decomposed issue numbers.
-                            // Note: spec is already Active (auto-transitioned earlier).
-                            if !child_numbers.is_empty() {
-                                spec.decomposed_issues = Some(child_numbers.join(","));
-                                db.update_spec(&spec)?;
-                                println!(
-                                    "spec {} decomposed into {} issues",
-                                    id,
-                                    child_numbers.len()
-                                );
-                            }
-                        }
-                    }
-                }
-                SpecCommands::List {
-                    workspace,
-                    status,
-                    json,
-                } => {
-                    let status_filter = status
-                        .map(|s| {
-                            s.parse::<belt_core::spec::SpecStatus>()
-                                .map_err(|e| anyhow::anyhow!(e))
-                        })
-                        .transpose()?;
-                    let specs = db.list_specs(workspace.as_deref(), status_filter)?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&specs)?);
-                    } else if specs.is_empty() {
-                        println!("no specs found");
-                    } else {
-                        for spec in &specs {
-                            println!(
-                                "{}\t{}\t{}\t{}",
-                                spec.id, spec.name, spec.status, spec.workspace_id
-                            );
-                        }
-                    }
-                }
-                SpecCommands::Show { id, json } => {
-                    let spec = db.get_spec(&id)?;
-                    if json {
-                        println!("{}", serde_json::to_string_pretty(&spec)?);
-                    } else {
-                        println!("ID:          {}", spec.id);
-                        println!("Name:        {}", spec.name);
-                        println!("Status:      {}", spec.status);
-                        println!("Workspace:   {}", spec.workspace_id);
-                        println!("Content:     {}", spec.content);
-                        if let Some(p) = spec.priority {
-                            println!("Priority:    {p}");
-                        }
-                        if let Some(l) = &spec.labels {
-                            println!("Labels:      {l}");
-                        }
-                        if let Some(d) = &spec.depends_on {
-                            println!("Depends On:  {d}");
-                        }
-                        if let Some(ep) = &spec.entry_point {
-                            println!("Entry Point: {ep}");
-                        }
-                        println!("Created At:  {}", spec.created_at);
-                        println!("Updated At:  {}", spec.updated_at);
-                    }
-                }
-                SpecCommands::Update {
-                    id,
-                    name,
-                    content,
-                    priority,
-                    labels,
-                    depends_on,
-                    entry_point,
-                    json,
-                } => {
-                    let mut spec = db.get_spec(&id)?;
-                    if let Some(n) = name {
-                        spec.name = n;
-                    }
-                    if let Some(c) = content {
-                        spec.content = c;
-                    }
-                    if priority.is_some() {
-                        spec.priority = priority;
-                    }
-                    if labels.is_some() {
-                        spec.labels = labels;
-                    }
-                    if depends_on.is_some() {
-                        spec.depends_on = depends_on;
-                    }
-                    if entry_point.is_some() {
-                        spec.entry_point = entry_point;
-                    }
-                    db.update_spec(&spec)?;
-
-                    // Force gap_detection re-evaluation on next daemon tick
-                    // by resetting the cron job's last_run_at to NULL.
-                    let gap_job_name = format!("{}:gap_detection", spec.workspace_id);
-                    let gap_reset = db.reset_cron_last_run(&gap_job_name).is_ok();
-                    if !gap_reset {
-                        tracing::warn!(
-                            job = %gap_job_name,
-                            "failed to reset gap_detection cron job"
-                        );
-                    }
-
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "success": true,
-                                "id": id,
-                                "action": "updated"
-                            }))?
-                        );
-                    } else {
-                        println!("spec updated: {id}");
-                        if gap_reset {
-                            println!("gap_detection scheduled for next tick ({})", gap_job_name);
-                        }
-                    }
-                }
-                SpecCommands::Pause { id, json } => {
-                    let spec = db.get_spec(&id)?;
-                    if !spec
-                        .status
-                        .can_transition_to(&belt_core::spec::SpecStatus::Paused)
-                    {
-                        anyhow::bail!(
-                            "cannot pause spec in status '{}': only active specs can be paused",
-                            spec.status
-                        );
-                    }
-                    db.update_spec_status(&id, belt_core::spec::SpecStatus::Paused)?;
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "success": true,
-                                "id": id,
-                                "status": "paused"
-                            }))?
-                        );
-                    } else {
-                        println!("spec paused: {id}");
-                    }
-                }
-                SpecCommands::Resume { id, json } => {
-                    let spec = db.get_spec(&id)?;
-                    if !spec
-                        .status
-                        .can_transition_to(&belt_core::spec::SpecStatus::Active)
-                    {
-                        anyhow::bail!(
-                            "cannot resume spec in status '{}': only draft, paused, or archived specs can be activated",
-                            spec.status
-                        );
-                    }
-                    let was_draft = spec.status == belt_core::spec::SpecStatus::Draft;
-                    let was_archived = spec.status == belt_core::spec::SpecStatus::Archived;
-                    db.update_spec_status(&id, belt_core::spec::SpecStatus::Active)?;
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "success": true,
-                                "id": id,
-                                "status": "active"
-                            }))?
-                        );
-                    } else if was_archived {
-                        println!("spec restored from archive: {id}");
-                    } else {
-                        println!("spec activated: {id}");
-                    }
-                    if was_draft {
-                        // TODO: trigger GitHub issue creation when spec transitions Draft -> Active
-                        tracing::info!(
-                            id,
-                            "spec activated from draft — GitHub issue creation pending"
-                        );
-                    }
-                }
-                SpecCommands::Complete { id, json } => {
-                    let spec = db.get_spec(&id)?;
-                    // Determine the target status based on current state:
-                    // Active -> Completing (enter completion flow)
-                    // Completing -> Completed (HITL final approval)
-                    let target = if spec.status == belt_core::spec::SpecStatus::Active {
-                        belt_core::spec::SpecStatus::Completing
-                    } else if spec.status == belt_core::spec::SpecStatus::Completing {
-                        belt_core::spec::SpecStatus::Completed
-                    } else {
-                        anyhow::bail!(
-                            "cannot complete spec in status '{}': only active or completing specs can advance toward completion",
-                            spec.status
-                        );
-                    };
-                    if !spec.status.can_transition_to(&target) {
-                        anyhow::bail!("invalid transition: {} -> {}", spec.status, target);
-                    }
-                    db.update_spec_status(&id, target)?;
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "success": true,
-                                "id": id,
-                                "status": target.to_string()
-                            }))?
-                        );
-                    } else {
-                        match target {
-                            belt_core::spec::SpecStatus::Completing => {
-                                println!("spec entering completion flow: {id}");
-                            }
-                            belt_core::spec::SpecStatus::Completed => {
-                                println!("spec completed: {id}");
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-                }
-                SpecCommands::Remove { id, json } => {
-                    let spec = db.get_spec(&id)?;
-                    if spec.status == belt_core::spec::SpecStatus::Completed {
-                        anyhow::bail!(
-                            "cannot archive spec in status 'completed': completed specs cannot be archived"
-                        );
-                    }
-                    if spec.status == belt_core::spec::SpecStatus::Archived {
-                        anyhow::bail!("spec is already archived");
-                    }
-                    db.update_spec_status(&id, belt_core::spec::SpecStatus::Archived)?;
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "success": true,
-                                "id": id,
-                                "status": "archived"
-                            }))?
-                        );
-                    } else {
-                        println!("spec archived: {id}");
-                    }
-                }
-                SpecCommands::Link { id, target, json } => {
-                    // Ensure spec exists.
-                    let _ = db.get_spec(&id)?;
-                    let link_id = format!("link-{}", chrono::Utc::now().timestamp_millis());
-                    let link =
-                        belt_core::spec::SpecLink::new(link_id.clone(), id.clone(), target.clone());
-                    db.insert_spec_link(&link)?;
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "success": true,
-                                "id": id,
-                                "target": target,
-                                "link_id": link_id
-                            }))?
-                        );
-                    } else {
-                        println!("linked {id} -> {target}");
-                    }
-                }
-                SpecCommands::Unlink { id, target, json } => {
-                    db.remove_spec_link(&id, &target)?;
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "success": true,
-                                "id": id,
-                                "target": target
-                            }))?
-                        );
-                    } else {
-                        println!("unlinked {id} -x- {target}");
-                    }
-                }
-                SpecCommands::Verify { id, json } => {
-                    let spec = db.get_spec(&id)?;
-
-                    // Validate spec content against required sections.
-                    let section_result = belt_core::spec::validate_required_sections(&spec.content);
-
-                    // Verify link reachability.
-                    let links = db.list_spec_links(&id)?;
-                    let mut link_results: Vec<belt_core::spec::LinkVerification> = Vec::new();
-                    for link in links {
-                        let (valid, detail) = verify_link_target(&link.target);
-                        link_results.push(belt_core::spec::LinkVerification {
-                            link,
-                            valid,
-                            detail,
-                        });
-                    }
-
-                    let sections_ok = section_result.is_ok();
-                    let links_ok = link_results.iter().all(|r| r.valid);
-
-                    if json {
-                        let missing_sections: Vec<&str> = match &section_result {
-                            Ok(()) => vec![],
-                            Err(missing) => missing.clone(),
-                        };
-                        let output = serde_json::json!({
-                            "spec_id": id,
-                            "valid": sections_ok && links_ok,
-                            "sections": {
-                                "valid": sections_ok,
-                                "missing": missing_sections,
-                            },
-                            "links": link_results,
-                        });
-                        println!("{}", serde_json::to_string_pretty(&output)?);
-                    } else {
-                        println!("Spec: {id}");
-                        println!();
-
-                        // Section validation results.
-                        match &section_result {
-                            Ok(()) => {
-                                println!("[OK] All required sections present");
-                            }
-                            Err(missing) => {
-                                println!(
-                                    "[FAIL] Missing required sections: {}",
-                                    missing.join(", ")
-                                );
-                            }
-                        }
-
-                        // Link verification results.
-                        if link_results.is_empty() {
-                            println!("[--] No links to verify");
-                        } else {
-                            for r in &link_results {
-                                let status_icon = if r.valid { "OK" } else { "FAIL" };
-                                println!("[{status_icon}] {} - {}", r.link.target, r.detail);
-                            }
-                            let total = link_results.len();
-                            let passed = link_results.iter().filter(|r| r.valid).count();
-                            println!("{passed}/{total} links verified");
-                        }
-
-                        println!();
-                        if sections_ok && links_ok {
-                            println!("Result: PASS");
-                        } else {
-                            println!("Result: FAIL");
-                        }
-                    }
-                }
-            }
         }
         Commands::Bootstrap {
             workspace,
@@ -3901,247 +3127,31 @@ async fn main() -> anyhow::Result<()> {
         Commands::Hitl { command } => match command {
             HitlCommands::Respond {
                 item_id,
+                hitl_id,
                 action,
                 respondent,
                 notes,
                 json: json_output,
             } => {
-                let action: belt_core::queue::HitlRespondAction =
-                    action.parse().map_err(|e: String| anyhow::anyhow!(e))?;
-                tracing::info!(
+                exit_if_refused(cmd_hitl_respond(
                     item_id,
-                    %action,
-                    ?respondent,
-                    ?notes,
-                    "responding to HITL item"
-                );
-                let db = open_db()?;
-                // Verify the item exists and is in HITL phase.
-                let item = db.get_item(&item_id)?;
-                if item.phase() != QueuePhase::Hitl {
-                    anyhow::bail!(
-                        "item '{}' is in phase '{}', not 'hitl'",
-                        item_id,
-                        item.phase()
-                    );
-                }
-                match action {
-                    belt_core::queue::HitlRespondAction::Replan => {
-                        let max_replan = 3u32;
-                        let new_count = item.replan_count + 1;
-                        if new_count > max_replan {
-                            db.update_phase(&item_id, QueuePhase::Failed)?;
-                            if json_output {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&serde_json::json!({
-                                        "success": true,
-                                        "work_id": item_id,
-                                        "action": "replan",
-                                        "phase": "failed",
-                                        "reason": "replan limit exceeded"
-                                    }))?
-                                );
-                            } else {
-                                println!(
-                                    "Item '{}' replan limit exceeded ({}/{}), transitioned to failed.",
-                                    item_id, new_count, max_replan
-                                );
-                            }
-                        } else {
-                            // Roll back original item to Pending.
-                            db.update_phase(&item_id, QueuePhase::Pending)?;
-                            // Create a spec-modification-proposed HITL item.
-                            let failure_reason =
-                                item.hitl_notes.as_deref().unwrap_or("unknown failure");
-                            let replan_work_id = format!("{item_id}:replan-{new_count}");
-                            let mut replan_item = belt_core::queue::QueueItem::new(
-                                replan_work_id.clone(),
-                                item.source_id.clone(),
-                                item.workspace_id.clone(),
-                                item.state.clone(),
-                            );
-                            replan_item.set_phase_unchecked(QueuePhase::Hitl);
-                            replan_item.hitl_created_at = Some(chrono::Utc::now().to_rfc3339());
-                            replan_item.hitl_reason =
-                                Some(belt_core::queue::HitlReason::SpecModificationProposed);
-                            replan_item.hitl_notes = Some(format!(
-                                "Claw replan delegation (attempt {new_count}): {failure_reason}"
-                            ));
-                            replan_item.title =
-                                Some(format!("spec-modification-proposed (replan #{new_count})"));
-                            replan_item.replan_count = new_count;
-                            db.insert_item(&replan_item)?;
-                            if json_output {
-                                println!(
-                                    "{}",
-                                    serde_json::to_string_pretty(&serde_json::json!({
-                                        "success": true,
-                                        "work_id": item_id,
-                                        "action": "replan",
-                                        "phase": "pending",
-                                        "replan_count": new_count,
-                                        "replan_work_id": replan_work_id
-                                    }))?
-                                );
-                            } else {
-                                println!(
-                                    "Item '{}' rolled back to pending (replan {}/{}). \
-                                     Created HITL item '{}' for spec modification review.",
-                                    item_id, new_count, max_replan, replan_work_id
-                                );
-                            }
-                        }
-                    }
-                    _ => {
-                        let target_phase = match action {
-                            belt_core::queue::HitlRespondAction::Done => QueuePhase::Done,
-                            belt_core::queue::HitlRespondAction::Retry => QueuePhase::Pending,
-                            belt_core::queue::HitlRespondAction::Skip => QueuePhase::Skipped,
-                            belt_core::queue::HitlRespondAction::Replan => unreachable!(),
-                        };
-                        db.update_phase(&item_id, target_phase)?;
-
-                        // Handle spec-completion HITL: transition spec status
-                        // based on the respond action.
-                        if item.state == "spec_completion" {
-                            let spec_id = &item.source_id;
-                            match action {
-                                belt_core::queue::HitlRespondAction::Done => {
-                                    match db.update_spec_status(
-                                        spec_id,
-                                        belt_core::spec::SpecStatus::Completed,
-                                    ) {
-                                        Ok(()) => {
-                                            tracing::info!(
-                                                spec_id = %spec_id,
-                                                "spec transitioned from Completing to \
-                                                 Completed via HITL approval"
-                                            );
-                                            println!(
-                                                "Spec '{}' transitioned to Completed.",
-                                                spec_id
-                                            );
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                spec_id = %spec_id,
-                                                error = %e,
-                                                "failed to transition spec to Completed \
-                                                 after HITL approval"
-                                            );
-                                        }
-                                    }
-                                }
-                                belt_core::queue::HitlRespondAction::Retry
-                                | belt_core::queue::HitlRespondAction::Skip => {
-                                    // Rejection or retry: revert spec to Active
-                                    // so gap-detection can re-evaluate.
-                                    match db.update_spec_status(
-                                        spec_id,
-                                        belt_core::spec::SpecStatus::Active,
-                                    ) {
-                                        Ok(()) => {
-                                            tracing::info!(
-                                                spec_id = %spec_id,
-                                                "spec reverted to Active after HITL \
-                                                 {action}"
-                                            );
-                                            println!("Spec '{}' reverted to Active.", spec_id);
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                spec_id = %spec_id,
-                                                error = %e,
-                                                "failed to revert spec to Active"
-                                            );
-                                        }
-                                    }
-                                }
-                                belt_core::queue::HitlRespondAction::Replan => {
-                                    unreachable!()
-                                }
-                            }
-                        }
-
-                        // Cleanup worktree on Done/Skipped (matches daemon pattern).
-                        if matches!(target_phase, QueuePhase::Done | QueuePhase::Skipped)
-                            && let Ok(home) = belt_home()
-                        {
-                            let wt_base = home.join("worktrees");
-                            let repo_path = std::path::PathBuf::from(".");
-                            let wt_mgr = GitWorktreeManager::new(wt_base, repo_path);
-                            if let Err(e) = wt_mgr.cleanup(&item_id) {
-                                tracing::warn!(
-                                    work_id = %item_id,
-                                    error = %e,
-                                    "worktree cleanup failed on hitl respond, continuing"
-                                );
-                            }
-                        }
-
-                        if json_output {
-                            println!(
-                                "{}",
-                                serde_json::to_string_pretty(&serde_json::json!({
-                                    "success": true,
-                                    "work_id": item_id,
-                                    "action": action.to_string(),
-                                    "phase": target_phase.as_str()
-                                }))?
-                            );
-                        } else {
-                            println!(
-                                "Item '{}' transitioned from hitl to {} (action: {}).",
-                                item_id, target_phase, action
-                            );
-                        }
-                    }
-                }
+                    hitl_id,
+                    &action,
+                    respondent,
+                    notes,
+                    json_output,
+                )?);
             }
             HitlCommands::List { workspace, format } => {
                 tracing::info!(?workspace, "listing HITL items...");
-                let db = open_db()?;
-                let items = db.list_items(Some(QueuePhase::Hitl), workspace.as_deref())?;
-                match format.as_str() {
-                    "json" => {
-                        println!("{}", serde_json::to_string_pretty(&items)?);
-                    }
-                    _ => {
-                        if items.is_empty() {
-                            println!("No items awaiting human review.");
-                        } else {
-                            println!(
-                                "{:<40} {:<20} {:<12} {:<24} TITLE",
-                                "WORK_ID", "WORKSPACE", "STATE", "REASON"
-                            );
-                            println!("{}", "-".repeat(104));
-                            for item in &items {
-                                let reason = item
-                                    .hitl_reason
-                                    .as_ref()
-                                    .map(|r| r.to_string())
-                                    .unwrap_or_else(|| "-".to_string());
-                                println!(
-                                    "{:<40} {:<20} {:<12} {:<24} {}",
-                                    item.work_id,
-                                    item.workspace_id,
-                                    item.state,
-                                    reason,
-                                    item.title.as_deref().unwrap_or("-"),
-                                );
-                            }
-                            println!("\n{} item(s) awaiting review.", items.len());
-                        }
-                    }
-                }
+                cmd_hitl_list(workspace.as_deref(), &format)?;
             }
             HitlCommands::Show {
                 item_id,
                 format,
                 interactive,
             } => {
-                cmd_hitl_show(&item_id, &format, interactive)?;
+                exit_if_refused(cmd_hitl_show(&item_id, &format, interactive)?);
             }
             HitlCommands::Timeout { command } => {
                 cmd_hitl_timeout(command)?;
@@ -4205,33 +3215,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_github_issue_ref_valid() {
-        let result = parse_github_issue_ref("owner/repo#123");
-        assert_eq!(result, Some(("owner/repo".to_string(), "123".to_string())));
-    }
-
-    #[test]
-    fn parse_github_issue_ref_url_not_matched() {
-        // Full URLs are not issue refs.
-        assert_eq!(
-            parse_github_issue_ref("https://github.com/owner/repo/issues/1"),
-            None
+    fn nl_sandbox_is_an_empty_directory_apart_from_the_working_directory() {
+        let sandbox = new_nl_sandbox().unwrap();
+        assert!(sandbox.path().is_dir());
+        assert_eq!(std::fs::read_dir(sandbox.path()).unwrap().count(), 0);
+        assert_ne!(
+            sandbox.path().canonicalize().unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap()
         );
+        let path = sandbox.path().to_path_buf();
+        drop(sandbox);
+        assert!(!path.exists());
     }
 
     #[test]
-    fn parse_github_issue_ref_no_hash() {
-        assert_eq!(parse_github_issue_ref("owner/repo"), None);
+    fn already_handled_refusal_reports_who_how_what_and_when() {
+        use belt_core::hitl::{ConfirmPath, HitlAction, HitlResolution, RespondOutcome};
+
+        let resolution = HitlResolution {
+            action: HitlAction::Skip,
+            by: "alice".to_string(),
+            via: "tui".to_string(),
+            at: "2026-01-02T03:04:05+00:00".to_string(),
+            path: ConfirmPath::Direct,
+        };
+
+        let value = refusal_value("w1", &already_handled_refusal(&resolution));
+        assert_eq!(value["success"], false);
+        assert_eq!(value["reason"], "already_handled");
+        assert_eq!(value["work_id"], "w1");
+        assert_eq!(value["by"], "alice");
+        assert_eq!(value["via"], "tui");
+        assert_eq!(value["action"], "skip");
+        assert_eq!(value["at"], "2026-01-02T03:04:05+00:00");
+
+        let code = emit_manual_outcome(
+            "w1",
+            true,
+            QueuePhase::Done,
+            ManualOutcome::HitlResponse {
+                action: HitlAction::Done,
+                by: "carol".to_string(),
+                outcome: RespondOutcome::AlreadyHandled(resolution),
+            },
+            serde_json::json!({}),
+            String::new(),
+        )
+        .unwrap();
+        assert_eq!(code, EXIT_REFUSED);
     }
 
     #[test]
-    fn parse_github_issue_ref_no_number() {
-        assert_eq!(parse_github_issue_ref("owner/repo#abc"), None);
-    }
-
-    #[test]
-    fn parse_github_issue_ref_no_slash() {
-        assert_eq!(parse_github_issue_ref("repo#123"), None);
+    fn conflict_refusal_exits_with_refused_code_and_current_phase() {
+        let refusal =
+            Refusal::from_transition(belt_core::transition::TransitionOutcome::Conflict {
+                current: QueuePhase::Done,
+            });
+        let value = refusal_value("w1", &refusal);
+        assert_eq!(value["reason"], "conflict");
+        assert_eq!(value["current"], "done");
+        assert_eq!(emit_refusal("w1", true, refusal).unwrap(), EXIT_REFUSED);
     }
 
     #[test]
@@ -4268,45 +3311,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_github_issue_ref_leading_slash() {
-        assert_eq!(parse_github_issue_ref("/repo#123"), None);
-    }
-
-    #[test]
-    fn parse_github_issue_ref_trailing_slash() {
-        assert_eq!(parse_github_issue_ref("owner/#123"), None);
-    }
-
-    #[test]
-    fn parse_github_issue_ref_empty_number() {
-        assert_eq!(parse_github_issue_ref("owner/repo#"), None);
-    }
-
-    #[test]
-    fn extract_issue_number_from_url() {
-        assert_eq!(
-            extract_issue_number("https://github.com/owner/repo/issues/42"),
-            Some("42".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_issue_number_no_number() {
-        assert_eq!(
-            extract_issue_number("https://github.com/owner/repo/issues/"),
-            None
-        );
-    }
-
-    #[test]
-    fn extract_issue_number_non_numeric() {
-        assert_eq!(
-            extract_issue_number("https://github.com/owner/repo/issues/abc"),
-            None
-        );
-    }
-
-    #[test]
     fn recommended_action_evaluate_failure() {
         use belt_core::queue::HitlReason;
         let (action, _) = recommended_action(Some(&HitlReason::EvaluateFailure));
@@ -4331,27 +3335,6 @@ mod tests {
     fn recommended_action_manual_escalation() {
         use belt_core::queue::HitlReason;
         let (action, _) = recommended_action(Some(&HitlReason::ManualEscalation));
-        assert_eq!(action, "done");
-    }
-
-    #[test]
-    fn recommended_action_spec_conflict() {
-        use belt_core::queue::HitlReason;
-        let (action, _) = recommended_action(Some(&HitlReason::SpecConflict));
-        assert_eq!(action, "replan");
-    }
-
-    #[test]
-    fn recommended_action_spec_completion_review() {
-        use belt_core::queue::HitlReason;
-        let (action, _) = recommended_action(Some(&HitlReason::SpecCompletionReview));
-        assert_eq!(action, "done");
-    }
-
-    #[test]
-    fn recommended_action_spec_modification_proposed() {
-        use belt_core::queue::HitlReason;
-        let (action, _) = recommended_action(Some(&HitlReason::SpecModificationProposed));
         assert_eq!(action, "done");
     }
 
@@ -4427,64 +3410,6 @@ mod tests {
     }
 
     #[test]
-    fn spec_add_skip_validation_flag() {
-        let cli = Cli::try_parse_from([
-            "belt",
-            "spec",
-            "add",
-            "--workspace",
-            "ws1",
-            "--name",
-            "my-spec",
-            "--content",
-            "some content",
-            "--skip-validation",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Spec {
-                command:
-                    SpecCommands::Add {
-                        skip_validation,
-                        workspace,
-                        name,
-                        ..
-                    },
-            } => {
-                assert!(skip_validation);
-                assert_eq!(workspace, "ws1");
-                assert_eq!(name, "my-spec");
-            }
-            _ => panic!("expected Spec Add command"),
-        }
-    }
-
-    #[test]
-    fn spec_add_without_skip_validation() {
-        let cli = Cli::try_parse_from([
-            "belt",
-            "spec",
-            "add",
-            "--workspace",
-            "ws1",
-            "--name",
-            "my-spec",
-            "--content",
-            "some content",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Spec {
-                command:
-                    SpecCommands::Add {
-                        skip_validation, ..
-                    },
-            } => assert!(!skip_validation),
-            _ => panic!("expected Spec Add command"),
-        }
-    }
-
-    #[test]
     fn cron_trigger_parses_name() {
         let cli = Cli::try_parse_from(["belt", "cron", "trigger", "daily-report"]).unwrap();
         match cli.command {
@@ -4492,583 +3417,6 @@ mod tests {
                 command: CronCommands::Trigger { name, .. },
             } => assert_eq!(name, "daily-report"),
             _ => panic!("expected Cron Trigger command"),
-        }
-    }
-
-    // --- Spec decomposition workflow integration tests ---
-
-    #[test]
-    fn spec_add_decompose_flag_parsing() {
-        let cli = Cli::try_parse_from([
-            "belt",
-            "spec",
-            "add",
-            "--workspace",
-            "ws1",
-            "--name",
-            "my-spec",
-            "--content",
-            "some content",
-            "--decompose",
-            "--skip-validation",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Spec {
-                command:
-                    SpecCommands::Add {
-                        decompose,
-                        yes,
-                        name,
-                        ..
-                    },
-            } => {
-                assert!(decompose);
-                assert!(!yes);
-                assert_eq!(name, "my-spec");
-            }
-            _ => panic!("expected Spec Add command"),
-        }
-    }
-
-    #[test]
-    fn spec_add_decompose_with_yes_flag() {
-        let cli = Cli::try_parse_from([
-            "belt",
-            "spec",
-            "add",
-            "--workspace",
-            "ws1",
-            "--name",
-            "decompose-test",
-            "--content",
-            "test content",
-            "--decompose",
-            "--yes",
-            "--skip-validation",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Spec {
-                command: SpecCommands::Add { decompose, yes, .. },
-            } => {
-                assert!(decompose);
-                assert!(yes);
-            }
-            _ => panic!("expected Spec Add command"),
-        }
-    }
-
-    #[test]
-    fn spec_add_decompose_defaults_to_false() {
-        let cli = Cli::try_parse_from([
-            "belt",
-            "spec",
-            "add",
-            "--workspace",
-            "ws1",
-            "--name",
-            "no-decompose",
-            "--content",
-            "test",
-            "--skip-validation",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Spec {
-                command: SpecCommands::Add { decompose, .. },
-            } => assert!(!decompose),
-            _ => panic!("expected Spec Add command"),
-        }
-    }
-
-    /// Integration test: spec insert -> extract AC -> build decomposed issues -> update DB.
-    ///
-    /// Simulates the decomposition workflow as performed by the CLI handler,
-    /// verifying that the DB state is updated correctly when child issues are
-    /// recorded in the spec.
-    #[test]
-    fn decompose_workflow_updates_spec_decomposed_issues_in_db() {
-        let db = belt_infra::db::Database::open_in_memory().unwrap();
-
-        let content = "\
-## Overview\nSome feature.\n\n\
-## Acceptance Criteria\n\
-- Users can sign up with email\n\
-- Users receive a verification email\n\
-- Admin can view all users\n\n\
-## Implementation\nDetails here.";
-
-        let id = "spec-test-decompose-1";
-        let spec = belt_core::spec::Spec::new(
-            id.to_string(),
-            "ws-test".to_string(),
-            "Auth Feature".to_string(),
-            content.to_string(),
-        );
-
-        db.insert_spec(&spec).unwrap();
-
-        // Extract acceptance criteria (as the CLI handler does).
-        let criteria = belt_core::spec::extract_acceptance_criteria(&spec.content);
-        assert_eq!(criteria.len(), 3);
-
-        // Build decomposed issues (no LLM refinement, with parent number).
-        let proposed = belt_core::spec::build_decomposed_issues(&criteria, None, Some("100"));
-        assert_eq!(proposed.len(), 3);
-        assert!(proposed[0].title.contains("AC1"));
-        assert!(proposed[0].title.contains("#100"));
-
-        // Simulate child issue creation by assigning mock issue numbers.
-        let child_numbers: Vec<String> = vec!["101".into(), "102".into(), "103".into()];
-
-        // Update the spec's decomposed_issues field (as the CLI handler does).
-        let mut spec = db.get_spec(id).unwrap();
-        spec.decomposed_issues = Some(child_numbers.join(","));
-        db.update_spec(&spec).unwrap();
-
-        // Transition Draft -> Active (as the CLI handler does after decomposition).
-        spec.transition_to(belt_core::spec::SpecStatus::Active)
-            .unwrap();
-        db.update_spec_status(&spec.id, spec.status).unwrap();
-
-        // Verify DB state reflects the decomposition.
-        let stored = db.get_spec(id).unwrap();
-        assert_eq!(stored.decomposed_issues, Some("101,102,103".to_string()));
-        assert_eq!(stored.status, belt_core::spec::SpecStatus::Active);
-
-        // Verify parsed issue numbers.
-        assert_eq!(stored.decomposed_issue_numbers(), vec!["101", "102", "103"]);
-    }
-
-    /// Integration test: verify spec links are stored for child issues
-    /// during the decomposition workflow.
-    #[test]
-    fn decompose_workflow_stores_spec_links_for_child_issues() {
-        let db = belt_infra::db::Database::open_in_memory().unwrap();
-
-        let spec_id = "spec-test-links-1";
-        let spec = belt_core::spec::Spec::new(
-            spec_id.to_string(),
-            "ws-test".to_string(),
-            "Link Test".to_string(),
-            "## Acceptance Criteria\n- AC one\n- AC two".to_string(),
-        );
-        db.insert_spec(&spec).unwrap();
-
-        // Store parent issue link (as the CLI handler does).
-        let parent_link = belt_core::spec::SpecLink::new(
-            format!("link-{spec_id}-parent"),
-            spec_id.to_string(),
-            "https://github.com/owner/repo/issues/200".to_string(),
-        );
-        db.insert_spec_link(&parent_link).unwrap();
-
-        // Store child issue links (as the CLI handler does).
-        let child_urls = [
-            "https://github.com/owner/repo/issues/201",
-            "https://github.com/owner/repo/issues/202",
-        ];
-        for (i, url) in child_urls.iter().enumerate() {
-            let link = belt_core::spec::SpecLink::new(
-                format!("link-{spec_id}-child-{i}"),
-                spec_id.to_string(),
-                url.to_string(),
-            );
-            db.insert_spec_link(&link).unwrap();
-        }
-
-        // Verify all links are stored.
-        let links = db.list_spec_links(spec_id).unwrap();
-        assert_eq!(links.len(), 3);
-        assert!(links[0].target.contains("200")); // parent
-        assert!(links[1].target.contains("201")); // child 1
-        assert!(links[2].target.contains("202")); // child 2
-    }
-
-    /// Integration test: decomposition with LLM-refined criteria produces
-    /// enriched issue bodies.
-    #[test]
-    fn decompose_workflow_with_llm_refined_criteria() {
-        let criteria = vec![
-            "Login works with email".to_string(),
-            "Logout clears session".to_string(),
-        ];
-        let refined = vec![
-            "## Login\n\nImplement email-based login with validation.".to_string(),
-            "## Logout\n\nClear session tokens and redirect.".to_string(),
-        ];
-
-        let issues =
-            belt_core::spec::build_decomposed_issues(&criteria, Some(&refined), Some("50"));
-
-        assert_eq!(issues.len(), 2);
-        // When refined text is available, it should appear in the body.
-        assert!(issues[0].body.contains("email-based login"));
-        assert!(issues[1].body.contains("Clear session tokens"));
-        // Parent reference is embedded.
-        assert!(issues[0].body.contains("Parent: #50"));
-    }
-
-    /// Integration test: when LLM refinement returns mismatched count,
-    /// raw criteria are used as fallback. Simulates the CLI handler's
-    /// fallback behavior.
-    #[test]
-    fn decompose_workflow_llm_mismatch_falls_back_to_raw() {
-        let criteria = vec![
-            "Feature A".to_string(),
-            "Feature B".to_string(),
-            "Feature C".to_string(),
-        ];
-        // Simulate LLM returning wrong count (2 instead of 3).
-        let refined = vec!["Refined A".to_string(), "Refined B".to_string()];
-
-        // The build_decomposed_issues function with mismatched refined vec
-        // falls back per-item (items without a refined entry use raw criterion).
-        let issues =
-            belt_core::spec::build_decomposed_issues(&criteria, Some(&refined), Some("10"));
-
-        assert_eq!(issues.len(), 3);
-        // First two use refined text.
-        assert!(issues[0].body.contains("Refined A"));
-        assert!(issues[1].body.contains("Refined B"));
-        // Third falls back to raw criterion.
-        assert!(issues[2].body.contains("Feature C"));
-    }
-
-    /// Integration test: full decomposition workflow from spec insert through
-    /// decomposed_issues DB update, verifying the spec transitions correctly.
-    #[test]
-    fn decompose_full_workflow_spec_status_transitions() {
-        let db = belt_infra::db::Database::open_in_memory().unwrap();
-
-        let content = "\
-## Overview\nTask manager.\n\n\
-## Acceptance Criteria\n\
-- Create tasks\n\
-- Delete tasks\n\n\
-## Notes\nEnd.";
-
-        let id = "spec-full-flow-1";
-        let mut spec = belt_core::spec::Spec::new(
-            id.to_string(),
-            "ws-flow".to_string(),
-            "Task Manager".to_string(),
-            content.to_string(),
-        );
-        db.insert_spec(&spec).unwrap();
-
-        // Spec starts in Draft.
-        assert_eq!(spec.status, belt_core::spec::SpecStatus::Draft);
-
-        // Extract criteria and build proposals.
-        let criteria = belt_core::spec::extract_acceptance_criteria(&spec.content);
-        assert_eq!(criteria.len(), 2);
-
-        let proposed = belt_core::spec::build_decomposed_issues(&criteria, None, Some("300"));
-        assert_eq!(proposed.len(), 2);
-
-        // Preview should list both issues.
-        let preview = belt_core::spec::format_decomposition_preview(&proposed);
-        assert!(preview.contains("2 child issue(s)"));
-        assert!(preview.contains("AC1"));
-        assert!(preview.contains("AC2"));
-
-        // Simulate issue creation and store decomposed_issues.
-        let child_nums = ["301".to_string(), "302".to_string()];
-        spec.decomposed_issues = Some(child_nums.join(","));
-        db.update_spec(&spec).unwrap();
-
-        // Transition Draft -> Active.
-        spec.transition_to(belt_core::spec::SpecStatus::Active)
-            .unwrap();
-        db.update_spec_status(&spec.id, spec.status).unwrap();
-
-        let stored = db.get_spec(id).unwrap();
-        assert_eq!(stored.status, belt_core::spec::SpecStatus::Active);
-        assert_eq!(stored.decomposed_issues, Some("301,302".to_string()));
-
-        // Verify that the spec recognizes it has been decomposed.
-        assert!(stored.is_decomposed());
-    }
-
-    /// Integration test: spec without acceptance criteria section should
-    /// result in empty criteria list, skipping decomposition.
-    #[test]
-    fn decompose_workflow_no_criteria_skips_decomposition() {
-        let content = "## Overview\nA spec with no AC section.\n\n## Notes\nDone.";
-        let criteria = belt_core::spec::extract_acceptance_criteria(content);
-        assert!(criteria.is_empty());
-
-        // With empty criteria, build_decomposed_issues returns empty vec.
-        let proposed = belt_core::spec::build_decomposed_issues(&criteria, None, Some("1"));
-        assert!(proposed.is_empty());
-    }
-
-    /// Integration test: parent issue body update includes sub-issue links
-    /// in the expected format.
-    #[test]
-    fn decompose_workflow_parent_body_update_format() {
-        let spec_content = "## Overview\nFeature spec.\n\n## Acceptance Criteria\n- A\n- B";
-        let child_urls = [
-            "https://github.com/owner/repo/issues/501".to_string(),
-            "https://github.com/owner/repo/issues/502".to_string(),
-        ];
-
-        // Build the updated parent body as the CLI handler does.
-        let links = child_urls
-            .iter()
-            .enumerate()
-            .map(|(i, url)| format!("- [ ] AC{}: {}", i + 1, url))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let updated_body = format!("{}\n\n## Sub-issues\n{}", spec_content, links);
-
-        assert!(updated_body.contains("## Sub-issues"));
-        assert!(updated_body.contains("- [ ] AC1: https://github.com/owner/repo/issues/501"));
-        assert!(updated_body.contains("- [ ] AC2: https://github.com/owner/repo/issues/502"));
-        // Original content is preserved.
-        assert!(updated_body.starts_with("## Overview"));
-    }
-
-    /// Integration test: extract_issue_number works with URLs produced during
-    /// decomposition (used for parent_number and child_numbers).
-    #[test]
-    fn decompose_workflow_issue_number_extraction() {
-        // Parent issue URL.
-        let parent = "https://github.com/owner/repo/issues/42";
-        assert_eq!(extract_issue_number(parent), Some("42".to_string()));
-
-        // Child issue URLs.
-        let child1 = "https://github.com/owner/repo/issues/43";
-        let child2 = "https://github.com/owner/repo/issues/44";
-        assert_eq!(extract_issue_number(child1), Some("43".to_string()));
-        assert_eq!(extract_issue_number(child2), Some("44".to_string()));
-
-        // The parent_number is used in build_decomposed_issues.
-        let criteria = vec!["Test criterion".to_string()];
-        let issues = belt_core::spec::build_decomposed_issues(
-            &criteria,
-            None,
-            extract_issue_number(parent).as_deref(),
-        );
-        assert!(issues[0].title.contains("#42"));
-    }
-
-    #[test]
-    fn spec_verify_parses_id_and_json_flag() {
-        let cli = Cli::try_parse_from(["belt", "spec", "verify", "spec-42", "--json"]).unwrap();
-        match cli.command {
-            Commands::Spec {
-                command: SpecCommands::Verify { id, json },
-            } => {
-                assert_eq!(id, "spec-42");
-                assert!(json);
-            }
-            _ => panic!("expected Spec Verify command"),
-        }
-    }
-
-    #[test]
-    fn spec_verify_parses_without_json_flag() {
-        let cli = Cli::try_parse_from(["belt", "spec", "verify", "spec-1"]).unwrap();
-        match cli.command {
-            Commands::Spec {
-                command: SpecCommands::Verify { id, json },
-            } => {
-                assert_eq!(id, "spec-1");
-                assert!(!json);
-            }
-            _ => panic!("expected Spec Verify command"),
-        }
-    }
-
-    #[test]
-    fn spec_link_parses_positional_args() {
-        let cli = Cli::try_parse_from([
-            "belt",
-            "spec",
-            "link",
-            "spec-10",
-            "https://example.com/issue/1",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Spec {
-                command: SpecCommands::Link { id, target, .. },
-            } => {
-                assert_eq!(id, "spec-10");
-                assert_eq!(target, "https://example.com/issue/1");
-            }
-            _ => panic!("expected Spec Link command"),
-        }
-    }
-
-    #[test]
-    fn spec_link_parses_github_issue_ref() {
-        let cli =
-            Cli::try_parse_from(["belt", "spec", "link", "spec-5", "owner/repo#123"]).unwrap();
-        match cli.command {
-            Commands::Spec {
-                command: SpecCommands::Link { id, target, .. },
-            } => {
-                assert_eq!(id, "spec-5");
-                assert_eq!(target, "owner/repo#123");
-            }
-            _ => panic!("expected Spec Link command"),
-        }
-    }
-
-    #[test]
-    fn spec_unlink_parses_positional_args() {
-        let cli = Cli::try_parse_from([
-            "belt",
-            "spec",
-            "unlink",
-            "spec-10",
-            "https://example.com/issue/1",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Spec {
-                command: SpecCommands::Unlink { id, target, .. },
-            } => {
-                assert_eq!(id, "spec-10");
-                assert_eq!(target, "https://example.com/issue/1");
-            }
-            _ => panic!("expected Spec Unlink command"),
-        }
-    }
-
-    /// Integration test: verify that the decompose-to-collect pipeline produces
-    /// issues whose labels match the DataSource trigger configuration.
-    ///
-    /// Simulates the full lifecycle:
-    ///   spec add --decompose -> extract AC -> build issues -> label attachment
-    ///   -> DataSource.collect() label matching
-    #[test]
-    fn decompose_to_collect_pipeline_label_matching() {
-        let content = "\
-## Overview\nAPI feature.\n\n\
-## Acceptance Criteria\n\
-- Endpoint returns 200\n\
-- Response includes pagination\n\n\
-## Notes\nDone.";
-
-        // Step 1: Extract acceptance criteria (as spec add handler does).
-        let criteria = belt_core::spec::extract_acceptance_criteria(content);
-        assert_eq!(criteria.len(), 2);
-
-        // Step 2: Build decomposed issues with parent number.
-        let proposed = belt_core::spec::build_decomposed_issues(&criteria, None, Some("400"));
-        assert_eq!(proposed.len(), 2);
-
-        // Step 3: Verify the labels that would be attached by
-        // create_github_issue_with_labels match what DataSource.collect() scans.
-        //
-        // The CLI handler calls:
-        //   create_github_issue_with_labels(&title, &body, &[&trigger_label, "autopilot:trigger"])
-        //
-        // DataSource.collect() scans issues matching state_config.trigger.label.
-        // For the pipeline to work, the trigger_label on child issues must match
-        // the label configured in the workspace source state.
-        let trigger_label = "autopilot:ready";
-        let child_labels: Vec<&str> = vec![trigger_label, "autopilot:trigger"];
-
-        // The trigger_label from workspace config must be present in child_labels.
-        assert!(
-            child_labels.contains(&trigger_label),
-            "child issue labels must include the workspace trigger label for collect() detection"
-        );
-
-        // Step 4: Verify parent issue also carries the trigger label for collect.
-        // create_github_issue now adds both trigger_label and "autopilot:trigger".
-        let parent_labels: Vec<&str> = if trigger_label == "autopilot:trigger" {
-            vec![trigger_label]
-        } else {
-            vec![trigger_label, "autopilot:trigger"]
-        };
-        assert!(
-            parent_labels.contains(&trigger_label),
-            "parent issue labels must include the workspace trigger label for collect() detection"
-        );
-        assert!(
-            parent_labels.contains(&"autopilot:trigger"),
-            "parent issue must carry autopilot:trigger marker"
-        );
-    }
-
-    /// Verify that resolve_trigger_label falls back to "autopilot:ready" when
-    /// no trigger label is configured in the workspace, and that this default
-    /// label is compatible with the collect pipeline.
-    #[test]
-    fn resolve_trigger_label_fallback_compatible_with_collect() {
-        // Build a workspace config without any trigger.label configured.
-        let yaml = r#"
-name: test-ws
-sources:
-  github:
-    url: "https://github.com/test/repo"
-    scan_interval_secs: 300
-    states:
-      analyze:
-        trigger: {}
-        prompt: "analyze this"
-"#;
-        let config: belt_core::workspace::WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
-
-        let label = resolve_trigger_label(&config);
-        assert_eq!(label, "autopilot:ready");
-    }
-
-    /// Verify that resolve_trigger_label extracts the configured trigger label.
-    #[test]
-    fn resolve_trigger_label_uses_configured_label() {
-        let yaml = r#"
-name: test-ws
-sources:
-  github:
-    url: "https://github.com/test/repo"
-    scan_interval_secs: 300
-    states:
-      build:
-        trigger:
-          label: "belt:build"
-        prompt: "build it"
-"#;
-        let config: belt_core::workspace::WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
-
-        let label = resolve_trigger_label(&config);
-        assert_eq!(label, "belt:build");
-    }
-
-    /// Integration test: full pipeline from spec content to queue item structure.
-    ///
-    /// Verifies that decomposed issues would produce valid QueueItem entries
-    /// when collected by DataSource, with correct work_id and source_id format.
-    #[test]
-    fn decompose_to_collect_queue_item_format() {
-        use belt_core::queue::QueueItem;
-
-        let content = "## Overview\nFeature.\n\n## Acceptance Criteria\n- Task A\n- Task B";
-        let criteria = belt_core::spec::extract_acceptance_criteria(content);
-        let proposed = belt_core::spec::build_decomposed_issues(&criteria, None, Some("600"));
-
-        // Simulate what DataSource.collect() would produce for each child issue.
-        let repo = "owner/repo";
-        let child_numbers = ["601", "602"];
-
-        for (i, num) in child_numbers.iter().enumerate() {
-            let source_id = format!("github:{repo}#{num}");
-            let state_name = "analyze";
-            let work_id = QueueItem::make_work_id(&source_id, state_name);
-
-            // Verify the work_id follows the expected format.
-            assert!(work_id.contains(&source_id));
-            assert!(work_id.contains(state_name));
-
-            // Verify the proposed issue title references the parent.
-            assert!(proposed[i].title.contains("#600"));
         }
     }
 
@@ -5129,6 +3477,11 @@ name: test-ws
 sources:
   github:
     url: "https://github.com/test/repo"
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 300
     states:
       implement:
@@ -5191,6 +3544,11 @@ name: test-ws
 sources:
   github:
     url: "https://github.com/test/repo"
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 300
     states:
       implement:
@@ -5251,6 +3609,11 @@ name: test-ws
 sources:
   github:
     url: "https://github.com/test/repo"
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 300
     states:
       implement:
@@ -5344,841 +3707,6 @@ sources:
         assert_eq!(final_item.phase(), QueuePhase::Skipped);
     }
 
-    // ---- cmd_queue_retry_script tests ----
-
-    /// retry_script: Failed item with on_done script that succeeds -> Done.
-    #[tokio::test]
-    async fn queue_retry_script_success_transitions_failed_to_done() {
-        let yaml = r#"
-name: test-ws
-sources:
-  github:
-    url: "https://github.com/test/repo"
-    scan_interval_secs: 300
-    states:
-      implement:
-        trigger: {}
-        prompt: "implement"
-        on_done:
-          - script: "true"
-"#;
-        let (db, ws_id, _tmp) = setup_workspace_with_config(yaml);
-        let item = make_item("retry-ok-1", &ws_id, "implement", QueuePhase::Failed);
-        db.insert_item(&item).unwrap();
-
-        // Replicate cmd_queue_retry_script logic.
-        let stored = db.get_item("retry-ok-1").unwrap();
-        assert_eq!(stored.phase(), QueuePhase::Failed);
-
-        let (_, config_path, _) = db.get_workspace(&stored.workspace_id).unwrap();
-        let config =
-            belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))
-                .unwrap();
-
-        let state_config = config
-            .sources
-            .values()
-            .find_map(|s| s.states.get(&stored.state))
-            .unwrap();
-
-        let on_done: Vec<belt_core::action::Action> = state_config
-            .on_done
-            .iter()
-            .map(belt_core::action::Action::from)
-            .collect();
-        assert!(!on_done.is_empty());
-
-        let worktree_dir = tempfile::tempdir().unwrap();
-        let env = belt_daemon::executor::ActionEnv::new("retry-ok-1", worktree_dir.path());
-        let executor = build_executor();
-
-        let result = executor.execute_all(&on_done, &env).await.unwrap();
-        match result {
-            Some(r) if r.success() => {
-                db.update_phase("retry-ok-1", QueuePhase::Done).unwrap();
-            }
-            _ => panic!("expected on_done success for retry"),
-        }
-
-        let final_item = db.get_item("retry-ok-1").unwrap();
-        assert_eq!(final_item.phase(), QueuePhase::Done);
-
-        // Verify script_retry transition event was recorded.
-        record_script_retry_event(&db, "retry-ok-1", &item.source_id, QueuePhase::Done, None);
-        let events = db.list_transition_events("retry-ok-1").unwrap();
-        let retry_events: Vec<_> = events
-            .iter()
-            .filter(|e| e.event_type == "script_retry")
-            .collect();
-        assert!(
-            !retry_events.is_empty(),
-            "expected script_retry transition event"
-        );
-        assert_eq!(retry_events.last().unwrap().phase.as_deref(), Some("done"));
-    }
-
-    /// retry_script: Failed item with on_done script that fails -> remains Failed.
-    #[tokio::test]
-    async fn queue_retry_script_failure_remains_failed() {
-        let yaml = r#"
-name: test-ws
-sources:
-  github:
-    url: "https://github.com/test/repo"
-    scan_interval_secs: 300
-    states:
-      implement:
-        trigger: {}
-        prompt: "implement"
-        on_done:
-          - script: "false"
-"#;
-        let (db, ws_id, _tmp) = setup_workspace_with_config(yaml);
-        let item = make_item("retry-fail-1", &ws_id, "implement", QueuePhase::Failed);
-        db.insert_item(&item).unwrap();
-
-        let stored = db.get_item("retry-fail-1").unwrap();
-        assert_eq!(stored.phase(), QueuePhase::Failed);
-
-        let (_, config_path, _) = db.get_workspace(&stored.workspace_id).unwrap();
-        let config =
-            belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))
-                .unwrap();
-
-        let state_config = config
-            .sources
-            .values()
-            .find_map(|s| s.states.get(&stored.state))
-            .unwrap();
-
-        let on_done: Vec<belt_core::action::Action> = state_config
-            .on_done
-            .iter()
-            .map(belt_core::action::Action::from)
-            .collect();
-
-        let worktree_dir = tempfile::tempdir().unwrap();
-        let env = belt_daemon::executor::ActionEnv::new("retry-fail-1", worktree_dir.path());
-        let executor = build_executor();
-
-        let result = executor.execute_all(&on_done, &env).await.unwrap();
-        match result {
-            Some(r) if r.success() => {
-                panic!("expected failure but script succeeded");
-            }
-            Some(_) => {
-                // Item remains Failed — no phase update (matches cmd_queue_retry_script behavior).
-            }
-            None => {
-                panic!("expected a result");
-            }
-        }
-
-        let final_item = db.get_item("retry-fail-1").unwrap();
-        assert_eq!(final_item.phase(), QueuePhase::Failed);
-
-        // Verify script_retry transition event was recorded for the failure case.
-        record_script_retry_event(
-            &db,
-            "retry-fail-1",
-            &item.source_id,
-            QueuePhase::Failed,
-            Some("exit code 1".to_string()),
-        );
-        let events = db.list_transition_events("retry-fail-1").unwrap();
-        let retry_events: Vec<_> = events
-            .iter()
-            .filter(|e| e.event_type == "script_retry")
-            .collect();
-        assert!(
-            !retry_events.is_empty(),
-            "expected script_retry transition event on failure"
-        );
-        assert_eq!(
-            retry_events.last().unwrap().phase.as_deref(),
-            Some("failed")
-        );
-        assert!(
-            retry_events
-                .last()
-                .unwrap()
-                .detail
-                .as_ref()
-                .unwrap()
-                .contains("exit code"),
-            "expected exit code detail"
-        );
-    }
-
-    /// retry_script: non-Failed item is rejected.
-    #[test]
-    fn queue_retry_script_rejects_non_failed_item() {
-        let db = belt_infra::db::Database::open_in_memory().unwrap();
-        db.add_workspace("test-ws", "/dev/null").unwrap();
-        let item = make_item(
-            "retry-reject-1",
-            "test-ws",
-            "implement",
-            QueuePhase::Running,
-        );
-        db.insert_item(&item).unwrap();
-
-        let stored = db.get_item("retry-reject-1").unwrap();
-        // cmd_queue_retry_script checks: if item.phase() != QueuePhase::Failed { bail! }
-        assert_ne!(stored.phase(), QueuePhase::Failed);
-    }
-
-    /// retry_script: timeout causes early return, item remains Failed.
-    #[tokio::test]
-    async fn queue_retry_script_timeout_remains_failed() {
-        let yaml = r#"
-name: test-ws
-sources:
-  github:
-    url: "https://github.com/test/repo"
-    scan_interval_secs: 300
-    states:
-      implement:
-        trigger: {}
-        prompt: "implement"
-        on_done:
-          - script: "sleep 10"
-"#;
-        let (db, ws_id, _tmp) = setup_workspace_with_config(yaml);
-        let item = make_item("retry-timeout-1", &ws_id, "implement", QueuePhase::Failed);
-        db.insert_item(&item).unwrap();
-
-        let stored = db.get_item("retry-timeout-1").unwrap();
-        let (_, config_path, _) = db.get_workspace(&stored.workspace_id).unwrap();
-        let config =
-            belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(&config_path))
-                .unwrap();
-
-        let state_config = config
-            .sources
-            .values()
-            .find_map(|s| s.states.get(&stored.state))
-            .unwrap();
-
-        let on_done: Vec<belt_core::action::Action> = state_config
-            .on_done
-            .iter()
-            .map(belt_core::action::Action::from)
-            .collect();
-
-        let worktree_dir = tempfile::tempdir().unwrap();
-        let env = belt_daemon::executor::ActionEnv::new("retry-timeout-1", worktree_dir.path());
-        let executor = build_executor();
-
-        // Apply timeout of 1 second (script sleeps 10).
-        let timeout_secs = 1u64;
-        let duration = std::time::Duration::from_secs(timeout_secs);
-        let timed_out = tokio::time::timeout(duration, executor.execute_all(&on_done, &env)).await;
-
-        assert!(timed_out.is_err(), "expected timeout");
-
-        // Item remains Failed since timeout prevents phase change.
-        let final_item = db.get_item("retry-timeout-1").unwrap();
-        assert_eq!(final_item.phase(), QueuePhase::Failed);
-    }
-
-    // --- Spec decompose: build_decomposed_issues_from_llm tests ---
-
-    /// Verify that build_decomposed_issues_from_llm produces correct titles,
-    /// bodies, and parent references from structured LLM output.
-    #[test]
-    fn decompose_from_llm_structured_output() {
-        use belt_core::spec::{LlmDecomposedIssue, build_decomposed_issues_from_llm};
-
-        let llm_issues = vec![
-            LlmDecomposedIssue {
-                title: "Add OAuth2 token refresh endpoint".to_string(),
-                description: "Implement the /auth/refresh endpoint.".to_string(),
-                acceptance_criteria: vec![
-                    "Refresh token is validated".to_string(),
-                    "New access token is issued".to_string(),
-                ],
-            },
-            LlmDecomposedIssue {
-                title: "Add logout endpoint".to_string(),
-                description: "Clear session on logout.".to_string(),
-                acceptance_criteria: vec!["Session is invalidated".to_string()],
-            },
-        ];
-
-        let issues = build_decomposed_issues_from_llm(&llm_issues, Some("99"));
-        assert_eq!(issues.len(), 2);
-
-        // Title format: [sub] #<parent> AC<index>: <title>
-        assert!(issues[0].title.contains("#99"));
-        assert!(issues[0].title.contains("AC1"));
-        assert!(
-            issues[0]
-                .title
-                .contains("Add OAuth2 token refresh endpoint")
-        );
-
-        assert!(issues[1].title.contains("AC2"));
-        assert!(issues[1].title.contains("Add logout endpoint"));
-
-        // Body includes parent reference.
-        assert!(issues[0].body.contains("Parent: #99"));
-        assert!(issues[1].body.contains("Parent: #99"));
-
-        // Body includes description.
-        assert!(
-            issues[0]
-                .body
-                .contains("Implement the /auth/refresh endpoint.")
-        );
-        assert!(issues[1].body.contains("Clear session on logout."));
-
-        // Body includes acceptance criteria as checklist.
-        assert!(issues[0].body.contains("- [ ] Refresh token is validated"));
-        assert!(issues[0].body.contains("- [ ] New access token is issued"));
-        assert!(issues[1].body.contains("- [ ] Session is invalidated"));
-
-        // Criterion field stores the LLM title.
-        assert_eq!(issues[0].criterion, "Add OAuth2 token refresh endpoint");
-    }
-
-    /// Verify build_decomposed_issues_from_llm without parent number uses
-    /// placeholder text.
-    #[test]
-    fn decompose_from_llm_without_parent_number() {
-        use belt_core::spec::{LlmDecomposedIssue, build_decomposed_issues_from_llm};
-
-        let llm_issues = vec![LlmDecomposedIssue {
-            title: "Setup CI pipeline".to_string(),
-            description: "Configure GitHub Actions.".to_string(),
-            acceptance_criteria: vec![],
-        }];
-
-        let issues = build_decomposed_issues_from_llm(&llm_issues, None);
-        assert_eq!(issues.len(), 1);
-        assert!(issues[0].title.contains("#?"));
-        assert!(issues[0].body.contains("Parent: (pending)"));
-        // Empty acceptance_criteria should not produce an AC section.
-        assert!(!issues[0].body.contains("## Acceptance Criteria"));
-    }
-
-    /// Verify build_decomposed_issues_from_llm with empty input returns empty vec.
-    #[test]
-    fn decompose_from_llm_empty_input() {
-        use belt_core::spec::build_decomposed_issues_from_llm;
-
-        let issues = build_decomposed_issues_from_llm(&[], Some("1"));
-        assert!(issues.is_empty());
-    }
-
-    // --- Spec collect: all_decomposed_issues_closed tests ---
-
-    /// Verify all_decomposed_issues_closed returns true when all issues are closed.
-    #[test]
-    fn collect_all_decomposed_issues_closed_all_closed() {
-        let states = vec![
-            ("101".to_string(), true),
-            ("102".to_string(), true),
-            ("103".to_string(), true),
-        ];
-        assert!(belt_core::spec::all_decomposed_issues_closed(&states));
-    }
-
-    /// Verify all_decomposed_issues_closed returns false when any issue is open.
-    #[test]
-    fn collect_all_decomposed_issues_closed_some_open() {
-        let states = vec![
-            ("101".to_string(), true),
-            ("102".to_string(), false),
-            ("103".to_string(), true),
-        ];
-        assert!(!belt_core::spec::all_decomposed_issues_closed(&states));
-    }
-
-    /// Verify all_decomposed_issues_closed returns false for empty input.
-    #[test]
-    fn collect_all_decomposed_issues_closed_empty() {
-        let states: Vec<(String, bool)> = vec![];
-        assert!(!belt_core::spec::all_decomposed_issues_closed(&states));
-    }
-
-    // --- Spec lifecycle: full transition chain tests ---
-
-    /// Verify the full spec lifecycle: Draft -> Active -> Paused -> Active ->
-    /// Completing -> Completed, with DB persistence at each step.
-    #[test]
-    fn spec_lifecycle_full_transition_chain() {
-        use belt_core::spec::{Spec, SpecStatus};
-
-        let db = belt_infra::db::Database::open_in_memory().unwrap();
-        let id = "spec-lifecycle-full";
-        let mut spec = Spec::new(
-            id.to_string(),
-            "ws-lifecycle".to_string(),
-            "Lifecycle Test".to_string(),
-            "## Overview\nTest.\n\n## Acceptance Criteria\n- Done".to_string(),
-        );
-        db.insert_spec(&spec).unwrap();
-        assert_eq!(spec.status, SpecStatus::Draft);
-
-        // Draft -> Active
-        spec.transition_to(SpecStatus::Active).unwrap();
-        db.update_spec_status(&spec.id, spec.status).unwrap();
-        let stored = db.get_spec(id).unwrap();
-        assert_eq!(stored.status, SpecStatus::Active);
-
-        // Active -> Paused
-        spec.transition_to(SpecStatus::Paused).unwrap();
-        db.update_spec_status(&spec.id, spec.status).unwrap();
-        let stored = db.get_spec(id).unwrap();
-        assert_eq!(stored.status, SpecStatus::Paused);
-
-        // Paused -> Active (resume)
-        spec.transition_to(SpecStatus::Active).unwrap();
-        db.update_spec_status(&spec.id, spec.status).unwrap();
-        let stored = db.get_spec(id).unwrap();
-        assert_eq!(stored.status, SpecStatus::Active);
-
-        // Active -> Completing
-        spec.transition_to(SpecStatus::Completing).unwrap();
-        db.update_spec_status(&spec.id, spec.status).unwrap();
-        let stored = db.get_spec(id).unwrap();
-        assert_eq!(stored.status, SpecStatus::Completing);
-
-        // Completing -> Completed
-        spec.transition_to(SpecStatus::Completed).unwrap();
-        db.update_spec_status(&spec.id, spec.status).unwrap();
-        let stored = db.get_spec(id).unwrap();
-        assert_eq!(stored.status, SpecStatus::Completed);
-
-        // Completed is terminal.
-        assert!(stored.status.is_terminal());
-    }
-
-    /// Verify that invalid spec transitions are rejected.
-    #[test]
-    fn spec_lifecycle_invalid_transitions() {
-        use belt_core::spec::{Spec, SpecStatus};
-
-        let mut spec = Spec::new(
-            "spec-invalid".to_string(),
-            "ws".to_string(),
-            "Invalid".to_string(),
-            "content".to_string(),
-        );
-        assert_eq!(spec.status, SpecStatus::Draft);
-
-        // Draft -> Completed is not valid (must go through Active, Completing).
-        assert!(spec.transition_to(SpecStatus::Completed).is_err());
-        // Draft -> Paused is not valid.
-        assert!(spec.transition_to(SpecStatus::Paused).is_err());
-        // Draft -> Completing is not valid.
-        assert!(spec.transition_to(SpecStatus::Completing).is_err());
-
-        // Transition to Active first.
-        spec.transition_to(SpecStatus::Active).unwrap();
-        // Active -> Completed is not valid (must go through Completing).
-        assert!(spec.transition_to(SpecStatus::Completed).is_err());
-    }
-
-    /// Verify Completing -> Active rollback transition (gap found during re-check).
-    #[test]
-    fn spec_lifecycle_completing_rollback_to_active() {
-        use belt_core::spec::{Spec, SpecStatus};
-
-        let db = belt_infra::db::Database::open_in_memory().unwrap();
-        let id = "spec-rollback";
-        let mut spec = Spec::new(
-            id.to_string(),
-            "ws-rb".to_string(),
-            "Rollback".to_string(),
-            "content".to_string(),
-        );
-        db.insert_spec(&spec).unwrap();
-
-        // Draft -> Active -> Completing
-        spec.transition_to(SpecStatus::Active).unwrap();
-        spec.transition_to(SpecStatus::Completing).unwrap();
-        db.update_spec_status(&spec.id, spec.status).unwrap();
-        assert_eq!(db.get_spec(id).unwrap().status, SpecStatus::Completing);
-
-        // Completing -> Active (rollback due to gap or test failure)
-        spec.transition_to(SpecStatus::Active).unwrap();
-        db.update_spec_status(&spec.id, spec.status).unwrap();
-        assert_eq!(db.get_spec(id).unwrap().status, SpecStatus::Active);
-    }
-
-    /// Verify archive transition from various states.
-    #[test]
-    fn spec_lifecycle_archive_from_multiple_states() {
-        use belt_core::spec::{Spec, SpecStatus};
-
-        // Draft -> Archived
-        let mut s1 = Spec::new(
-            "s1".to_string(),
-            "ws".to_string(),
-            "S1".to_string(),
-            "c".to_string(),
-        );
-        assert!(s1.transition_to(SpecStatus::Archived).is_ok());
-
-        // Active -> Archived
-        let mut s2 = Spec::new(
-            "s2".to_string(),
-            "ws".to_string(),
-            "S2".to_string(),
-            "c".to_string(),
-        );
-        s2.transition_to(SpecStatus::Active).unwrap();
-        assert!(s2.transition_to(SpecStatus::Archived).is_ok());
-
-        // Paused -> Archived
-        let mut s3 = Spec::new(
-            "s3".to_string(),
-            "ws".to_string(),
-            "S3".to_string(),
-            "c".to_string(),
-        );
-        s3.transition_to(SpecStatus::Active).unwrap();
-        s3.transition_to(SpecStatus::Paused).unwrap();
-        assert!(s3.transition_to(SpecStatus::Archived).is_ok());
-
-        // Archived -> Active (restore)
-        assert!(s3.transition_to(SpecStatus::Active).is_ok());
-    }
-
-    // --- Spec decompose: acceptance criteria extraction edge cases ---
-
-    /// Verify extract_acceptance_criteria handles asterisk bullets.
-    #[test]
-    fn decompose_extract_ac_with_asterisk_bullets() {
-        let content = "\
-## Overview\nFeature.\n\n\
-## Acceptance Criteria\n\
-* First criterion\n\
-* Second criterion\n\n\
-## Notes\nEnd.";
-        let criteria = belt_core::spec::extract_acceptance_criteria(content);
-        assert_eq!(criteria.len(), 2);
-        assert_eq!(criteria[0], "First criterion");
-        assert_eq!(criteria[1], "Second criterion");
-    }
-
-    /// Verify extract_acceptance_criteria handles short "AC" header.
-    #[test]
-    fn decompose_extract_ac_with_short_header() {
-        let content = "## AC\n- Criterion A\n- Criterion B";
-        let criteria = belt_core::spec::extract_acceptance_criteria(content);
-        assert_eq!(criteria.len(), 2);
-        assert_eq!(criteria[0], "Criterion A");
-        assert_eq!(criteria[1], "Criterion B");
-    }
-
-    /// Verify extract_acceptance_criteria stops at the next section heading.
-    #[test]
-    fn decompose_extract_ac_stops_at_next_section() {
-        let content = "\
-## Acceptance Criteria\n\
-- AC one\n\
-- AC two\n\
-## Implementation\n\
-- This is not an AC";
-        let criteria = belt_core::spec::extract_acceptance_criteria(content);
-        assert_eq!(criteria.len(), 2);
-    }
-
-    /// Verify extract_acceptance_criteria skips empty bullet lines.
-    #[test]
-    fn decompose_extract_ac_skips_empty_bullets() {
-        let content = "## Acceptance Criteria\n- \n- Valid AC\n-  \n- Another AC";
-        let criteria = belt_core::spec::extract_acceptance_criteria(content);
-        assert_eq!(criteria.len(), 2);
-        assert_eq!(criteria[0], "Valid AC");
-        assert_eq!(criteria[1], "Another AC");
-    }
-
-    // --- Spec decompose: format_decomposition_preview tests ---
-
-    /// Verify format_decomposition_preview with LLM-generated issues.
-    #[test]
-    fn decompose_preview_format_with_llm_issues() {
-        use belt_core::spec::{LlmDecomposedIssue, build_decomposed_issues_from_llm};
-
-        let llm_issues = vec![
-            LlmDecomposedIssue {
-                title: "Setup database".to_string(),
-                description: "Create schema.".to_string(),
-                acceptance_criteria: vec!["Schema created".to_string()],
-            },
-            LlmDecomposedIssue {
-                title: "Add API routes".to_string(),
-                description: "REST endpoints.".to_string(),
-                acceptance_criteria: vec![],
-            },
-        ];
-
-        let issues = build_decomposed_issues_from_llm(&llm_issues, Some("50"));
-        let preview = belt_core::spec::format_decomposition_preview(&issues);
-
-        assert!(preview.contains("2 child issue(s)"));
-        assert!(preview.contains("AC1"));
-        assert!(preview.contains("AC2"));
-        assert!(preview.contains("Setup database"));
-        assert!(preview.contains("Add API routes"));
-    }
-
-    // --- Spec collect: decomposed spec readiness check with DB ---
-
-    /// Integration test: verify that decomposed spec transitions to Completing
-    /// only when all child issues are closed.
-    #[test]
-    fn collect_decomposed_spec_completing_readiness() {
-        use belt_core::spec::{Spec, SpecStatus};
-
-        let db = belt_infra::db::Database::open_in_memory().unwrap();
-        let id = "spec-collect-ready";
-        let mut spec = Spec::new(
-            id.to_string(),
-            "ws-collect".to_string(),
-            "Collect Test".to_string(),
-            "## Acceptance Criteria\n- Task A\n- Task B".to_string(),
-        );
-        spec.decomposed_issues = Some("701,702".to_string());
-        db.insert_spec(&spec).unwrap();
-        spec.transition_to(SpecStatus::Active).unwrap();
-        db.update_spec_status(&spec.id, spec.status).unwrap();
-
-        // Simulate: one issue open, one closed.
-        let states_partial = vec![("701".to_string(), true), ("702".to_string(), false)];
-        assert!(!belt_core::spec::all_decomposed_issues_closed(
-            &states_partial
-        ));
-        // Spec should NOT transition to Completing yet.
-
-        // Simulate: all issues closed.
-        let states_all = vec![("701".to_string(), true), ("702".to_string(), true)];
-        assert!(belt_core::spec::all_decomposed_issues_closed(&states_all));
-
-        // Now spec can transition to Completing.
-        spec.transition_to(SpecStatus::Completing).unwrap();
-        db.update_spec_status(&spec.id, spec.status).unwrap();
-        assert_eq!(db.get_spec(id).unwrap().status, SpecStatus::Completing);
-    }
-
-    // --- Spec decompose: extract_issue_number edge cases ---
-
-    /// Verify extract_issue_number returns None for non-numeric trailing segment.
-    #[test]
-    fn decompose_extract_issue_number_non_numeric() {
-        assert_eq!(
-            extract_issue_number("https://github.com/o/r/issues/abc"),
-            None
-        );
-    }
-
-    /// Verify extract_issue_number returns None for URL ending with slash.
-    #[test]
-    fn decompose_extract_issue_number_trailing_slash() {
-        // rsplit('/').next() returns empty string for trailing slash.
-        assert_eq!(extract_issue_number("https://github.com/o/r/issues/"), None);
-    }
-
-    /// Verify extract_issue_number works with plain number path.
-    #[test]
-    fn decompose_extract_issue_number_plain_number() {
-        assert_eq!(extract_issue_number("42"), Some("42".to_string()));
-    }
-
-    // --- Spec collect: workspace trigger label with multiple sources ---
-
-    /// Verify resolve_trigger_label picks the first trigger label from
-    /// multiple sources and states.
-    #[test]
-    fn collect_resolve_trigger_label_multiple_sources() {
-        let yaml = r#"
-name: multi-source-ws
-sources:
-  github:
-    url: "https://github.com/test/repo"
-    scan_interval_secs: 300
-    states:
-      analyze:
-        trigger:
-          label: "custom:analyze"
-        prompt: "analyze"
-      build:
-        trigger:
-          label: "custom:build"
-        prompt: "build"
-"#;
-        let config: belt_core::workspace::WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
-        let label = resolve_trigger_label(&config);
-        // Should return one of the configured labels (first found).
-        assert!(
-            label == "custom:analyze" || label == "custom:build",
-            "expected a configured trigger label, got: {label}"
-        );
-    }
-
-    // --- Spec decompose: conflict detection during decompose ---
-
-    /// Verify that ConflictDetector detects file-level overlap between specs
-    /// sharing the same entry_point.
-    #[test]
-    fn decompose_conflict_detection_file_overlap() {
-        use belt_core::spec::{ConflictDetector, OverlapType, Spec};
-
-        let mut existing = Spec::new(
-            "spec-existing".to_string(),
-            "ws".to_string(),
-            "Existing".to_string(),
-            "content".to_string(),
-        );
-        existing.entry_point = Some("src/auth/mod.rs".to_string());
-
-        let mut new_spec = Spec::new(
-            "spec-new".to_string(),
-            "ws".to_string(),
-            "New".to_string(),
-            "content".to_string(),
-        );
-        new_spec.entry_point = Some("src/auth/mod.rs".to_string());
-
-        let conflicts = ConflictDetector::detect(&new_spec, &[existing]);
-        assert!(!conflicts.is_empty());
-        assert_eq!(conflicts[0].overlap_type, OverlapType::File);
-        assert_eq!(conflicts[0].path, "src/auth/mod.rs");
-    }
-
-    /// Verify that ConflictDetector finds no conflicts when entry_points
-    /// do not overlap.
-    #[test]
-    fn decompose_conflict_detection_no_overlap() {
-        use belt_core::spec::{ConflictDetector, Spec};
-
-        let mut existing = Spec::new(
-            "spec-a".to_string(),
-            "ws".to_string(),
-            "A".to_string(),
-            "c".to_string(),
-        );
-        existing.entry_point = Some("src/auth/mod.rs".to_string());
-
-        let mut new_spec = Spec::new(
-            "spec-b".to_string(),
-            "ws".to_string(),
-            "B".to_string(),
-            "c".to_string(),
-        );
-        new_spec.entry_point = Some("src/api/handler.rs".to_string());
-
-        let conflicts = ConflictDetector::detect(&new_spec, &[existing]);
-        assert!(conflicts.is_empty());
-    }
-
-    // --- Spec lifecycle: decompose + collect end-to-end pipeline ---
-
-    /// Integration test: full pipeline from spec creation with decompose
-    /// through collect readiness, simulating the complete lifecycle.
-    ///
-    /// 1. Insert spec with AC
-    /// 2. Extract AC and build decomposed issues
-    /// 3. Store decomposed_issues in DB
-    /// 4. Transition Draft -> Active
-    /// 5. Simulate all child issues closed
-    /// 6. Transition Active -> Completing -> Completed
-    #[test]
-    fn spec_lifecycle_decompose_to_collect_to_complete() {
-        use belt_core::spec::{Spec, SpecStatus};
-
-        let db = belt_infra::db::Database::open_in_memory().unwrap();
-        let content = "\
-## Overview\nPayment system.\n\n\
-## Acceptance Criteria\n\
-- Process credit card payments\n\
-- Generate payment receipts\n\
-- Handle refunds\n\n\
-## Implementation\nStripe integration.";
-
-        let id = "spec-e2e-pipeline";
-        let mut spec = Spec::new(
-            id.to_string(),
-            "ws-e2e".to_string(),
-            "Payment System".to_string(),
-            content.to_string(),
-        );
-        db.insert_spec(&spec).unwrap();
-
-        // Step 1: Extract AC.
-        let criteria = belt_core::spec::extract_acceptance_criteria(&spec.content);
-        assert_eq!(criteria.len(), 3);
-
-        // Step 2: Build decomposed issues.
-        let proposed = belt_core::spec::build_decomposed_issues(&criteria, None, Some("800"));
-        assert_eq!(proposed.len(), 3);
-
-        // Step 3: Store decomposed_issues (simulating GitHub issue creation).
-        let child_numbers = ["801".to_string(), "802".to_string(), "803".to_string()];
-        spec.decomposed_issues = Some(child_numbers.join(","));
-        db.update_spec(&spec).unwrap();
-
-        // Step 4: Draft -> Active.
-        spec.transition_to(SpecStatus::Active).unwrap();
-        db.update_spec_status(&spec.id, spec.status).unwrap();
-
-        let stored = db.get_spec(id).unwrap();
-        assert_eq!(stored.status, SpecStatus::Active);
-        assert!(stored.is_decomposed());
-        assert_eq!(stored.decomposed_issue_numbers(), vec!["801", "802", "803"]);
-
-        // Step 5: Simulate child issues closing progressively.
-        let partial = vec![
-            ("801".to_string(), true),
-            ("802".to_string(), true),
-            ("803".to_string(), false),
-        ];
-        assert!(!belt_core::spec::all_decomposed_issues_closed(&partial));
-
-        let all_closed = vec![
-            ("801".to_string(), true),
-            ("802".to_string(), true),
-            ("803".to_string(), true),
-        ];
-        assert!(belt_core::spec::all_decomposed_issues_closed(&all_closed));
-
-        // Step 6: Active -> Completing -> Completed.
-        spec.transition_to(SpecStatus::Completing).unwrap();
-        db.update_spec_status(&spec.id, spec.status).unwrap();
-        assert_eq!(db.get_spec(id).unwrap().status, SpecStatus::Completing);
-
-        spec.transition_to(SpecStatus::Completed).unwrap();
-        db.update_spec_status(&spec.id, spec.status).unwrap();
-        let final_spec = db.get_spec(id).unwrap();
-        assert_eq!(final_spec.status, SpecStatus::Completed);
-        assert!(final_spec.status.is_terminal());
-    }
-
-    /// Verify that decomposed_issue_numbers returns empty vec when
-    /// decomposed_issues is None.
-    #[test]
-    fn spec_decomposed_issue_numbers_none() {
-        let spec = belt_core::spec::Spec::new(
-            "s".to_string(),
-            "w".to_string(),
-            "n".to_string(),
-            "c".to_string(),
-        );
-        assert!(spec.decomposed_issue_numbers().is_empty());
-        assert!(!spec.is_decomposed());
-    }
-
-    /// Verify format_decomposition_preview with empty input.
-    #[test]
-    fn decompose_preview_empty() {
-        let preview = belt_core::spec::format_decomposition_preview(&[]);
-        assert!(preview.contains("0 child issue(s)"));
-    }
-
     // --- JSON flag parsing tests ---
 
     #[test]
@@ -6231,18 +3759,6 @@ sources:
                 command: QueueCommands::Skip { json, .. },
             } => assert!(json),
             _ => panic!("expected Queue Skip command"),
-        }
-    }
-
-    #[test]
-    fn queue_retry_script_json_flag() {
-        let cli =
-            Cli::try_parse_from(["belt", "queue", "retry-script", "item-1", "--json"]).unwrap();
-        match cli.command {
-            Commands::Queue {
-                command: QueueCommands::RetryScript { json, .. },
-            } => assert!(json),
-            _ => panic!("expected Queue RetryScript command"),
         }
     }
 
@@ -6487,102 +4003,6 @@ sources:
                 command: CronCommands::Run { json, .. },
             } => assert!(json),
             _ => panic!("expected Cron Run command"),
-        }
-    }
-
-    #[test]
-    fn spec_update_json_flag() {
-        let cli = Cli::try_parse_from([
-            "belt", "spec", "update", "spec-1", "--name", "new-name", "--json",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Spec {
-                command: SpecCommands::Update { json, .. },
-            } => assert!(json),
-            _ => panic!("expected Spec Update command"),
-        }
-    }
-
-    #[test]
-    fn spec_pause_json_flag() {
-        let cli = Cli::try_parse_from(["belt", "spec", "pause", "spec-1", "--json"]).unwrap();
-        match cli.command {
-            Commands::Spec {
-                command: SpecCommands::Pause { json, .. },
-            } => assert!(json),
-            _ => panic!("expected Spec Pause command"),
-        }
-    }
-
-    #[test]
-    fn spec_resume_json_flag() {
-        let cli = Cli::try_parse_from(["belt", "spec", "resume", "spec-1", "--json"]).unwrap();
-        match cli.command {
-            Commands::Spec {
-                command: SpecCommands::Resume { json, .. },
-            } => assert!(json),
-            _ => panic!("expected Spec Resume command"),
-        }
-    }
-
-    #[test]
-    fn spec_complete_json_flag() {
-        let cli = Cli::try_parse_from(["belt", "spec", "complete", "spec-1", "--json"]).unwrap();
-        match cli.command {
-            Commands::Spec {
-                command: SpecCommands::Complete { json, .. },
-            } => assert!(json),
-            _ => panic!("expected Spec Complete command"),
-        }
-    }
-
-    #[test]
-    fn spec_remove_json_flag() {
-        let cli = Cli::try_parse_from(["belt", "spec", "remove", "spec-1", "--json"]).unwrap();
-        match cli.command {
-            Commands::Spec {
-                command: SpecCommands::Remove { json, .. },
-            } => assert!(json),
-            _ => panic!("expected Spec Remove command"),
-        }
-    }
-
-    #[test]
-    fn spec_link_json_flag() {
-        let cli = Cli::try_parse_from([
-            "belt",
-            "spec",
-            "link",
-            "spec-1",
-            "https://example.com",
-            "--json",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Spec {
-                command: SpecCommands::Link { json, .. },
-            } => assert!(json),
-            _ => panic!("expected Spec Link command"),
-        }
-    }
-
-    #[test]
-    fn spec_unlink_json_flag() {
-        let cli = Cli::try_parse_from([
-            "belt",
-            "spec",
-            "unlink",
-            "spec-1",
-            "https://example.com",
-            "--json",
-        ])
-        .unwrap();
-        match cli.command {
-            Commands::Spec {
-                command: SpecCommands::Unlink { json, .. },
-            } => assert!(json),
-            _ => panic!("expected Spec Unlink command"),
         }
     }
 

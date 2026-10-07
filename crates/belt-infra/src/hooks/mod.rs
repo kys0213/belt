@@ -35,10 +35,6 @@ pub struct HookParams {
     pub repo: String,
     /// Optional HITL label override.
     pub hitl_label: Option<String>,
-    /// Whether to post comments on successful completion.
-    pub comment_on_done: bool,
-    /// Whether to post comments on failure.
-    pub comment_on_fail: bool,
 }
 
 impl HookParams {
@@ -48,8 +44,6 @@ impl HookParams {
             source_type: source_type.to_string(),
             repo: repo.to_string(),
             hitl_label: None,
-            comment_on_done: false,
-            comment_on_fail: true,
         }
     }
 }
@@ -83,8 +77,6 @@ pub fn create_hook(
     match params.source_type.as_str() {
         "github" => {
             let mut config = GitHubHookConfig::new(&params.repo);
-            config.comment_on_done = params.comment_on_done;
-            config.comment_on_fail = params.comment_on_fail;
             if let Some(ref label) = params.hitl_label {
                 config = config.with_hitl_label(label);
             }
@@ -181,6 +173,7 @@ mod tests {
                     phase: "running".to_string(),
                     state: "implement".to_string(),
                     source_id: "github:org/repo#42".to_string(),
+                    derived_from: None,
                 },
                 source: SourceContext {
                     source_type: "github".to_string(),
@@ -283,7 +276,5 @@ mod tests {
         assert_eq!(params.source_type, "github");
         assert_eq!(params.repo, "org/repo");
         assert!(params.hitl_label.is_none());
-        assert!(!params.comment_on_done);
-        assert!(params.comment_on_fail);
     }
 }

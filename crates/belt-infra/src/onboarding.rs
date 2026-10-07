@@ -3,7 +3,7 @@
 //! Orchestrates the full workspace registration process:
 //! 1. Parse workspace.yml
 //! 2. Save workspace to DB
-//! 3. Seed per-workspace cron jobs (CR-13)
+//! 3. Seed per-workspace cron jobs
 //! 4. Create per-workspace Claw directory (R-052)
 
 use std::path::{Path, PathBuf};
@@ -30,15 +30,13 @@ pub struct OnboardingResult {
     pub claw_dir: PathBuf,
 }
 
-/// Per-workspace cron seed definitions (CR-13).
+/// Per-workspace cron seed definitions.
 ///
 /// Each tuple is `(job_name_suffix, schedule_expression)`.
 const WORKSPACE_CRON_SEEDS: &[(&str, &str)] = &[
     ("hitl_timeout", "*/5 * * * *"),
     ("daily_report", "0 6 * * *"),
     ("log_cleanup", "0 0 * * *"),
-    ("evaluate", "0 */6 * * *"),
-    ("gap_detection", "0 */12 * * *"),
     ("knowledge_extraction", "0 0 * * *"),
 ];
 
@@ -83,7 +81,7 @@ pub fn onboard_workspace(
         Err(e) => return Err(e.into()),
     };
 
-    // Step 3: Seed per-workspace cron jobs (CR-13)
+    // Step 3: Seed per-workspace cron jobs
     let cron_jobs_seeded = seed_workspace_cron_jobs(db, &config.name)?;
 
     // Step 4: Create per-workspace Claw directory (R-052)
@@ -204,9 +202,19 @@ concurrency: 2
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 300
   slack:
     url: https://slack.com/workspace
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
 
     #[test]
@@ -218,7 +226,7 @@ sources:
         let result = onboard_workspace(&db, tmp.path(), belt_home.path()).unwrap();
         assert_eq!(result.workspace_name, "test-project");
         assert_eq!(result.source_count, 2);
-        assert_eq!(result.cron_jobs_seeded, 6);
+        assert_eq!(result.cron_jobs_seeded, 4);
         assert!(result.created);
 
         // Verify workspace is in DB
@@ -227,13 +235,13 @@ sources:
 
         // Verify cron jobs are in DB
         let jobs = db.list_cron_jobs().unwrap();
-        assert_eq!(jobs.len(), 6);
+        assert_eq!(jobs.len(), 4);
         let job_names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
         assert!(job_names.contains(&"test-project:hitl_timeout"));
         assert!(job_names.contains(&"test-project:daily_report"));
         assert!(job_names.contains(&"test-project:log_cleanup"));
-        assert!(job_names.contains(&"test-project:evaluate"));
-        assert!(job_names.contains(&"test-project:gap_detection"));
+        assert!(!job_names.contains(&"test-project:evaluate"));
+        assert!(!job_names.contains(&"test-project:gap_detection"));
         assert!(job_names.contains(&"test-project:knowledge_extraction"));
 
         // All jobs should be scoped to the workspace
@@ -252,7 +260,7 @@ sources:
         // First onboard
         let result1 = onboard_workspace(&db, tmp.path(), belt_home.path()).unwrap();
         assert!(result1.created);
-        assert_eq!(result1.cron_jobs_seeded, 6);
+        assert_eq!(result1.cron_jobs_seeded, 4);
 
         // Second onboard should update, not create
         let result2 = onboard_workspace(&db, tmp.path(), belt_home.path()).unwrap();
@@ -261,7 +269,7 @@ sources:
 
         // Still only 6 cron jobs total
         let jobs = db.list_cron_jobs().unwrap();
-        assert_eq!(jobs.len(), 6);
+        assert_eq!(jobs.len(), 4);
     }
 
     #[test]
@@ -285,12 +293,22 @@ name: project-a
 sources:
   github:
     url: https://github.com/org/repo-a
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
         let yaml_b = r#"
 name: project-b
 sources:
   github:
     url: https://github.com/org/repo-b
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
         let tmp_a = write_workspace_yaml(yaml_a);
         let tmp_b = write_workspace_yaml(yaml_b);
@@ -299,7 +317,7 @@ sources:
         onboard_workspace(&db, tmp_b.path(), belt_home.path()).unwrap();
 
         let jobs = db.list_cron_jobs().unwrap();
-        assert_eq!(jobs.len(), 12); // 6 per workspace
+        assert_eq!(jobs.len(), 8); // 4 per workspace
 
         let job_names: Vec<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
         assert!(job_names.contains(&"project-a:hitl_timeout"));
@@ -329,6 +347,11 @@ concurrency: 2
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
         let tmp = write_workspace_yaml(yaml);
         let result = onboard_workspace(&db, tmp.path(), belt_home.path());
@@ -344,10 +367,25 @@ name: three-source-project
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
   slack:
     url: https://slack.com/workspace
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
   jira:
     url: https://jira.example.com
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
         let tmp = write_workspace_yaml(yaml);
         let result = onboard_workspace(&db, tmp.path(), belt_home.path()).unwrap();
@@ -365,7 +403,7 @@ sources:
         assert_eq!(result.source_count, 0);
         assert!(result.created);
         // Cron jobs are still seeded regardless of source count.
-        assert_eq!(result.cron_jobs_seeded, 6);
+        assert_eq!(result.cron_jobs_seeded, 4);
     }
 
     #[test]
@@ -396,11 +434,8 @@ sources:
         );
         assert_eq!(job_map.get("test-project:daily_report"), Some(&"0 6 * * *"));
         assert_eq!(job_map.get("test-project:log_cleanup"), Some(&"0 0 * * *"));
-        assert_eq!(job_map.get("test-project:evaluate"), Some(&"0 */6 * * *"));
-        assert_eq!(
-            job_map.get("test-project:gap_detection"),
-            Some(&"0 */12 * * *")
-        );
+        assert_eq!(job_map.get("test-project:evaluate"), None);
+        assert_eq!(job_map.get("test-project:gap_detection"), None);
         assert_eq!(
             job_map.get("test-project:knowledge_extraction"),
             Some(&"0 0 * * *")
@@ -420,7 +455,7 @@ sources:
 
         assert!(!result3.created);
         assert_eq!(result3.cron_jobs_seeded, 0);
-        assert_eq!(db.list_cron_jobs().unwrap().len(), 6);
+        assert_eq!(db.list_cron_jobs().unwrap().len(), 4);
     }
 
     #[test]
@@ -663,8 +698,8 @@ sources:
     fn multiple_workspaces_get_separate_claw_dirs() {
         let db = test_db();
         let belt_home = test_belt_home();
-        let yaml_a = "name: project-a\nsources:\n  github:\n    url: https://github.com/org/a\n";
-        let yaml_b = "name: project-b\nsources:\n  github:\n    url: https://github.com/org/b\n";
+        let yaml_a = "name: project-a\nsources:\n  github:\n    url: https://github.com/org/a\n    escalation:\n      1: retry\n      terminal: skip\n";
+        let yaml_b = "name: project-b\nsources:\n  github:\n    url: https://github.com/org/b\n    escalation:\n      1: retry\n      terminal: skip\n";
         let tmp_a = write_workspace_yaml(yaml_a);
         let tmp_b = write_workspace_yaml(yaml_b);
 

@@ -26,6 +26,10 @@ pub enum DaemonSignal {
     /// Request the daemon to synchronize cron jobs from the database and
     /// perform an immediate tick.
     CronSync,
+    /// A cancel request was recorded: handle open cancel requests now
+    /// instead of at the next tick. Kept apart from [`DaemonSignal::CronSync`]
+    /// so a cancel never waits for a cron sync.
+    CancelRequested,
 }
 
 /// A TCP-based IPC listener that the daemon uses to receive cross-platform
@@ -182,6 +186,14 @@ mod tests {
         // Round-trip back to the original variant.
         let deserialized: DaemonSignal = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, DaemonSignal::CronSync);
+    }
+
+    #[test]
+    fn daemon_signal_serde_cancel_requested() {
+        let json = serde_json::to_string(&DaemonSignal::CancelRequested).unwrap();
+        assert_eq!(json, r#"{"signal":"CancelRequested"}"#);
+        let deserialized: DaemonSignal = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, DaemonSignal::CancelRequested);
     }
 
     #[tokio::test]

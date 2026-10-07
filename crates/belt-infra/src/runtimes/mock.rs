@@ -1,11 +1,15 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 
+use belt_core::platform::{NoopProcessSink, ProcessSink};
 use belt_core::runtime::{
     AgentRuntime, RuntimeCapabilities, RuntimeRequest, RuntimeResponse, TokenUsage,
 };
+
+/// Default pid reported by [`MockRuntime`]; no live process owns it.
+pub const DEFAULT_REPORTED_PID: u32 = 999_999_999;
 
 /// 테스트용 MockRuntime.
 pub struct MockRuntime {
@@ -14,6 +18,9 @@ pub struct MockRuntime {
     calls: Mutex<Vec<String>>,
     /// Per-invocation token usage. If empty, no token usage is reported.
     token_usages: Mutex<Vec<TokenUsage>>,
+    /// Pid reported to a [`ProcessSink`]. It names no live process, so a
+    /// process killer pointed at it fails instead of hitting something real.
+    reported_pid: u32,
 }
 
 impl MockRuntime {
@@ -23,6 +30,7 @@ impl MockRuntime {
             exit_codes: Mutex::new(exit_codes),
             calls: Mutex::new(Vec::new()),
             token_usages: Mutex::new(Vec::new()),
+            reported_pid: DEFAULT_REPORTED_PID,
         }
     }
 
@@ -33,6 +41,12 @@ impl MockRuntime {
     /// Configure per-invocation token usage responses.
     pub fn with_token_usages(self, usages: Vec<TokenUsage>) -> Self {
         *self.token_usages.lock().unwrap() = usages;
+        self
+    }
+
+    /// Report `pid` to the [`ProcessSink`] instead of [`DEFAULT_REPORTED_PID`].
+    pub fn with_reported_pid(mut self, pid: u32) -> Self {
+        self.reported_pid = pid;
         self
     }
 
@@ -48,6 +62,17 @@ impl AgentRuntime for MockRuntime {
     }
 
     async fn invoke(&self, request: RuntimeRequest) -> RuntimeResponse {
+        self.invoke_with_sink(request, Arc::new(NoopProcessSink))
+            .await
+    }
+
+    async fn invoke_with_sink(
+        &self,
+        request: RuntimeRequest,
+        sink: Arc<dyn ProcessSink>,
+    ) -> RuntimeResponse {
+        // The mock spawns nothing; the configured pid stands in for the handler.
+        sink.spawned(self.reported_pid);
         self.calls.lock().unwrap().push(request.prompt.clone());
 
         let exit_code = {
@@ -127,5 +152,28 @@ mod tests {
         };
         mock.invoke(req2).await;
         assert_eq!(mock.calls(), vec!["first", "second"]);
+    }
+
+    #[tokio::test]
+    async fn mock_invoke_with_sink_reports_a_pid_once() {
+        use crate::platform::testing::RecordingSink;
+        use std::sync::Arc;
+
+        let mock = MockRuntime::always_ok("test");
+        let sink = Arc::new(RecordingSink::default());
+        let req = RuntimeRequest {
+            working_dir: PathBuf::from("/tmp"),
+            prompt: "hello".to_string(),
+            model: None,
+            system_prompt: None,
+            session_id: None,
+            structured_output: None,
+        };
+
+        let response = mock.invoke_with_sink(req, sink.clone()).await;
+
+        assert_eq!(response.exit_code, 0);
+        assert_eq!(sink.pids().len(), 1);
+        assert_eq!(mock.calls(), vec!["hello"]);
     }
 }

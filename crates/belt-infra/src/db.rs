@@ -4,18 +4,28 @@
 //! cron jobs, and token usage — all backed by a single SQLite database.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use belt_core::error::BeltError;
 use belt_core::escalation::EscalationAction;
+use belt_core::hitl::{
+    ConfirmPath, HitlAction, HitlId, HitlResolution, HitlStatus, RespondOutcome,
+};
+use belt_core::lineage::{AttemptStatus, CollectDecision, collect_decision, count_since_reset};
 use belt_core::phase::QueuePhase;
-use belt_core::queue::QueueItem;
+use belt_core::queue::{HitlReason, QueueItem};
 use belt_core::runtime::TokenUsage;
-use belt_core::spec::{Spec, SpecLink, SpecStatus};
+use belt_core::transition::{
+    Actor, GuardDecision, ItemSnapshot, Processing, TransitionOutcome, TransitionReason,
+    TransitionRequest, guard,
+};
+
+use crate::db_migrations;
 
 /// An immutable history event recording an attempt on a work item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,7 +191,7 @@ pub struct RuntimeStats {
 /// Column list shared by all `queue_items` SELECT and INSERT statements.
 ///
 /// Keeping this in one place avoids drift when columns are added or reordered.
-const QUEUE_ITEM_COLUMNS: &str = "work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, hitl_created_at, hitl_respondent, hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action, replan_count, worktree_preserved, previous_worktree_path";
+const QUEUE_ITEM_COLUMNS: &str = "work_id, source_id, workspace_id, state, phase, title, created_at, updated_at, replan_count, worktree_preserved, previous_worktree_path, derived_from, lineage_root";
 
 /// Shorthand for extracting a column value and mapping the error to `BeltError::Database`.
 fn col<T: rusqlite::types::FromSql>(row: &rusqlite::Row<'_>, idx: usize) -> Result<T, BeltError> {
@@ -197,205 +207,63 @@ pub struct Database {
 }
 
 impl Database {
-    /// Open (or create) a database at the given path and initialize the schema.
+    /// Open (or create) a database at the given path and migrate it to the
+    /// current schema version.
+    ///
+    /// A database created by an older binary is backed up next to `path`
+    /// (`{path}.bak-v{old}`) before it is migrated. Migration is forward-only:
+    /// a migrated database cannot be opened by an older binary.
     ///
     /// # Errors
-    /// Returns `BeltError::Database` if the connection or schema creation fails.
+    /// Returns `BeltError::Database` if the connection fails, the database was
+    /// written by a newer binary, or the migration fails (it is rolled back).
     pub fn open(path: &str) -> Result<Self, BeltError> {
-        let conn = Connection::open(path).map_err(|e| BeltError::Database(e.to_string()))?;
-        let db = Self {
+        let mut conn = Connection::open(path).map_err(|e| BeltError::Database(e.to_string()))?;
+        db_migrations::migrate(&mut conn, Some(Path::new(path)))?;
+        Ok(Self {
             conn: Mutex::new(conn),
-        };
-        db.init()?;
-        Ok(db)
+        })
     }
 
-    /// Open an in-memory database — useful for testing.
+    /// Open an in-memory database at the current schema version — useful for testing.
     ///
     /// # Errors
     /// Returns `BeltError::Database` if schema creation fails.
     pub fn open_in_memory() -> Result<Self, BeltError> {
-        let conn = Connection::open_in_memory().map_err(|e| BeltError::Database(e.to_string()))?;
-        let db = Self {
+        let mut conn =
+            Connection::open_in_memory().map_err(|e| BeltError::Database(e.to_string()))?;
+        db_migrations::migrate(&mut conn, None)?;
+        Ok(Self {
             conn: Mutex::new(conn),
-        };
-        db.init()?;
-        Ok(db)
-    }
-
-    /// Create all tables if they do not already exist.
-    fn init(&self) -> Result<(), BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS queue_items (
-                work_id          TEXT PRIMARY KEY,
-                source_id        TEXT NOT NULL,
-                workspace_id     TEXT NOT NULL,
-                state            TEXT NOT NULL,
-                phase            TEXT NOT NULL,
-                title            TEXT,
-                created_at       TEXT NOT NULL,
-                updated_at       TEXT NOT NULL,
-                hitl_created_at  TEXT,
-                hitl_respondent  TEXT,
-                hitl_notes       TEXT,
-                hitl_reason          TEXT,
-                hitl_timeout_at      TEXT,
-                hitl_terminal_action TEXT,
-                replan_count         INTEGER NOT NULL DEFAULT 0,
-                worktree_preserved   INTEGER NOT NULL DEFAULT 0,
-                previous_worktree_path TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS history (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                work_id    TEXT NOT NULL,
-                source_id  TEXT NOT NULL,
-                state      TEXT NOT NULL,
-                status     TEXT NOT NULL,
-                attempt    INTEGER NOT NULL,
-                summary    TEXT,
-                error      TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS workspaces (
-                name        TEXT PRIMARY KEY,
-                config_path TEXT NOT NULL,
-                created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS cron_jobs (
-                name        TEXT PRIMARY KEY,
-                schedule    TEXT NOT NULL,
-                script      TEXT NOT NULL DEFAULT '',
-                workspace   TEXT,
-                enabled     INTEGER NOT NULL DEFAULT 1,
-                last_run_at TEXT,
-                created_at  TEXT NOT NULL,
-                updated_at  TEXT NOT NULL DEFAULT ''
-            );
-
-            CREATE TABLE IF NOT EXISTS knowledge_base (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                workspace  TEXT NOT NULL,
-                source_ref TEXT NOT NULL,
-                category   TEXT NOT NULL,
-                content    TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS token_usage (
-                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-                work_id            TEXT NOT NULL,
-                workspace          TEXT NOT NULL,
-                runtime            TEXT NOT NULL,
-                model              TEXT NOT NULL,
-                input_tokens       INTEGER NOT NULL,
-                output_tokens      INTEGER NOT NULL,
-                cache_read_tokens  INTEGER,
-                cache_write_tokens INTEGER,
-                duration_ms        INTEGER,
-                created_at         TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS specs (
-                id                TEXT PRIMARY KEY,
-                workspace_id      TEXT NOT NULL,
-                name              TEXT NOT NULL,
-                status            TEXT NOT NULL,
-                content           TEXT NOT NULL,
-                priority          INTEGER,
-                labels            TEXT,
-                depends_on        TEXT,
-                entry_point       TEXT,
-                decomposed_issues TEXT,
-                test_commands     TEXT,
-                created_at        TEXT NOT NULL,
-                updated_at        TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS spec_links (
-                id         TEXT PRIMARY KEY,
-                spec_id    TEXT NOT NULL,
-                target     TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE(spec_id, target)
-            );
-
-            CREATE TABLE IF NOT EXISTS transition_events (
-                id         TEXT PRIMARY KEY,
-                work_id    TEXT NOT NULL,
-                source_id  TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                phase      TEXT,
-                from_phase TEXT,
-                detail     TEXT,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS queue_dependencies (
-                work_id    TEXT NOT NULL,
-                depends_on TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                PRIMARY KEY (work_id, depends_on)
-            );
-            ",
-        )
-        .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(())
+        })
     }
 
     // ---- Queue CRUD --------------------------------------------------------
 
     /// Insert a new queue item.
     ///
+    /// Writes no transition log row and issues no `work_id`; collection goes
+    /// through [`Database::insert_collected`].
+    ///
     /// # Errors
-    /// Returns `BeltError::Database` on constraint violation or I/O error.
+    /// Returns `BeltError::Database` on constraint violation, I/O error, or an
+    /// empty `lineage_root`.
     pub fn insert_item(&self, item: &QueueItem) -> Result<(), BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        conn.execute(
-            &format!(
-                "INSERT INTO queue_items ({QUEUE_ITEM_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)"
-            ),
-            params![
-                item.work_id,
-                item.source_id,
-                item.workspace_id,
-                item.state,
-                phase_to_str(item.phase()),
-                item.title,
-                item.created_at,
-                item.updated_at,
-                item.hitl_created_at,
-                item.hitl_respondent,
-                item.hitl_notes,
-                item.hitl_reason.map(|r| r.to_string()),
-                item.hitl_timeout_at,
-                item.hitl_terminal_action.map(|a| a.to_string()),
-                item.replan_count,
-                item.worktree_preserved,
-                item.previous_worktree_path,
-            ],
-        )
-        .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(())
+        let conn = self.lock_conn()?;
+        insert_queue_row(&conn, item)
     }
 
     /// Update the phase of an existing queue item.
     ///
     /// Also refreshes `updated_at` to the current UTC time.
     ///
+    /// Test setup only: it overwrites the phase without the transition
+    /// contract or the transition log, so production code uses
+    /// [`Database::transition`].
+    ///
     /// # Errors
     /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn update_phase(&self, work_id: &str, phase: QueuePhase) -> Result<(), BeltError> {
         let now = Utc::now().to_rfc3339();
         let conn = self
@@ -416,16 +284,16 @@ impl Database {
 
     /// Persist worktree preservation state for an item.
     ///
-    /// Sets `worktree_preserved`, `previous_worktree_path`, and `phase`,
-    /// and refreshes `updated_at`. Used during daemon shutdown rollback
-    /// to ensure worktree reuse information survives restart.
+    /// Sets `worktree_preserved` and `previous_worktree_path` only: the phase
+    /// belongs to the transition contract, so a rollback that lost a race
+    /// is never overwritten here. Used during daemon shutdown rollback to
+    /// ensure worktree reuse information survives restart.
     ///
     /// # Errors
     /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
     pub fn update_item_worktree_state(
         &self,
         work_id: &str,
-        phase: QueuePhase,
         worktree_preserved: bool,
         previous_worktree_path: Option<&str>,
     ) -> Result<(), BeltError> {
@@ -436,182 +304,14 @@ impl Database {
             .map_err(|e| BeltError::Database(e.to_string()))?;
         let rows = conn
             .execute(
-                "UPDATE queue_items SET phase = ?1, worktree_preserved = ?2, previous_worktree_path = ?3, updated_at = ?4 WHERE work_id = ?5",
-                params![phase_to_str(phase), worktree_preserved, previous_worktree_path, now, work_id],
+                "UPDATE queue_items SET worktree_preserved = ?1, previous_worktree_path = ?2, updated_at = ?3 WHERE work_id = ?4",
+                params![worktree_preserved, previous_worktree_path, now, work_id],
             )
             .map_err(|e| BeltError::Database(e.to_string()))?;
         if rows == 0 {
             return Err(BeltError::ItemNotFound(work_id.to_string()));
         }
         Ok(())
-    }
-
-    /// Escalate an item to HITL phase with metadata.
-    ///
-    /// Sets `phase` to `Hitl`, records `hitl_created_at`, `hitl_reason`, and
-    /// `hitl_notes`, and refreshes `updated_at`.
-    ///
-    /// # Errors
-    /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
-    pub fn escalate_to_hitl(
-        &self,
-        work_id: &str,
-        reason: &str,
-        notes: &str,
-    ) -> Result<(), BeltError> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "UPDATE queue_items SET phase = 'hitl', updated_at = ?1, hitl_created_at = ?2, hitl_reason = ?3, hitl_notes = ?4 WHERE work_id = ?5",
-                params![now, now, reason, notes, work_id],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        if rows == 0 {
-            return Err(BeltError::ItemNotFound(work_id.to_string()));
-        }
-        Ok(())
-    }
-
-    /// Increment the `replan_count` for a queue item.
-    ///
-    /// Used by `EvaluateJob` to track per-item evaluate failure counts.
-    /// Also refreshes `updated_at`.
-    ///
-    /// # Errors
-    /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
-    pub fn increment_replan_count(&self, work_id: &str) -> Result<u32, BeltError> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "UPDATE queue_items SET replan_count = replan_count + 1, updated_at = ?1 WHERE work_id = ?2",
-                params![now, work_id],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        if rows == 0 {
-            return Err(BeltError::ItemNotFound(work_id.to_string()));
-        }
-        // Return updated count.
-        let count: u32 = conn
-            .query_row(
-                "SELECT replan_count FROM queue_items WHERE work_id = ?1",
-                params![work_id],
-                |row| row.get(0),
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(count)
-    }
-
-    /// Update HITL metadata when responding to a HITL item.
-    ///
-    /// Sets `hitl_respondent`, `hitl_notes`, phase, and refreshes `updated_at`.
-    ///
-    /// # Errors
-    /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
-    pub fn respond_hitl(
-        &self,
-        work_id: &str,
-        phase: QueuePhase,
-        respondent: Option<&str>,
-        notes: Option<&str>,
-    ) -> Result<(), BeltError> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "UPDATE queue_items SET phase = ?1, updated_at = ?2, hitl_respondent = ?3, hitl_notes = COALESCE(?4, hitl_notes) WHERE work_id = ?5",
-                params![phase_to_str(phase), now, respondent, notes, work_id],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        if rows == 0 {
-            return Err(BeltError::ItemNotFound(work_id.to_string()));
-        }
-        Ok(())
-    }
-
-    /// List queue items in HITL phase that have exceeded the timeout threshold.
-    ///
-    /// Returns work_ids of HITL items where `hitl_created_at` is older than
-    /// `timeout_hours` from now.
-    pub fn list_expired_hitl_items(&self, timeout_hours: u64) -> Result<Vec<String>, BeltError> {
-        let cutoff = (Utc::now() - chrono::Duration::hours(timeout_hours as i64)).to_rfc3339();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT work_id FROM queue_items WHERE phase = 'hitl' AND hitl_created_at IS NOT NULL AND hitl_created_at < ?1",
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let work_ids = stmt
-            .query_map(params![cutoff], |row| row.get::<_, String>(0))
-            .map_err(|e| BeltError::Database(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(work_ids)
-    }
-
-    /// Set HITL timeout on a queue item.
-    ///
-    /// Stores `hitl_timeout_at` (the absolute expiry time) and an optional
-    /// `terminal_action` (skip/failed/replan) to apply when the timeout fires.
-    ///
-    /// # Errors
-    /// Returns `BeltError::ItemNotFound` if no row matches the given `work_id`.
-    pub fn set_hitl_timeout(
-        &self,
-        work_id: &str,
-        timeout_at: &str,
-        terminal_action: Option<&EscalationAction>,
-    ) -> Result<(), BeltError> {
-        let now = Utc::now().to_rfc3339();
-        let action_str = terminal_action.map(|a| a.to_string());
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "UPDATE queue_items SET hitl_timeout_at = ?1, hitl_terminal_action = ?2, updated_at = ?3 WHERE work_id = ?4",
-                params![timeout_at, action_str, now, work_id],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        if rows == 0 {
-            return Err(BeltError::ItemNotFound(work_id.to_string()));
-        }
-        Ok(())
-    }
-
-    /// List HITL items that have a timeout set and are pending expiry.
-    ///
-    /// Returns items where `hitl_timeout_at` is set and the item is still in HITL phase.
-    pub fn list_hitl_items_with_timeout(&self) -> Result<Vec<QueueItem>, BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let mut stmt = conn
-            .prepare(
-                &format!("SELECT {QUEUE_ITEM_COLUMNS} FROM queue_items WHERE phase = 'hitl' AND hitl_timeout_at IS NOT NULL"),
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let items = stmt
-            .query_map([], |row| Ok(row_to_queue_item(row)))
-            .map_err(|e| BeltError::Database(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        items.into_iter().collect::<Result<Vec<_>, _>>()
     }
 
     /// Retrieve a single queue item by `work_id`.
@@ -1142,260 +842,6 @@ impl Database {
             return Err(BeltError::ItemNotFound(name.to_string()));
         }
         Ok(())
-    }
-
-    // ---- Specs -------------------------------------------------------------
-
-    /// Insert a new spec.
-    ///
-    /// # Errors
-    /// Returns `BeltError::Database` on constraint violation or I/O error.
-    pub fn insert_spec(&self, spec: &Spec) -> Result<(), BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        conn.execute(
-            "INSERT INTO specs (id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, test_commands, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                spec.id,
-                spec.workspace_id,
-                spec.name,
-                spec.status.as_str(),
-                spec.content,
-                spec.priority,
-                spec.labels,
-                spec.depends_on,
-                spec.entry_point,
-                spec.decomposed_issues,
-                spec.test_commands,
-                spec.created_at,
-                spec.updated_at,
-            ],
-        )
-        .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(())
-    }
-
-    /// Retrieve a single spec by ID.
-    ///
-    /// # Errors
-    /// Returns `BeltError::SpecNotFound` if no row matches.
-    pub fn get_spec(&self, id: &str) -> Result<Spec, BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        conn.query_row(
-            "SELECT id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, test_commands, created_at, updated_at
-                 FROM specs WHERE id = ?1",
-            params![id],
-            |row| Ok(row_to_spec(row)),
-        )
-        .map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => BeltError::SpecNotFound(id.to_string()),
-            other => BeltError::Database(other.to_string()),
-        })?
-    }
-
-    /// List all specs, optionally filtered by workspace and/or status.
-    ///
-    /// By default, archived specs are excluded unless explicitly requested
-    /// via `status = Some(SpecStatus::Archived)`.
-    pub fn list_specs(
-        &self,
-        workspace: Option<&str>,
-        status: Option<SpecStatus>,
-    ) -> Result<Vec<Spec>, BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let mut sql = String::from(
-            "SELECT id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, test_commands, created_at, updated_at FROM specs WHERE 1=1",
-        );
-        let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(ws) = workspace {
-            sql.push_str(" AND workspace_id = ?");
-            param_values.push(Box::new(ws.to_string()));
-        }
-        if let Some(s) = status {
-            sql.push_str(" AND status = ?");
-            param_values.push(Box::new(s.as_str().to_string()));
-        } else {
-            // Exclude archived specs by default
-            sql.push_str(" AND status != ?");
-            param_values.push(Box::new(SpecStatus::Archived.as_str().to_string()));
-        }
-
-        sql.push_str(" ORDER BY created_at ASC");
-
-        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-            param_values.iter().map(|p| p.as_ref()).collect();
-
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-
-        let specs = stmt
-            .query_map(params_ref.as_slice(), |row| Ok(row_to_spec(row)))
-            .map_err(|e| BeltError::Database(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-
-        specs.into_iter().collect::<Result<Vec<_>, _>>()
-    }
-
-    /// Update a spec's name, content, priority, labels, and depends_on.
-    ///
-    /// # Errors
-    /// Returns `BeltError::SpecNotFound` if no spec matches the given ID.
-    pub fn update_spec(&self, spec: &Spec) -> Result<(), BeltError> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "UPDATE specs SET name = ?1, content = ?2, priority = ?3, labels = ?4, depends_on = ?5, entry_point = ?6, decomposed_issues = ?7, test_commands = ?8, updated_at = ?9 WHERE id = ?10",
-                params![
-                    spec.name,
-                    spec.content,
-                    spec.priority,
-                    spec.labels,
-                    spec.depends_on,
-                    spec.entry_point,
-                    spec.decomposed_issues,
-                    spec.test_commands,
-                    now,
-                    spec.id,
-                ],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        if rows == 0 {
-            return Err(BeltError::SpecNotFound(spec.id.clone()));
-        }
-        Ok(())
-    }
-
-    /// Update the status of a spec.
-    ///
-    /// This method does NOT validate state machine transitions; the caller
-    /// is responsible for checking `SpecStatus::can_transition_to` before
-    /// calling this.
-    ///
-    /// # Errors
-    /// Returns `BeltError::SpecNotFound` if no spec matches the given ID.
-    pub fn update_spec_status(&self, id: &str, status: SpecStatus) -> Result<(), BeltError> {
-        let now = Utc::now().to_rfc3339();
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "UPDATE specs SET status = ?1, updated_at = ?2 WHERE id = ?3",
-                params![status.as_str(), now, id],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        if rows == 0 {
-            return Err(BeltError::SpecNotFound(id.to_string()));
-        }
-        Ok(())
-    }
-
-    /// Soft-delete a spec by transitioning it to Archived status.
-    ///
-    /// # Errors
-    /// Returns `BeltError::SpecNotFound` if no spec matches the given ID.
-    pub fn remove_spec(&self, id: &str) -> Result<(), BeltError> {
-        self.update_spec_status(id, SpecStatus::Archived)
-    }
-
-    // ---- Spec Links ---------------------------------------------------------
-
-    /// Insert a new spec link (association between a spec and an external resource).
-    ///
-    /// # Errors
-    /// Returns `BeltError::Database` on constraint violation.
-    pub fn insert_spec_link(&self, link: &SpecLink) -> Result<(), BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        conn.execute(
-            "INSERT INTO spec_links (id, spec_id, target, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![link.id, link.spec_id, link.target, link.created_at],
-        )
-        .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(())
-    }
-
-    /// List all links for a given spec.
-    pub fn list_spec_links(&self, spec_id: &str) -> Result<Vec<SpecLink>, BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, spec_id, target, created_at FROM spec_links WHERE spec_id = ?1 ORDER BY created_at ASC",
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let links = stmt
-            .query_map(params![spec_id], |row| {
-                Ok(SpecLink {
-                    id: row.get(0)?,
-                    spec_id: row.get(1)?,
-                    target: row.get(2)?,
-                    created_at: row.get(3)?,
-                })
-            })
-            .map_err(|e| BeltError::Database(e.to_string()))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(links)
-    }
-
-    /// Remove a spec link by spec_id and target.
-    ///
-    /// # Errors
-    /// Returns `BeltError::Database` with a descriptive message if no matching link exists.
-    pub fn remove_spec_link(&self, spec_id: &str, target: &str) -> Result<(), BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "DELETE FROM spec_links WHERE spec_id = ?1 AND target = ?2",
-                params![spec_id, target],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        if rows == 0 {
-            return Err(BeltError::Database(format!(
-                "no link found for spec '{spec_id}' with target '{target}'"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Remove all links for a spec (used when removing a spec).
-    pub fn remove_all_spec_links(&self, spec_id: &str) -> Result<usize, BeltError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        let rows = conn
-            .execute(
-                "DELETE FROM spec_links WHERE spec_id = ?1",
-                params![spec_id],
-            )
-            .map_err(|e| BeltError::Database(e.to_string()))?;
-        Ok(rows)
     }
 
     // ---- Knowledge Base ----------------------------------------------------
@@ -2170,6 +1616,1608 @@ impl Database {
     }
 }
 
+// ---- Transition / lineage store API ----------------------------------------
+
+/// Values of `transition_log.kind` written by this binary.
+///
+/// Rows copied from the legacy `transition_events` table keep their original
+/// `event_type` (`handler`, `evaluate`, `on_done`, ...) and are marked by the
+/// `legacy` actor, so readers must treat `kind` as an open vocabulary. The
+/// legacy phase kind is the same word as [`PHASE_ENTER`], which keeps phase
+/// history uniform across the migration.
+pub mod transition_kind {
+    /// An item entered a phase (`from_phase` → `to_phase`).
+    pub const PHASE_ENTER: &str = "phase_enter";
+    /// An item was created: collected, or derived (origin in `detail`).
+    pub const ITEM_CREATED: &str = "item_created";
+    /// A transition was refused with `busy` because the item is being processed.
+    pub const TRANSITION_REJECTED: &str = "transition_rejected";
+    /// A transition found a phase other than the expected one.
+    pub const TRANSITION_CONFLICT: &str = "transition_conflict";
+    /// A HITL response was refused; `reason` is `already_handled` or
+    /// `unauthorized`. The phase columns are empty: no transition happened.
+    pub const HITL_RESPONSE_REJECTED: &str = "hitl_response_rejected";
+    /// A LifecycleHook call failed; `reason` names the callback, `detail`
+    /// carries the error. The failure changed no phase.
+    pub const HOOK: &str = "hook";
+    /// A cancel request was recorded; `actor` is the path it came through,
+    /// `detail` the requester.
+    pub const CANCEL_REQUESTED: &str = "cancel_requested";
+    /// The daemon accepted a cancel request.
+    pub const CANCEL_ACCEPTED: &str = "cancel_accepted";
+    /// A cancel request was closed; `reason` is the result.
+    pub const CANCEL_CLOSED: &str = "cancel_closed";
+    /// A non-fatal step of HITL post-processing failed; post-processing went on.
+    pub const POST_PROCESSING_ERROR: &str = "post_processing_error";
+    /// HITL post-processing gave up after repeated result-transition
+    /// failures and moved the item from Hitl to Failed.
+    pub const POST_PROCESSING_FAILED: &str = "post_processing_failed";
+    /// A progress notification, a HITL request delivery attempt or a reply to
+    /// an external response could not be sent; `reason` names what was sent
+    /// (an event such as `started`, or `reply`), `detail` is `<channel>: <error>`.
+    /// The failure changed no phase.
+    pub const NOTIFICATION_FAILED: &str = "notification_failed";
+}
+
+/// A non-phase event to append to the `transition_log` with
+/// [`Database::record_event`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventRecord<'a> {
+    pub work_id: &'a str,
+    /// See [`transition_kind`]; never [`transition_kind::PHASE_ENTER`].
+    pub kind: &'a str,
+    pub actor: Actor,
+    pub reason: Option<&'a str>,
+    pub detail: Option<&'a str>,
+}
+
+/// One row of the append-only `transition_log`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransitionLogEntry {
+    /// Global, strictly increasing, never reused.
+    pub seq: u64,
+    pub work_id: String,
+    pub source_id: String,
+    /// See [`transition_kind`]; legacy rows carry their original event type.
+    pub kind: String,
+    /// Phase before the event; `None` for creation and non-phase events.
+    pub from_phase: Option<String>,
+    pub to_phase: Option<String>,
+    /// `daemon`, `cli`, `tui`, `cron`, an external channel name, or `legacy`.
+    pub actor: String,
+    pub reason: Option<String>,
+    pub detail: Option<String>,
+    /// RFC 3339.
+    pub created_at: String,
+}
+
+/// An item to create from collection. The `work_id` is issued by the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewItem {
+    pub source_id: String,
+    pub workspace_id: String,
+    pub state: String,
+    pub title: Option<String>,
+    pub actor: Actor,
+}
+
+/// Result of [`Database::insert_collected`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CollectOutcome {
+    /// A new Pending item (first item of a new lineage) was created.
+    Inserted { work_id: String },
+    /// The same `(source_id, state)` still has an item that is not Done or Skipped.
+    Duplicate,
+}
+
+/// Why an item is being derived. Decides worktree and failure-count handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeriveKind {
+    /// escalation retry: the origin's worktree is handed over to the derived item.
+    EscalationRetry,
+    /// replan: the derived item gets a new worktree and a failure-count reset point.
+    Replan,
+}
+
+/// Request to end `work_id` as Skipped and continue the work in a derived item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeriveRequest {
+    pub work_id: String,
+    pub expected_from: QueuePhase,
+    pub kind: DeriveKind,
+    pub actor: Actor,
+    pub reason: TransitionReason,
+    pub detail: Option<String>,
+}
+
+/// Result of [`Database::derive`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeriveOutcome {
+    Derived {
+        work_id: String,
+    },
+    /// The origin's transition was refused; nothing was derived.
+    Rejected(TransitionOutcome),
+}
+
+/// Request to enter Hitl and open a HITL request for `work_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenHitlRequest {
+    pub work_id: String,
+    pub expected_from: QueuePhase,
+    pub reason: HitlReason,
+    pub notes: Option<String>,
+    pub actor: Actor,
+    /// Recorded on the `X -> Hitl` transition (e.g. `Escalation(Hitl)`).
+    pub transition_reason: TransitionReason,
+    /// Absolute expiry time (RFC 3339), if the request can expire.
+    pub timeout_at: Option<String>,
+    /// Action applied on expiry; `skip` or `replan`.
+    pub terminal_action: Option<EscalationAction>,
+}
+
+/// Result of [`Database::open_hitl`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenHitlOutcome {
+    Opened {
+        hitl_id: HitlId,
+        /// `transition_log.seq` of the `X -> Hitl` transition.
+        seq: u64,
+    },
+    /// The `X -> Hitl` transition was refused; no request was created.
+    Rejected(TransitionOutcome),
+}
+
+/// Which request a response addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HitlTarget {
+    /// One specific request instance.
+    Id(HitlId),
+    /// The current request of an item: its open request, else its latest one.
+    Item(String),
+}
+
+/// One row of `hitl_requests`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HitlRequest {
+    pub hitl_id: HitlId,
+    pub work_id: String,
+    pub status: HitlStatus,
+    pub reason: Option<HitlReason>,
+    pub notes: Option<String>,
+    /// RFC 3339.
+    pub opened_at: String,
+    pub timeout_at: Option<String>,
+    pub terminal_action: Option<EscalationAction>,
+    /// The winning response or expiry; `None` while open.
+    pub resolution: Option<HitlResolution>,
+    pub resolution_notes: Option<String>,
+    pub post_processed_at: Option<String>,
+    pub post_processing_failures: u32,
+}
+
+/// Result of [`Database::complete_post_processing`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompleteOutcome {
+    Completed {
+        /// `transition_log.seq` of the result transition.
+        seq: u64,
+    },
+    /// The request is still open or was already post-processed.
+    NotPending,
+    /// The result transition was refused; the request stays pending.
+    Rejected(TransitionOutcome),
+}
+
+/// `resolution.by` / `resolution.via` recorded when a request expires.
+const REJECT_ALREADY_HANDLED: &str = "already_handled";
+const REJECT_UNAUTHORIZED: &str = "unauthorized";
+const EXPIRY_BY: &str = "system";
+const EXPIRY_VIA: &str = "timeout";
+
+const HITL_COLUMNS: &str = "hitl_id, work_id, status, reason, notes, opened_at, timeout_at, \
+     terminal_action, action, respondent, via, confirm_path, resolved_at, resolution_notes, \
+     post_processed_at, post_processing_failures";
+
+/// What a transition attempt inside a transaction decided.
+enum Step {
+    Applied {
+        seq: u64,
+    },
+    Rejected(TransitionOutcome),
+    /// The request maps to a HITL response; the HITL API owns that race.
+    HitlResponse,
+}
+
+/// Fields of a `transition_log` row to append.
+struct LogRecord<'a> {
+    work_id: &'a str,
+    source_id: &'a str,
+    kind: &'a str,
+    from_phase: Option<&'a str>,
+    to_phase: Option<&'a str>,
+    actor: &'a str,
+    reason: Option<&'a str>,
+    detail: Option<&'a str>,
+}
+
+impl Database {
+    /// Attempt a phase transition through the transition contract.
+    ///
+    /// One `BEGIN IMMEDIATE` transaction: read the current state, ask
+    /// [`belt_core::transition::guard`], then (only on `Proceed`) change the
+    /// phase and append a `phase_enter` row. `busy` and `conflict` refusals
+    /// are committed as `transition_rejected` / `transition_conflict` rows;
+    /// `invalid_action` leaves no row. Refusals are values, not errors.
+    ///
+    /// A request that leaves Hitl without being a daemon post-processing
+    /// transition corresponds to a HITL response. This method does not decide
+    /// that race: it reports `InvalidAction { current: Hitl }` and changes
+    /// nothing; the caller maps its target phase with
+    /// [`belt_core::transition::hitl_response_for`] and, when that yields an
+    /// action, answers through [`Database::resolve_hitl`]. The
+    /// `InvalidAction` result alone never justifies a HITL response: the caller
+    /// branches with `hitl_response_for` first, because the same value also
+    /// means a request with no matching response and a daemon post-processing
+    /// attempt without a confirmed request.
+    ///
+    /// A daemon post-processing transition leaves Hitl only while a confirmed
+    /// request awaits post-processing; with only an open request it is
+    /// `InvalidAction { current: Hitl }`.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`, `BeltError::Database`
+    /// on I/O failure.
+    pub fn transition(&self, req: &TransitionRequest) -> Result<TransitionOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let (_, step) = transition_in_tx(tx, req)?;
+            Ok(match step {
+                Step::Applied { seq } => TransitionOutcome::Applied { seq },
+                Step::Rejected(outcome) => outcome,
+                Step::HitlResponse => TransitionOutcome::InvalidAction {
+                    current: QueuePhase::Hitl,
+                },
+            })
+        })
+    }
+
+    /// Create the first item of a new lineage from collection.
+    ///
+    /// One transaction: read the phases of the same `(source_id, state)` and
+    /// the highest issued sequence, apply
+    /// [`belt_core::lineage::collect_decision`], then insert the Pending item
+    /// (`lineage_root` = its own `work_id`, no origin) and an `item_created` row.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or unreadable stored phases.
+    pub fn insert_collected(&self, new: &NewItem) -> Result<CollectOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let (phases, max_seq) = read_series(tx, &new.source_id, &new.state)?;
+            let work_id = match collect_decision(&phases, max_seq) {
+                CollectDecision::Duplicate => return Ok(CollectOutcome::Duplicate),
+                CollectDecision::New { seq } => issue_work_id(&new.source_id, &new.state, seq),
+            };
+            let mut item = QueueItem::new(
+                work_id.clone(),
+                new.source_id.clone(),
+                new.workspace_id.clone(),
+                new.state.clone(),
+            );
+            item.title = new.title.clone();
+            insert_queue_row(tx, &item)?;
+            append_log(
+                tx,
+                &LogRecord {
+                    work_id: &work_id,
+                    source_id: &new.source_id,
+                    kind: transition_kind::ITEM_CREATED,
+                    from_phase: None,
+                    to_phase: Some(phase_to_str(QueuePhase::Pending)),
+                    actor: &actor_str(&new.actor),
+                    reason: Some("collected"),
+                    detail: None,
+                },
+            )?;
+            Ok(CollectOutcome::Inserted { work_id })
+        })
+    }
+
+    /// End an item as Skipped and continue its work in a derived Pending item.
+    ///
+    /// One transaction: transition the origin to Skipped through the same
+    /// contract as [`Database::transition`], then insert the derived item
+    /// (next sequence, `derived_from` = origin, same `lineage_root`, inherited
+    /// `replan_count`) with an `item_created` row naming the origin.
+    /// [`DeriveKind::EscalationRetry`] hands the worktree over
+    /// (`worktree_owner` = the origin's owner, or the origin itself);
+    /// [`DeriveKind::Replan`] leaves the owner empty, counts one more replan
+    /// in the derived item's `replan_count` and records a failure-count reset
+    /// point. If the origin's transition is refused,
+    /// nothing is derived.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown origin; `BeltError::Database`
+    /// on I/O failure or when the `(source_id, state)` already has another open item.
+    pub fn derive(&self, req: &DeriveRequest) -> Result<DeriveOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let skip = TransitionRequest {
+                work_id: req.work_id.clone(),
+                expected_from: req.expected_from,
+                to: QueuePhase::Skipped,
+                actor: req.actor.clone(),
+                reason: req.reason.clone(),
+                detail: req.detail.clone(),
+            };
+            let (origin, step) = transition_in_tx(tx, &skip)?;
+            match step {
+                Step::Applied { .. } => {}
+                Step::Rejected(outcome) => return Ok(DeriveOutcome::Rejected(outcome)),
+                Step::HitlResponse => {
+                    return Ok(DeriveOutcome::Rejected(TransitionOutcome::InvalidAction {
+                        current: QueuePhase::Hitl,
+                    }));
+                }
+            }
+
+            let (phases, max_seq) = read_series(tx, &origin.item.source_id, &origin.item.state)?;
+            let seq = match collect_decision(&phases, max_seq) {
+                CollectDecision::New { seq: Some(n) } => n,
+                CollectDecision::New { seq: None } | CollectDecision::Duplicate => {
+                    return Err(BeltError::Database(format!(
+                        "cannot derive from {}: another item of ({}, {}) is still open",
+                        req.work_id, origin.item.source_id, origin.item.state
+                    )));
+                }
+            };
+            let work_id = issue_work_id(&origin.item.source_id, &origin.item.state, Some(seq));
+            let mut derived = QueueItem::new(
+                work_id.clone(),
+                origin.item.source_id.clone(),
+                origin.item.workspace_id.clone(),
+                origin.item.state.clone(),
+            );
+            derived.title = origin.item.title.clone();
+            // `replan_count` counts the lineage's replans: inherited, plus
+            // this derivation when it is one.
+            derived.replan_count = match req.kind {
+                DeriveKind::EscalationRetry => origin.item.replan_count,
+                DeriveKind::Replan => origin.item.replan_count + 1,
+            };
+            derived.derived_from = Some(origin.item.work_id.clone());
+            derived.lineage_root = origin.item.lineage_root.clone();
+            insert_queue_row(tx, &derived)?;
+
+            // Replan leaves Hitl as post-processing of a confirmed request;
+            // completing it here keeps it out of `pending_post_processing`.
+            tx.execute(
+                "UPDATE hitl_requests SET post_processed_at = ?1
+                 WHERE work_id = ?2 AND status IN ('resolved', 'expired')
+                   AND post_processed_at IS NULL",
+                params![Utc::now().to_rfc3339(), origin.item.work_id],
+            )
+            .map_err(sql_err)?;
+
+            match req.kind {
+                DeriveKind::EscalationRetry => {
+                    let owner = origin
+                        .worktree_owner
+                        .as_deref()
+                        .unwrap_or(&origin.item.work_id);
+                    tx.execute(
+                        "UPDATE queue_items SET worktree_owner = ?1 WHERE work_id = ?2",
+                        params![owner, work_id],
+                    )
+                    .map_err(sql_err)?;
+                }
+                DeriveKind::Replan => insert_reset_row(
+                    tx,
+                    &origin.item.source_id,
+                    &origin.item.state,
+                    &origin.item.work_id,
+                )?,
+            }
+
+            append_log(
+                tx,
+                &LogRecord {
+                    work_id: &work_id,
+                    source_id: &origin.item.source_id,
+                    kind: transition_kind::ITEM_CREATED,
+                    from_phase: None,
+                    to_phase: Some(phase_to_str(QueuePhase::Pending)),
+                    actor: &actor_str(&req.actor),
+                    reason: Some("derived"),
+                    detail: Some(&origin.item.work_id),
+                },
+            )?;
+            Ok(DeriveOutcome::Derived { work_id })
+        })
+    }
+
+    /// Failures of the lineage `work_id` belongs to since its last reset point.
+    ///
+    /// Collects the attempt history of every item sharing `work_id`'s
+    /// `lineage_root` in insertion order and applies
+    /// [`belt_core::lineage::count_since_reset`]. A re-collected item starts a
+    /// new lineage and does not inherit earlier lineages' failures.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`.
+    /// `BeltError::Database` on I/O failure or a history status that maps to
+    /// no attempt status (`failed`, `reset`, `running`, `completed`/`done`/`success`,
+    /// `skipped`, `hitl`).
+    pub fn failure_count(&self, work_id: &str) -> Result<u32, BeltError> {
+        let conn = self.lock_conn()?;
+        let root = lineage_root_of(&conn, work_id)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT h.status FROM history h
+                 JOIN queue_items q ON q.work_id = h.work_id
+                 WHERE q.lineage_root = ?1 ORDER BY h.id",
+            )
+            .map_err(sql_err)?;
+        let attempts = stmt
+            .query_map(params![root], |row| row.get::<_, String>(0))
+            .map_err(sql_err)?
+            .map(|status| attempt_status(&status.map_err(sql_err)?))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(count_since_reset(&attempts))
+    }
+
+    /// Record a failure-count reset point on the lineage of `work_id`
+    /// (the HITL-retried item).
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`.
+    /// `BeltError::Database` on I/O failure.
+    pub fn record_reset(&self, work_id: &str) -> Result<(), BeltError> {
+        self.write_tx(|tx| {
+            let (source_id, state): (String, String) = tx
+                .query_row(
+                    "SELECT source_id, state FROM queue_items WHERE work_id = ?1",
+                    params![work_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .map_err(sql_err)?
+                .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+            insert_reset_row(tx, &source_id, &state, work_id)
+        })
+    }
+
+    /// Append a non-phase event about an item to the transition log and
+    /// return its `seq`. Phase changes are recorded only by the transition
+    /// contract, so a `phase_enter` kind is refused.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`; `BeltError::Database`
+    /// for a `phase_enter` kind or on I/O failure.
+    pub fn record_event(&self, event: &EventRecord<'_>) -> Result<u64, BeltError> {
+        if event.kind == transition_kind::PHASE_ENTER {
+            return Err(BeltError::Database(format!(
+                "{} is recorded only by a transition, not as an event of {}",
+                transition_kind::PHASE_ENTER,
+                event.work_id
+            )));
+        }
+        self.write_tx(|tx| {
+            let source_id: String = tx
+                .query_row(
+                    "SELECT source_id FROM queue_items WHERE work_id = ?1",
+                    params![event.work_id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(sql_err)?
+                .ok_or_else(|| BeltError::ItemNotFound(event.work_id.to_string()))?;
+            append_log(
+                tx,
+                &LogRecord {
+                    work_id: event.work_id,
+                    source_id: &source_id,
+                    kind: event.kind,
+                    from_phase: None,
+                    to_phase: None,
+                    actor: &actor_str(&event.actor),
+                    reason: event.reason,
+                    detail: event.detail,
+                },
+            )
+        })
+    }
+
+    /// Transition log rows with `seq` greater than the cursor, oldest first.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn transitions_since(&self, seq: u64) -> Result<Vec<TransitionLogEntry>, BeltError> {
+        let cursor = i64::try_from(seq)
+            .map_err(|_| BeltError::Database(format!("seq cursor out of range: {seq}")))?;
+        self.query_log("WHERE seq > ?1", params![cursor])
+    }
+
+    /// `seq` of the newest transition log row, or 0 for an empty log. A
+    /// consumer that must not replay the past starts its cursor here.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn latest_transition_seq(&self) -> Result<u64, BeltError> {
+        let conn = self.lock_conn()?;
+        let seq: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM transition_log",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)?;
+        u64::try_from(seq).map_err(|_| BeltError::Database(format!("negative log seq {seq}")))
+    }
+
+    /// All transition log rows of one item, oldest first.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn transitions_of(&self, work_id: &str) -> Result<Vec<TransitionLogEntry>, BeltError> {
+        self.query_log("WHERE work_id = ?1", params![work_id])
+    }
+
+    /// The most recently created item of the lineage `work_id` belongs to.
+    ///
+    /// Creation order is the `item_created` log sequence, which survives row
+    /// re-insertion and `VACUUM`; legacy items without an `item_created` row
+    /// sort oldest and fall back to `created_at`.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`.
+    pub fn latest_in_lineage(&self, work_id: &str) -> Result<QueueItem, BeltError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {QUEUE_ITEM_COLUMNS} FROM queue_items
+                 WHERE lineage_root = (SELECT lineage_root FROM queue_items WHERE work_id = ?1)
+                 ORDER BY (SELECT MAX(t.seq) FROM transition_log t
+                           WHERE t.work_id = queue_items.work_id AND t.kind = '{kind}')
+                          DESC NULLS LAST,
+                          created_at DESC, rowid DESC
+                 LIMIT 1",
+                kind = transition_kind::ITEM_CREATED
+            ))
+            .map_err(sql_err)?;
+        let mut rows = stmt.query(params![work_id]).map_err(sql_err)?;
+        match rows.next().map_err(sql_err)? {
+            Some(row) => row_to_queue_item(row),
+            None => Err(BeltError::ItemNotFound(work_id.to_string())),
+        }
+    }
+
+    /// The key of the worktree `work_id` works in.
+    ///
+    /// An item handed a worktree by escalation retry works in the worktree
+    /// of the item it was first created for (its `worktree_owner`); any
+    /// other item works in its own, keyed by its `work_id`.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`.
+    pub fn worktree_key(&self, work_id: &str) -> Result<String, BeltError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT COALESCE(worktree_owner, work_id) FROM queue_items WHERE work_id = ?1",
+            params![work_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(sql_err)?
+        .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))
+    }
+
+    /// The `work_id` of the item that currently owns the worktree keyed `key`.
+    ///
+    /// The owner is the most recently created item the worktree was handed
+    /// to; a worktree never handed over is owned by the item `key` names.
+    /// Only the owner's phase decides whether the worktree may be cleaned up.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn worktree_holder(&self, key: &str) -> Result<String, BeltError> {
+        let conn = self.lock_conn()?;
+        let handed: Option<String> = conn
+            .query_row(
+                &format!(
+                    "SELECT work_id FROM queue_items WHERE worktree_owner = ?1
+                     ORDER BY (SELECT MAX(t.seq) FROM transition_log t
+                               WHERE t.work_id = queue_items.work_id AND t.kind = '{kind}')
+                              DESC NULLS LAST,
+                              created_at DESC, rowid DESC
+                     LIMIT 1",
+                    kind = transition_kind::ITEM_CREATED
+                ),
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?;
+        Ok(handed.unwrap_or_else(|| key.to_string()))
+    }
+
+    fn lock_conn(&self) -> Result<std::sync::MutexGuard<'_, Connection>, BeltError> {
+        self.conn
+            .lock()
+            .map_err(|e| BeltError::Database(e.to_string()))
+    }
+
+    /// Run `f` in a `BEGIN IMMEDIATE` transaction; commit when it returns `Ok`.
+    fn write_tx<T>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T, BeltError>,
+    ) -> Result<T, BeltError> {
+        let mut conn = self.lock_conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(sql_err)?;
+        let value = f(&tx)?;
+        tx.commit().map_err(sql_err)?;
+        Ok(value)
+    }
+
+    fn query_log(
+        &self,
+        filter: &str,
+        args: impl rusqlite::Params,
+    ) -> Result<Vec<TransitionLogEntry>, BeltError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT seq, work_id, source_id, kind, from_phase, to_phase, actor, reason, detail, created_at
+                 FROM transition_log {filter} ORDER BY seq"
+            ))
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(args, |row| {
+                Ok(TransitionLogEntry {
+                    seq: u64::try_from(row.get::<_, i64>(0)?).unwrap_or(0),
+                    work_id: row.get(1)?,
+                    source_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    from_phase: row.get(4)?,
+                    to_phase: row.get(5)?,
+                    actor: row.get(6)?,
+                    reason: row.get(7)?,
+                    detail: row.get(8)?,
+                    created_at: row.get(9)?,
+                })
+            })
+            .map_err(sql_err)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(sql_err)?;
+        Ok(rows)
+    }
+}
+
+impl Database {
+    /// Enter Hitl and open a HITL request, in one transaction.
+    ///
+    /// Runs the `expected_from -> Hitl` transition through the transition
+    /// contract and, only if it is applied, inserts the open request. A
+    /// request cannot exist without the phase change or vice versa. An item
+    /// that already has an open request is in Hitl, so a second open is
+    /// refused by the transition contract (`InvalidAction { Hitl }`).
+    ///
+    /// The `hitl_id` is `hitl-{seq}` with the `transition_log.seq` of the
+    /// entering transition: unique for the lifetime of the database and
+    /// disjoint from migrated `hitl-legacy-{n}` ids.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`; `BeltError::Database`
+    /// on I/O failure or a violated request constraint (everything is rolled back).
+    pub fn open_hitl(&self, req: &OpenHitlRequest) -> Result<OpenHitlOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let entering = TransitionRequest {
+                work_id: req.work_id.clone(),
+                expected_from: req.expected_from,
+                to: QueuePhase::Hitl,
+                actor: req.actor.clone(),
+                reason: req.transition_reason.clone(),
+                detail: Some(req.reason.to_string()),
+            };
+            let (_, step) = transition_in_tx(tx, &entering)?;
+            let seq = match step {
+                Step::Applied { seq } => seq,
+                Step::Rejected(outcome) => return Ok(OpenHitlOutcome::Rejected(outcome)),
+                Step::HitlResponse => {
+                    return Ok(OpenHitlOutcome::Rejected(
+                        TransitionOutcome::InvalidAction {
+                            current: QueuePhase::Hitl,
+                        },
+                    ));
+                }
+            };
+            let hitl_id = HitlId::new(format!("hitl-{seq}"));
+            tx.execute(
+                "INSERT INTO hitl_requests
+                 (hitl_id, work_id, status, reason, notes, opened_at, timeout_at, terminal_action)
+                 VALUES (?1, ?2, 'open', ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    hitl_id.as_str(),
+                    req.work_id,
+                    req.reason.to_string(),
+                    req.notes,
+                    Utc::now().to_rfc3339(),
+                    req.timeout_at,
+                    req.terminal_action.map(|a| a.to_string()),
+                ],
+            )
+            .map_err(sql_err)?;
+            Ok(OpenHitlOutcome::Opened { hitl_id, seq })
+        })
+    }
+
+    /// Confirm a response, first response wins.
+    ///
+    /// Only an open request can be resolved. A request that is already
+    /// resolved or expired yields `AlreadyHandled` carrying the winning
+    /// response, so a loser is a value and never a database error. The item's
+    /// phase is untouched: it leaves Hitl only through
+    /// [`Database::complete_post_processing`].
+    ///
+    /// [`HitlTarget::Item`] addresses only the item's current request (open,
+    /// or confirmed and not yet post-processed); otherwise `NotFound`.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn resolve_hitl(
+        &self,
+        target: &HitlTarget,
+        resolution: &HitlResolution,
+        notes: Option<&str>,
+    ) -> Result<RespondOutcome, BeltError> {
+        self.write_tx(|tx| confirm_in_tx(tx, target, resolution, notes))
+    }
+
+    /// Record a response of `by` through `via` that was refused as
+    /// unauthorized, in the `transition_log`. The request is left untouched.
+    ///
+    /// Returns `false` when `target` names no request (nothing to attribute
+    /// the rejection to).
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn record_unauthorized_response(
+        &self,
+        target: &HitlTarget,
+        by: &str,
+        via: &str,
+    ) -> Result<bool, BeltError> {
+        self.write_tx(|tx| {
+            let Some(request) = find_hitl(tx, target)? else {
+                return Ok(false);
+            };
+            append_rejection(tx, &request, REJECT_UNAUTHORIZED, by, via, None)?;
+            Ok(true)
+        })
+    }
+
+    /// Every open request, oldest first.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn open_hitl_requests(&self) -> Result<Vec<HitlRequest>, BeltError> {
+        let conn = self.lock_conn()?;
+        read_open_requests(&conn)
+    }
+
+    /// Requests whose external responses are still worth reading: every open
+    /// request, and every confirmed one whose confirmation is at or after
+    /// `confirmed_since` (RFC 3339, UTC) so that late responses can still be
+    /// answered `already_handled`. Ordered by creation.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn hitl_requests_to_poll(
+        &self,
+        confirmed_since: &str,
+    ) -> Result<Vec<HitlRequest>, BeltError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {HITL_COLUMNS} FROM hitl_requests
+                 WHERE status = 'open'
+                    OR (status IN ('resolved', 'expired') AND resolved_at >= ?1)
+                 ORDER BY rowid"
+            ))
+            .map_err(sql_err)?;
+        let mut rows = stmt.query(params![confirmed_since]).map_err(sql_err)?;
+        let mut requests = Vec::new();
+        while let Some(row) = rows.next().map_err(sql_err)? {
+            requests.push(row_to_hitl_request(row)?);
+        }
+        Ok(requests)
+    }
+
+    /// Claim the `on_hitl_opened` notification of every open request that
+    /// has not been claimed yet, and return those requests.
+    ///
+    /// The claim is stored before the hook runs, so each request is handed
+    /// out exactly once: a failing hook is not retried, and a request that
+    /// was confirmed before it was observed is never handed out.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn claim_opened_hooks(&self) -> Result<Vec<HitlRequest>, BeltError> {
+        self.write_tx(|tx| {
+            let now = Utc::now().to_rfc3339();
+            let mut claimed = Vec::new();
+            for request in read_open_requests(tx)? {
+                let changed = tx
+                    .execute(
+                        "UPDATE hitl_requests SET opened_hook_done_at = ?1
+                         WHERE hitl_id = ?2 AND status = 'open' AND opened_hook_done_at IS NULL",
+                        params![now, request.hitl_id.as_str()],
+                    )
+                    .map_err(sql_err)?;
+                if changed == 1 {
+                    claimed.push(request);
+                }
+            }
+            Ok(claimed)
+        })
+    }
+
+    /// Expire an open request by timeout, applying `terminal`.
+    ///
+    /// Races with [`Database::resolve_hitl`] on the same open-state
+    /// compare-and-set: whichever is confirmed first wins and the other gets
+    /// `AlreadyHandled`. The expiry is recorded as a resolution by `system`
+    /// via `timeout` with the terminal action. Only `skip` and `replan` are
+    /// terminal actions; any other value is `InvalidAction`.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn expire_hitl(
+        &self,
+        hitl_id: &HitlId,
+        terminal: EscalationAction,
+    ) -> Result<RespondOutcome, BeltError> {
+        let Some(action) = belt_core::hitl::expiry_action(terminal) else {
+            return Ok(RespondOutcome::InvalidAction);
+        };
+        let expiry = HitlResolution {
+            action,
+            by: EXPIRY_BY.to_string(),
+            via: EXPIRY_VIA.to_string(),
+            at: Utc::now().to_rfc3339(),
+            path: ConfirmPath::Direct,
+        };
+        self.write_tx(|tx| {
+            let Some(current) = find_hitl(tx, &HitlTarget::Id(hitl_id.clone()))? else {
+                return Ok(RespondOutcome::NotFound);
+            };
+            match current.status {
+                HitlStatus::Open => {
+                    confirm_open(tx, &current.hitl_id, HitlStatus::Expired, &expiry, None)?;
+                    Ok(RespondOutcome::Won {
+                        hitl_id: current.hitl_id,
+                    })
+                }
+                HitlStatus::Resolved | HitlStatus::Expired => {
+                    Ok(RespondOutcome::AlreadyHandled(stored_resolution(&current)?))
+                }
+            }
+        })
+    }
+
+    /// Replace the deadline and terminal action of an open request.
+    ///
+    /// `terminal_action = None` clears the stored action, so the expiry uses
+    /// the workspace default. Returns `false` when the request is unknown or
+    /// already confirmed; those rows are left untouched.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn set_hitl_expiry(
+        &self,
+        hitl_id: &HitlId,
+        timeout_at: &str,
+        terminal_action: Option<EscalationAction>,
+    ) -> Result<bool, BeltError> {
+        let conn = self.lock_conn()?;
+        let rows = conn
+            .execute(
+                "UPDATE hitl_requests SET timeout_at = ?1, terminal_action = ?2
+                 WHERE hitl_id = ?3 AND status = 'open'",
+                params![
+                    timeout_at,
+                    terminal_action.map(|a| a.to_string()),
+                    hitl_id.as_str()
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(rows == 1)
+    }
+
+    /// One request by id, or `None`.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn hitl_request(&self, hitl_id: &HitlId) -> Result<Option<HitlRequest>, BeltError> {
+        let conn = self.lock_conn()?;
+        find_hitl(&conn, &HitlTarget::Id(hitl_id.clone()))
+    }
+
+    /// Requests that are confirmed (resolved or expired) and not yet
+    /// post-processed, oldest confirmation first. The daemon works through
+    /// these; each one holds its item in Hitl as "processing".
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn pending_post_processing(&self) -> Result<Vec<HitlRequest>, BeltError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {HITL_COLUMNS} FROM hitl_requests
+                 WHERE status IN ('resolved', 'expired') AND post_processed_at IS NULL
+                 ORDER BY resolved_at, rowid"
+            ))
+            .map_err(sql_err)?;
+        let mut rows = stmt.query([]).map_err(sql_err)?;
+        let mut pending = Vec::new();
+        while let Some(row) = rows.next().map_err(sql_err)? {
+            pending.push(row_to_hitl_request(row)?);
+        }
+        Ok(pending)
+    }
+
+    /// Apply the post-processing result transition and mark the request
+    /// processed, in one transaction (crash-safe: both or neither).
+    ///
+    /// `result.work_id` must be the request's item. If the transition is
+    /// refused the request stays pending.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `hitl_id`; `BeltError::Database`
+    /// when `result` names another item, or on I/O failure.
+    pub fn complete_post_processing(
+        &self,
+        hitl_id: &HitlId,
+        result: &TransitionRequest,
+    ) -> Result<CompleteOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let Some(request) = find_hitl(tx, &HitlTarget::Id(hitl_id.clone()))? else {
+                return Err(BeltError::ItemNotFound(hitl_id.to_string()));
+            };
+            if request.work_id != result.work_id {
+                return Err(BeltError::Database(format!(
+                    "post-processing result for {} does not belong to HITL request {hitl_id} of {}",
+                    result.work_id, request.work_id
+                )));
+            }
+            if request.status == HitlStatus::Open || request.post_processed_at.is_some() {
+                return Ok(CompleteOutcome::NotPending);
+            }
+            let (_, step) = transition_in_tx(tx, result)?;
+            let seq = match step {
+                Step::Applied { seq } => seq,
+                Step::Rejected(outcome) => return Ok(CompleteOutcome::Rejected(outcome)),
+                Step::HitlResponse => {
+                    return Ok(CompleteOutcome::Rejected(
+                        TransitionOutcome::InvalidAction {
+                            current: QueuePhase::Hitl,
+                        },
+                    ));
+                }
+            };
+            let changed = tx
+                .execute(
+                    "UPDATE hitl_requests SET post_processed_at = ?1
+                     WHERE hitl_id = ?2 AND post_processed_at IS NULL",
+                    params![Utc::now().to_rfc3339(), hitl_id.as_str()],
+                )
+                .map_err(sql_err)?;
+            if changed != 1 {
+                return Err(BeltError::Database(format!(
+                    "post-processing mark on {hitl_id} changed {changed} rows under an immediate transaction"
+                )));
+            }
+            Ok(CompleteOutcome::Completed { seq })
+        })
+    }
+
+    /// Count one more failed post-processing attempt and return the total.
+    ///
+    /// # Errors
+    /// `BeltError::Database` when the request does not exist or is not
+    /// awaiting post-processing (open, or already processed), or on I/O failure.
+    pub fn record_post_processing_failure(&self, hitl_id: &HitlId) -> Result<u32, BeltError> {
+        self.write_tx(|tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE hitl_requests
+                     SET post_processing_failures = post_processing_failures + 1
+                     WHERE hitl_id = ?1 AND status IN ('resolved', 'expired')
+                       AND post_processed_at IS NULL",
+                    params![hitl_id.as_str()],
+                )
+                .map_err(sql_err)?;
+            if changed != 1 {
+                return Err(BeltError::Database(format!(
+                    "HITL request {hitl_id} is not awaiting post-processing"
+                )));
+            }
+            tx.query_row(
+                "SELECT post_processing_failures FROM hitl_requests WHERE hitl_id = ?1",
+                params![hitl_id.as_str()],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)
+        })
+    }
+}
+
+/// Decide a response against the target request inside the caller's transaction.
+fn confirm_in_tx(
+    tx: &Transaction<'_>,
+    target: &HitlTarget,
+    resolution: &HitlResolution,
+    notes: Option<&str>,
+) -> Result<RespondOutcome, BeltError> {
+    let Some(current) = find_hitl(tx, target)? else {
+        return Ok(RespondOutcome::NotFound);
+    };
+    match current.status {
+        HitlStatus::Open => {
+            confirm_open(
+                tx,
+                &current.hitl_id,
+                HitlStatus::Resolved,
+                resolution,
+                notes,
+            )?;
+            Ok(RespondOutcome::Won {
+                hitl_id: current.hitl_id,
+            })
+        }
+        HitlStatus::Resolved | HitlStatus::Expired => {
+            let winner = stored_resolution(&current)?;
+            append_rejection(
+                tx,
+                &current,
+                REJECT_ALREADY_HANDLED,
+                &resolution.by,
+                &resolution.via,
+                Some(resolution.action),
+            )?;
+            Ok(RespondOutcome::AlreadyHandled(winner))
+        }
+    }
+}
+
+/// Record a response of `by` through `via` refused against `request` in the
+/// `transition_log`, inside the caller's transaction. `action` is `None`
+/// when the response was refused before its action was read.
+fn append_rejection(
+    tx: &Transaction<'_>,
+    request: &HitlRequest,
+    reason: &str,
+    by: &str,
+    via: &str,
+    action: Option<HitlAction>,
+) -> Result<(), BeltError> {
+    let source_id: String = tx
+        .query_row(
+            "SELECT source_id FROM queue_items WHERE work_id = ?1",
+            params![request.work_id],
+            |r| r.get(0),
+        )
+        .map_err(sql_err)?;
+    let detail = serde_json::json!({
+        "hitl_id": request.hitl_id.as_str(),
+        "by": by,
+        "via": via,
+        "action": action.map(|a| a.to_string()),
+        "winner": request.resolution.as_ref().map(|w| serde_json::json!({
+            "by": w.by,
+            "via": w.via,
+            "action": w.action.to_string(),
+            "at": w.at,
+        })),
+    })
+    .to_string();
+    append_log(
+        tx,
+        &LogRecord {
+            work_id: &request.work_id,
+            source_id: &source_id,
+            kind: transition_kind::HITL_RESPONSE_REJECTED,
+            from_phase: None,
+            to_phase: None,
+            actor: via,
+            reason: Some(reason),
+            detail: Some(&detail),
+        },
+    )?;
+    Ok(())
+}
+
+/// Open -> `status` compare-and-set recording the winning resolution.
+fn confirm_open(
+    tx: &Transaction<'_>,
+    hitl_id: &HitlId,
+    status: HitlStatus,
+    resolution: &HitlResolution,
+    notes: Option<&str>,
+) -> Result<(), BeltError> {
+    let status = match status {
+        HitlStatus::Resolved => "resolved",
+        HitlStatus::Expired => "expired",
+        HitlStatus::Open => {
+            return Err(BeltError::Database(
+                "a request cannot be confirmed into the open status".to_string(),
+            ));
+        }
+    };
+    let path = match resolution.path {
+        ConfirmPath::Direct => "direct",
+        ConfirmPath::NaturalLanguage => "natural_language",
+    };
+    let changed = tx
+        .execute(
+            "UPDATE hitl_requests
+             SET status = ?1, action = ?2, respondent = ?3, via = ?4, confirm_path = ?5,
+                 resolved_at = ?6, resolution_notes = ?7
+             WHERE hitl_id = ?8 AND status = 'open'",
+            params![
+                status,
+                resolution.action.to_string(),
+                resolution.by,
+                resolution.via,
+                path,
+                resolution.at,
+                notes,
+                hitl_id.as_str(),
+            ],
+        )
+        .map_err(sql_err)?;
+    if changed != 1 {
+        return Err(BeltError::Database(format!(
+            "open-state compare-and-set on {hitl_id} changed {changed} rows under an immediate transaction"
+        )));
+    }
+    close_proposals_in_tx(tx, hitl_id)?;
+    Ok(())
+}
+
+/// The request a target names. An item names only its current request: the
+/// open one, or a confirmed one still awaiting post-processing. Requests
+/// already post-processed belong to the item's past and are not found.
+fn find_hitl(conn: &Connection, target: &HitlTarget) -> Result<Option<HitlRequest>, BeltError> {
+    let (filter, key) = match target {
+        HitlTarget::Id(id) => ("hitl_id = ?1", id.as_str()),
+        HitlTarget::Item(work_id) => (
+            "work_id = ?1 AND (status = 'open' OR post_processed_at IS NULL)",
+            work_id.as_str(),
+        ),
+    };
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {HITL_COLUMNS} FROM hitl_requests WHERE {filter}
+             ORDER BY (status = 'open') DESC, rowid DESC LIMIT 1"
+        ))
+        .map_err(sql_err)?;
+    let mut rows = stmt.query(params![key]).map_err(sql_err)?;
+    rows.next()
+        .map_err(sql_err)?
+        .map(row_to_hitl_request)
+        .transpose()
+}
+
+fn read_open_requests(conn: &Connection) -> Result<Vec<HitlRequest>, BeltError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {HITL_COLUMNS} FROM hitl_requests WHERE status = 'open' ORDER BY rowid"
+        ))
+        .map_err(sql_err)?;
+    let mut rows = stmt.query([]).map_err(sql_err)?;
+    let mut open = Vec::new();
+    while let Some(row) = rows.next().map_err(sql_err)? {
+        open.push(row_to_hitl_request(row)?);
+    }
+    Ok(open)
+}
+
+/// The recorded winner of a confirmed request.
+fn stored_resolution(request: &HitlRequest) -> Result<HitlResolution, BeltError> {
+    request.resolution.clone().ok_or_else(|| {
+        BeltError::Database(format!(
+            "HITL request {} is {:?} but has no recorded resolution",
+            request.hitl_id, request.status
+        ))
+    })
+}
+
+fn row_to_hitl_request(row: &rusqlite::Row<'_>) -> Result<HitlRequest, BeltError> {
+    let hitl_id = HitlId::new(col::<String>(row, 0)?);
+    let status = match col::<String>(row, 2)?.as_str() {
+        "open" => HitlStatus::Open,
+        "resolved" => HitlStatus::Resolved,
+        "expired" => HitlStatus::Expired,
+        other => {
+            return Err(BeltError::Database(format!(
+                "unknown hitl status of {hitl_id}: {other}"
+            )));
+        }
+    };
+    let action: Option<String> = col(row, 8)?;
+    let resolution = match status {
+        HitlStatus::Open => None,
+        HitlStatus::Resolved | HitlStatus::Expired => {
+            let missing = |field: &str| {
+                BeltError::Database(format!("confirmed HITL request {hitl_id} has no {field}"))
+            };
+            let action = action.ok_or_else(|| missing("action"))?;
+            let path = col::<Option<String>>(row, 11)?.ok_or_else(|| missing("confirm_path"))?;
+            Some(HitlResolution {
+                action: action.parse::<HitlAction>().map_err(BeltError::Database)?,
+                by: col::<Option<String>>(row, 9)?.ok_or_else(|| missing("respondent"))?,
+                via: col::<Option<String>>(row, 10)?.ok_or_else(|| missing("via"))?,
+                at: col::<Option<String>>(row, 12)?.ok_or_else(|| missing("resolved_at"))?,
+                path: match path.as_str() {
+                    "direct" => ConfirmPath::Direct,
+                    "natural_language" => ConfirmPath::NaturalLanguage,
+                    other => {
+                        return Err(BeltError::Database(format!(
+                            "unknown confirm_path of {hitl_id}: {other}"
+                        )));
+                    }
+                },
+            })
+        }
+    };
+    Ok(HitlRequest {
+        work_id: col(row, 1)?,
+        status,
+        reason: col::<Option<String>>(row, 3)?
+            .as_deref()
+            .map(parse_hitl_reason)
+            .transpose()?,
+        notes: col(row, 4)?,
+        opened_at: col(row, 5)?,
+        timeout_at: col(row, 6)?,
+        terminal_action: col::<Option<String>>(row, 7)?
+            .as_deref()
+            .map(|s| s.parse::<EscalationAction>().map_err(BeltError::Database))
+            .transpose()?,
+        resolution,
+        resolution_notes: col(row, 13)?,
+        post_processed_at: col(row, 14)?,
+        post_processing_failures: col(row, 15)?,
+        hitl_id,
+    })
+}
+
+fn sql_err(e: rusqlite::Error) -> BeltError {
+    BeltError::Database(e.to_string())
+}
+
+/// An item as read inside a transition transaction.
+struct StoredItem {
+    item: QueueItem,
+    worktree_owner: Option<String>,
+    snapshot: ItemSnapshot,
+}
+
+fn read_stored_item(tx: &Transaction<'_>, work_id: &str) -> Result<StoredItem, BeltError> {
+    let mut stmt = tx
+        .prepare(&format!(
+            "SELECT {QUEUE_ITEM_COLUMNS}, worktree_owner FROM queue_items WHERE work_id = ?1"
+        ))
+        .map_err(sql_err)?;
+    let mut rows = stmt.query(params![work_id]).map_err(sql_err)?;
+    let Some(row) = rows.next().map_err(sql_err)? else {
+        return Err(BeltError::ItemNotFound(work_id.to_string()));
+    };
+    let item = row_to_queue_item(row)?;
+    let worktree_owner = col(row, 13)?;
+    let processing = processing_of(tx, &item)?;
+    let snapshot = ItemSnapshot {
+        phase: item.phase(),
+        processing,
+    };
+    Ok(StoredItem {
+        item,
+        worktree_owner,
+        snapshot,
+    })
+}
+
+/// Running means the daemon's handler owns the item; Hitl means a resolved or
+/// expired request is waiting for the daemon's post-processing.
+fn processing_of(tx: &Transaction<'_>, item: &QueueItem) -> Result<Option<Processing>, BeltError> {
+    match item.phase() {
+        QueuePhase::Running => Ok(Some(Processing::Handler)),
+        QueuePhase::Hitl => {
+            let waiting: bool = tx
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM hitl_requests
+                     WHERE work_id = ?1 AND status IN ('resolved', 'expired') AND post_processed_at IS NULL)",
+                    params![item.work_id],
+                    |row| row.get(0),
+                )
+                .map_err(sql_err)?;
+            Ok(waiting.then_some(Processing::PostProcessing))
+        }
+        QueuePhase::Pending
+        | QueuePhase::Ready
+        | QueuePhase::Completed
+        | QueuePhase::Done
+        | QueuePhase::Failed
+        | QueuePhase::Skipped => Ok(None),
+    }
+}
+
+/// Guard, then CAS and log, inside the caller's transaction.
+///
+/// The reason `Canceled` from an actor other than the daemon is refused as
+/// `InvalidAction`: the guard lets it through the handler lock, so only
+/// [`Database::cancel_directly`], which first checks for an open cancel
+/// request, may use it.
+fn transition_in_tx(
+    tx: &Transaction<'_>,
+    req: &TransitionRequest,
+) -> Result<(StoredItem, Step), BeltError> {
+    if req.reason == TransitionReason::Canceled && req.actor != Actor::Daemon {
+        let stored = read_stored_item(tx, &req.work_id)?;
+        let current = stored.snapshot.phase;
+        return Ok((
+            stored,
+            Step::Rejected(TransitionOutcome::InvalidAction { current }),
+        ));
+    }
+    apply_transition_in_tx(tx, req)
+}
+
+/// [`transition_in_tx`] without the reserved-reason check.
+fn apply_transition_in_tx(
+    tx: &Transaction<'_>,
+    req: &TransitionRequest,
+) -> Result<(StoredItem, Step), BeltError> {
+    let stored = read_stored_item(tx, &req.work_id)?;
+    let actor = actor_str(&req.actor);
+    let current = phase_to_str(stored.snapshot.phase);
+    let step = match guard(&stored.snapshot, req) {
+        GuardDecision::Proceed => {
+            let now = Utc::now().to_rfc3339();
+            let changed = tx
+                .execute(
+                    "UPDATE queue_items SET phase = ?1, handler_pid = NULL, updated_at = ?2 WHERE work_id = ?3 AND phase = ?4",
+                    params![phase_to_str(req.to), now, req.work_id, current],
+                )
+                .map_err(sql_err)?;
+            if changed != 1 {
+                return Err(BeltError::Database(format!(
+                    "phase compare-and-set on {} changed {changed} rows under an immediate transaction",
+                    req.work_id
+                )));
+            }
+            let reason = reason_str(&req.reason);
+            let seq = append_log(
+                tx,
+                &LogRecord {
+                    work_id: &req.work_id,
+                    source_id: &stored.item.source_id,
+                    kind: transition_kind::PHASE_ENTER,
+                    from_phase: Some(current),
+                    to_phase: Some(phase_to_str(req.to)),
+                    actor: &actor,
+                    reason: Some(&reason),
+                    detail: req.detail.as_deref(),
+                },
+            )?;
+            Step::Applied { seq }
+        }
+        GuardDecision::Reject(outcome) => {
+            let kind = match outcome {
+                TransitionOutcome::Busy { .. } => Some(transition_kind::TRANSITION_REJECTED),
+                TransitionOutcome::Conflict { .. } => Some(transition_kind::TRANSITION_CONFLICT),
+                TransitionOutcome::InvalidAction { .. } | TransitionOutcome::Applied { .. } => None,
+            };
+            if let Some(kind) = kind {
+                append_log(
+                    tx,
+                    &LogRecord {
+                        work_id: &req.work_id,
+                        source_id: &stored.item.source_id,
+                        kind,
+                        from_phase: Some(current),
+                        to_phase: Some(phase_to_str(req.to)),
+                        actor: &actor,
+                        reason: None,
+                        detail: req.detail.as_deref(),
+                    },
+                )?;
+            }
+            Step::Rejected(outcome)
+        }
+        GuardDecision::ConvertToHitlResponse(_) => Step::HitlResponse,
+    };
+    Ok((stored, step))
+}
+
+fn append_log(tx: &Transaction<'_>, rec: &LogRecord<'_>) -> Result<u64, BeltError> {
+    tx.execute(
+        "INSERT INTO transition_log
+         (work_id, source_id, kind, from_phase, to_phase, actor, reason, detail, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            rec.work_id,
+            rec.source_id,
+            rec.kind,
+            rec.from_phase,
+            rec.to_phase,
+            rec.actor,
+            rec.reason,
+            rec.detail,
+            Utc::now().to_rfc3339(),
+        ],
+    )
+    .map_err(sql_err)?;
+    u64::try_from(tx.last_insert_rowid())
+        .map_err(|_| BeltError::Database("transition_log seq out of range".to_string()))
+}
+
+/// Phases of every item of `(source_id, state)` and the highest sequence ever
+/// issued for it. The base `work_id` counts as 1. Issued ids are also read
+/// from the transition log, so a removed item's `work_id` is never reissued.
+fn read_series(
+    tx: &Transaction<'_>,
+    source_id: &str,
+    state: &str,
+) -> Result<(Vec<QueuePhase>, Option<u32>), BeltError> {
+    let phases = {
+        let mut stmt = tx
+            .prepare("SELECT phase FROM queue_items WHERE source_id = ?1 AND state = ?2")
+            .map_err(sql_err)?;
+        stmt.query_map(params![source_id, state], |row| row.get::<_, String>(0))
+            .map_err(sql_err)?
+            .map(|phase| str_to_phase(&phase.map_err(sql_err)?))
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    let base = QueueItem::make_work_id(source_id, state);
+    let prefix = format!("{base}:");
+    let issued = {
+        let mut stmt = tx
+            .prepare(
+                "SELECT work_id FROM queue_items WHERE source_id = ?1 AND state = ?2
+                 UNION
+                 SELECT work_id FROM transition_log WHERE source_id = ?1 AND substr(work_id, 1, ?3) = ?4",
+            )
+            .map_err(sql_err)?;
+        let prefix_len = i64::try_from(base.chars().count())
+            .map_err(|_| BeltError::Database("work_id prefix too long".to_string()))?;
+        stmt.query_map(params![source_id, state, prefix_len, base], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(sql_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql_err)?
+    };
+    let max_seq = issued
+        .iter()
+        .filter_map(|id| {
+            if *id == base {
+                Some(1)
+            } else {
+                id.strip_prefix(&prefix)?.parse::<u32>().ok()
+            }
+        })
+        .max();
+    Ok((phases, max_seq))
+}
+
+fn issue_work_id(source_id: &str, state: &str, seq: Option<u32>) -> String {
+    match seq {
+        None => QueueItem::make_work_id(source_id, state),
+        Some(n) => QueueItem::make_derived_work_id(source_id, state, n),
+    }
+}
+
+/// Insert a `queue_items` row. An empty `lineage_root` (serde default for
+/// items deserialized without one) is rejected: every item belongs to a lineage.
+fn insert_queue_row(conn: &Connection, item: &QueueItem) -> Result<(), BeltError> {
+    if item.lineage_root.is_empty() {
+        return Err(BeltError::Database(format!(
+            "queue item {} has an empty lineage_root",
+            item.work_id
+        )));
+    }
+    conn.execute(
+        &format!(
+            "INSERT INTO queue_items ({QUEUE_ITEM_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+        ),
+        params![
+            item.work_id,
+            item.source_id,
+            item.workspace_id,
+            item.state,
+            phase_to_str(item.phase()),
+            item.title,
+            item.created_at,
+            item.updated_at,
+            item.replan_count,
+            item.worktree_preserved,
+            item.previous_worktree_path,
+            item.derived_from,
+            item.lineage_root,
+        ],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+fn lineage_root_of(conn: &Connection, work_id: &str) -> Result<String, BeltError> {
+    conn.query_row(
+        "SELECT lineage_root FROM queue_items WHERE work_id = ?1",
+        params![work_id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(sql_err)?
+    .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))
+}
+
+fn insert_reset_row(
+    tx: &Transaction<'_>,
+    source_id: &str,
+    state: &str,
+    work_id: &str,
+) -> Result<(), BeltError> {
+    tx.execute(
+        "INSERT INTO history (work_id, source_id, state, status, attempt, summary, error, created_at)
+         VALUES (?1, ?2, ?3, ?4, 0, NULL, NULL, ?5)",
+        params![work_id, source_id, state, HISTORY_STATUS_RESET, Utc::now().to_rfc3339()],
+    )
+    .map_err(sql_err)?;
+    Ok(())
+}
+
+/// `history.status` of a failure-count reset point.
+const HISTORY_STATUS_RESET: &str = "reset";
+
+fn attempt_status(status: &str) -> Result<AttemptStatus, BeltError> {
+    match status {
+        "failed" => Ok(AttemptStatus::Failed),
+        HISTORY_STATUS_RESET => Ok(AttemptStatus::Reset),
+        "running" => Ok(AttemptStatus::Running),
+        "completed" | "done" | "success" => Ok(AttemptStatus::Done),
+        "skipped" => Ok(AttemptStatus::Skipped),
+        "hitl" => Ok(AttemptStatus::Hitl),
+        other => Err(BeltError::Database(format!(
+            "unknown history status: {other}"
+        ))),
+    }
+}
+
+fn actor_str(actor: &Actor) -> String {
+    match actor {
+        Actor::Daemon => "daemon".to_string(),
+        Actor::Cli => "cli".to_string(),
+        Actor::Tui => "tui".to_string(),
+        Actor::Cron => "cron".to_string(),
+        Actor::Channel(name) => name.clone(),
+    }
+}
+
+fn reason_str(reason: &TransitionReason) -> String {
+    match reason {
+        TransitionReason::Manual => "manual".to_string(),
+        TransitionReason::Advance => "advance".to_string(),
+        TransitionReason::Derived => "derived".to_string(),
+        TransitionReason::Canceled => "canceled".to_string(),
+        TransitionReason::Rollback => "rollback".to_string(),
+        TransitionReason::Escalation(action) => format!("escalation:{action}"),
+        TransitionReason::PostProcessing(action) => format!("post_processing:{action}"),
+    }
+}
+
 // ---- Helpers ---------------------------------------------------------------
 
 /// Convert a `QueuePhase` to its database string representation.
@@ -2214,37 +3262,15 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>, BeltError> {
         .map_err(|_| BeltError::Database(format!("invalid datetime: {s}")))
 }
 
-/// Parse a database status string back into a `SpecStatus`.
-///
-/// # Errors
-/// Returns `BeltError::Database` for unrecognised status values.
-fn str_to_spec_status(s: &str) -> Result<SpecStatus, BeltError> {
-    s.parse::<SpecStatus>()
-        .map_err(|_| BeltError::Database(format!("unknown spec status: {s}")))
-}
-
-/// Extract a `Spec` from a rusqlite `Row`.
-///
-/// Column order must match:
-/// `id, workspace_id, name, status, content, priority, labels, depends_on, entry_point, decomposed_issues, test_commands, created_at, updated_at`
-fn row_to_spec(row: &rusqlite::Row<'_>) -> Result<Spec, BeltError> {
-    let status_str: String = col(row, 3)?;
-
-    Ok(Spec {
-        id: col(row, 0)?,
-        workspace_id: col(row, 1)?,
-        name: col(row, 2)?,
-        status: str_to_spec_status(&status_str)?,
-        content: col(row, 4)?,
-        priority: col(row, 5)?,
-        labels: col(row, 6)?,
-        depends_on: col(row, 7)?,
-        entry_point: col(row, 8)?,
-        decomposed_issues: col(row, 9)?,
-        test_commands: col(row, 10)?,
-        created_at: col(row, 11)?,
-        updated_at: col(row, 12)?,
-    })
+fn parse_hitl_reason(s: &str) -> Result<HitlReason, BeltError> {
+    match s {
+        "evaluate_failure" => Ok(HitlReason::EvaluateFailure),
+        "retry_max_exceeded" => Ok(HitlReason::RetryMaxExceeded),
+        "timeout" => Ok(HitlReason::Timeout),
+        "manual_escalation" => Ok(HitlReason::ManualEscalation),
+        "stagnation_detected" => Ok(HitlReason::StagnationDetected),
+        other => Err(BeltError::Database(format!("unknown hitl_reason: {other}"))),
+    }
 }
 
 /// Extract a `QueueItem` from a rusqlite `Row`.
@@ -2252,43 +3278,1009 @@ fn row_to_spec(row: &rusqlite::Row<'_>) -> Result<Spec, BeltError> {
 /// Column order must match [`QUEUE_ITEM_COLUMNS`].
 fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
     let phase_str: String = col(row, 4)?;
-    let hitl_reason_str: Option<String> = col(row, 11)?;
-    let hitl_reason = hitl_reason_str
-        .as_deref()
-        .map(|s| match s {
-            "evaluate_failure" => Ok(belt_core::queue::HitlReason::EvaluateFailure),
-            "retry_max_exceeded" => Ok(belt_core::queue::HitlReason::RetryMaxExceeded),
-            "timeout" => Ok(belt_core::queue::HitlReason::Timeout),
-            "manual_escalation" => Ok(belt_core::queue::HitlReason::ManualEscalation),
-            "spec_conflict" => Ok(belt_core::queue::HitlReason::SpecConflict),
-            "spec_completion_review" => Ok(belt_core::queue::HitlReason::SpecCompletionReview),
-            "spec_modification_proposed" => {
-                Ok(belt_core::queue::HitlReason::SpecModificationProposed)
-            }
-            "stagnation_detected" => Ok(belt_core::queue::HitlReason::StagnationDetected),
-            other => Err(BeltError::Database(format!("unknown hitl_reason: {other}"))),
-        })
-        .transpose()?;
-
     let mut item = QueueItem::new(col(row, 0)?, col(row, 1)?, col(row, 2)?, col(row, 3)?);
     item.set_phase_unchecked(str_to_phase(&phase_str)?);
     item.title = col(row, 5)?;
     item.created_at = col(row, 6)?;
     item.updated_at = col(row, 7)?;
-    item.hitl_created_at = col(row, 8)?;
-    item.hitl_respondent = col(row, 9)?;
-    item.hitl_notes = col(row, 10)?;
-    item.hitl_reason = hitl_reason;
-    item.hitl_timeout_at = col(row, 12)?;
-    item.hitl_terminal_action = col::<Option<String>>(row, 13)?
-        .as_deref()
-        .map(|s| s.parse::<EscalationAction>().map_err(BeltError::Database))
-        .transpose()?;
-    item.replan_count = row.get::<_, u32>(14).unwrap_or(0);
-    item.worktree_preserved = col(row, 15)?;
-    item.previous_worktree_path = col(row, 16)?;
-    item.lateral_plan = col(row, 17).unwrap_or(None);
+    item.replan_count = col(row, 8)?;
+    item.worktree_preserved = col(row, 9)?;
+    item.previous_worktree_path = col(row, 10)?;
+    item.derived_from = col(row, 11)?;
+    item.lineage_root = col(row, 12)?;
     Ok(item)
+}
+
+// ---- Handler process and cancel request store API ---------------------------
+
+/// Lifecycle state of a cancel request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelStatus {
+    Requested,
+    Accepted,
+    Closed,
+}
+
+impl CancelStatus {
+    fn parse(value: &str) -> Result<Self, BeltError> {
+        match value {
+            "requested" => Ok(Self::Requested),
+            "accepted" => Ok(Self::Accepted),
+            "closed" => Ok(Self::Closed),
+            other => Err(BeltError::Database(format!(
+                "unknown cancel request status '{other}'"
+            ))),
+        }
+    }
+}
+
+/// How a cancel request ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelResult {
+    /// The daemon stopped the handler and moved the item Running to Skipped.
+    Canceled,
+    /// The CLI moved the item without a daemon.
+    CanceledDirectly,
+    /// The item had already left Running.
+    TooLate,
+}
+
+impl CancelResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Canceled => "canceled",
+            Self::CanceledDirectly => "canceled_directly",
+            Self::TooLate => "too_late",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, BeltError> {
+        match value {
+            "canceled" => Ok(Self::Canceled),
+            "canceled_directly" => Ok(Self::CanceledDirectly),
+            "too_late" => Ok(Self::TooLate),
+            other => Err(BeltError::Database(format!(
+                "unknown cancel request result '{other}'"
+            ))),
+        }
+    }
+}
+
+/// One row of `cancel_requests`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelRequestRecord {
+    pub id: i64,
+    pub work_id: String,
+    pub requester: String,
+    /// Path the request came through: `cli` or `tui`.
+    pub via: String,
+    pub status: CancelStatus,
+    /// `Some` once the request is closed.
+    pub result: Option<CancelResult>,
+    /// RFC 3339.
+    pub requested_at: String,
+    pub accepted_at: Option<String>,
+    pub closed_at: Option<String>,
+}
+
+/// Result of [`Database::request_cancel`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestCancelOutcome {
+    /// A new request was recorded.
+    Opened { id: i64 },
+    /// The item already has an open request; it is the same request.
+    Existing(CancelRequestRecord),
+}
+
+/// The handler process recorded for a Running item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandlerProcess {
+    /// Leader of the handler's process group.
+    pub pid: u32,
+    /// When the item entered Running. The handler cannot have started
+    /// before it, which tells a live handler from a reused pid.
+    pub running_since: DateTime<Utc>,
+}
+
+/// Result of [`Database::cancel_directly`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DirectCancelOutcome {
+    /// The item moved Running to Skipped and the request closed as
+    /// `canceled_directly`. `handler` is the process recorded before the
+    /// move, left for the caller to stop.
+    Canceled { handler: Option<HandlerProcess> },
+    /// The item had already left Running; the request closed as `too_late`.
+    TooLate { current: QueuePhase },
+    /// The request is unknown or already closed; nothing changed.
+    NotOpen,
+}
+
+const CANCEL_COLUMNS: &str =
+    "id, work_id, requester, via, status, result, requested_at, accepted_at, closed_at";
+
+impl Database {
+    /// Record the process id of the handler running `work_id`.
+    ///
+    /// The pid is valid only while the item is Running, so it is stored only
+    /// then: returns `false` and stores nothing for any other phase. Every
+    /// applied transition clears it, so a pid never outlives the Running
+    /// phase it was recorded in.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`; `BeltError::Database`
+    /// on I/O failure.
+    pub fn set_handler_process(&self, work_id: &str, pid: u32) -> Result<bool, BeltError> {
+        self.write_tx(|tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE queue_items SET handler_pid = ?1 WHERE work_id = ?2 AND phase = 'running'",
+                    params![i64::from(pid), work_id],
+                )
+                .map_err(sql_err)?;
+            if changed == 0 {
+                source_id_of(tx, work_id)?;
+            }
+            Ok(changed == 1)
+        })
+    }
+
+    /// Forget the handler process id of `work_id`.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`; `BeltError::Database`
+    /// on I/O failure.
+    pub fn clear_handler_process(&self, work_id: &str) -> Result<(), BeltError> {
+        self.write_tx(|tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE queue_items SET handler_pid = NULL WHERE work_id = ?1",
+                    params![work_id],
+                )
+                .map_err(sql_err)?;
+            if changed == 0 {
+                source_id_of(tx, work_id)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// The recorded handler process id of `work_id`, if any.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`; `BeltError::Database`
+    /// on I/O failure or a stored pid out of range.
+    pub fn handler_process(&self, work_id: &str) -> Result<Option<u32>, BeltError> {
+        let conn = self.lock_conn()?;
+        let pid: Option<i64> = conn
+            .query_row(
+                "SELECT handler_pid FROM queue_items WHERE work_id = ?1",
+                params![work_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+        pid.map(|pid| {
+            u32::try_from(pid)
+                .map_err(|_| BeltError::Database(format!("handler pid {pid} out of range")))
+        })
+        .transpose()
+    }
+
+    /// Record a request to cancel `work_id`, one open request per item.
+    ///
+    /// A second request while one is open (requested or accepted) is the same
+    /// request and is returned unchanged as `Existing`. The item's phase is
+    /// not inspected: whether the request still hits a Running item is
+    /// decided when it is handled, and a late one is closed as `TooLate`.
+    /// `via` is the path the request came through and is logged as the actor.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`; `BeltError::Database`
+    /// on I/O failure.
+    pub fn request_cancel(
+        &self,
+        work_id: &str,
+        requester: &str,
+        via: &Actor,
+    ) -> Result<RequestCancelOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let source_id = source_id_of(tx, work_id)?;
+            let open = read_cancels(
+                tx,
+                "WHERE work_id = ?1 AND status IN ('requested', 'accepted')",
+                params![work_id],
+            )?;
+            if let Some(existing) = open.into_iter().next() {
+                return Ok(RequestCancelOutcome::Existing(existing));
+            }
+            let via = actor_str(via);
+            tx.execute(
+                "INSERT INTO cancel_requests (work_id, requester, via, status, requested_at)
+                 VALUES (?1, ?2, ?3, 'requested', ?4)",
+                params![work_id, requester, via, Utc::now().to_rfc3339()],
+            )
+            .map_err(sql_err)?;
+            let id = tx.last_insert_rowid();
+            append_log(
+                tx,
+                &LogRecord {
+                    work_id,
+                    source_id: &source_id,
+                    kind: transition_kind::CANCEL_REQUESTED,
+                    from_phase: None,
+                    to_phase: None,
+                    actor: &via,
+                    reason: None,
+                    detail: Some(requester),
+                },
+            )?;
+            Ok(RequestCancelOutcome::Opened { id })
+        })
+    }
+
+    /// Mark a requested cancel as accepted by `actor` (the daemon).
+    ///
+    /// Compare-and-set on `requested`: returns `false` and changes nothing
+    /// when the request is unknown, already accepted or closed.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn accept_cancel(&self, id: i64, actor: &Actor) -> Result<bool, BeltError> {
+        self.write_tx(|tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE cancel_requests SET status = 'accepted', accepted_at = ?1
+                     WHERE id = ?2 AND status = 'requested'",
+                    params![Utc::now().to_rfc3339(), id],
+                )
+                .map_err(sql_err)?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            log_cancel_event(tx, id, transition_kind::CANCEL_ACCEPTED, actor, None)?;
+            Ok(true)
+        })
+    }
+
+    /// Close an open cancel request with `result`.
+    ///
+    /// Compare-and-set on `requested` or `accepted`: returns `false` and
+    /// changes nothing when the request is unknown or already closed. After
+    /// the close the item has no open request, so a new one can be made.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn close_cancel(
+        &self,
+        id: i64,
+        result: CancelResult,
+        actor: &Actor,
+    ) -> Result<bool, BeltError> {
+        self.write_tx(|tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE cancel_requests SET status = 'closed', result = ?1, closed_at = ?2
+                     WHERE id = ?3 AND status IN ('requested', 'accepted')",
+                    params![result.as_str(), Utc::now().to_rfc3339(), id],
+                )
+                .map_err(sql_err)?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            log_cancel_event(
+                tx,
+                id,
+                transition_kind::CANCEL_CLOSED,
+                actor,
+                Some(result.as_str()),
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Every open (requested or accepted) cancel request, oldest first.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn open_cancel_requests(&self) -> Result<Vec<CancelRequestRecord>, BeltError> {
+        let conn = self.lock_conn()?;
+        read_cancels(
+            &conn,
+            "WHERE status IN ('requested', 'accepted') ORDER BY id",
+            [],
+        )
+    }
+
+    /// The open (requested or accepted) cancel request of `work_id`, if any.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn open_cancel_request(
+        &self,
+        work_id: &str,
+    ) -> Result<Option<CancelRequestRecord>, BeltError> {
+        let conn = self.lock_conn()?;
+        Ok(read_cancels(
+            &conn,
+            "WHERE work_id = ?1 AND status IN ('requested', 'accepted') ORDER BY id",
+            params![work_id],
+        )?
+        .into_iter()
+        .next())
+    }
+
+    /// The handler process recorded for `work_id` while it is Running.
+    ///
+    /// `None` when the item is not Running or no pid was reported.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`; `BeltError::Database`
+    /// on I/O failure or an unreadable stored value.
+    pub fn running_handler(&self, work_id: &str) -> Result<Option<HandlerProcess>, BeltError> {
+        let conn = self.lock_conn()?;
+        let (phase, pid, updated_at): (String, Option<i64>, String) = conn
+            .query_row(
+                "SELECT phase, handler_pid, updated_at FROM queue_items WHERE work_id = ?1",
+                params![work_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(sql_err)?
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+        if phase != phase_to_str(QueuePhase::Running) {
+            return Ok(None);
+        }
+        pid.map(|pid| handler_process_of(pid, &updated_at))
+            .transpose()
+    }
+
+    /// Cancel the item of an open cancel request without a daemon.
+    ///
+    /// The direct path of a cancel request, for when the daemon is absent or
+    /// does not answer. One transaction: the request must still be open;
+    /// a Running item moves to Skipped (reason `canceled`, actor `actor`,
+    /// past the handler lock) and the request closes as `canceled_directly`;
+    /// an item that already left Running closes it as `too_late`. The
+    /// handler process recorded before the move is returned so the caller
+    /// can stop it; the move itself clears the record.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` when the request names an unknown item;
+    /// `BeltError::Database` on I/O failure.
+    pub fn cancel_directly(
+        &self,
+        request_id: i64,
+        actor: &Actor,
+    ) -> Result<DirectCancelOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let Some(request) = read_cancels(
+                tx,
+                "WHERE id = ?1 AND status IN ('requested', 'accepted')",
+                params![request_id],
+            )?
+            .into_iter()
+            .next() else {
+                return Ok(DirectCancelOutcome::NotOpen);
+            };
+            let (pid, updated_at): (Option<i64>, String) = tx
+                .query_row(
+                    "SELECT handler_pid, updated_at FROM queue_items WHERE work_id = ?1",
+                    params![request.work_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(sql_err)?
+                .ok_or_else(|| BeltError::ItemNotFound(request.work_id.clone()))?;
+            let (_, step) = apply_transition_in_tx(
+                tx,
+                &TransitionRequest {
+                    work_id: request.work_id.clone(),
+                    expected_from: QueuePhase::Running,
+                    to: QueuePhase::Skipped,
+                    actor: actor.clone(),
+                    reason: TransitionReason::Canceled,
+                    detail: Some(format!("cancel request {request_id}: canceled directly")),
+                },
+            )?;
+            let outcome = match step {
+                Step::Applied { .. } => DirectCancelOutcome::Canceled {
+                    handler: pid
+                        .map(|pid| handler_process_of(pid, &updated_at))
+                        .transpose()?,
+                },
+                Step::Rejected(TransitionOutcome::Conflict { current })
+                | Step::Rejected(TransitionOutcome::InvalidAction { current }) => {
+                    DirectCancelOutcome::TooLate { current }
+                }
+                Step::Rejected(refused @ TransitionOutcome::Busy { .. })
+                | Step::Rejected(refused @ TransitionOutcome::Applied { .. }) => {
+                    return Err(BeltError::Database(format!(
+                        "direct cancel of {} was refused unexpectedly: {refused:?}",
+                        request.work_id
+                    )));
+                }
+                Step::HitlResponse => DirectCancelOutcome::TooLate {
+                    current: QueuePhase::Hitl,
+                },
+            };
+            let result = match outcome {
+                DirectCancelOutcome::Canceled { .. } => CancelResult::CanceledDirectly,
+                DirectCancelOutcome::TooLate { .. } | DirectCancelOutcome::NotOpen => {
+                    CancelResult::TooLate
+                }
+            };
+            tx.execute(
+                "UPDATE cancel_requests SET status = 'closed', result = ?1, closed_at = ?2
+                 WHERE id = ?3",
+                params![result.as_str(), Utc::now().to_rfc3339(), request_id],
+            )
+            .map_err(sql_err)?;
+            log_cancel_event(
+                tx,
+                request_id,
+                transition_kind::CANCEL_CLOSED,
+                actor,
+                Some(result.as_str()),
+            )?;
+            Ok(outcome)
+        })
+    }
+}
+
+fn handler_process_of(pid: i64, running_since: &str) -> Result<HandlerProcess, BeltError> {
+    let pid = u32::try_from(pid)
+        .map_err(|_| BeltError::Database(format!("handler pid {pid} out of range")))?;
+    let running_since = DateTime::parse_from_rfc3339(running_since)
+        .map_err(|e| BeltError::Database(format!("unreadable updated_at '{running_since}': {e}")))?
+        .with_timezone(&Utc);
+    Ok(HandlerProcess { pid, running_since })
+}
+
+fn source_id_of(tx: &Transaction<'_>, work_id: &str) -> Result<String, BeltError> {
+    tx.query_row(
+        "SELECT source_id FROM queue_items WHERE work_id = ?1",
+        params![work_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(sql_err)?
+    .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))
+}
+
+fn read_cancels(
+    conn: &Connection,
+    filter: &str,
+    args: impl rusqlite::Params,
+) -> Result<Vec<CancelRequestRecord>, BeltError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {CANCEL_COLUMNS} FROM cancel_requests {filter}"
+        ))
+        .map_err(sql_err)?;
+    let rows = stmt
+        .query_map(args, |row| {
+            Ok(CancelRow {
+                id: row.get(0)?,
+                work_id: row.get(1)?,
+                requester: row.get(2)?,
+                via: row.get(3)?,
+                status: row.get(4)?,
+                result: row.get(5)?,
+                requested_at: row.get(6)?,
+                accepted_at: row.get(7)?,
+                closed_at: row.get(8)?,
+            })
+        })
+        .map_err(sql_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql_err)?;
+    rows.into_iter().map(CancelRow::into_record).collect()
+}
+
+/// Raw `cancel_requests` row, before status and result are parsed.
+struct CancelRow {
+    id: i64,
+    work_id: String,
+    requester: String,
+    via: String,
+    status: String,
+    result: Option<String>,
+    requested_at: String,
+    accepted_at: Option<String>,
+    closed_at: Option<String>,
+}
+
+impl CancelRow {
+    fn into_record(self) -> Result<CancelRequestRecord, BeltError> {
+        Ok(CancelRequestRecord {
+            id: self.id,
+            work_id: self.work_id,
+            requester: self.requester,
+            via: self.via,
+            status: CancelStatus::parse(&self.status)?,
+            result: self
+                .result
+                .as_deref()
+                .map(CancelResult::parse)
+                .transpose()?,
+            requested_at: self.requested_at,
+            accepted_at: self.accepted_at,
+            closed_at: self.closed_at,
+        })
+    }
+}
+
+/// Append a `cancel_*` event for the item of request `id`.
+fn log_cancel_event(
+    tx: &Transaction<'_>,
+    id: i64,
+    kind: &str,
+    actor: &Actor,
+    reason: Option<&str>,
+) -> Result<(), BeltError> {
+    let work_id: String = tx
+        .query_row(
+            "SELECT work_id FROM cancel_requests WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(sql_err)?;
+    let source_id = source_id_of(tx, &work_id)?;
+    append_log(
+        tx,
+        &LogRecord {
+            work_id: &work_id,
+            source_id: &source_id,
+            kind,
+            from_phase: None,
+            to_phase: None,
+            actor: &actor_str(actor),
+            reason,
+            detail: None,
+        },
+    )?;
+    Ok(())
+}
+
+// ---- Delivery, external responses and natural-language proposals ----------
+
+/// How many failed attempts a delivery tolerates before it becomes `failed`.
+pub const DELIVERY_MAX_ATTEMPTS: u32 = 5;
+
+/// Delivery state of one HITL request on one channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryStatus {
+    Pending,
+    Sent,
+    Failed,
+}
+
+impl DeliveryStatus {
+    fn parse(value: &str) -> Result<Self, BeltError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "sent" => Ok(Self::Sent),
+            "failed" => Ok(Self::Failed),
+            other => Err(BeltError::Database(format!(
+                "unknown delivery status '{other}'"
+            ))),
+        }
+    }
+}
+
+/// One row of `hitl_deliveries`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    pub hitl_id: HitlId,
+    pub channel: String,
+    pub status: DeliveryStatus,
+    /// Failed attempts so far.
+    pub attempts: u32,
+    /// Reference of the delivered message, set once `sent`.
+    pub message_ref: Option<String>,
+    pub last_error: Option<String>,
+    /// RFC 3339.
+    pub updated_at: String,
+}
+
+/// Result of one delivery attempt, as reported to [`Database::mark_delivery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryAttempt {
+    Sent { message_ref: Option<String> },
+    Failed { error: String },
+}
+
+/// Result of [`Database::record_external_response`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalResponseOutcome {
+    /// First time this `(channel, external_id)` is seen.
+    Recorded,
+    /// Already processed; the caller skips it.
+    Duplicate,
+}
+
+/// Lifecycle state of a natural-language proposal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalStatus {
+    Pending,
+    Confirmed,
+    Superseded,
+}
+
+impl ProposalStatus {
+    fn parse(value: &str) -> Result<Self, BeltError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "confirmed" => Ok(Self::Confirmed),
+            "superseded" => Ok(Self::Superseded),
+            other => Err(BeltError::Database(format!(
+                "unknown proposal status '{other}'"
+            ))),
+        }
+    }
+}
+
+/// One row of `nl_proposals`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NlProposal {
+    pub id: i64,
+    pub hitl_id: HitlId,
+    pub respondent: String,
+    /// Channel the proposal was sent to and the confirmation comes from.
+    pub channel: String,
+    pub action: HitlAction,
+    pub summary: Option<String>,
+    pub status: ProposalStatus,
+    /// RFC 3339.
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A proposal to record via [`Database::upsert_proposal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewProposal {
+    pub hitl_id: HitlId,
+    pub respondent: String,
+    pub channel: String,
+    pub action: HitlAction,
+    pub summary: Option<String>,
+}
+
+/// Result of [`Database::upsert_proposal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpsertProposalOutcome {
+    Recorded(NlProposal),
+    /// The request was already confirmed; the caller answers `already_handled`
+    /// from the request's resolution.
+    HitlConfirmed(HitlRequest),
+    NotFound,
+}
+
+/// Result of [`Database::confirm_proposal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmProposalOutcome {
+    /// The proposal was pending and is now confirmed; the caller attempts the
+    /// HITL resolution with its action.
+    Confirmed(NlProposal),
+    /// The proposal was superseded or confirmed before. When the request is
+    /// confirmed too, the caller answers `already_handled` from its resolution.
+    NotPending(NlProposal),
+}
+
+impl Database {
+    /// Register `channel` as a delivery target of `hitl_id` (pending, no
+    /// attempts). Idempotent: an existing row is left untouched.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn ensure_delivery(&self, hitl_id: &HitlId, channel: &str) -> Result<(), BeltError> {
+        self.write_tx(|tx| {
+            tx.execute(
+                "INSERT OR IGNORE INTO hitl_deliveries (hitl_id, channel, status, attempts, updated_at)
+                 VALUES (?1, ?2, 'pending', 0, ?3)",
+                params![hitl_id.as_str(), channel, Utc::now().to_rfc3339()],
+            )
+            .map_err(sql_err)?;
+            Ok(())
+        })
+    }
+
+    /// Deliveries still to be sent: `pending` rows of open requests, oldest
+    /// request first. Confirmed requests are no longer worth delivering.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored row.
+    pub fn deliveries_due(&self) -> Result<Vec<Delivery>, BeltError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT d.hitl_id, d.channel, d.status, d.attempts, d.message_ref, d.last_error, d.updated_at
+                 FROM hitl_deliveries d
+                 JOIN hitl_requests r ON r.hitl_id = d.hitl_id
+                 WHERE d.status = 'pending' AND r.status = 'open'
+                 ORDER BY r.opened_at, d.hitl_id, d.channel",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |row| Ok(delivery_columns(row)))
+            .map_err(sql_err)?;
+        rows.map(|r| r.map_err(sql_err)?).collect()
+    }
+
+    /// One delivery, or `None` when the channel was never registered.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored row.
+    pub fn delivery(&self, hitl_id: &HitlId, channel: &str) -> Result<Option<Delivery>, BeltError> {
+        let conn = self.lock_conn()?;
+        read_delivery(&conn, hitl_id, channel)
+    }
+
+    /// Every delivery of `hitl_id`, ordered by channel.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored row.
+    pub fn deliveries_of(&self, hitl_id: &HitlId) -> Result<Vec<Delivery>, BeltError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT hitl_id, channel, status, attempts, message_ref, last_error, updated_at
+                 FROM hitl_deliveries WHERE hitl_id = ?1 ORDER BY channel",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![hitl_id.as_str()], |row| Ok(delivery_columns(row)))
+            .map_err(sql_err)?;
+        rows.map(|r| r.map_err(sql_err)?).collect()
+    }
+
+    /// Record the outcome of one delivery attempt on a `pending` delivery and
+    /// return the stored row.
+    ///
+    /// `Sent` stores the message reference. `Failed` counts the attempt and
+    /// keeps the row `pending` for the next tick until
+    /// [`DELIVERY_MAX_ATTEMPTS`] failures, then marks it `failed`. A delivery
+    /// that is already `sent` or `failed` is returned unchanged. `None` when
+    /// the channel was never registered.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored row.
+    pub fn mark_delivery(
+        &self,
+        hitl_id: &HitlId,
+        channel: &str,
+        attempt: &DeliveryAttempt,
+    ) -> Result<Option<Delivery>, BeltError> {
+        self.write_tx(|tx| {
+            let now = Utc::now().to_rfc3339();
+            match attempt {
+                DeliveryAttempt::Sent { message_ref } => {
+                    tx.execute(
+                        "UPDATE hitl_deliveries
+                         SET status = 'sent', message_ref = ?1, last_error = NULL, updated_at = ?2
+                         WHERE hitl_id = ?3 AND channel = ?4 AND status = 'pending'",
+                        params![message_ref, now, hitl_id.as_str(), channel],
+                    )
+                    .map_err(sql_err)?;
+                }
+                DeliveryAttempt::Failed { error } => {
+                    tx.execute(
+                        "UPDATE hitl_deliveries
+                         SET attempts = attempts + 1,
+                             status = CASE WHEN attempts + 1 >= ?1 THEN 'failed' ELSE 'pending' END,
+                             last_error = ?2, updated_at = ?3
+                         WHERE hitl_id = ?4 AND channel = ?5 AND status = 'pending'",
+                        params![DELIVERY_MAX_ATTEMPTS, error, now, hitl_id.as_str(), channel],
+                    )
+                    .map_err(sql_err)?;
+                }
+            }
+            read_delivery(tx, hitl_id, channel)
+        })
+    }
+
+    /// Record that the external response `external_id` of `channel` was
+    /// processed. The second record of the same pair is `Duplicate`, also
+    /// across restarts. `hitl_id` and `respondent` are what the response was
+    /// correlated to, when known.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn record_external_response(
+        &self,
+        channel: &str,
+        external_id: &str,
+        hitl_id: Option<&HitlId>,
+        respondent: Option<&str>,
+    ) -> Result<ExternalResponseOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let inserted = tx
+                .execute(
+                    "INSERT OR IGNORE INTO external_responses (channel, external_id, hitl_id, respondent, received_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        channel,
+                        external_id,
+                        hitl_id.map(HitlId::as_str),
+                        respondent,
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .map_err(sql_err)?;
+            Ok(if inserted == 1 {
+                ExternalResponseOutcome::Recorded
+            } else {
+                ExternalResponseOutcome::Duplicate
+            })
+        })
+    }
+
+    /// Record a pending proposal. The respondent's previous pending proposal
+    /// on the same request is superseded in the same transaction, so there is
+    /// at most one. A request that is already confirmed takes no proposal.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored row.
+    pub fn upsert_proposal(
+        &self,
+        proposal: &NewProposal,
+    ) -> Result<UpsertProposalOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let Some(request) = find_hitl(tx, &HitlTarget::Id(proposal.hitl_id.clone()))? else {
+                return Ok(UpsertProposalOutcome::NotFound);
+            };
+            if request.status != HitlStatus::Open {
+                return Ok(UpsertProposalOutcome::HitlConfirmed(request));
+            }
+            let now = Utc::now().to_rfc3339();
+            tx.execute(
+                "UPDATE nl_proposals SET status = 'superseded', updated_at = ?1
+                 WHERE hitl_id = ?2 AND respondent = ?3 AND status = 'pending'",
+                params![now, proposal.hitl_id.as_str(), proposal.respondent],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "INSERT INTO nl_proposals (hitl_id, respondent, channel, action, summary, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6)",
+                params![
+                    proposal.hitl_id.as_str(),
+                    proposal.respondent,
+                    proposal.channel,
+                    proposal.action.to_string(),
+                    proposal.summary,
+                    now
+                ],
+            )
+            .map_err(sql_err)?;
+            let id = tx.last_insert_rowid();
+            Ok(UpsertProposalOutcome::Recorded(read_proposal(tx, id)?))
+        })
+    }
+
+    /// The respondent's most recent proposal on `hitl_id` in any status, or
+    /// `None`. A confirmation checks the status: only `pending` is
+    /// actionable; otherwise the caller consults the request for
+    /// `already_handled`.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored row.
+    pub fn latest_proposal(
+        &self,
+        hitl_id: &HitlId,
+        respondent: &str,
+    ) -> Result<Option<NlProposal>, BeltError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT id, hitl_id, respondent, channel, action, summary, status, created_at, updated_at
+             FROM nl_proposals WHERE hitl_id = ?1 AND respondent = ?2
+             ORDER BY id DESC LIMIT 1",
+            params![hitl_id.as_str(), respondent],
+            |row| Ok(proposal_columns(row)),
+        )
+        .optional()
+        .map_err(sql_err)?
+        .transpose()
+    }
+
+    /// Mark a pending proposal confirmed. This precedes the HITL resolution
+    /// attempt, whether or not that attempt wins.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure, an inconsistent stored row, or an
+    /// unknown proposal id.
+    pub fn confirm_proposal(&self, id: i64) -> Result<ConfirmProposalOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE nl_proposals SET status = 'confirmed', updated_at = ?1
+                     WHERE id = ?2 AND status = 'pending'",
+                    params![Utc::now().to_rfc3339(), id],
+                )
+                .map_err(sql_err)?;
+            let stored = read_proposal(tx, id)?;
+            Ok(if changed == 1 {
+                ConfirmProposalOutcome::Confirmed(stored)
+            } else {
+                ConfirmProposalOutcome::NotPending(stored)
+            })
+        })
+    }
+
+    /// Close every pending proposal of `hitl_id` as superseded; returns how
+    /// many were closed. [`Database::resolve_hitl`] and
+    /// [`Database::expire_hitl`] already do this in their own transaction.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn close_proposals(&self, hitl_id: &HitlId) -> Result<usize, BeltError> {
+        self.write_tx(|tx| close_proposals_in_tx(tx, hitl_id))
+    }
+}
+
+fn close_proposals_in_tx(tx: &Transaction<'_>, hitl_id: &HitlId) -> Result<usize, BeltError> {
+    tx.execute(
+        "UPDATE nl_proposals SET status = 'superseded', updated_at = ?1
+         WHERE hitl_id = ?2 AND status = 'pending'",
+        params![Utc::now().to_rfc3339(), hitl_id.as_str()],
+    )
+    .map_err(sql_err)
+}
+
+fn delivery_columns(row: &rusqlite::Row<'_>) -> Result<Delivery, BeltError> {
+    Ok(Delivery {
+        hitl_id: HitlId::new(row.get::<_, String>(0).map_err(sql_err)?),
+        channel: row.get(1).map_err(sql_err)?,
+        status: DeliveryStatus::parse(&row.get::<_, String>(2).map_err(sql_err)?)?,
+        attempts: row.get(3).map_err(sql_err)?,
+        message_ref: row.get(4).map_err(sql_err)?,
+        last_error: row.get(5).map_err(sql_err)?,
+        updated_at: row.get(6).map_err(sql_err)?,
+    })
+}
+
+fn read_delivery(
+    conn: &Connection,
+    hitl_id: &HitlId,
+    channel: &str,
+) -> Result<Option<Delivery>, BeltError> {
+    conn.query_row(
+        "SELECT hitl_id, channel, status, attempts, message_ref, last_error, updated_at
+         FROM hitl_deliveries WHERE hitl_id = ?1 AND channel = ?2",
+        params![hitl_id.as_str(), channel],
+        |row| Ok(delivery_columns(row)),
+    )
+    .optional()
+    .map_err(sql_err)?
+    .transpose()
+}
+
+fn proposal_columns(row: &rusqlite::Row<'_>) -> Result<NlProposal, BeltError> {
+    Ok(NlProposal {
+        id: row.get(0).map_err(sql_err)?,
+        hitl_id: HitlId::new(row.get::<_, String>(1).map_err(sql_err)?),
+        respondent: row.get(2).map_err(sql_err)?,
+        channel: row.get(3).map_err(sql_err)?,
+        action: row
+            .get::<_, String>(4)
+            .map_err(sql_err)?
+            .parse::<HitlAction>()
+            .map_err(BeltError::Database)?,
+        summary: row.get(5).map_err(sql_err)?,
+        status: ProposalStatus::parse(&row.get::<_, String>(6).map_err(sql_err)?)?,
+        created_at: row.get(7).map_err(sql_err)?,
+        updated_at: row.get(8).map_err(sql_err)?,
+    })
+}
+
+fn read_proposal(conn: &Connection, id: i64) -> Result<NlProposal, BeltError> {
+    conn.query_row(
+        "SELECT id, hitl_id, respondent, channel, action, summary, status, created_at, updated_at
+         FROM nl_proposals WHERE id = ?1",
+        params![id],
+        |row| Ok(proposal_columns(row)),
+    )
+    .map_err(sql_err)?
 }
 
 #[cfg(test)]
@@ -2346,53 +4338,6 @@ mod tests {
         let err = db
             .update_phase("nonexistent", QueuePhase::Ready)
             .unwrap_err();
-        assert!(matches!(err, BeltError::ItemNotFound(_)));
-    }
-
-    #[test]
-    fn escalate_to_hitl_sets_metadata() {
-        let db = test_db();
-        let item = sample_item();
-        db.insert_item(&item).unwrap();
-
-        db.escalate_to_hitl(&item.work_id, "evaluate_failure", "failed 3 times")
-            .unwrap();
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.phase(), QueuePhase::Hitl);
-        assert!(fetched.hitl_created_at.is_some());
-        assert_eq!(fetched.hitl_notes.as_deref(), Some("failed 3 times"));
-    }
-
-    #[test]
-    fn escalate_to_hitl_not_found() {
-        let db = test_db();
-        let err = db
-            .escalate_to_hitl("nonexistent", "evaluate_failure", "error")
-            .unwrap_err();
-        assert!(matches!(err, BeltError::ItemNotFound(_)));
-    }
-
-    #[test]
-    fn increment_replan_count_returns_new_value() {
-        let db = test_db();
-        let item = sample_item();
-        db.insert_item(&item).unwrap();
-
-        let count = db.increment_replan_count(&item.work_id).unwrap();
-        assert_eq!(count, 1);
-
-        let count = db.increment_replan_count(&item.work_id).unwrap();
-        assert_eq!(count, 2);
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.replan_count, 2);
-    }
-
-    #[test]
-    fn increment_replan_count_not_found() {
-        let db = test_db();
-        let err = db.increment_replan_count("nonexistent").unwrap_err();
         assert!(matches!(err, BeltError::ItemNotFound(_)));
     }
 
@@ -3047,382 +4992,52 @@ mod tests {
         assert_send_sync::<Database>();
     }
 
-    // ---- Specs -------------------------------------------------------------
+    // ---- Legacy spec tables ------------------------------------------------
 
-    fn sample_spec() -> Spec {
-        Spec::new(
-            "spec-1".to_string(),
-            "ws-1".to_string(),
-            "Test Spec".to_string(),
-            "Some content".to_string(),
+    fn table_exists(db: &Database, name: &str) -> bool {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |row| row.get::<_, i64>(0),
         )
+        .unwrap()
+            > 0
     }
 
     #[test]
-    fn insert_and_get_spec() {
+    fn new_database_has_no_spec_tables() {
         let db = test_db();
-        let spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        let fetched = db.get_spec(&spec.id).unwrap();
-        assert_eq!(fetched.id, spec.id);
-        assert_eq!(fetched.name, "Test Spec");
-        assert_eq!(fetched.status, SpecStatus::Draft);
-        assert_eq!(fetched.content, "Some content");
+        assert!(!table_exists(&db, "specs"));
+        assert!(!table_exists(&db, "spec_links"));
     }
 
     #[test]
-    fn get_spec_not_found() {
-        let db = test_db();
-        let err = db.get_spec("nonexistent").unwrap_err();
-        assert!(matches!(err, BeltError::SpecNotFound(_)));
-    }
-
-    #[test]
-    fn list_specs_no_filter() {
-        let db = test_db();
-        db.insert_spec(&sample_spec()).unwrap();
-
-        let specs = db.list_specs(None, None).unwrap();
-        assert_eq!(specs.len(), 1);
-    }
-
-    #[test]
-    fn list_specs_filter_by_workspace() {
-        let db = test_db();
-        db.insert_spec(&sample_spec()).unwrap();
-
-        let specs = db.list_specs(Some("ws-1"), None).unwrap();
-        assert_eq!(specs.len(), 1);
-
-        let specs = db.list_specs(Some("other"), None).unwrap();
-        assert!(specs.is_empty());
-    }
-
-    #[test]
-    fn list_specs_filter_by_status() {
-        let db = test_db();
-        db.insert_spec(&sample_spec()).unwrap();
-
-        let specs = db.list_specs(None, Some(SpecStatus::Draft)).unwrap();
-        assert_eq!(specs.len(), 1);
-
-        let specs = db.list_specs(None, Some(SpecStatus::Active)).unwrap();
-        assert!(specs.is_empty());
-    }
-
-    #[test]
-    fn update_spec_fields() {
-        let db = test_db();
-        let mut spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        spec.name = "Updated Name".to_string();
-        spec.content = "Updated content".to_string();
-        spec.priority = Some(1);
-        spec.labels = Some("urgent".to_string());
-        db.update_spec(&spec).unwrap();
-
-        let fetched = db.get_spec(&spec.id).unwrap();
-        assert_eq!(fetched.name, "Updated Name");
-        assert_eq!(fetched.content, "Updated content");
-        assert_eq!(fetched.priority, Some(1));
-        assert_eq!(fetched.labels.as_deref(), Some("urgent"));
-    }
-
-    #[test]
-    fn update_spec_not_found() {
-        let db = test_db();
-        let spec = sample_spec();
-        let err = db.update_spec(&spec).unwrap_err();
-        assert!(matches!(err, BeltError::SpecNotFound(_)));
-    }
-
-    #[test]
-    fn update_spec_status() {
-        let db = test_db();
-        let spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        db.update_spec_status(&spec.id, SpecStatus::Active).unwrap();
-        let fetched = db.get_spec(&spec.id).unwrap();
-        assert_eq!(fetched.status, SpecStatus::Active);
-    }
-
-    #[test]
-    fn update_spec_status_not_found() {
-        let db = test_db();
-        let err = db
-            .update_spec_status("nonexistent", SpecStatus::Active)
-            .unwrap_err();
-        assert!(matches!(err, BeltError::SpecNotFound(_)));
-    }
-
-    #[test]
-    fn remove_spec() {
-        let db = test_db();
-        let spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        db.remove_spec(&spec.id).unwrap();
-        // Soft delete: spec still exists but is archived
-        let fetched = db.get_spec(&spec.id).unwrap();
-        assert_eq!(fetched.status, SpecStatus::Archived);
-        // Archived specs are excluded from default listing
-        let listed = db.list_specs(None, None).unwrap();
-        assert!(listed.is_empty());
-        // But can be listed explicitly
-        let archived = db.list_specs(None, Some(SpecStatus::Archived)).unwrap();
-        assert_eq!(archived.len(), 1);
-    }
-
-    #[test]
-    fn remove_spec_not_found() {
-        let db = test_db();
-        let err = db.remove_spec("nonexistent").unwrap_err();
-        assert!(matches!(err, BeltError::SpecNotFound(_)));
-    }
-
-    #[test]
-    fn spec_with_optional_fields() {
-        let db = test_db();
-        let mut spec = sample_spec();
-        spec.priority = Some(5);
-        spec.labels = Some("bug,feature".to_string());
-        spec.depends_on = Some("spec-0".to_string());
-        db.insert_spec(&spec).unwrap();
-
-        let fetched = db.get_spec(&spec.id).unwrap();
-        assert_eq!(fetched.priority, Some(5));
-        assert_eq!(fetched.labels.as_deref(), Some("bug,feature"));
-        assert_eq!(fetched.depends_on.as_deref(), Some("spec-0"));
-    }
-
-    #[test]
-    fn spec_status_roundtrip() {
-        let statuses = [
-            SpecStatus::Draft,
-            SpecStatus::Active,
-            SpecStatus::Paused,
-            SpecStatus::Completed,
-        ];
-        for s in statuses {
-            assert_eq!(str_to_spec_status(s.as_str()).unwrap(), s);
+    fn existing_database_with_spec_tables_opens_and_keeps_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        let path = path.to_str().unwrap();
+        {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE specs (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+                 CREATE TABLE spec_links (id TEXT PRIMARY KEY, spec_id TEXT NOT NULL);
+                 INSERT INTO specs (id, name) VALUES ('s1', 'legacy');",
+            )
+            .unwrap();
         }
-    }
 
-    // ---- Spec links -----------------------------------------------------------
-
-    #[test]
-    fn insert_and_list_spec_links() {
-        let db = test_db();
-        let spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        let link = SpecLink::new(
-            "link-1".to_string(),
-            spec.id.clone(),
-            "https://example.com".to_string(),
-        );
-        db.insert_spec_link(&link).unwrap();
-
-        let links = db.list_spec_links(&spec.id).unwrap();
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].target, "https://example.com");
-    }
-
-    #[test]
-    fn remove_spec_link() {
-        let db = test_db();
-        let spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        let link = SpecLink::new(
-            "link-1".to_string(),
-            spec.id.clone(),
-            "https://example.com".to_string(),
-        );
-        db.insert_spec_link(&link).unwrap();
-        db.remove_spec_link(&spec.id, "https://example.com")
+        let db = Database::open(path).unwrap();
+        assert!(table_exists(&db, "specs"));
+        assert!(table_exists(&db, "spec_links"));
+        db.insert_item(&sample_item()).unwrap();
+        let count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM specs", [], |r| r.get(0))
             .unwrap();
-
-        let links = db.list_spec_links(&spec.id).unwrap();
-        assert!(links.is_empty());
-    }
-
-    #[test]
-    fn remove_spec_link_not_found() {
-        let db = test_db();
-        let err = db
-            .remove_spec_link("nonexistent", "https://example.com")
-            .unwrap_err();
-        assert!(matches!(err, BeltError::Database(_)));
-    }
-
-    #[test]
-    fn remove_all_spec_links() {
-        let db = test_db();
-        let spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        let link1 = SpecLink::new(
-            "link-1".to_string(),
-            spec.id.clone(),
-            "https://example.com".to_string(),
-        );
-        let link2 = SpecLink::new(
-            "link-2".to_string(),
-            spec.id.clone(),
-            "https://other.com".to_string(),
-        );
-        db.insert_spec_link(&link1).unwrap();
-        db.insert_spec_link(&link2).unwrap();
-
-        let removed = db.remove_all_spec_links(&spec.id).unwrap();
-        assert_eq!(removed, 2);
-
-        let links = db.list_spec_links(&spec.id).unwrap();
-        assert!(links.is_empty());
-    }
-
-    #[test]
-    fn duplicate_spec_link_rejected() {
-        let db = test_db();
-        let spec = sample_spec();
-        db.insert_spec(&spec).unwrap();
-
-        let link = SpecLink::new(
-            "link-1".to_string(),
-            spec.id.clone(),
-            "https://example.com".to_string(),
-        );
-        db.insert_spec_link(&link).unwrap();
-
-        let link2 = SpecLink::new(
-            "link-2".to_string(),
-            spec.id.clone(),
-            "https://example.com".to_string(),
-        );
-        let err = db.insert_spec_link(&link2).unwrap_err();
-        assert!(matches!(err, BeltError::Database(_)));
-    }
-
-    // ---- HITL metadata --------------------------------------------------------
-
-    #[test]
-    fn insert_and_get_item_with_hitl_metadata() {
-        let db = test_db();
-        let mut item = sample_item();
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_created_at = Some(Utc::now().to_rfc3339());
-        item.hitl_reason = Some(belt_core::queue::HitlReason::RetryMaxExceeded);
-        item.hitl_notes = Some("max retries".to_string());
-        db.insert_item(&item).unwrap();
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.phase(), QueuePhase::Hitl);
-        assert!(fetched.hitl_created_at.is_some());
-        assert_eq!(
-            fetched.hitl_reason,
-            Some(belt_core::queue::HitlReason::RetryMaxExceeded)
-        );
-        assert_eq!(fetched.hitl_notes.as_deref(), Some("max retries"));
-    }
-
-    #[test]
-    fn respond_hitl_updates_metadata() {
-        let db = test_db();
-        let mut item = sample_item();
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_created_at = Some(Utc::now().to_rfc3339());
-        db.insert_item(&item).unwrap();
-
-        db.respond_hitl(
-            &item.work_id,
-            QueuePhase::Done,
-            Some("irene"),
-            Some("looks good"),
-        )
-        .unwrap();
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.phase(), QueuePhase::Done);
-        assert_eq!(fetched.hitl_respondent.as_deref(), Some("irene"));
-        assert_eq!(fetched.hitl_notes.as_deref(), Some("looks good"));
-    }
-
-    #[test]
-    fn list_expired_hitl_items_returns_old_items() {
-        let db = test_db();
-        // Item with hitl_created_at 25 hours ago
-        let mut old_item = sample_item();
-        old_item.set_phase_unchecked(QueuePhase::Hitl);
-        old_item.hitl_created_at = Some((Utc::now() - chrono::Duration::hours(25)).to_rfc3339());
-        db.insert_item(&old_item).unwrap();
-        db.update_phase(&old_item.work_id, QueuePhase::Hitl)
-            .unwrap();
-
-        // Item with hitl_created_at 1 hour ago (not expired)
-        let mut new_item = sample_item();
-        new_item.work_id = "gh:org/repo#2:implement".to_string();
-        new_item.set_phase_unchecked(QueuePhase::Hitl);
-        new_item.hitl_created_at = Some((Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
-        db.insert_item(&new_item).unwrap();
-        db.update_phase(&new_item.work_id, QueuePhase::Hitl)
-            .unwrap();
-
-        let expired = db.list_expired_hitl_items(24).unwrap();
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0], old_item.work_id);
-    }
-
-    #[test]
-    fn set_hitl_timeout_updates_item() {
-        let db = test_db();
-        let mut item = sample_item();
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        db.insert_item(&item).unwrap();
-
-        let timeout_at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
-        db.set_hitl_timeout(&item.work_id, &timeout_at, Some(&EscalationAction::Skip))
-            .unwrap();
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(
-            fetched.hitl_timeout_at.as_deref(),
-            Some(timeout_at.as_str())
-        );
-        assert_eq!(fetched.hitl_terminal_action, Some(EscalationAction::Skip));
-    }
-
-    #[test]
-    fn set_hitl_timeout_not_found() {
-        let db = test_db();
-        let result = db.set_hitl_timeout("nonexistent", "2026-01-01T00:00:00Z", None);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn list_hitl_items_with_timeout_returns_matching() {
-        let db = test_db();
-
-        // Item with timeout set.
-        let mut item1 = sample_item();
-        item1.work_id = "w-timeout".to_string();
-        item1.set_phase_unchecked(QueuePhase::Hitl);
-        item1.hitl_timeout_at = Some((Utc::now() + chrono::Duration::hours(1)).to_rfc3339());
-        item1.hitl_terminal_action = Some(EscalationAction::Skip);
-        db.insert_item(&item1).unwrap();
-
-        // Item without timeout.
-        let mut item2 = sample_item();
-        item2.work_id = "w-no-timeout".to_string();
-        item2.set_phase_unchecked(QueuePhase::Hitl);
-        db.insert_item(&item2).unwrap();
-
-        let items = db.list_hitl_items_with_timeout().unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].work_id, "w-timeout");
+        assert_eq!(count, 1);
     }
 
     // ---- Transition Events tests -------------------------------------------
@@ -3781,21 +5396,21 @@ mod tests {
     }
 
     #[test]
-    fn update_item_worktree_state_persists_path() {
+    fn update_item_worktree_state_persists_path_and_keeps_the_phase() {
         let db = test_db();
-        let item = sample_item();
+        let mut item = sample_item();
+        item.set_phase_unchecked(QueuePhase::Skipped);
         db.insert_item(&item).unwrap();
 
-        db.update_item_worktree_state(
-            &item.work_id,
-            QueuePhase::Pending,
-            true,
-            Some("/tmp/wt/preserved"),
-        )
-        .unwrap();
+        db.update_item_worktree_state(&item.work_id, true, Some("/tmp/wt/preserved"))
+            .unwrap();
 
         let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.phase(), QueuePhase::Pending);
+        assert_eq!(
+            fetched.phase(),
+            QueuePhase::Skipped,
+            "the phase is not written"
+        );
         assert!(fetched.worktree_preserved);
         assert_eq!(
             fetched.previous_worktree_path.as_deref(),
@@ -3810,7 +5425,7 @@ mod tests {
         item.previous_worktree_path = Some("/tmp/wt/old".to_string());
         db.insert_item(&item).unwrap();
 
-        db.update_item_worktree_state(&item.work_id, QueuePhase::Running, false, None)
+        db.update_item_worktree_state(&item.work_id, false, None)
             .unwrap();
 
         let fetched = db.get_item(&item.work_id).unwrap();
@@ -3822,7 +5437,7 @@ mod tests {
     fn update_item_worktree_state_not_found() {
         let db = test_db();
         let err = db
-            .update_item_worktree_state("nonexistent", QueuePhase::Pending, true, None)
+            .update_item_worktree_state("nonexistent", true, None)
             .unwrap_err();
         assert!(matches!(err, BeltError::ItemNotFound(_)));
     }
@@ -3868,12 +5483,10 @@ mod tests {
     #[test]
     fn queue_item_columns_count_matches_schema() {
         let col_count = QUEUE_ITEM_COLUMNS.split(',').count();
-        // The queue_items table has exactly 17 columns:
-        // work_id, source_id, workspace_id, state, phase, title,
-        // created_at, updated_at, hitl_created_at, hitl_respondent,
-        // hitl_notes, hitl_reason, hitl_timeout_at, hitl_terminal_action,
-        // replan_count, worktree_preserved, previous_worktree_path
-        assert_eq!(col_count, 17);
+        // QueueItem maps 13 queue_items columns. The legacy hitl_* columns
+        // stay in the schema but are neither read nor written; handler_pid
+        // and worktree_owner are not part of QueueItem either.
+        assert_eq!(col_count, 13);
     }
 
     #[test]
@@ -3895,15 +5508,11 @@ mod tests {
             "title",
             "created_at",
             "updated_at",
-            "hitl_created_at",
-            "hitl_respondent",
-            "hitl_notes",
-            "hitl_reason",
-            "hitl_timeout_at",
-            "hitl_terminal_action",
             "replan_count",
             "worktree_preserved",
             "previous_worktree_path",
+            "derived_from",
+            "lineage_root",
         ];
         let columns: Vec<&str> = QUEUE_ITEM_COLUMNS.split(',').map(|s| s.trim()).collect();
         for col_name in &expected {
@@ -3913,57 +5522,6 @@ mod tests {
             );
         }
         assert_eq!(columns.len(), expected.len());
-    }
-
-    // ---- respond_hitl additional tests -------------------------------------
-
-    #[test]
-    fn respond_hitl_not_found() {
-        let db = test_db();
-        let err = db
-            .respond_hitl("nonexistent", QueuePhase::Done, Some("irene"), None)
-            .unwrap_err();
-        assert!(matches!(err, BeltError::ItemNotFound(_)));
-    }
-
-    #[test]
-    fn respond_hitl_with_none_respondent_and_notes() {
-        let db = test_db();
-        let mut item = sample_item();
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_created_at = Some(Utc::now().to_rfc3339());
-        item.hitl_notes = Some("original notes".to_string());
-        db.insert_item(&item).unwrap();
-
-        db.respond_hitl(&item.work_id, QueuePhase::Pending, None, None)
-            .unwrap();
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.phase(), QueuePhase::Pending);
-        assert!(fetched.hitl_respondent.is_none());
-        // When notes is NULL, COALESCE preserves original notes
-        assert_eq!(fetched.hitl_notes.as_deref(), Some("original notes"));
-    }
-
-    #[test]
-    fn respond_hitl_overwrites_notes_when_provided() {
-        let db = test_db();
-        let mut item = sample_item();
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_created_at = Some(Utc::now().to_rfc3339());
-        item.hitl_notes = Some("old notes".to_string());
-        db.insert_item(&item).unwrap();
-
-        db.respond_hitl(
-            &item.work_id,
-            QueuePhase::Done,
-            Some("bob"),
-            Some("new notes"),
-        )
-        .unwrap();
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(fetched.hitl_notes.as_deref(), Some("new notes"));
     }
 
     // ---- toggle_cron_job tests ---------------------------------------------
@@ -4074,27 +5632,6 @@ mod tests {
         assert!(matches!(err, BeltError::ItemNotFound(_)));
     }
 
-    // ---- set_hitl_timeout additional tests ----------------------------------
-
-    #[test]
-    fn set_hitl_timeout_with_no_terminal_action() {
-        let db = test_db();
-        let mut item = sample_item();
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        db.insert_item(&item).unwrap();
-
-        let timeout_at = (Utc::now() + chrono::Duration::hours(2)).to_rfc3339();
-        db.set_hitl_timeout(&item.work_id, &timeout_at, None)
-            .unwrap();
-
-        let fetched = db.get_item(&item.work_id).unwrap();
-        assert_eq!(
-            fetched.hitl_timeout_at.as_deref(),
-            Some(timeout_at.as_str())
-        );
-        assert!(fetched.hitl_terminal_action.is_none());
-    }
-
     // ---- list_cron_jobs tests -----------------------------------------------
 
     #[test]
@@ -4185,5 +5722,2541 @@ mod tests {
         assert_eq!(rows[0].3, 2); // executions
         assert_eq!(rows[1].0, "sonnet");
         assert_eq!(rows[1].3, 1);
+    }
+
+    // ---- Transition / lineage store API ------------------------------------
+
+    use belt_core::transition::{Actor, Processing, TransitionOutcome, TransitionReason};
+
+    fn new_item(source_id: &str, state: &str) -> NewItem {
+        NewItem {
+            source_id: source_id.to_string(),
+            workspace_id: "ws".to_string(),
+            state: state.to_string(),
+            title: None,
+            actor: Actor::Daemon,
+        }
+    }
+
+    fn collect(db: &Database, source_id: &str, state: &str) -> CollectOutcome {
+        db.insert_collected(&new_item(source_id, state)).unwrap()
+    }
+
+    fn inserted_id(outcome: CollectOutcome) -> String {
+        match outcome {
+            CollectOutcome::Inserted { work_id } => work_id,
+            CollectOutcome::Duplicate => panic!("expected Inserted"),
+        }
+    }
+
+    fn request(work_id: &str, from: QueuePhase, to: QueuePhase, actor: Actor) -> TransitionRequest {
+        TransitionRequest {
+            work_id: work_id.to_string(),
+            expected_from: from,
+            to,
+            actor,
+            reason: TransitionReason::Manual,
+            detail: None,
+        }
+    }
+
+    fn step(db: &Database, work_id: &str, from: QueuePhase, to: QueuePhase) {
+        let outcome = db
+            .transition(&request(work_id, from, to, Actor::Daemon))
+            .unwrap();
+        assert!(
+            matches!(outcome, TransitionOutcome::Applied { .. }),
+            "{from:?}->{to:?} gave {outcome:?}"
+        );
+    }
+
+    fn run_to_running(db: &Database, work_id: &str) {
+        step(db, work_id, QueuePhase::Pending, QueuePhase::Ready);
+        step(db, work_id, QueuePhase::Ready, QueuePhase::Running);
+    }
+
+    fn history(db: &Database, work_id: &str, source_id: &str, state: &str, status: &str) {
+        db.append_history(&HistoryEvent {
+            work_id: work_id.to_string(),
+            source_id: source_id.to_string(),
+            state: state.to_string(),
+            status: status.to_string(),
+            attempt: 1,
+            summary: None,
+            error: None,
+            created_at: Utc::now().to_rfc3339(),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn transition_applies_and_logs_phase_enter_in_same_commit() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "analyze"));
+
+        let outcome = db
+            .transition(&request(
+                &id,
+                QueuePhase::Pending,
+                QueuePhase::Ready,
+                Actor::Cron,
+            ))
+            .unwrap();
+
+        let TransitionOutcome::Applied { seq } = outcome else {
+            panic!("expected Applied, got {outcome:?}");
+        };
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Ready);
+        let log = db.transitions_of(&id).unwrap();
+        let last = log.last().unwrap();
+        assert_eq!(last.seq, seq);
+        assert_eq!(last.kind, transition_kind::PHASE_ENTER);
+        assert_eq!(last.from_phase.as_deref(), Some("pending"));
+        assert_eq!(last.to_phase.as_deref(), Some("ready"));
+        assert_eq!(last.actor, "cron");
+        assert_eq!(last.reason.as_deref(), Some("manual"));
+    }
+
+    #[test]
+    fn transition_conflict_returns_current_phase_and_logs_conflict() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "analyze"));
+        step(&db, &id, QueuePhase::Pending, QueuePhase::Ready);
+
+        let outcome = db
+            .transition(&request(
+                &id,
+                QueuePhase::Pending,
+                QueuePhase::Ready,
+                Actor::Cli,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            TransitionOutcome::Conflict {
+                current: QueuePhase::Ready
+            }
+        );
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Ready);
+        let last = db.transitions_of(&id).unwrap().pop().unwrap();
+        assert_eq!(last.kind, transition_kind::TRANSITION_CONFLICT);
+        assert_eq!(last.actor, "cli");
+    }
+
+    #[test]
+    fn transition_on_running_item_is_busy_for_non_owner_and_logged() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "analyze"));
+        run_to_running(&db, &id);
+
+        let outcome = db
+            .transition(&request(
+                &id,
+                QueuePhase::Running,
+                QueuePhase::Skipped,
+                Actor::Cli,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            TransitionOutcome::Busy {
+                processing: Processing::Handler
+            }
+        );
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Running);
+        let last = db.transitions_of(&id).unwrap().pop().unwrap();
+        assert_eq!(last.kind, transition_kind::TRANSITION_REJECTED);
+        // The owner is never blocked by its own lock.
+        step(&db, &id, QueuePhase::Running, QueuePhase::Completed);
+    }
+
+    #[test]
+    fn hitl_item_in_post_processing_is_busy_for_non_owner() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "analyze"));
+        run_to_running(&db, &id);
+        step(&db, &id, QueuePhase::Running, QueuePhase::Hitl);
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO hitl_requests (hitl_id, work_id, status, opened_at, resolved_at, action)
+                 VALUES ('h1', ?1, 'resolved', 't', 't', 'retry')",
+                params![id],
+            )
+            .unwrap();
+        }
+
+        let outcome = db
+            .transition(&request(
+                &id,
+                QueuePhase::Hitl,
+                QueuePhase::Skipped,
+                Actor::Cli,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            TransitionOutcome::Busy {
+                processing: Processing::PostProcessing
+            }
+        );
+    }
+
+    #[test]
+    fn hitl_exit_without_matching_action_is_invalid_and_not_applied() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "analyze"));
+        run_to_running(&db, &id);
+        step(&db, &id, QueuePhase::Running, QueuePhase::Hitl);
+
+        let outcome = db
+            .transition(&request(
+                &id,
+                QueuePhase::Hitl,
+                QueuePhase::Pending,
+                Actor::Cli,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            TransitionOutcome::InvalidAction {
+                current: QueuePhase::Hitl
+            }
+        );
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+    }
+
+    #[test]
+    fn transition_outside_state_machine_is_invalid_action_without_log() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "analyze"));
+        let before = db.transitions_of(&id).unwrap().len();
+
+        let outcome = db
+            .transition(&request(
+                &id,
+                QueuePhase::Pending,
+                QueuePhase::Done,
+                Actor::Cli,
+            ))
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            TransitionOutcome::InvalidAction {
+                current: QueuePhase::Pending
+            }
+        );
+        assert_eq!(db.transitions_of(&id).unwrap().len(), before);
+    }
+
+    #[test]
+    fn transition_of_unknown_item_is_item_not_found() {
+        let db = test_db();
+        let err = db
+            .transition(&request(
+                "nope",
+                QueuePhase::Pending,
+                QueuePhase::Ready,
+                Actor::Daemon,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, BeltError::ItemNotFound(_)));
+    }
+
+    #[test]
+    fn concurrent_transitions_on_one_item_apply_once_and_conflict_once() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        let path = path.to_str().unwrap().to_string();
+        let setup = Database::open(&path).unwrap();
+
+        for round in 0..10 {
+            let id = inserted_id(collect(&setup, &format!("s{round}"), "analyze"));
+            let barrier = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = path.clone();
+                    let id = id.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let db = Database::open(&path).unwrap();
+                        barrier.wait();
+                        db.transition(&request(
+                            &id,
+                            QueuePhase::Pending,
+                            QueuePhase::Ready,
+                            Actor::Cli,
+                        ))
+                    })
+                })
+                .collect();
+            let outcomes: Vec<_> = handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap()
+                        .expect("no database error under contention")
+                })
+                .collect();
+
+            let applied = outcomes
+                .iter()
+                .filter(|o| matches!(o, TransitionOutcome::Applied { .. }))
+                .count();
+            let conflicts = outcomes
+                .iter()
+                .filter(|o| {
+                    matches!(
+                        o,
+                        TransitionOutcome::Conflict {
+                            current: QueuePhase::Ready
+                        }
+                    )
+                })
+                .count();
+            assert_eq!((applied, conflicts), (1, 1), "round {round}: {outcomes:?}");
+        }
+
+        let seqs: Vec<u64> = setup
+            .transitions_since(0)
+            .unwrap()
+            .iter()
+            .map(|e| e.seq)
+            .collect();
+        let unique: std::collections::BTreeSet<_> = seqs.iter().collect();
+        assert_eq!(unique.len(), seqs.len(), "duplicate transition_log seq");
+        assert!(seqs.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn transition_log_seq_is_strictly_increasing_across_items() {
+        let db = test_db();
+        let a = inserted_id(collect(&db, "s1", "analyze"));
+        let b = inserted_id(collect(&db, "s2", "analyze"));
+        step(&db, &a, QueuePhase::Pending, QueuePhase::Ready);
+        step(&db, &b, QueuePhase::Pending, QueuePhase::Ready);
+        step(&db, &a, QueuePhase::Ready, QueuePhase::Running);
+
+        let all = db.transitions_since(0).unwrap();
+        assert!(all.windows(2).all(|w| w[0].seq < w[1].seq));
+        let cursor = all[1].seq;
+        let rest = db.transitions_since(cursor).unwrap();
+        assert_eq!(rest.len(), all.len() - 2);
+        assert!(rest.iter().all(|e| e.seq > cursor));
+    }
+
+    #[test]
+    fn insert_collected_first_item_uses_base_work_id_and_logs_creation() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "gh:o/r#1", "implement"));
+
+        assert_eq!(id, "gh:o/r#1:implement");
+        let item = db.get_item(&id).unwrap();
+        assert_eq!(item.lineage_root, id);
+        assert_eq!(item.derived_from, None);
+        let log = db.transitions_of(&id).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].kind, transition_kind::ITEM_CREATED);
+        assert_eq!(log[0].from_phase, None);
+        assert_eq!(log[0].to_phase.as_deref(), Some("pending"));
+    }
+
+    #[test]
+    fn insert_collected_is_duplicate_while_an_item_is_open() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "implement"));
+        assert_eq!(collect(&db, "s1", "implement"), CollectOutcome::Duplicate);
+
+        // Failed is not terminal for collection (C-26).
+        run_to_running(&db, &id);
+        step(&db, &id, QueuePhase::Running, QueuePhase::Failed);
+        assert_eq!(collect(&db, "s1", "implement"), CollectOutcome::Duplicate);
+        assert_eq!(db.list_items(None, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn insert_collected_after_terminal_items_takes_next_sequence() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        step(&db, &first, QueuePhase::Pending, QueuePhase::Skipped);
+
+        let second = inserted_id(collect(&db, "s1", "implement"));
+        assert_eq!(second, "s1:implement:2");
+        step(&db, &second, QueuePhase::Pending, QueuePhase::Skipped);
+
+        let third = inserted_id(collect(&db, "s1", "implement"));
+        assert_eq!(third, "s1:implement:3");
+        // A recollected item starts a new lineage with no origin.
+        let item = db.get_item(&third).unwrap();
+        assert_eq!(item.lineage_root, third);
+        assert_eq!(item.derived_from, None);
+        // Another state of the same source is independent.
+        assert_eq!(inserted_id(collect(&db, "s1", "analyze")), "s1:analyze");
+    }
+
+    #[test]
+    fn insert_collected_never_reuses_a_work_id_of_a_removed_item() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        step(&db, &first, QueuePhase::Pending, QueuePhase::Skipped);
+        let second = inserted_id(collect(&db, "s1", "implement"));
+        step(&db, &second, QueuePhase::Pending, QueuePhase::Skipped);
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute("DELETE FROM queue_items", []).unwrap();
+        }
+
+        assert_eq!(
+            inserted_id(collect(&db, "s1", "implement")),
+            "s1:implement:3"
+        );
+    }
+
+    #[test]
+    fn insert_item_rejects_empty_lineage_root() {
+        let db = test_db();
+        let mut item = sample_item();
+        item.lineage_root = String::new();
+        let err = db.insert_item(&item).unwrap_err();
+        assert!(matches!(err, BeltError::Database(_)));
+        assert!(matches!(
+            db.get_item(&item.work_id),
+            Err(BeltError::ItemNotFound(_))
+        ));
+    }
+
+    fn derive_request(work_id: &str, from: QueuePhase, kind: DeriveKind) -> DeriveRequest {
+        DeriveRequest {
+            work_id: work_id.to_string(),
+            expected_from: from,
+            kind,
+            actor: Actor::Daemon,
+            reason: TransitionReason::Derived,
+            detail: None,
+        }
+    }
+
+    #[test]
+    fn derive_retry_skips_origin_and_creates_pending_item_with_origin_recorded() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+
+        let outcome = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap();
+
+        let DeriveOutcome::Derived { work_id } = outcome else {
+            panic!("expected Derived, got {outcome:?}");
+        };
+        assert_eq!(work_id, "s1:implement:2");
+        assert_eq!(db.get_item(&first).unwrap().phase(), QueuePhase::Skipped);
+        let derived = db.get_item(&work_id).unwrap();
+        assert_eq!(derived.phase(), QueuePhase::Pending);
+        assert_eq!(derived.derived_from.as_deref(), Some(first.as_str()));
+        assert_eq!(derived.lineage_root, first);
+        let created = db.transitions_of(&work_id).unwrap();
+        assert_eq!(created[0].kind, transition_kind::ITEM_CREATED);
+        assert_eq!(created[0].reason.as_deref(), Some("derived"));
+        assert_eq!(created[0].detail.as_deref(), Some(first.as_str()));
+        let origin_log = db.transitions_of(&first).unwrap();
+        let ended = origin_log.last().unwrap();
+        assert_eq!(ended.to_phase.as_deref(), Some("skipped"));
+        assert_eq!(ended.reason.as_deref(), Some("derived"));
+    }
+
+    #[test]
+    fn derive_retry_hands_worktree_over_and_keeps_failure_count() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+        history(&db, &first, "s1", "implement", "failed");
+
+        let DeriveOutcome::Derived { work_id: second } = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+        run_to_running(&db, &second);
+        let DeriveOutcome::Derived { work_id: third } = db
+            .derive(&derive_request(
+                &second,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+
+        let owner = |id: &str| -> Option<String> {
+            let conn = db.conn.lock().unwrap();
+            conn.query_row(
+                "SELECT worktree_owner FROM queue_items WHERE work_id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(owner(&first), None);
+        assert_eq!(owner(&second).as_deref(), Some(first.as_str()));
+        assert_eq!(owner(&third).as_deref(), Some(first.as_str()));
+        assert_eq!(db.failure_count(&first).unwrap(), 1);
+    }
+
+    #[test]
+    fn worktree_key_and_holder_follow_the_handover() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        assert_eq!(db.worktree_key(&first).unwrap(), first);
+        assert_eq!(db.worktree_holder(&first).unwrap(), first);
+
+        run_to_running(&db, &first);
+        let DeriveOutcome::Derived { work_id: second } = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+        assert_eq!(db.worktree_key(&second).unwrap(), first);
+        assert_eq!(db.worktree_holder(&first).unwrap(), second);
+
+        run_to_running(&db, &second);
+        let DeriveOutcome::Derived { work_id: third } = db
+            .derive(&derive_request(
+                &second,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+        assert_eq!(db.worktree_key(&third).unwrap(), first);
+        assert_eq!(db.worktree_holder(&first).unwrap(), third);
+        assert!(matches!(
+            db.worktree_key("missing"),
+            Err(BeltError::ItemNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn derive_replan_resets_failure_count_and_starts_a_new_worktree() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+        history(&db, &first, "s1", "implement", "failed");
+        history(&db, &first, "s1", "implement", "failed");
+        // Replan leaves Hitl only as post-processing of a confirmed request.
+        let hitl_id = opened(&db, &first);
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id),
+            &resolution(HitlAction::Replan, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.failure_count(&first).unwrap(), 2);
+
+        let outcome = db
+            .derive(&DeriveRequest {
+                reason: TransitionReason::PostProcessing(belt_core::hitl::HitlAction::Replan),
+                ..derive_request(&first, QueuePhase::Hitl, DeriveKind::Replan)
+            })
+            .unwrap();
+
+        let DeriveOutcome::Derived { work_id } = outcome else {
+            panic!("expected Derived, got {outcome:?}");
+        };
+        assert_eq!(db.failure_count(&work_id).unwrap(), 0);
+        history(&db, &work_id, "s1", "implement", "failed");
+        assert_eq!(db.failure_count(&first).unwrap(), 1);
+        let conn = db.conn.lock().unwrap();
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT worktree_owner FROM queue_items WHERE work_id = ?1",
+                params![work_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owner, None);
+    }
+
+    /// Seeds the lineage's replan count the way earlier derivations leave it.
+    fn seed_replan_count(db: &Database, work_id: &str, count: u32) {
+        db.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE queue_items SET replan_count = ?1 WHERE work_id = ?2",
+                params![count, work_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn derive_inherits_replan_count() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        seed_replan_count(&db, &first, 1);
+        run_to_running(&db, &first);
+
+        let DeriveOutcome::Derived { work_id } = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+        assert_eq!(db.get_item(&work_id).unwrap().replan_count, 1);
+    }
+
+    #[test]
+    fn derive_replan_counts_one_more_lineage_replan() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        seed_replan_count(&db, &first, 1);
+        run_to_running(&db, &first);
+        let hitl_id = opened(&db, &first);
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id),
+            &resolution(HitlAction::Replan, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+
+        let DeriveOutcome::Derived { work_id } = db
+            .derive(&DeriveRequest {
+                reason: TransitionReason::PostProcessing(HitlAction::Replan),
+                ..derive_request(&first, QueuePhase::Hitl, DeriveKind::Replan)
+            })
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+        assert_eq!(db.get_item(&work_id).unwrap().replan_count, 2);
+        assert_eq!(db.get_item(&first).unwrap().replan_count, 1);
+    }
+
+    #[test]
+    fn record_event_appends_a_non_phase_row() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+
+        let seq = db
+            .record_event(&EventRecord {
+                work_id: &first,
+                kind: transition_kind::HOOK,
+                actor: Actor::Daemon,
+                reason: Some("on_hitl_resolved"),
+                detail: Some("label api down"),
+            })
+            .unwrap();
+
+        let row = db.transitions_of(&first).unwrap().pop().unwrap();
+        assert_eq!(row.seq, seq);
+        assert_eq!(row.kind, "hook");
+        assert_eq!(row.source_id, "s1");
+        assert_eq!((row.from_phase, row.to_phase), (None, None));
+        assert_eq!(row.actor, "daemon");
+        assert_eq!(row.reason.as_deref(), Some("on_hitl_resolved"));
+        assert_eq!(row.detail.as_deref(), Some("label api down"));
+    }
+
+    #[test]
+    fn record_event_refuses_phase_entries_and_unknown_items() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        let event = |work_id, kind| EventRecord {
+            work_id,
+            kind,
+            actor: Actor::Daemon,
+            reason: None,
+            detail: None,
+        };
+
+        assert!(matches!(
+            db.record_event(&event(&first, transition_kind::PHASE_ENTER)),
+            Err(BeltError::Database(_))
+        ));
+        assert!(matches!(
+            db.record_event(&event("missing", transition_kind::HOOK)),
+            Err(BeltError::ItemNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn derive_rejected_by_guard_leaves_everything_untouched() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+
+        let outcome = db
+            .derive(&DeriveRequest {
+                actor: Actor::Cli,
+                ..derive_request(&first, QueuePhase::Running, DeriveKind::EscalationRetry)
+            })
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DeriveOutcome::Rejected(TransitionOutcome::Busy {
+                processing: Processing::Handler
+            })
+        );
+
+        let outcome = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Ready,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap();
+        assert_eq!(
+            outcome,
+            DeriveOutcome::Rejected(TransitionOutcome::Conflict {
+                current: QueuePhase::Running
+            })
+        );
+        assert_eq!(db.get_item(&first).unwrap().phase(), QueuePhase::Running);
+        assert_eq!(db.list_items(None, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn failure_count_counts_only_failures_after_the_last_reset() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        let other = inserted_id(collect(&db, "s1", "other"));
+        let foreign = inserted_id(collect(&db, "s2", "implement"));
+        for status in ["failed", "done", "failed"] {
+            history(&db, &first, "s1", "implement", status);
+        }
+        history(&db, &other, "s1", "other", "failed");
+        history(&db, &foreign, "s2", "implement", "failed");
+        assert_eq!(db.failure_count(&first).unwrap(), 2);
+
+        db.record_reset(&first).unwrap();
+        assert_eq!(db.failure_count(&first).unwrap(), 0);
+
+        history(&db, &first, "s1", "implement", "failed");
+        assert_eq!(db.failure_count(&first).unwrap(), 1);
+        // Other lineages are untouched by the reset.
+        assert_eq!(db.failure_count(&other).unwrap(), 1);
+        assert_eq!(db.failure_count(&foreign).unwrap(), 1);
+    }
+
+    #[test]
+    fn failure_count_does_not_carry_over_to_a_recollected_lineage() {
+        let db = test_db();
+        let a = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &a);
+        history(&db, &a, "s1", "implement", "failed");
+        history(&db, &a, "s1", "implement", "failed");
+        step(&db, &a, QueuePhase::Running, QueuePhase::Completed);
+        step(&db, &a, QueuePhase::Completed, QueuePhase::Done);
+        assert_eq!(db.failure_count(&a).unwrap(), 2);
+
+        let b = inserted_id(collect(&db, "s1", "implement"));
+        assert_ne!(a, b);
+        assert_eq!(db.failure_count(&b).unwrap(), 0);
+        history(&db, &b, "s1", "implement", "failed");
+        assert_eq!(db.failure_count(&b).unwrap(), 1);
+        assert_eq!(db.failure_count(&a).unwrap(), 2);
+    }
+
+    #[test]
+    fn failure_count_accumulates_across_escalation_retry_derivation() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+        history(&db, &first, "s1", "implement", "failed");
+        let DeriveOutcome::Derived { work_id: second } = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+        history(&db, &second, "s1", "implement", "failed");
+        assert_eq!(db.failure_count(&second).unwrap(), 2);
+        assert_eq!(db.failure_count(&first).unwrap(), 2);
+    }
+
+    #[test]
+    fn failure_count_and_record_reset_reject_unknown_work_id() {
+        let db = test_db();
+        assert!(matches!(
+            db.failure_count("nope"),
+            Err(BeltError::ItemNotFound(_))
+        ));
+        assert!(matches!(
+            db.record_reset("nope"),
+            Err(BeltError::ItemNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn failure_count_treats_legacy_completed_history_as_a_non_failure() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "implement"));
+        history(&db, &id, "s1", "implement", "completed");
+        history(&db, &id, "s1", "implement", "failed");
+        history(&db, &id, "s1", "implement", "completed");
+        assert_eq!(db.failure_count(&id).unwrap(), 1);
+    }
+
+    #[test]
+    fn latest_in_lineage_follows_creation_order_not_rowid() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+        let second = match db.derive(&derive_request(
+            &first,
+            QueuePhase::Running,
+            DeriveKind::EscalationRetry,
+        )) {
+            Ok(DeriveOutcome::Derived { work_id }) => work_id,
+            other => panic!("expected Derived, got {other:?}"),
+        };
+        // Re-insert the newest row so that it gets the lowest rowid.
+        {
+            let conn = db.conn.lock().unwrap();
+            let rowid: i64 = conn
+                .query_row("SELECT MIN(rowid) FROM queue_items", [], |r| r.get(0))
+                .unwrap();
+            conn.execute(
+                "UPDATE queue_items SET rowid = ?1 WHERE work_id = ?2",
+                params![rowid - 1, second],
+            )
+            .unwrap();
+        }
+        assert_eq!(db.latest_in_lineage(&first).unwrap().work_id, second);
+    }
+
+    #[test]
+    fn derive_replan_marks_the_confirmed_request_post_processed() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+        let hitl_id = opened(&db, &first);
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id.clone()),
+            &resolution(HitlAction::Replan, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.pending_post_processing().unwrap().len(), 1);
+
+        let outcome = db
+            .derive(&DeriveRequest {
+                reason: TransitionReason::PostProcessing(HitlAction::Replan),
+                ..derive_request(&first, QueuePhase::Hitl, DeriveKind::Replan)
+            })
+            .unwrap();
+
+        assert!(
+            matches!(outcome, DeriveOutcome::Derived { .. }),
+            "{outcome:?}"
+        );
+        assert!(db.pending_post_processing().unwrap().is_empty());
+        let stored = db.hitl_request(&hitl_id).unwrap().unwrap();
+        assert!(stored.post_processed_at.is_some());
+    }
+
+    #[test]
+    fn derive_from_running_has_no_hitl_request_to_mark() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+        let outcome = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap();
+        assert!(matches!(outcome, DeriveOutcome::Derived { .. }));
+        let conn = db.conn.lock().unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM hitl_requests", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn concurrent_collection_of_one_series_inserts_once_and_reports_duplicate_once() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        let path = path.to_str().unwrap().to_string();
+        let _migrated = Database::open(&path).unwrap();
+
+        for round in 0..10 {
+            let source = format!("s{round}");
+            let barrier = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let (path, source, barrier) =
+                        (path.clone(), source.clone(), Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        let db = Database::open(&path).unwrap();
+                        barrier.wait();
+                        db.insert_collected(&new_item(&source, "implement"))
+                    })
+                })
+                .collect();
+            let outcomes: Vec<_> = handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap()
+                        .expect("no database error under contention")
+                })
+                .collect();
+            let inserted = outcomes
+                .iter()
+                .filter(|o| matches!(o, CollectOutcome::Inserted { .. }))
+                .count();
+            let duplicates = outcomes
+                .iter()
+                .filter(|o| matches!(o, CollectOutcome::Duplicate))
+                .count();
+            assert_eq!(
+                (inserted, duplicates),
+                (1, 1),
+                "round {round}: {outcomes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_database_connection_uses_wal_and_busy_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        let conn = db.conn.lock().unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        let timeout: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        assert!(timeout > 0, "busy_timeout = {timeout}");
+    }
+
+    #[test]
+    fn failure_count_rejects_unknown_history_status() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "s1", "implement"));
+        history(&db, &id, "s1", "implement", "weird");
+        assert!(matches!(db.failure_count(&id), Err(BeltError::Database(_))));
+    }
+
+    #[test]
+    fn latest_in_lineage_follows_derivation_and_ignores_other_lineages() {
+        let db = test_db();
+        let first = inserted_id(collect(&db, "s1", "implement"));
+        run_to_running(&db, &first);
+        let DeriveOutcome::Derived { work_id: second } = db
+            .derive(&derive_request(
+                &first,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap()
+        else {
+            panic!("expected Derived");
+        };
+
+        assert_eq!(db.latest_in_lineage(&first).unwrap().work_id, second);
+        assert_eq!(db.latest_in_lineage(&second).unwrap().work_id, second);
+
+        // A recollected item is a different lineage.
+        step(&db, &second, QueuePhase::Pending, QueuePhase::Skipped);
+        let third = inserted_id(collect(&db, "s1", "implement"));
+        assert_eq!(db.latest_in_lineage(&first).unwrap().work_id, second);
+        assert_eq!(db.latest_in_lineage(&third).unwrap().work_id, third);
+        assert!(matches!(
+            db.latest_in_lineage("missing"),
+            Err(BeltError::ItemNotFound(_))
+        ));
+    }
+
+    // ---- HITL request store --------------------------------------------------
+
+    use belt_core::hitl::{
+        ConfirmPath, HitlAction, HitlId, HitlResolution, HitlStatus, RespondOutcome,
+    };
+    use belt_core::queue::HitlReason;
+
+    fn open_req(work_id: &str) -> OpenHitlRequest {
+        OpenHitlRequest {
+            work_id: work_id.to_string(),
+            expected_from: QueuePhase::Running,
+            reason: HitlReason::EvaluateFailure,
+            notes: Some("needs review".to_string()),
+            actor: Actor::Daemon,
+            transition_reason: TransitionReason::Escalation(EscalationAction::Hitl),
+            timeout_at: Some("2099-01-01T00:00:00Z".to_string()),
+            terminal_action: Some(EscalationAction::Skip),
+        }
+    }
+
+    fn running_item(db: &Database, source: &str) -> String {
+        let id = inserted_id(collect(db, source, "analyze"));
+        run_to_running(db, &id);
+        id
+    }
+
+    fn opened(db: &Database, work_id: &str) -> HitlId {
+        match db.open_hitl(&open_req(work_id)).unwrap() {
+            OpenHitlOutcome::Opened { hitl_id, .. } => hitl_id,
+            other => panic!("expected Opened, got {other:?}"),
+        }
+    }
+
+    fn resolution(action: HitlAction, by: &str, via: &str) -> HitlResolution {
+        HitlResolution {
+            action,
+            by: by.to_string(),
+            via: via.to_string(),
+            at: Utc::now().to_rfc3339(),
+            path: ConfirmPath::Direct,
+        }
+    }
+
+    fn post_processing(work_id: &str, to: QueuePhase, action: HitlAction) -> TransitionRequest {
+        TransitionRequest {
+            work_id: work_id.to_string(),
+            expected_from: QueuePhase::Hitl,
+            to,
+            actor: Actor::Daemon,
+            reason: TransitionReason::PostProcessing(action),
+            detail: None,
+        }
+    }
+
+    fn hitl_rows(db: &Database, work_id: &str) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM hitl_requests WHERE work_id = ?1",
+            params![work_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn open_hitl_enters_hitl_and_creates_open_request_together() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+
+        let OpenHitlOutcome::Opened { hitl_id, seq } = db.open_hitl(&open_req(&id)).unwrap() else {
+            panic!("expected Opened");
+        };
+
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+        let stored = db.hitl_request(&hitl_id).unwrap().expect("request row");
+        assert_eq!(stored.work_id, id);
+        assert_eq!(stored.status, HitlStatus::Open);
+        assert_eq!(stored.reason, Some(HitlReason::EvaluateFailure));
+        assert_eq!(stored.notes.as_deref(), Some("needs review"));
+        assert_eq!(stored.terminal_action, Some(EscalationAction::Skip));
+        assert_eq!(stored.timeout_at.as_deref(), Some("2099-01-01T00:00:00Z"));
+        assert_eq!(stored.resolution, None);
+        assert_eq!(stored.post_processed_at, None);
+        assert_eq!(stored.post_processing_failures, 0);
+
+        let log = db.transitions_of(&id).unwrap();
+        let last = log.last().unwrap();
+        assert_eq!(last.seq, seq);
+        assert_eq!(last.kind, transition_kind::PHASE_ENTER);
+        assert_eq!(last.to_phase.as_deref(), Some("hitl"));
+        assert_eq!(last.reason.as_deref(), Some("escalation:hitl"));
+    }
+
+    #[test]
+    fn hitl_id_is_unique_and_disjoint_from_legacy_ids() {
+        let db = test_db();
+        let a = running_item(&db, "s1");
+        let b = running_item(&db, "s2");
+        let first = opened(&db, &a);
+        let second = opened(&db, &b);
+
+        assert_ne!(first, second);
+        for id in [&first, &second] {
+            assert!(id.as_str().starts_with("hitl-"));
+            assert!(!id.as_str().starts_with("hitl-legacy-"));
+        }
+    }
+
+    #[test]
+    fn open_hitl_failing_request_insert_rolls_back_the_phase_change() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO hitl_requests (hitl_id, work_id, status, opened_at)
+                 VALUES ('stray', ?1, 'open', 't')",
+                params![id],
+            )
+            .unwrap();
+        }
+
+        assert!(db.open_hitl(&open_req(&id)).is_err());
+
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Running);
+        assert_eq!(hitl_rows(&db, &id), 1);
+        assert!(
+            db.transitions_of(&id)
+                .unwrap()
+                .iter()
+                .all(|e| e.to_phase.as_deref() != Some("hitl"))
+        );
+    }
+
+    #[test]
+    fn second_open_hitl_on_an_open_item_is_rejected() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        opened(&db, &id);
+
+        for from in [QueuePhase::Running, QueuePhase::Hitl] {
+            let mut again = open_req(&id);
+            again.expected_from = from;
+            assert_eq!(
+                db.open_hitl(&again).unwrap(),
+                OpenHitlOutcome::Rejected(TransitionOutcome::InvalidAction {
+                    current: QueuePhase::Hitl
+                })
+            );
+        }
+        assert_eq!(hitl_rows(&db, &id), 1);
+    }
+
+    #[test]
+    fn open_hitl_by_non_owner_on_running_item_is_busy_and_creates_no_request() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let mut req = open_req(&id);
+        req.actor = Actor::Cli;
+
+        assert_eq!(
+            db.open_hitl(&req).unwrap(),
+            OpenHitlOutcome::Rejected(TransitionOutcome::Busy {
+                processing: Processing::Handler
+            })
+        );
+        assert_eq!(hitl_rows(&db, &id), 0);
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Running);
+    }
+
+    #[test]
+    fn open_hitl_unknown_item_is_item_not_found() {
+        let db = test_db();
+        assert!(matches!(
+            db.open_hitl(&open_req("nope")),
+            Err(BeltError::ItemNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_hitl_first_response_wins_and_second_sees_the_winner() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        let winner = resolution(HitlAction::Retry, "irene", "cli");
+        assert_eq!(
+            db.resolve_hitl(&HitlTarget::Id(hitl_id.clone()), &winner, Some("again"))
+                .unwrap(),
+            RespondOutcome::Won {
+                hitl_id: hitl_id.clone()
+            }
+        );
+
+        let late = resolution(HitlAction::Skip, "bob", "github");
+        assert_eq!(
+            db.resolve_hitl(&HitlTarget::Item(id.clone()), &late, None)
+                .unwrap(),
+            RespondOutcome::AlreadyHandled(winner.clone())
+        );
+        assert_eq!(
+            db.resolve_hitl(&HitlTarget::Id(hitl_id.clone()), &late, None)
+                .unwrap(),
+            RespondOutcome::AlreadyHandled(winner.clone())
+        );
+
+        let stored = db.hitl_request(&hitl_id).unwrap().unwrap();
+        assert_eq!(stored.status, HitlStatus::Resolved);
+        assert_eq!(stored.resolution, Some(winner));
+        assert_eq!(stored.resolution_notes.as_deref(), Some("again"));
+        // The phase changes only through post-processing.
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+    }
+
+    #[test]
+    fn resolve_hitl_unknown_target_is_not_found() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let any = resolution(HitlAction::Done, "irene", "cli");
+
+        assert_eq!(
+            db.resolve_hitl(&HitlTarget::Id(HitlId::new("missing")), &any, None)
+                .unwrap(),
+            RespondOutcome::NotFound
+        );
+        assert_eq!(
+            db.resolve_hitl(&HitlTarget::Item(id), &any, None).unwrap(),
+            RespondOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn resolve_hitl_by_item_targets_the_current_request_not_an_old_one() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let first = opened(&db, &id);
+        let old = resolution(HitlAction::Retry, "irene", "cli");
+        db.resolve_hitl(&HitlTarget::Id(first.clone()), &old, None)
+            .unwrap();
+        db.complete_post_processing(
+            &first,
+            &post_processing(&id, QueuePhase::Pending, HitlAction::Retry),
+        )
+        .unwrap();
+        run_to_running(&db, &id);
+        let second = opened(&db, &id);
+        assert_ne!(first, second);
+
+        let fresh = resolution(HitlAction::Done, "bob", "tui");
+        assert_eq!(
+            db.resolve_hitl(&HitlTarget::Item(id.clone()), &fresh, None)
+                .unwrap(),
+            RespondOutcome::Won { hitl_id: second }
+        );
+        // A late answer addressed to the old request does not touch the new one.
+        assert_eq!(
+            db.resolve_hitl(&HitlTarget::Id(first), &fresh, None)
+                .unwrap(),
+            RespondOutcome::AlreadyHandled(old)
+        );
+    }
+
+    #[test]
+    fn concurrent_resolve_hitl_has_one_winner_and_the_loser_sees_it() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        let path = path.to_str().unwrap().to_string();
+        let setup = Database::open(&path).unwrap();
+
+        for round in 0..10 {
+            let id = running_item(&setup, &format!("s{round}"));
+            let hitl_id = opened(&setup, &id);
+            let barrier = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = [("cli", HitlAction::Done), ("github", HitlAction::Skip)]
+                .into_iter()
+                .map(|(via, action)| {
+                    let path = path.clone();
+                    let hitl_id = hitl_id.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let db = Database::open(&path).unwrap();
+                        let r = resolution(action, via, via);
+                        barrier.wait();
+                        (
+                            r.clone(),
+                            db.resolve_hitl(&HitlTarget::Id(hitl_id), &r, None),
+                        )
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles
+                .into_iter()
+                .map(|h| {
+                    let (r, outcome) = h.join().unwrap();
+                    (r, outcome.expect("no database error under contention"))
+                })
+                .collect();
+
+            let winners: Vec<_> = results
+                .iter()
+                .filter(|(_, o)| matches!(o, RespondOutcome::Won { .. }))
+                .collect();
+            assert_eq!(winners.len(), 1, "round {round}: {results:?}");
+            let winning = &winners[0].0;
+            let loser = results
+                .iter()
+                .find(|(_, o)| matches!(o, RespondOutcome::AlreadyHandled(_)))
+                .unwrap_or_else(|| panic!("round {round}: no loser in {results:?}"));
+            assert_eq!(loser.1, RespondOutcome::AlreadyHandled(winning.clone()));
+        }
+    }
+
+    #[test]
+    fn expire_hitl_then_resolve_reports_the_expiry_as_already_handled() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        assert_eq!(
+            db.expire_hitl(&hitl_id, EscalationAction::Skip).unwrap(),
+            RespondOutcome::Won {
+                hitl_id: hitl_id.clone()
+            }
+        );
+
+        let late = resolution(HitlAction::Done, "irene", "cli");
+        let RespondOutcome::AlreadyHandled(winner) = db
+            .resolve_hitl(&HitlTarget::Id(hitl_id.clone()), &late, None)
+            .unwrap()
+        else {
+            panic!("expected AlreadyHandled");
+        };
+        assert_eq!(winner.action, HitlAction::Skip);
+        assert_eq!(winner.via, "timeout");
+        assert_eq!(
+            db.hitl_request(&hitl_id).unwrap().unwrap().status,
+            HitlStatus::Expired
+        );
+    }
+
+    #[test]
+    fn resolve_then_expire_keeps_the_response() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        let human = resolution(HitlAction::Retry, "irene", "cli");
+        db.resolve_hitl(&HitlTarget::Id(hitl_id.clone()), &human, None)
+            .unwrap();
+
+        assert_eq!(
+            db.expire_hitl(&hitl_id, EscalationAction::Replan).unwrap(),
+            RespondOutcome::AlreadyHandled(human.clone())
+        );
+        let stored = db.hitl_request(&hitl_id).unwrap().unwrap();
+        assert_eq!(stored.status, HitlStatus::Resolved);
+        assert_eq!(stored.resolution, Some(human));
+    }
+
+    #[test]
+    fn set_hitl_expiry_replaces_deadline_and_terminal_of_an_open_request() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        let updated = db
+            .set_hitl_expiry(
+                &hitl_id,
+                "2099-02-02T00:00:00+00:00",
+                Some(EscalationAction::Replan),
+            )
+            .unwrap();
+
+        assert!(updated);
+        let request = db.hitl_request(&hitl_id).unwrap().unwrap();
+        assert_eq!(
+            request.timeout_at.as_deref(),
+            Some("2099-02-02T00:00:00+00:00")
+        );
+        assert_eq!(request.terminal_action, Some(EscalationAction::Replan));
+        assert_eq!(request.status, HitlStatus::Open);
+    }
+
+    #[test]
+    fn set_hitl_expiry_without_terminal_leaves_it_to_the_workspace_default() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        assert!(
+            db.set_hitl_expiry(&hitl_id, "2099-02-02T00:00:00+00:00", None)
+                .unwrap()
+        );
+
+        let request = db.hitl_request(&hitl_id).unwrap().unwrap();
+        assert_eq!(request.terminal_action, None);
+    }
+
+    #[test]
+    fn set_hitl_expiry_leaves_confirmed_and_unknown_requests_alone() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id.clone()),
+            &resolution(HitlAction::Skip, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+
+        let updated = db
+            .set_hitl_expiry(
+                &hitl_id,
+                "2099-02-02T00:00:00+00:00",
+                Some(EscalationAction::Replan),
+            )
+            .unwrap();
+
+        assert!(!updated);
+        let request = db.hitl_request(&hitl_id).unwrap().unwrap();
+        assert_eq!(request.timeout_at.as_deref(), Some("2099-01-01T00:00:00Z"));
+        assert_eq!(request.terminal_action, Some(EscalationAction::Skip));
+        assert!(
+            !db.set_hitl_expiry(&HitlId::new("missing"), "2099-02-02T00:00:00+00:00", None)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn expire_hitl_rejects_non_terminal_actions_and_unknown_requests() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        for action in [
+            EscalationAction::Retry,
+            EscalationAction::RetryWithComment,
+            EscalationAction::Hitl,
+        ] {
+            assert_eq!(
+                db.expire_hitl(&hitl_id, action).unwrap(),
+                RespondOutcome::InvalidAction
+            );
+        }
+        assert_eq!(
+            db.hitl_request(&hitl_id).unwrap().unwrap().status,
+            HitlStatus::Open
+        );
+        assert_eq!(
+            db.expire_hitl(&HitlId::new("missing"), EscalationAction::Skip)
+                .unwrap(),
+            RespondOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn concurrent_expire_and_resolve_let_exactly_one_win() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        let path = path.to_str().unwrap().to_string();
+        let setup = Database::open(&path).unwrap();
+
+        for round in 0..10 {
+            let id = running_item(&setup, &format!("s{round}"));
+            let hitl_id = opened(&setup, &id);
+            let barrier = Arc::new(Barrier::new(2));
+
+            let expirer = {
+                let (path, hitl_id, barrier) =
+                    (path.clone(), hitl_id.clone(), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    let db = Database::open(&path).unwrap();
+                    barrier.wait();
+                    db.expire_hitl(&hitl_id, EscalationAction::Skip)
+                })
+            };
+            let responder = {
+                let (path, hitl_id, barrier) =
+                    (path.clone(), hitl_id.clone(), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    let db = Database::open(&path).unwrap();
+                    barrier.wait();
+                    db.resolve_hitl(
+                        &HitlTarget::Id(hitl_id),
+                        &resolution(HitlAction::Done, "irene", "cli"),
+                        None,
+                    )
+                })
+            };
+            let expired = expirer.join().unwrap().expect("no database error");
+            let resolved = responder.join().unwrap().expect("no database error");
+
+            let stored = setup.hitl_request(&hitl_id).unwrap().unwrap();
+            match stored.status {
+                HitlStatus::Expired => {
+                    assert!(
+                        matches!(expired, RespondOutcome::Won { .. }),
+                        "round {round}"
+                    );
+                    assert!(matches!(resolved, RespondOutcome::AlreadyHandled(_)));
+                }
+                HitlStatus::Resolved => {
+                    assert!(
+                        matches!(resolved, RespondOutcome::Won { .. }),
+                        "round {round}"
+                    );
+                    assert!(matches!(expired, RespondOutcome::AlreadyHandled(_)));
+                }
+                HitlStatus::Open => panic!("round {round}: nobody won"),
+            }
+        }
+    }
+
+    #[test]
+    fn confirmed_request_makes_the_item_busy_for_non_owners() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        // Open: a CLI skip maps to a HITL response, not to busy.
+        assert_eq!(
+            db.transition(&request(
+                &id,
+                QueuePhase::Hitl,
+                QueuePhase::Skipped,
+                Actor::Cli
+            ))
+            .unwrap(),
+            TransitionOutcome::InvalidAction {
+                current: QueuePhase::Hitl
+            }
+        );
+
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id),
+            &resolution(HitlAction::Skip, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.transition(&request(
+                &id,
+                QueuePhase::Hitl,
+                QueuePhase::Skipped,
+                Actor::Cli
+            ))
+            .unwrap(),
+            TransitionOutcome::Busy {
+                processing: Processing::PostProcessing
+            }
+        );
+    }
+
+    #[test]
+    fn daemon_post_processing_cannot_leave_hitl_while_the_request_is_open() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        for (to, action) in [
+            (QueuePhase::Done, HitlAction::Done),
+            (QueuePhase::Skipped, HitlAction::Skip),
+            (QueuePhase::Pending, HitlAction::Retry),
+            (QueuePhase::Failed, HitlAction::Replan),
+        ] {
+            assert_eq!(
+                db.transition(&post_processing(&id, to, action)).unwrap(),
+                TransitionOutcome::InvalidAction {
+                    current: QueuePhase::Hitl
+                },
+                "to {to:?}"
+            );
+        }
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+        assert_eq!(
+            db.hitl_request(&hitl_id).unwrap().unwrap().status,
+            HitlStatus::Open
+        );
+    }
+
+    #[test]
+    fn cli_skip_on_open_hitl_maps_to_a_response_through_the_core_mapping() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        let skip = request(&id, QueuePhase::Hitl, QueuePhase::Skipped, Actor::Cli);
+
+        let outcome = db.transition(&skip).unwrap();
+        assert_eq!(
+            outcome,
+            TransitionOutcome::InvalidAction {
+                current: QueuePhase::Hitl
+            }
+        );
+        let action = belt_core::transition::hitl_response_for(skip.to)
+            .expect("queue skip on Hitl is a HITL response");
+        assert_eq!(
+            db.resolve_hitl(
+                &HitlTarget::Item(id.clone()),
+                &resolution(action, "irene", "cli"),
+                None
+            )
+            .unwrap(),
+            RespondOutcome::Won { hitl_id }
+        );
+    }
+
+    #[test]
+    fn resolve_hitl_by_item_ignores_requests_already_post_processed() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id.clone()),
+            &resolution(HitlAction::Retry, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+        db.complete_post_processing(
+            &hitl_id,
+            &post_processing(&id, QueuePhase::Pending, HitlAction::Retry),
+        )
+        .unwrap();
+
+        // The item left Hitl; its old request is history, not a target.
+        assert_eq!(
+            db.resolve_hitl(
+                &HitlTarget::Item(id.clone()),
+                &resolution(HitlAction::Done, "bob", "cli"),
+                None
+            )
+            .unwrap(),
+            RespondOutcome::NotFound
+        );
+        // Addressed by id, the old request still reports its winner.
+        assert!(matches!(
+            db.resolve_hitl(
+                &HitlTarget::Id(hitl_id),
+                &resolution(HitlAction::Done, "bob", "cli"),
+                None
+            )
+            .unwrap(),
+            RespondOutcome::AlreadyHandled(_)
+        ));
+    }
+
+    #[test]
+    fn expired_request_also_makes_the_item_busy() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        db.expire_hitl(&hitl_id, EscalationAction::Replan).unwrap();
+
+        assert_eq!(
+            db.transition(&request(
+                &id,
+                QueuePhase::Hitl,
+                QueuePhase::Skipped,
+                Actor::Tui
+            ))
+            .unwrap(),
+            TransitionOutcome::Busy {
+                processing: Processing::PostProcessing
+            }
+        );
+    }
+
+    #[test]
+    fn pending_post_processing_lists_only_confirmed_unprocessed_requests() {
+        let db = test_db();
+        let open_item = running_item(&db, "s-open");
+        let resolved_item = running_item(&db, "s-resolved");
+        let expired_item = running_item(&db, "s-expired");
+        let _open = opened(&db, &open_item);
+        let resolved = opened(&db, &resolved_item);
+        let expired = opened(&db, &expired_item);
+        db.resolve_hitl(
+            &HitlTarget::Id(resolved.clone()),
+            &resolution(HitlAction::Done, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+        db.expire_hitl(&expired, EscalationAction::Skip).unwrap();
+
+        let pending = db.pending_post_processing().unwrap();
+
+        let ids: Vec<_> = pending.iter().map(|r| r.hitl_id.clone()).collect();
+        assert_eq!(ids, vec![resolved, expired]);
+        assert_eq!(pending[0].status, HitlStatus::Resolved);
+        assert_eq!(pending[1].status, HitlStatus::Expired);
+    }
+
+    #[test]
+    fn complete_post_processing_applies_result_transition_and_marks_done_together() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id.clone()),
+            &resolution(HitlAction::Done, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+
+        let outcome = db
+            .complete_post_processing(
+                &hitl_id,
+                &post_processing(&id, QueuePhase::Done, HitlAction::Done),
+            )
+            .unwrap();
+
+        assert!(
+            matches!(outcome, CompleteOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Done);
+        assert!(db.pending_post_processing().unwrap().is_empty());
+        let stored = db.hitl_request(&hitl_id).unwrap().unwrap();
+        assert!(stored.post_processed_at.is_some());
+        assert_eq!(
+            db.complete_post_processing(
+                &hitl_id,
+                &post_processing(&id, QueuePhase::Done, HitlAction::Done),
+            )
+            .unwrap(),
+            CompleteOutcome::NotPending
+        );
+    }
+
+    #[test]
+    fn complete_post_processing_before_confirmation_is_not_pending() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        assert_eq!(
+            db.complete_post_processing(
+                &hitl_id,
+                &post_processing(&id, QueuePhase::Done, HitlAction::Done),
+            )
+            .unwrap(),
+            CompleteOutcome::NotPending
+        );
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+    }
+
+    #[test]
+    fn rejected_result_transition_leaves_the_request_pending() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        db.expire_hitl(&hitl_id, EscalationAction::Skip).unwrap();
+
+        // Not a daemon post-processing transition: the guard refuses.
+        let mut by_cli = post_processing(&id, QueuePhase::Skipped, HitlAction::Skip);
+        by_cli.actor = Actor::Cli;
+        assert_eq!(
+            db.complete_post_processing(&hitl_id, &by_cli).unwrap(),
+            CompleteOutcome::Rejected(TransitionOutcome::Busy {
+                processing: Processing::PostProcessing
+            })
+        );
+        // A transition outside the state machine is refused as well.
+        let invalid = post_processing(&id, QueuePhase::Hitl, HitlAction::Skip);
+        assert!(matches!(
+            db.complete_post_processing(&hitl_id, &invalid).unwrap(),
+            CompleteOutcome::Rejected(TransitionOutcome::InvalidAction { .. })
+        ));
+
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+        assert_eq!(db.pending_post_processing().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn complete_post_processing_for_another_item_is_an_error() {
+        let db = test_db();
+        let a = running_item(&db, "s1");
+        let b = running_item(&db, "s2");
+        let hitl_a = opened(&db, &a);
+        opened(&db, &b);
+        db.expire_hitl(&hitl_a, EscalationAction::Skip).unwrap();
+
+        assert!(
+            db.complete_post_processing(
+                &hitl_a,
+                &post_processing(&b, QueuePhase::Skipped, HitlAction::Skip),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn post_processing_failures_accumulate_until_completion() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        db.expire_hitl(&hitl_id, EscalationAction::Skip).unwrap();
+
+        assert_eq!(db.record_post_processing_failure(&hitl_id).unwrap(), 1);
+        assert_eq!(db.record_post_processing_failure(&hitl_id).unwrap(), 2);
+        assert_eq!(
+            db.hitl_request(&hitl_id)
+                .unwrap()
+                .unwrap()
+                .post_processing_failures,
+            2
+        );
+
+        db.complete_post_processing(
+            &hitl_id,
+            &post_processing(&id, QueuePhase::Skipped, HitlAction::Skip),
+        )
+        .unwrap();
+        assert!(db.record_post_processing_failure(&hitl_id).is_err());
+    }
+
+    #[test]
+    fn post_processing_failure_on_open_or_unknown_request_is_an_error() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        assert!(db.record_post_processing_failure(&hitl_id).is_err());
+        assert!(
+            db.record_post_processing_failure(&HitlId::new("missing"))
+                .is_err()
+        );
+    }
+
+    // ---- Handler process and cancel requests -------------------------------
+
+    fn kinds_of(db: &Database, work_id: &str) -> Vec<String> {
+        db.transitions_of(work_id)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.kind)
+            .collect()
+    }
+
+    fn leave_running(db: &Database, work_id: &str, to: QueuePhase) {
+        let req = TransitionRequest {
+            work_id: work_id.to_string(),
+            expected_from: QueuePhase::Running,
+            to,
+            actor: Actor::Daemon,
+            reason: TransitionReason::Manual,
+            detail: None,
+        };
+        assert!(matches!(
+            db.transition(&req).unwrap(),
+            TransitionOutcome::Applied { .. }
+        ));
+    }
+
+    #[test]
+    fn handler_pid_is_recorded_while_running_and_cleared_on_leaving() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#900");
+        assert_eq!(db.handler_process(&id).unwrap(), None);
+
+        assert!(db.set_handler_process(&id, 4242).unwrap());
+        assert_eq!(db.handler_process(&id).unwrap(), Some(4242));
+
+        leave_running(&db, &id, QueuePhase::Completed);
+        assert_eq!(db.handler_process(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn deriving_from_running_leaves_no_handler_pid_behind() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#906");
+        db.set_handler_process(&id, 4242).unwrap();
+
+        let outcome = db
+            .derive(&derive_request(
+                &id,
+                QueuePhase::Running,
+                DeriveKind::EscalationRetry,
+            ))
+            .unwrap();
+
+        let DeriveOutcome::Derived { work_id } = outcome else {
+            panic!("expected Derived, got {outcome:?}");
+        };
+        assert_eq!(db.handler_process(&id).unwrap(), None);
+        assert_eq!(db.handler_process(&work_id).unwrap(), None);
+    }
+
+    #[test]
+    fn handler_pid_is_refused_outside_running() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "gh:org/repo#901", "analyze"));
+
+        assert!(!db.set_handler_process(&id, 4242).unwrap());
+        assert_eq!(db.handler_process(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn clear_handler_process_forgets_the_pid() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#902");
+        db.set_handler_process(&id, 4242).unwrap();
+
+        db.clear_handler_process(&id).unwrap();
+
+        assert_eq!(db.handler_process(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn handler_process_calls_on_unknown_items_are_errors() {
+        let db = test_db();
+        assert!(matches!(
+            db.set_handler_process("nope", 1),
+            Err(BeltError::ItemNotFound(_))
+        ));
+        assert!(matches!(
+            db.clear_handler_process("nope"),
+            Err(BeltError::ItemNotFound(_))
+        ));
+        assert!(matches!(
+            db.handler_process("nope"),
+            Err(BeltError::ItemNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_cancel_request_is_the_same_request() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#903");
+
+        let first = db.request_cancel(&id, "alice", &Actor::Cli).unwrap();
+        let RequestCancelOutcome::Opened { id: request_id } = first else {
+            panic!("expected Opened, got {first:?}");
+        };
+        let second = db.request_cancel(&id, "bob", &Actor::Tui).unwrap();
+
+        let RequestCancelOutcome::Existing(existing) = second else {
+            panic!("expected Existing, got {second:?}");
+        };
+        assert_eq!(existing.id, request_id);
+        assert_eq!(existing.requester, "alice");
+        assert_eq!(existing.via, "cli");
+        assert_eq!(existing.status, CancelStatus::Requested);
+        assert_eq!(db.open_cancel_requests().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_request_stays_the_same_request_after_it_is_accepted() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#904");
+        let RequestCancelOutcome::Opened { id: request_id } =
+            db.request_cancel(&id, "alice", &Actor::Cli).unwrap()
+        else {
+            panic!("expected Opened");
+        };
+        assert!(db.accept_cancel(request_id, &Actor::Daemon).unwrap());
+
+        let again = db.request_cancel(&id, "alice", &Actor::Cli).unwrap();
+
+        let RequestCancelOutcome::Existing(existing) = again else {
+            panic!("expected Existing, got {again:?}");
+        };
+        assert_eq!(existing.id, request_id);
+        assert_eq!(existing.status, CancelStatus::Accepted);
+        assert!(existing.accepted_at.is_some());
+    }
+
+    #[test]
+    fn accept_cancel_is_a_compare_and_set_on_requested() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#905");
+        let RequestCancelOutcome::Opened { id: request_id } =
+            db.request_cancel(&id, "alice", &Actor::Cli).unwrap()
+        else {
+            panic!("expected Opened");
+        };
+
+        assert!(db.accept_cancel(request_id, &Actor::Daemon).unwrap());
+        assert!(!db.accept_cancel(request_id, &Actor::Daemon).unwrap());
+        assert!(!db.accept_cancel(request_id + 100, &Actor::Daemon).unwrap());
+    }
+
+    #[test]
+    fn close_cancel_leaves_no_open_request_and_allows_a_new_one() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#906");
+        let RequestCancelOutcome::Opened { id: request_id } =
+            db.request_cancel(&id, "alice", &Actor::Cli).unwrap()
+        else {
+            panic!("expected Opened");
+        };
+
+        assert!(
+            db.close_cancel(request_id, CancelResult::TooLate, &Actor::Cli)
+                .unwrap()
+        );
+
+        assert!(db.open_cancel_requests().unwrap().is_empty());
+        assert!(
+            !db.close_cancel(request_id, CancelResult::Canceled, &Actor::Daemon)
+                .unwrap()
+        );
+        assert!(matches!(
+            db.request_cancel(&id, "alice", &Actor::Cli).unwrap(),
+            RequestCancelOutcome::Opened { .. }
+        ));
+    }
+
+    #[test]
+    fn every_close_result_is_stored_and_closing_after_accept_works() {
+        let db = test_db();
+        for (n, result) in [
+            CancelResult::Canceled,
+            CancelResult::CanceledDirectly,
+            CancelResult::TooLate,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = running_item(&db, &format!("gh:org/repo#91{n}"));
+            let RequestCancelOutcome::Opened { id: request_id } =
+                db.request_cancel(&id, "alice", &Actor::Cli).unwrap()
+            else {
+                panic!("expected Opened");
+            };
+            db.accept_cancel(request_id, &Actor::Daemon).unwrap();
+            assert!(db.close_cancel(request_id, result, &Actor::Daemon).unwrap());
+
+            let conn = db.conn.lock().unwrap();
+            let rows = read_cancels(&conn, "WHERE id = ?1", params![request_id]).unwrap();
+            assert_eq!(rows[0].status, CancelStatus::Closed);
+            assert_eq!(rows[0].result, Some(result));
+            assert!(rows[0].closed_at.is_some());
+        }
+    }
+
+    #[test]
+    fn open_cancel_requests_lists_open_ones_oldest_first() {
+        let db = test_db();
+        let a = running_item(&db, "gh:org/repo#920");
+        let b = running_item(&db, "gh:org/repo#921");
+        let c = running_item(&db, "gh:org/repo#922");
+        for id in [&b, &a, &c] {
+            db.request_cancel(id, "alice", &Actor::Tui).unwrap();
+        }
+        let RequestCancelOutcome::Existing(for_a) =
+            db.request_cancel(&a, "alice", &Actor::Tui).unwrap()
+        else {
+            panic!("expected Existing");
+        };
+        db.close_cancel(for_a.id, CancelResult::Canceled, &Actor::Daemon)
+            .unwrap();
+
+        let open = db.open_cancel_requests().unwrap();
+
+        assert_eq!(
+            open.iter().map(|r| r.work_id.as_str()).collect::<Vec<_>>(),
+            vec![b.as_str(), c.as_str()]
+        );
+    }
+
+    #[test]
+    fn cancel_request_on_unknown_item_is_an_error() {
+        let db = test_db();
+        assert!(matches!(
+            db.request_cancel("nope", "alice", &Actor::Cli),
+            Err(BeltError::ItemNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn cancel_lifecycle_is_logged_without_a_phase_change() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#930");
+        let RequestCancelOutcome::Opened { id: request_id } =
+            db.request_cancel(&id, "alice", &Actor::Cli).unwrap()
+        else {
+            panic!("expected Opened");
+        };
+        db.accept_cancel(request_id, &Actor::Daemon).unwrap();
+        db.close_cancel(request_id, CancelResult::Canceled, &Actor::Daemon)
+            .unwrap();
+
+        let kinds = kinds_of(&db, &id);
+
+        assert_eq!(
+            &kinds[kinds.len() - 3..],
+            ["cancel_requested", "cancel_accepted", "cancel_closed"]
+        );
+        let closed = db.transitions_of(&id).unwrap().pop().unwrap();
+        assert_eq!(closed.reason.as_deref(), Some("canceled"));
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Running);
+    }
+
+    fn canceled_by(work_id: &str, actor: Actor) -> TransitionRequest {
+        TransitionRequest {
+            reason: TransitionReason::Canceled,
+            ..request(work_id, QueuePhase::Running, QueuePhase::Skipped, actor)
+        }
+    }
+
+    fn open_request(db: &Database, work_id: &str) -> i64 {
+        match db.request_cancel(work_id, "alice", &Actor::Cli).unwrap() {
+            RequestCancelOutcome::Opened { id } => id,
+            other => panic!("expected Opened, got {other:?}"),
+        }
+    }
+
+    fn closed_result(db: &Database, work_id: &str) -> Option<CancelResult> {
+        let conn = db.lock_conn().unwrap();
+        read_cancels(&conn, "WHERE work_id = ?1", params![work_id])
+            .unwrap()
+            .pop()
+            .and_then(|r| r.result)
+    }
+
+    #[test]
+    fn canceled_reason_outside_the_cancel_api_is_refused_for_non_daemon_actors() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#951");
+
+        for actor in [Actor::Cli, Actor::Tui] {
+            let outcome = db.transition(&canceled_by(&id, actor)).unwrap();
+            assert_eq!(
+                outcome,
+                TransitionOutcome::InvalidAction {
+                    current: QueuePhase::Running
+                }
+            );
+        }
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Running);
+    }
+
+    #[test]
+    fn cancel_directly_skips_a_running_item_and_returns_its_handler() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#952");
+        db.set_handler_process(&id, 4242).unwrap();
+        let cancel_id = open_request(&db, &id);
+
+        let outcome = db.cancel_directly(cancel_id, &Actor::Cli).unwrap();
+
+        let DirectCancelOutcome::Canceled {
+            handler: Some(handler),
+        } = outcome
+        else {
+            panic!("expected Canceled with a handler, got {outcome:?}");
+        };
+        assert_eq!(handler.pid, 4242);
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Skipped);
+        assert_eq!(db.handler_process(&id).unwrap(), None);
+        assert_eq!(
+            closed_result(&db, &id),
+            Some(CancelResult::CanceledDirectly)
+        );
+        assert!(db.open_cancel_requests().unwrap().is_empty());
+        let enter = db
+            .transitions_of(&id)
+            .unwrap()
+            .into_iter()
+            .rfind(|e| e.kind == transition_kind::PHASE_ENTER)
+            .unwrap();
+        assert_eq!(enter.reason.as_deref(), Some("canceled"));
+        assert_eq!(enter.actor, "cli");
+    }
+
+    #[test]
+    fn cancel_directly_closes_too_late_when_the_item_left_running() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#953");
+        let cancel_id = open_request(&db, &id);
+        db.transition(&TransitionRequest {
+            reason: TransitionReason::Advance,
+            ..request(
+                &id,
+                QueuePhase::Running,
+                QueuePhase::Completed,
+                Actor::Daemon,
+            )
+        })
+        .unwrap();
+
+        let outcome = db.cancel_directly(cancel_id, &Actor::Cli).unwrap();
+
+        assert_eq!(
+            outcome,
+            DirectCancelOutcome::TooLate {
+                current: QueuePhase::Completed
+            }
+        );
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Completed);
+        assert_eq!(closed_result(&db, &id), Some(CancelResult::TooLate));
+    }
+
+    #[test]
+    fn cancel_directly_without_an_open_request_changes_nothing() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#954");
+        let cancel_id = open_request(&db, &id);
+        db.close_cancel(cancel_id, CancelResult::Canceled, &Actor::Daemon)
+            .unwrap();
+
+        assert_eq!(
+            db.cancel_directly(cancel_id, &Actor::Cli).unwrap(),
+            DirectCancelOutcome::NotOpen
+        );
+        assert_eq!(
+            db.cancel_directly(9_999, &Actor::Cli).unwrap(),
+            DirectCancelOutcome::NotOpen
+        );
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Running);
+    }
+
+    #[test]
+    fn running_handler_is_reported_only_while_running() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#955");
+        assert_eq!(db.running_handler(&id).unwrap(), None, "no pid yet");
+
+        db.set_handler_process(&id, 4242).unwrap();
+        let handler = db.running_handler(&id).unwrap().unwrap();
+        assert_eq!(handler.pid, 4242);
+        assert!(handler.running_since <= Utc::now());
+
+        assert!(matches!(
+            db.running_handler("nope"),
+            Err(BeltError::ItemNotFound(_))
+        ));
+    }
+
+    // ---- Delivery, external responses, proposals ----------------------------
+
+    fn failed(error: &str) -> DeliveryAttempt {
+        DeliveryAttempt::Failed {
+            error: error.to_string(),
+        }
+    }
+
+    fn new_proposal(hitl_id: &HitlId, respondent: &str, action: HitlAction) -> NewProposal {
+        NewProposal {
+            hitl_id: hitl_id.clone(),
+            respondent: respondent.to_string(),
+            channel: "origin".to_string(),
+            action,
+            summary: Some("because".to_string()),
+        }
+    }
+
+    fn recorded(outcome: UpsertProposalOutcome) -> NlProposal {
+        match outcome {
+            UpsertProposalOutcome::Recorded(p) => p,
+            other => panic!("expected Recorded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delivery_is_due_until_sent_and_keeps_the_message_ref() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "d1"));
+        db.ensure_delivery(&hitl_id, "origin").unwrap();
+        db.ensure_delivery(&hitl_id, "origin").unwrap();
+
+        let due = db.deliveries_due().unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].status, DeliveryStatus::Pending);
+        assert_eq!(due[0].attempts, 0);
+
+        let sent = db
+            .mark_delivery(
+                &hitl_id,
+                "origin",
+                &DeliveryAttempt::Sent {
+                    message_ref: Some("comment-9".to_string()),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent.status, DeliveryStatus::Sent);
+        assert_eq!(sent.message_ref.as_deref(), Some("comment-9"));
+        assert!(db.deliveries_due().unwrap().is_empty());
+
+        // A sent delivery does not move again.
+        let again = db
+            .mark_delivery(&hitl_id, "origin", &failed("late"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, sent);
+    }
+
+    #[test]
+    fn delivery_fails_after_the_attempt_cap_and_leaves_the_due_list() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "d2"));
+        db.ensure_delivery(&hitl_id, "origin").unwrap();
+
+        for n in 1..DELIVERY_MAX_ATTEMPTS {
+            let row = db
+                .mark_delivery(&hitl_id, "origin", &failed("boom"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.status, DeliveryStatus::Pending);
+            assert_eq!(row.attempts, n);
+            assert_eq!(db.deliveries_due().unwrap().len(), 1);
+        }
+        let last = db
+            .mark_delivery(&hitl_id, "origin", &failed("boom"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.status, DeliveryStatus::Failed);
+        assert_eq!(last.attempts, DELIVERY_MAX_ATTEMPTS);
+        assert_eq!(last.last_error.as_deref(), Some("boom"));
+        assert!(db.deliveries_due().unwrap().is_empty());
+        assert_eq!(db.deliveries_of(&hitl_id).unwrap(), vec![last]);
+    }
+
+    #[test]
+    fn deliveries_of_a_confirmed_request_are_not_due() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "d3"));
+        db.ensure_delivery(&hitl_id, "origin").unwrap();
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id.clone()),
+            &resolution(HitlAction::Skip, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+        assert!(db.deliveries_due().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_delivery_of_an_unregistered_channel_is_none() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "d4"));
+        assert_eq!(
+            db.mark_delivery(&hitl_id, "origin", &failed("x")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn external_response_second_record_is_duplicate() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "e1"));
+        assert_eq!(
+            db.record_external_response("origin", "c-1", Some(&hitl_id), Some("bob"))
+                .unwrap(),
+            ExternalResponseOutcome::Recorded
+        );
+        assert_eq!(
+            db.record_external_response("origin", "c-1", None, None)
+                .unwrap(),
+            ExternalResponseOutcome::Duplicate
+        );
+        // The key is the pair: another channel or another id is new.
+        assert_eq!(
+            db.record_external_response("other", "c-1", None, None)
+                .unwrap(),
+            ExternalResponseOutcome::Recorded
+        );
+        assert_eq!(
+            db.record_external_response("origin", "c-2", None, None)
+                .unwrap(),
+            ExternalResponseOutcome::Recorded
+        );
+    }
+
+    #[test]
+    fn new_proposal_of_the_same_respondent_supersedes_the_pending_one() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "p1"));
+        let first = recorded(
+            db.upsert_proposal(&new_proposal(&hitl_id, "bob", HitlAction::Skip))
+                .unwrap(),
+        );
+        let other = recorded(
+            db.upsert_proposal(&new_proposal(&hitl_id, "carol", HitlAction::Done))
+                .unwrap(),
+        );
+        let second = recorded(
+            db.upsert_proposal(&new_proposal(&hitl_id, "bob", HitlAction::Retry))
+                .unwrap(),
+        );
+        assert_ne!(first.id, second.id);
+
+        let latest = db.latest_proposal(&hitl_id, "bob").unwrap().unwrap();
+        assert_eq!(latest.id, second.id);
+        assert_eq!(latest.status, ProposalStatus::Pending);
+        assert_eq!(latest.action, HitlAction::Retry);
+        // Confirming the replaced proposal is refused.
+        match db.confirm_proposal(first.id).unwrap() {
+            ConfirmProposalOutcome::NotPending(p) => {
+                assert_eq!(p.status, ProposalStatus::Superseded);
+            }
+            other => panic!("expected NotPending, got {other:?}"),
+        }
+        // Another respondent's proposal is untouched.
+        assert_eq!(
+            db.latest_proposal(&hitl_id, "carol").unwrap().unwrap(),
+            other
+        );
+        assert_eq!(db.latest_proposal(&hitl_id, "dave").unwrap(), None);
+    }
+
+    #[test]
+    fn confirmation_after_the_request_is_confirmed_is_not_pending() {
+        for expire in [false, true] {
+            let db = test_db();
+            let hitl_id = opened(&db, &running_item(&db, "p2"));
+            let proposal = recorded(
+                db.upsert_proposal(&new_proposal(&hitl_id, "bob", HitlAction::Skip))
+                    .unwrap(),
+            );
+            if expire {
+                db.expire_hitl(&hitl_id, EscalationAction::Skip).unwrap();
+            } else {
+                db.resolve_hitl(
+                    &HitlTarget::Id(hitl_id.clone()),
+                    &resolution(HitlAction::Retry, "irene", "cli"),
+                    None,
+                )
+                .unwrap();
+            }
+
+            // The confirmation sees a closed proposal and the winner's resolution.
+            let seen = db.latest_proposal(&hitl_id, "bob").unwrap().unwrap();
+            assert_eq!(seen.status, ProposalStatus::Superseded);
+            assert!(matches!(
+                db.confirm_proposal(proposal.id).unwrap(),
+                ConfirmProposalOutcome::NotPending(_)
+            ));
+            let request = db.hitl_request(&hitl_id).unwrap().unwrap();
+            assert!(request.resolution.is_some());
+        }
+    }
+
+    #[test]
+    fn upsert_proposal_on_a_confirmed_or_unknown_request_records_nothing() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "p3"));
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id.clone()),
+            &resolution(HitlAction::Done, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+        match db
+            .upsert_proposal(&new_proposal(&hitl_id, "bob", HitlAction::Skip))
+            .unwrap()
+        {
+            UpsertProposalOutcome::HitlConfirmed(request) => {
+                assert_eq!(request.hitl_id, hitl_id);
+            }
+            other => panic!("expected HitlConfirmed, got {other:?}"),
+        }
+        assert_eq!(db.latest_proposal(&hitl_id, "bob").unwrap(), None);
+
+        let unknown = HitlId::new("nope");
+        assert_eq!(
+            db.upsert_proposal(&new_proposal(&unknown, "bob", HitlAction::Skip))
+                .unwrap(),
+            UpsertProposalOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn confirmed_proposal_keeps_its_status_when_the_request_is_confirmed() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "p4"));
+        let proposal = recorded(
+            db.upsert_proposal(&new_proposal(&hitl_id, "bob", HitlAction::Skip))
+                .unwrap(),
+        );
+        assert!(matches!(
+            db.confirm_proposal(proposal.id).unwrap(),
+            ConfirmProposalOutcome::Confirmed(_)
+        ));
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id.clone()),
+            &resolution(HitlAction::Skip, "bob", "origin"),
+            None,
+        )
+        .unwrap();
+        let stored = db.latest_proposal(&hitl_id, "bob").unwrap().unwrap();
+        assert_eq!(stored.status, ProposalStatus::Confirmed);
+    }
+
+    #[test]
+    fn close_proposals_supersedes_only_pending_ones() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "p5"));
+        let bob = recorded(
+            db.upsert_proposal(&new_proposal(&hitl_id, "bob", HitlAction::Skip))
+                .unwrap(),
+        );
+        recorded(
+            db.upsert_proposal(&new_proposal(&hitl_id, "carol", HitlAction::Done))
+                .unwrap(),
+        );
+        db.confirm_proposal(bob.id).unwrap();
+        assert_eq!(db.close_proposals(&hitl_id).unwrap(), 1);
+        assert_eq!(db.close_proposals(&hitl_id).unwrap(), 0);
+        assert_eq!(
+            db.latest_proposal(&hitl_id, "bob").unwrap().unwrap().status,
+            ProposalStatus::Confirmed
+        );
+        assert_eq!(
+            db.latest_proposal(&hitl_id, "carol")
+                .unwrap()
+                .unwrap()
+                .status,
+            ProposalStatus::Superseded
+        );
+    }
+
+    #[test]
+    fn latest_transition_seq_follows_the_log() {
+        let db = test_db();
+        assert_eq!(db.latest_transition_seq().unwrap(), 0);
+        let id = running_item(&db, "s1");
+        let last = db.transitions_of(&id).unwrap().last().unwrap().seq;
+        assert_eq!(db.latest_transition_seq().unwrap(), last);
+        assert!(db.transitions_since(last).unwrap().is_empty());
+    }
+
+    #[test]
+    fn requests_to_poll_are_open_ones_and_those_confirmed_since_the_cutoff() {
+        let db = test_db();
+        let open = opened(&db, &running_item(&db, "q1"));
+        let confirmed = opened(&db, &running_item(&db, "q2"));
+        let before = Utc::now().to_rfc3339();
+        db.resolve_hitl(
+            &HitlTarget::Id(confirmed.clone()),
+            &resolution(HitlAction::Done, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+
+        let ids = |cutoff: &str| -> Vec<HitlId> {
+            db.hitl_requests_to_poll(cutoff)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.hitl_id)
+                .collect()
+        };
+        assert_eq!(ids(&before), vec![open.clone(), confirmed]);
+        assert_eq!(ids("2999-01-01T00:00:00+00:00"), vec![open]);
     }
 }

@@ -1,20 +1,19 @@
 //! Integration tests for the Advancer module.
 //!
-//! Tests phase transitions (Pending -> Ready -> Running), dependency gates,
-//! queue dependency gates, conflict detection, and transition event recording
+//! Tests phase transitions (Pending -> Ready -> Running), queue dependency
+//! gates, and transition event recording
 //! using an in-memory SQLite database.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use belt_core::dependency::SpecDependencyGuard;
 use belt_core::phase::QueuePhase;
+use belt_core::queue::QueueItem;
 use belt_core::queue::testing::test_item;
-use belt_core::queue::{HitlReason, QueueItem};
-use belt_core::spec::{Spec, SpecStatus};
+use belt_core::transition::{Actor, TransitionReason};
 use belt_daemon::advancer::Advancer;
 use belt_daemon::concurrency::ConcurrencyTracker;
-use belt_infra::db::Database;
+use belt_infra::db::{Database, DeriveKind, DeriveOutcome, DeriveRequest};
 
 /// Helper: create a VecDeque from a Vec of QueueItems.
 fn make_queue(items: Vec<QueueItem>) -> VecDeque<QueueItem> {
@@ -31,26 +30,6 @@ fn setup_db() -> (Arc<Database>, Option<Arc<Database>>) {
 /// Helper: insert a QueueItem into the DB.
 fn insert_item_to_db(db: &Database, item: &QueueItem) {
     db.insert_item(item).expect("insert_item");
-}
-
-/// Helper: create and insert a spec with given status and optional depends_on/entry_point.
-fn insert_spec(
-    db: &Database,
-    id: &str,
-    status: SpecStatus,
-    depends_on: Option<&str>,
-    entry_point: Option<&str>,
-) {
-    let mut spec = Spec::new(
-        id.to_string(),
-        "test-ws".to_string(),
-        format!("Spec {id}"),
-        "content".to_string(),
-    );
-    spec.status = status;
-    spec.depends_on = depends_on.map(|s| s.to_string());
-    spec.entry_point = entry_point.map(|s| s.to_string());
-    db.insert_spec(&spec).expect("insert_spec");
 }
 
 // ---------------------------------------------------------------------------
@@ -74,9 +53,8 @@ fn advance_cycle_records_transition_events() {
 
     let mut queue = make_queue(vec![item]);
     let mut tracker = ConcurrencyTracker::new(4);
-    let dep_guard = SpecDependencyGuard;
 
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
     let advanced = advancer.run();
 
     // Pending -> Ready (1) + Ready -> Running (1) = 2
@@ -85,17 +63,13 @@ fn advance_cycle_records_transition_events() {
 
     // Verify at least one transition event was recorded.
     let work_id = &queue[0].work_id;
-    let events = db
-        .list_transition_events(work_id)
-        .expect("list_transition_events");
-    assert!(
-        !events.is_empty(),
-        "at least one transition event should be recorded"
-    );
+    let events = db.transitions_of(work_id).expect("transitions_of");
+    assert_eq!(events.len(), 2, "one log row per transition");
     // The first recorded event should be Pending -> Ready.
     assert_eq!(events[0].from_phase.as_deref(), Some("pending"));
-    assert_eq!(events[0].phase.as_deref(), Some("ready"));
-    assert_eq!(events[0].event_type, "phase_enter");
+    assert_eq!(events[0].to_phase.as_deref(), Some("ready"));
+    assert_eq!(events[0].kind, "phase_enter");
+    assert_eq!(events[0].actor, "daemon");
 }
 
 /// Multiple items advance through the full cycle; each records events.
@@ -109,9 +83,8 @@ fn advance_multiple_items_records_events_per_item() {
 
     let mut queue = make_queue(vec![item1, item2]);
     let mut tracker = ConcurrencyTracker::new(4);
-    let dep_guard = SpecDependencyGuard;
 
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 4, &dep_guard);
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 4);
     let advanced = advancer.run();
 
     // Both items: Pending->Ready + Ready->Running = 4 transitions
@@ -119,198 +92,30 @@ fn advance_multiple_items_records_events_per_item() {
 
     for item in queue.iter() {
         assert_eq!(item.phase(), QueuePhase::Running);
-        let events = db.list_transition_events(&item.work_id).unwrap();
-        assert!(
-            !events.is_empty(),
-            "each item should have at least one transition event"
-        );
+        let events = db.transitions_of(&item.work_id).unwrap();
+        assert_eq!(events.len(), 2, "each item logs both claim transitions");
     }
 }
 
-// ---------------------------------------------------------------------------
-// Dependency gate: spec depends_on blocks Pending -> Ready
-// ---------------------------------------------------------------------------
-
-/// Spec dependency gate blocks advance when dependency is not completed.
+/// A claim refused as `InvalidAction` names the stored phase; the copy follows it.
+///
+/// A stored Hitl row refuses any claim that is not post-processing, so the
+/// copy that still says Pending must become Hitl and not be retried.
 #[test]
-fn dependency_gate_blocks_when_dep_not_completed() {
+fn claim_refused_as_invalid_action_follows_the_stored_phase() {
     let (db, db_opt) = setup_db();
-
-    // Create specs: item's spec depends on dep-spec which is Active (not Completed).
-    insert_spec(&db, "dep-spec", SpecStatus::Active, None, None);
-    insert_spec(&db, "my-spec", SpecStatus::Active, Some("dep-spec"), None);
-
-    // Create an item whose source_id matches "my-spec".
-    let item = test_item("my-spec", "implement");
+    let item = test_item("src-1", "analyze");
     insert_item_to_db(&db, &item);
+    db.update_phase(&item.work_id, QueuePhase::Hitl).unwrap();
 
     let mut queue = make_queue(vec![item]);
     let mut tracker = ConcurrencyTracker::new(4);
-    let dep_guard = SpecDependencyGuard;
 
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
     let advanced = advancer.run();
 
-    // Item should remain in Pending because dependency is not completed.
     assert_eq!(advanced, 0);
-    assert_eq!(queue[0].phase(), QueuePhase::Pending);
-}
-
-/// Spec dependency gate passes when all dependencies are completed.
-#[test]
-fn dependency_gate_passes_when_dep_completed() {
-    let (db, db_opt) = setup_db();
-
-    // dep-spec is Completed -> gate should pass.
-    insert_spec(&db, "dep-spec", SpecStatus::Completed, None, None);
-    insert_spec(&db, "my-spec", SpecStatus::Active, Some("dep-spec"), None);
-
-    let item = test_item("my-spec", "implement");
-    insert_item_to_db(&db, &item);
-
-    let mut queue = make_queue(vec![item]);
-    let mut tracker = ConcurrencyTracker::new(4);
-    let dep_guard = SpecDependencyGuard;
-
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
-    let advanced = advancer.run();
-
-    // Item should advance: Pending->Ready + Ready->Running = 2.
-    assert_eq!(advanced, 2);
-    assert_eq!(queue[0].phase(), QueuePhase::Running);
-}
-
-/// Item without a spec in the DB passes dependency gate (no spec = no deps).
-#[test]
-fn dependency_gate_passes_when_no_spec_in_db() {
-    let (db, db_opt) = setup_db();
-
-    // No spec inserted for source_id "unknown-spec".
-    let item = test_item("unknown-spec", "analyze");
-    insert_item_to_db(&db, &item);
-
-    let mut queue = make_queue(vec![item]);
-    let mut tracker = ConcurrencyTracker::new(4);
-    let dep_guard = SpecDependencyGuard;
-
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
-    let advanced = advancer.run();
-
-    // Should advance normally since spec not found => gate open.
-    assert_eq!(advanced, 2);
-    assert_eq!(queue[0].phase(), QueuePhase::Running);
-}
-
-// ---------------------------------------------------------------------------
-// Conflict detection: overlapping entry_points escalate to HITL
-// ---------------------------------------------------------------------------
-
-/// Spec conflict detection escalates item to HITL when entry_points overlap.
-#[test]
-fn conflict_detection_escalates_to_hitl() {
-    let (db, db_opt) = setup_db();
-
-    // Two specs share the same entry_point path.
-    insert_spec(
-        &db,
-        "existing-spec",
-        SpecStatus::Active,
-        None,
-        Some("src/auth/mod.rs"),
-    );
-    insert_spec(
-        &db,
-        "new-spec",
-        SpecStatus::Active,
-        None,
-        Some("src/auth/mod.rs"),
-    );
-
-    let item = test_item("new-spec", "implement");
-    insert_item_to_db(&db, &item);
-
-    let mut queue = make_queue(vec![item]);
-    let mut tracker = ConcurrencyTracker::new(4);
-    let dep_guard = SpecDependencyGuard;
-
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
-    let advanced = advancer.run();
-
-    // Item advances Pending->Ready (1), then conflict detected -> HITL.
-    // Ready->Running does NOT happen because item is now in HITL.
-    assert_eq!(advanced, 1);
     assert_eq!(queue[0].phase(), QueuePhase::Hitl);
-    assert_eq!(queue[0].hitl_reason, Some(HitlReason::SpecConflict));
-    assert!(
-        queue[0]
-            .hitl_notes
-            .as_deref()
-            .unwrap()
-            .contains("spec-conflict"),
-        "hitl_notes should describe the conflict"
-    );
-    assert!(
-        queue[0].hitl_created_at.is_some(),
-        "hitl_created_at should be set"
-    );
-
-    // Verify transition events were recorded (at least the Pending->Ready event).
-    // The Ready->Hitl event may or may not be present due to sub-millisecond
-    // ID collision (same timestamp_millis for both events).
-    let events = db
-        .list_transition_events(&queue[0].work_id)
-        .expect("list_transition_events");
-    assert!(
-        !events.is_empty(),
-        "at least one transition event should be recorded"
-    );
-    assert_eq!(events[0].from_phase.as_deref(), Some("pending"));
-    assert_eq!(events[0].phase.as_deref(), Some("ready"));
-
-    // If both events were recorded (different milliseconds), verify HITL event.
-    if events.len() >= 2 {
-        assert_eq!(events[1].from_phase.as_deref(), Some("ready"));
-        assert_eq!(events[1].phase.as_deref(), Some("hitl"));
-        assert!(
-            events[1].detail.is_some(),
-            "HITL transition event should include conflict detail"
-        );
-    }
-}
-
-/// No conflict when entry_points do not overlap.
-#[test]
-fn no_conflict_when_entry_points_differ() {
-    let (db, db_opt) = setup_db();
-
-    insert_spec(
-        &db,
-        "spec-a",
-        SpecStatus::Active,
-        None,
-        Some("src/auth/mod.rs"),
-    );
-    insert_spec(
-        &db,
-        "spec-b",
-        SpecStatus::Active,
-        None,
-        Some("src/db/mod.rs"),
-    );
-
-    let item = test_item("spec-b", "implement");
-    insert_item_to_db(&db, &item);
-
-    let mut queue = make_queue(vec![item]);
-    let mut tracker = ConcurrencyTracker::new(4);
-    let dep_guard = SpecDependencyGuard;
-
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
-    let advanced = advancer.run();
-
-    // No conflict -> should reach Running.
-    assert_eq!(advanced, 2);
-    assert_eq!(queue[0].phase(), QueuePhase::Running);
 }
 
 // ---------------------------------------------------------------------------
@@ -338,9 +143,8 @@ fn queue_dependency_gate_blocks_when_dep_not_done() {
     let _ = dep_item.transit(QueuePhase::Ready);
     let mut queue = make_queue(vec![item, dep_item]);
     let mut tracker = ConcurrencyTracker::new(4);
-    let dep_guard = SpecDependencyGuard;
 
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 4, &dep_guard);
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 4);
     let _advanced = advancer.run();
 
     // item (index 0) should advance Pending->Ready (1), but NOT Ready->Running
@@ -383,9 +187,8 @@ fn queue_dependency_gate_passes_when_dep_done() {
     // Only the current item is in the queue (dep is Done, no longer in queue).
     let mut queue = make_queue(vec![item]);
     let mut tracker = ConcurrencyTracker::new(4);
-    let dep_guard = SpecDependencyGuard;
 
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
     let advanced = advancer.run();
 
     // Item should advance Pending->Ready + Ready->Running = 2.
@@ -412,9 +215,8 @@ fn queue_dependency_gate_passes_when_dep_done_in_memory() {
 
     let mut queue = make_queue(vec![item, dep_item]);
     let mut tracker = ConcurrencyTracker::new(4);
-    let dep_guard = SpecDependencyGuard;
 
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 4, &dep_guard);
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 4);
     let _advanced = advancer.run();
 
     let my_item = queue.iter().find(|i| i.work_id == "my-work").unwrap();
@@ -423,6 +225,95 @@ fn queue_dependency_gate_passes_when_dep_done_in_memory() {
         QueuePhase::Running,
         "item should advance to Running when dep is Done in memory"
     );
+}
+
+/// Helper: a dependency item that escalation retry derived into a successor.
+/// Returns the successor's work_id; the original ends Skipped(derived).
+fn derive_dependency(db: &Database) -> String {
+    let mut dep_item = test_item("dep-src", "analyze");
+    dep_item.work_id = "dep-work".to_string();
+    insert_item_to_db(db, &dep_item);
+    db.update_phase("dep-work", QueuePhase::Ready).unwrap();
+    db.update_phase("dep-work", QueuePhase::Running).unwrap();
+    let outcome = db
+        .derive(&DeriveRequest {
+            work_id: "dep-work".to_string(),
+            expected_from: QueuePhase::Running,
+            kind: DeriveKind::EscalationRetry,
+            actor: Actor::Daemon,
+            reason: TransitionReason::Derived,
+            detail: None,
+        })
+        .unwrap();
+    match outcome {
+        DeriveOutcome::Derived { work_id } => work_id,
+        other => panic!("expected Derived, got {other:?}"),
+    }
+}
+
+/// Helper: a Pending dependent item waiting on `dep-work`, alone in the queue.
+fn dependent_on_dep_work(db: &Database) -> VecDeque<QueueItem> {
+    let mut item = test_item("my-src", "implement");
+    item.work_id = "my-work".to_string();
+    insert_item_to_db(db, &item);
+    db.add_queue_dependency("my-work", "dep-work").unwrap();
+    make_queue(vec![item])
+}
+
+/// The dependency was derived and its successor is not Done: the dependent
+/// waits on the lineage head, not on the original's Skipped.
+#[test]
+fn queue_dependency_gate_waits_while_derived_successor_is_pending() {
+    let (db, db_opt) = setup_db();
+    let successor = derive_dependency(&db);
+    assert_eq!(
+        db.get_item("dep-work").unwrap().phase(),
+        QueuePhase::Skipped
+    );
+    assert_eq!(
+        db.get_item(&successor).unwrap().phase(),
+        QueuePhase::Pending
+    );
+    let mut queue = dependent_on_dep_work(&db);
+    let mut tracker = ConcurrencyTracker::new(4);
+
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 4);
+    advancer.run();
+
+    assert_eq!(queue[0].phase(), QueuePhase::Ready);
+}
+
+/// Once the derived successor is Done the dependent proceeds.
+#[test]
+fn queue_dependency_gate_passes_when_derived_successor_is_done() {
+    let (db, db_opt) = setup_db();
+    let successor = derive_dependency(&db);
+    db.update_phase(&successor, QueuePhase::Ready).unwrap();
+    db.update_phase(&successor, QueuePhase::Running).unwrap();
+    db.update_phase(&successor, QueuePhase::Done).unwrap();
+    let mut queue = dependent_on_dep_work(&db);
+    let mut tracker = ConcurrencyTracker::new(4);
+
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 4);
+    advancer.run();
+
+    assert_eq!(queue[0].phase(), QueuePhase::Running);
+}
+
+/// A lineage that ends in Skipped keeps blocking the dependent (spec: Skipped
+/// dependency blocks until released manually).
+#[test]
+fn queue_dependency_gate_blocks_when_lineage_ends_skipped() {
+    let (db, db_opt) = setup_db();
+    let successor = derive_dependency(&db);
+    db.update_phase(&successor, QueuePhase::Skipped).unwrap();
+    let mut queue = dependent_on_dep_work(&db);
+    let mut tracker = ConcurrencyTracker::new(4);
+
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 4);
+    advancer.run();
+
+    assert_eq!(queue[0].phase(), QueuePhase::Ready);
 }
 
 // ---------------------------------------------------------------------------
@@ -445,10 +336,9 @@ fn advance_respects_ws_concurrency_with_db() {
 
     let mut queue = make_queue(items);
     let mut tracker = ConcurrencyTracker::new(4);
-    let dep_guard = SpecDependencyGuard;
 
     // ws_concurrency = 1: only 1 item can be Running at a time.
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 1, &dep_guard);
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 1);
     advancer.run();
 
     let running_count = queue
@@ -480,13 +370,12 @@ fn advance_ready_to_running_per_ws_limits_with_db() {
 
     let mut queue = make_queue(vec![item1, item2]);
     let mut tracker = ConcurrencyTracker::new(4);
-    let dep_guard = SpecDependencyGuard;
 
     let mut limits = HashMap::new();
     limits.insert("ws-a".to_string(), 1);
     limits.insert("ws-b".to_string(), 1);
 
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
     advancer.advance_ready_to_running(&limits, 1);
 
     assert!(
@@ -512,13 +401,12 @@ fn advance_ready_to_running_respects_global_limit() {
     let mut queue = make_queue(vec![item1, item2]);
     // Global max = 1: only 1 item can run globally.
     let mut tracker = ConcurrencyTracker::new(1);
-    let dep_guard = SpecDependencyGuard;
 
     let mut limits = HashMap::new();
     limits.insert("ws-a".to_string(), 2);
     limits.insert("ws-b".to_string(), 2);
 
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
     advancer.advance_ready_to_running(&limits, 2);
 
     let running_count = queue
@@ -542,9 +430,8 @@ fn empty_queue_with_db_is_noop() {
 
     let mut queue: VecDeque<QueueItem> = VecDeque::new();
     let mut tracker = ConcurrencyTracker::new(4);
-    let dep_guard = SpecDependencyGuard;
 
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
     let advanced = advancer.run();
 
     assert_eq!(advanced, 0);
@@ -566,9 +453,8 @@ fn mixed_phases_advance_correctly() {
 
     let mut queue = make_queue(vec![pending_item, ready_item]);
     let mut tracker = ConcurrencyTracker::new(4);
-    let dep_guard = SpecDependencyGuard;
 
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 4, &dep_guard);
+    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 4);
     let advanced = advancer.run();
 
     // pending_item: Pending->Ready (1) + Ready->Running (1) = 2
@@ -578,34 +464,4 @@ fn mixed_phases_advance_correctly() {
         queue.iter().all(|i| i.phase() == QueuePhase::Running),
         "all items should be Running"
     );
-}
-
-/// Dependency gate with multiple dependencies: all must be completed.
-#[test]
-fn dependency_gate_all_deps_must_be_completed() {
-    let (db, db_opt) = setup_db();
-
-    insert_spec(&db, "dep-1", SpecStatus::Completed, None, None);
-    insert_spec(&db, "dep-2", SpecStatus::Active, None, None); // NOT completed
-    insert_spec(
-        &db,
-        "my-spec",
-        SpecStatus::Active,
-        Some("dep-1,dep-2"),
-        None,
-    );
-
-    let item = test_item("my-spec", "implement");
-    insert_item_to_db(&db, &item);
-
-    let mut queue = make_queue(vec![item]);
-    let mut tracker = ConcurrencyTracker::new(4);
-    let dep_guard = SpecDependencyGuard;
-
-    let mut advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
-    let advanced = advancer.run();
-
-    // dep-2 is not completed -> gate blocks.
-    assert_eq!(advanced, 0);
-    assert_eq!(queue[0].phase(), QueuePhase::Pending);
 }

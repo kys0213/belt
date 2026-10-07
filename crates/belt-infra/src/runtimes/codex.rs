@@ -1,11 +1,15 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 
+use belt_core::platform::{NoopProcessSink, ProcessSink};
 use belt_core::runtime::{
     AgentRuntime, RuntimeCapabilities, RuntimeRequest, RuntimeResponse, TokenUsage,
 };
+
+use crate::platform::output_in_new_group;
 
 /// OpenAI Codex (코드 특화) AgentRuntime 구현.
 ///
@@ -20,11 +24,22 @@ use belt_core::runtime::{
 ///   3. codex CLI 기본값
 pub struct CodexRuntime {
     default_model: Option<String>,
+    /// Executable to spawn; replaced by a stand-in script in tests.
+    program: String,
 }
 
 impl CodexRuntime {
     pub fn new(default_model: Option<String>) -> Self {
-        Self { default_model }
+        Self {
+            default_model,
+            program: "codex".to_string(),
+        }
+    }
+
+    #[cfg(all(test, unix))]
+    fn with_program(mut self, program: &str) -> Self {
+        self.program = program.to_string();
+        self
     }
 }
 
@@ -74,10 +89,19 @@ impl AgentRuntime for CodexRuntime {
     }
 
     async fn invoke(&self, request: RuntimeRequest) -> RuntimeResponse {
+        self.invoke_with_sink(request, Arc::new(NoopProcessSink))
+            .await
+    }
+
+    async fn invoke_with_sink(
+        &self,
+        request: RuntimeRequest,
+        sink: Arc<dyn ProcessSink>,
+    ) -> RuntimeResponse {
         let start = Instant::now();
         let resolved_model = request.model.or_else(|| self.default_model.clone());
 
-        let mut cmd = tokio::process::Command::new("codex");
+        let mut cmd = tokio::process::Command::new(&self.program);
         cmd.arg("--prompt").arg(&request.prompt);
         cmd.arg("--output-format").arg("json");
         cmd.current_dir(&request.working_dir);
@@ -90,7 +114,7 @@ impl AgentRuntime for CodexRuntime {
             cmd.arg("--system-prompt").arg(system_prompt);
         }
 
-        match cmd.output().await {
+        match output_in_new_group(&mut cmd, sink.as_ref()).await {
             Ok(output) => {
                 let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -321,5 +345,29 @@ mod tests {
         let usage = usage.unwrap();
         assert!(usage.cache_read_tokens.is_none());
         assert!(usage.cache_write_tokens.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invoke_with_sink_reports_the_spawned_pid_once() {
+        use crate::platform::testing::{RecordingSink, fake_cli};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let runtime = CodexRuntime::new(None).with_program(&fake_cli(dir.path()));
+        let sink = Arc::new(RecordingSink::default());
+        let request = RuntimeRequest {
+            working_dir: dir.path().to_path_buf(),
+            prompt: "hi".to_string(),
+            model: None,
+            system_prompt: None,
+            session_id: None,
+            structured_output: None,
+        };
+
+        let response = runtime.invoke_with_sink(request, sink.clone()).await;
+
+        assert!(response.success(), "{}", response.stderr);
+        assert_eq!(sink.pids().len(), 1);
     }
 }

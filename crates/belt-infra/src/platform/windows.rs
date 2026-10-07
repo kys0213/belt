@@ -5,12 +5,17 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::process::Command;
 
 use belt_core::error::BeltError;
-use belt_core::platform::{DaemonNotifier, ShellExecutor, ShellOutput};
+use belt_core::platform::{
+    DaemonNotifier, NoopProcessSink, ProcessKiller, ProcessSink, ShellExecutor, ShellOutput,
+};
+
+use super::output_in_new_group;
 
 /// Executes shell commands via `cmd.exe /C` on Windows systems.
 #[derive(Debug, Default, Clone)]
@@ -24,12 +29,23 @@ impl ShellExecutor for WindowsShellExecutor {
         working_dir: &Path,
         env_vars: &HashMap<String, String>,
     ) -> Result<ShellOutput, BeltError> {
-        let output = Command::new("cmd.exe")
-            .arg("/C")
+        self.execute_with_sink(command, working_dir, env_vars, Arc::new(NoopProcessSink))
+            .await
+    }
+
+    async fn execute_with_sink(
+        &self,
+        command: &str,
+        working_dir: &Path,
+        env_vars: &HashMap<String, String>,
+        sink: Arc<dyn ProcessSink>,
+    ) -> Result<ShellOutput, BeltError> {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.arg("/C")
             .arg(command)
             .current_dir(working_dir)
-            .envs(env_vars)
-            .output()
+            .envs(env_vars);
+        let output = output_in_new_group(&mut cmd, sink.as_ref())
             .await
             .map_err(|e| {
                 BeltError::Runtime(format!("failed to spawn shell command '{command}': {e}"))
@@ -41,6 +57,45 @@ impl ShellExecutor for WindowsShellExecutor {
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         })
     }
+}
+
+/// Terminates a handler process tree with `taskkill /T /F` on Windows.
+#[derive(Debug, Default, Clone)]
+pub struct WindowsProcessKiller;
+
+impl ProcessKiller for WindowsProcessKiller {
+    fn kill_group(&self, pid: u32) -> Result<(), BeltError> {
+        if pid == 0 {
+            return Err(BeltError::Runtime(
+                "refusing to kill process tree of invalid pid 0".to_string(),
+            ));
+        }
+        let output = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output()
+            .map_err(|e| {
+                BeltError::Runtime(format!("failed to run taskkill for pid {pid}: {e}"))
+            })?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(BeltError::Runtime(format!(
+                "taskkill failed for pid {pid}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )))
+        }
+    }
+}
+
+/// Windows side of [`super::probe_handler`]: the start time of a process is
+/// not checked here, so a recorded pid cannot be told from a reused one.
+pub(crate) fn probe_handler(
+    pid: u32,
+    _running_since: chrono::DateTime<chrono::Utc>,
+) -> super::HandlerProbe {
+    super::HandlerProbe::Unknown(format!(
+        "pid {pid}: process identity is not verified on Windows"
+    ))
 }
 
 /// Sends a wake-up notification to a daemon process via a named pipe on Windows.
@@ -92,6 +147,64 @@ mod tests {
             .unwrap();
         assert!(output.success());
         assert!(output.stdout.contains("hello"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn execute_with_sink_reports_the_spawned_pid_once() {
+        use crate::platform::testing::RecordingSink;
+
+        let sink = Arc::new(RecordingSink::default());
+        let tmp = tempfile::tempdir().unwrap();
+
+        let output = WindowsShellExecutor
+            .execute_with_sink("echo hello", tmp.path(), &HashMap::new(), sink.clone())
+            .await
+            .unwrap();
+
+        assert!(output.success());
+        assert_eq!(sink.pids().len(), 1);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn kill_group_terminates_the_handler_quickly() {
+        use crate::platform::testing::RecordingSink;
+
+        let sink = Arc::new(RecordingSink::default());
+        let tmp = tempfile::tempdir().unwrap();
+        let running = {
+            let sink = sink.clone();
+            let dir = tmp.path().to_path_buf();
+            tokio::spawn(async move {
+                WindowsShellExecutor
+                    .execute_with_sink("ping -n 30 127.0.0.1 >nul", &dir, &HashMap::new(), sink)
+                    .await
+            })
+        };
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(pid) = sink.pids().first() {
+                    break *pid;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the executor must report the pid after the spawn");
+
+        WindowsProcessKiller.kill_group(pid).unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), running)
+            .await
+            .expect("handler must end after the tree kill")
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn kill_group_rejects_pid_zero() {
+        assert!(WindowsProcessKiller.kill_group(0).is_err());
     }
 
     #[cfg(target_os = "windows")]

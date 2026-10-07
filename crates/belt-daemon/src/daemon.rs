@@ -8,21 +8,28 @@ use chrono::Utc;
 
 use belt_core::action::Action;
 use belt_core::context::{HistoryEntry, ItemContext, QueueContext, SourceContext};
-use belt_core::dependency::SpecDependencyGuard;
 use belt_core::error::BeltError;
-use belt_core::escalation::EscalationAction;
+use belt_core::escalation::{EscalationAction, EscalationPolicy};
 use belt_core::lifecycle::{HookContext, LifecycleHook, NoopLifecycleHook};
 use belt_core::phase::QueuePhase;
-use belt_core::queue::{HistoryEvent, HitlReason, HitlRespondAction, QueueItem};
+use belt_core::platform::{ProcessKiller, ProcessSink};
+use belt_core::queue::{HITL_TIMEOUT_HOURS, HistoryEvent, HitlReason, QueueItem};
 use belt_core::runtime::RuntimeRegistry;
 use belt_core::source::DataSource;
 use belt_core::stagnation::{
     CompositeSimilarity, LateralAnalyzer, OscillationDetector, Persona, SpinningDetector,
     StagnationDetector,
 };
+use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
 use belt_core::workspace::{StateConfig, WorkspaceConfig};
-use belt_infra::db::{Database, TransitionEvent};
+use belt_infra::db::{
+    CancelRequestRecord, CancelResult, CollectOutcome, Database, NewItem, OpenHitlOutcome,
+    OpenHitlRequest, TransitionEvent,
+};
 use belt_infra::worktree::WorktreeManager;
+use tokio::task::JoinSet;
+
+use crate::cancel::{HandlerControl, InFlight, StopReason, accept_in_flight_cancels};
 
 use crate::concurrency::ConcurrencyTracker;
 use crate::cron::{
@@ -30,7 +37,10 @@ use crate::cron::{
 };
 use crate::evaluator::Evaluator;
 use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
+use crate::hitl::{HitlExpiry, HitlService};
 use crate::hook_cache::DynamicHookLoader;
+use crate::notify::{ChannelSend, DeliveryResult, Notifier, PollResult};
+use crate::post_processing::OnDoneRun;
 
 /// Safely transition a [`QueueItem`] to a new phase.
 ///
@@ -72,18 +82,20 @@ pub struct Daemon {
     tracker: ConcurrencyTracker,
     queue: VecDeque<QueueItem>,
     history: Vec<HistoryEntry>,
-    db: Option<Arc<Database>>,
+    db: Arc<Database>,
+    /// The HITL contract over `db`: every HITL request the daemon opens goes through it.
+    hitl: HitlService,
+    /// Highest transition-log sequence the in-memory copy has been matched to.
+    store_cursor: u64,
     /// History events with full lineage information for failure tracking.
     history_events: Vec<HistoryEvent>,
     evaluator: Evaluator,
-    /// Cron engine for scheduling periodic jobs (evaluate, hitl_timeout, etc.).
+    /// Cron engine for scheduling periodic jobs (hitl_timeout, daily_report, etc.).
     cron_engine: Option<CronEngine>,
     /// Graceful shutdown 플래그. true이면 새 아이템 수집을 중단한다.
     shutdown_requested: bool,
     /// Evaluator 스크립트 실행을 위한 Belt home 디렉토리.
     belt_home: PathBuf,
-    /// Dependency guard for spec execution ordering.
-    dependency_guard: SpecDependencyGuard,
     /// Lifecycle hook called at phase transitions (on_enter, on_done, on_fail, on_escalation).
     ///
     /// When `hook_loader` is `Some`, this serves as the fallback for workspaces
@@ -96,17 +108,56 @@ pub struct Daemon {
     /// the DB and parsing the workspace yaml.  Results are cached in an LRU
     /// to avoid repeated yaml parsing.
     hook_loader: Option<Arc<DynamicHookLoader>>,
+    /// Handler executions in flight. The run loop waits on them next to the
+    /// tick and the wake signals, so a running handler never blocks a tick.
+    handlers: JoinSet<ExecutionResult>,
+    /// The control of every in-flight execution, by work_id. The item's
+    /// Running copy stays in `queue` meanwhile. Shared with the IPC wake
+    /// task, which accepts cancels and stops handlers while a tick is busy.
+    in_flight: Arc<InFlight>,
+    /// The work_id of every handler task in `handlers`, so a task that dies
+    /// without a result (a panic) can still be matched to its item.
+    handler_tasks: HashMap<tokio::task::Id, String>,
+    /// Stops handler process groups (cancel, shutdown, leftovers at start).
+    killer: Arc<dyn ProcessKiller>,
+    /// Progress notifications, HITL request delivery and external responses.
+    /// `None` runs the daemon without any channel (dashboard only).
+    notifier: Option<Notifier>,
 }
 
 #[derive(Debug)]
 pub enum ItemOutcome {
     Completed(QueueItem),
+    /// The execution was canceled by request: the item ended Skipped with
+    /// no hook, escalation or failure attempt.
+    Canceled(QueueItem),
     Failed {
         item: QueueItem,
         error: String,
         escalation: EscalationAction,
     },
     Skipped(QueueItem),
+    /// The stored phase differed from the one the result transition expected.
+    /// The daemon follows the stored phase; no hook, escalation or attempt
+    /// history ran for this execution.
+    Conflicted {
+        item: QueueItem,
+        current: QueuePhase,
+    },
+    /// The store could not record the result. The row keeps its stored phase
+    /// and the item leaves the in-memory queue.
+    StoreError {
+        item: QueueItem,
+        error: String,
+    },
+}
+
+/// Result of finishing an evaluated Completed item.
+enum OnDoneOutcome {
+    Done,
+    ScriptFailed,
+    /// The store did not apply the transition; the stored phase wins.
+    Discarded,
 }
 
 /// 병렬 실행 태스크의 결과. daemon 상태 업데이트에 필요한 데이터를 담는다.
@@ -134,66 +185,108 @@ enum ExecutionOutcome {
     WorktreeError {
         error: String,
     },
+    /// A stop (cancel or shutdown) arrived before the next step started.
+    Stopped,
+}
+
+/// Aborts its task when dropped, so a background task never outlives the
+/// loop that started it.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// What a spawned execution needs besides its item.
+struct ExecutionDeps {
+    executor: Arc<ActionExecutor>,
+    worktree_mgr: Arc<dyn WorktreeManager>,
+    hook: Arc<dyn LifecycleHook>,
+    control: Arc<HandlerControl>,
 }
 
 impl Daemon {
+    /// Create a daemon over `db`, which owns all queue state.
+    ///
+    /// Also initializes the built-in cron jobs which require a database handle
+    /// and loads user-defined custom cron jobs from the database.
     pub fn new(
         config: WorkspaceConfig,
         sources: Vec<Box<dyn DataSource>>,
         registry: Arc<RuntimeRegistry>,
         worktree_mgr: Box<dyn WorktreeManager>,
         max_concurrent: u32,
+        db: Database,
     ) -> Self {
         let evaluator = Evaluator::new(&config.name);
+        let db = Arc::new(db);
+        let hitl = HitlService::new(Arc::clone(&db));
+        let worktree_mgr: Arc<dyn WorktreeManager> = worktree_mgr.into();
+        let belt_home =
+            PathBuf::from(std::env::var("BELT_HOME").unwrap_or_else(|_| ".belt".to_string()));
+        let cron = Self::init_cron(&db, &worktree_mgr, &belt_home);
         Self {
             config,
             sources,
             executor: Arc::new(ActionExecutor::new(registry)),
-            worktree_mgr: worktree_mgr.into(),
+            worktree_mgr,
             tracker: ConcurrencyTracker::new(max_concurrent),
             queue: VecDeque::new(),
             history: Vec::new(),
-            db: None,
+            db,
+            hitl,
+            store_cursor: 0,
             history_events: Vec::new(),
             evaluator,
-            cron_engine: None,
+            cron_engine: Some(cron),
             shutdown_requested: false,
-            belt_home: PathBuf::from(
-                std::env::var("BELT_HOME").unwrap_or_else(|_| ".belt".to_string()),
-            ),
-            dependency_guard: SpecDependencyGuard,
+            belt_home,
             hook: Arc::new(NoopLifecycleHook),
             hook_loader: None,
+            handlers: JoinSet::new(),
+            in_flight: Arc::new(InFlight::default()),
+            handler_tasks: HashMap::new(),
+            killer: Arc::from(belt_infra::platform::default_process_killer()),
+            notifier: None,
         }
     }
 
-    /// Set the database for persisting token usage records.
+    /// Set the notifier the tick drives (steps 4 to 6 of the tick order).
     ///
-    /// Also initializes the built-in cron jobs which require a database handle
-    /// and loads user-defined custom cron jobs from the database.
-    pub fn with_db(mut self, db: Database) -> Self {
-        let db = Arc::new(db);
-        let report_dir = Some(self.belt_home.join("reports"));
+    /// The notifier is built once at start from the workspace's
+    /// `notifications` section, so a changed section applies after a restart.
+    pub fn with_notifier(mut self, notifier: Notifier) -> Self {
+        self.notifier = Some(notifier);
+        self
+    }
+
+    /// Register the built-in jobs, seed per-workspace jobs and load custom jobs.
+    fn init_cron(
+        db: &Arc<Database>,
+        worktree_mgr: &Arc<dyn WorktreeManager>,
+        belt_home: &Path,
+    ) -> CronEngine {
+        let report_dir = Some(belt_home.join("reports"));
         let deps = BuiltinJobDeps {
-            db: Arc::clone(&db),
-            worktree_mgr: Arc::clone(&self.worktree_mgr),
-            workspace_root: self.belt_home.clone(),
+            db: Arc::clone(db),
+            worktree_mgr: Arc::clone(worktree_mgr),
             report_dir: report_dir.clone(),
         };
-        let mut cron = self.cron_engine.take().unwrap_or_default();
+        let mut cron = CronEngine::default();
         for job in builtin_jobs(deps) {
             cron.register(job);
         }
 
-        // Seed per-workspace cron jobs for all registered workspaces (CR-13).
+        // Seed per-workspace cron jobs for all registered workspaces.
         // This ensures that workspace-scoped cron handlers are active when the
         // daemon starts, not only when `workspace add` is run.
         if let Ok(workspaces) = db.list_workspaces() {
             for (ws_name, _config_path, _created_at) in &workspaces {
                 let ws_deps = BuiltinJobDeps {
-                    db: Arc::clone(&db),
-                    worktree_mgr: Arc::clone(&self.worktree_mgr),
-                    workspace_root: self.belt_home.clone(),
+                    db: Arc::clone(db),
+                    worktree_mgr: Arc::clone(worktree_mgr),
                     report_dir: report_dir.clone(),
                 };
                 seed_workspace_crons(&mut cron, ws_name, ws_deps);
@@ -202,16 +295,18 @@ impl Daemon {
         }
 
         // Load user-defined custom cron jobs from the DB.
-        load_custom_jobs(&mut cron, &db);
-
-        self.cron_engine = Some(cron);
-        self.db = Some(db);
-        self
+        load_custom_jobs(&mut cron, db);
+        cron
     }
 
-    /// Return a reference to the database, if configured.
-    pub fn database(&self) -> Option<&Arc<Database>> {
-        self.db.as_ref()
+    /// Return a reference to the database that owns the queue state.
+    pub fn database(&self) -> &Arc<Database> {
+        &self.db
+    }
+
+    /// The HITL service over the daemon's store.
+    pub fn hitl(&self) -> &HitlService {
+        &self.hitl
     }
 
     /// Set the belt home directory for evaluator scripts.
@@ -292,38 +387,93 @@ impl Daemon {
     // Transition event recording
     // ---------------------------------------------------------------
 
-    /// Record a phase transition event to the database.
+    /// Commit a daemon-owned transition of `item` through the store.
     ///
-    /// Silently logs a warning on failure — transition recording must not
-    /// block the state machine.
-    fn record_transition(
-        db: &Option<Arc<Database>>,
-        work_id: &str,
-        source_id: &str,
+    /// The expected phase is the item's in-memory phase. When the store
+    /// applies the transition the in-memory phase follows; on a conflict the
+    /// in-memory phase follows the stored one. A refusal other than conflict
+    /// leaves the item untouched.
+    fn commit_transition(
+        db: &Database,
+        item: &mut QueueItem,
+        to: QueuePhase,
+        reason: TransitionReason,
+        detail: Option<String>,
+    ) -> Result<TransitionOutcome, BeltError> {
+        let outcome = db.transition(&TransitionRequest {
+            work_id: item.work_id.clone(),
+            expected_from: item.phase(),
+            to,
+            actor: Actor::Daemon,
+            reason,
+            detail,
+        })?;
+        match outcome {
+            TransitionOutcome::Applied { .. } => {
+                transit(item, to)?;
+            }
+            TransitionOutcome::Conflict { current } => item.set_phase_unchecked(current),
+            TransitionOutcome::Busy { .. } | TransitionOutcome::InvalidAction { .. } => {}
+        }
+        Ok(outcome)
+    }
+
+    /// Whether a commit lost to a writer that finished the row (Done or
+    /// Skipped): the in-memory copy has nothing left to process.
+    fn lost_to_finished_row(outcome: &TransitionOutcome) -> bool {
+        matches!(
+            outcome,
+            TransitionOutcome::Conflict {
+                current: QueuePhase::Done | QueuePhase::Skipped
+            }
+        )
+    }
+
+    /// Turn a refused transition into the error public `mark_*` methods return.
+    fn require_applied(
+        outcome: TransitionOutcome,
         from: QueuePhase,
         to: QueuePhase,
+    ) -> Result<(), BeltError> {
+        match outcome {
+            TransitionOutcome::Applied { .. } => Ok(()),
+            TransitionOutcome::Conflict { current }
+            | TransitionOutcome::InvalidAction { current } => {
+                Err(BeltError::InvalidTransition { from: current, to })
+            }
+            TransitionOutcome::Busy { .. } => Err(BeltError::InvalidTransition { from, to }),
+        }
+    }
+
+    /// Record a non-phase item event (`on_enter`, `evaluate`) to the database.
+    ///
+    /// Logs a warning on failure: these events are diagnostics and must not
+    /// block the state machine. Phase changes never come through here; they
+    /// are written by the store inside the transition itself.
+    fn record_item_event(
+        db: &Database,
+        item: &QueueItem,
+        phase: QueuePhase,
         event_type: &str,
         detail: Option<String>,
     ) {
-        let Some(db) = db.as_ref() else {
-            return;
-        };
         let now = Utc::now();
         let event = TransitionEvent {
-            id: format!("te-{}-{}", work_id, now.timestamp_millis()),
-            work_id: work_id.to_string(),
-            source_id: source_id.to_string(),
+            id: format!("te-{}-{}", item.work_id, now.timestamp_millis()),
+            work_id: item.work_id.clone(),
+            source_id: item.source_id.clone(),
             event_type: event_type.to_string(),
-            phase: Some(to.as_str().to_string()),
-            from_phase: Some(from.as_str().to_string()),
+            phase: Some(phase.as_str().to_string()),
+            from_phase: Some(phase.as_str().to_string()),
             detail,
             created_at: now.to_rfc3339(),
         };
         if let Err(e) = db.insert_transition_event(&event) {
             tracing::warn!(
-                work_id = %work_id,
+                work_id = %item.work_id,
                 error = %e,
-                "failed to record transition event"
+                event_type,
+                "failed to record item event"
             );
         }
     }
@@ -332,15 +482,7 @@ impl Daemon {
     ///
     /// Uses `event_type = "stagnation"` with no phase fields, since stagnation
     /// is an analytical event rather than a state-machine transition.
-    fn record_stagnation_event(
-        db: &Option<Arc<Database>>,
-        work_id: &str,
-        source_id: &str,
-        detail: &str,
-    ) {
-        let Some(db) = db.as_ref() else {
-            return;
-        };
+    fn record_stagnation_event(db: &Database, work_id: &str, source_id: &str, detail: &str) {
         let now = Utc::now();
         let event = TransitionEvent {
             id: format!("te-{}-{}", work_id, now.timestamp_millis()),
@@ -366,40 +508,206 @@ impl Daemon {
     // ---------------------------------------------------------------
 
     /// Collect new items from all DataSources and add them to the Pending queue.
+    ///
+    /// The store issues `work_id` and decides duplicates ([`Database::insert_collected`]):
+    /// an item whose `(source_id, state)` still has an open item is dropped.
+    /// Returns the number of items the store accepted.
     pub async fn collect(&mut self) -> Result<usize> {
-        let mut total = 0;
+        let mut inserted = 0;
         for source in &mut self.sources {
             let items = source.collect(&self.config).await?;
-            total += items.len();
-            for mut item in items {
-                if !self.queue.iter().any(|q| q.work_id == item.work_id) {
-                    // Restore previous_worktree_path from DB if the item was
-                    // previously rolled back with a preserved worktree.
-                    if let Some(db) = &self.db
-                        && let Ok(db_item) = db.get_item(&item.work_id)
-                        && let Some(path) = db_item.previous_worktree_path.as_deref()
-                    {
-                        if std::path::Path::new(path).exists() {
-                            item.previous_worktree_path = db_item.previous_worktree_path.clone();
-                            item.worktree_preserved = db_item.worktree_preserved;
-                            tracing::info!(
-                                work_id = %item.work_id,
-                                path,
-                                "restored previous_worktree_path from DB"
-                            );
-                        } else {
-                            tracing::debug!(
-                                work_id = %item.work_id,
-                                path,
-                                "previous_worktree_path from DB no longer exists, skipping"
-                            );
-                        }
+            for item in items {
+                let outcome = self.db.insert_collected(&NewItem {
+                    source_id: item.source_id.clone(),
+                    workspace_id: self.config.name.clone(),
+                    state: item.state.clone(),
+                    title: item.title.clone(),
+                    actor: Actor::Daemon,
+                })?;
+                match outcome {
+                    CollectOutcome::Inserted { work_id } => {
+                        self.queue.push_back(self.db.get_item(&work_id)?);
+                        inserted += 1;
                     }
-                    self.queue.push_back(item);
+                    CollectOutcome::Duplicate => {
+                        tracing::debug!(
+                            source_id = %item.source_id,
+                            state = %item.state,
+                            "collect skipped: an open item exists"
+                        );
+                    }
                 }
             }
         }
-        Ok(total)
+        Ok(inserted)
+    }
+
+    // ---------------------------------------------------------------
+    // Store restore and observation
+    // ---------------------------------------------------------------
+
+    /// Restore the in-memory queue from the store at daemon start.
+    ///
+    /// 1. Handler processes recorded for Running items are killed, once the
+    ///    platform confirms the pid still names that handler
+    ///    ([`crate::cancel::stop_leftover_handler`]); a possibly reused pid
+    ///    is left alone and logged.
+    /// 2. Open cancel requests are closed: a Running item goes to Skipped
+    ///    (`canceled`) instead of being rolled back, any other closes
+    ///    `too_late`.
+    /// 3. The remaining Running items go back to Pending (reason
+    ///    `rollback`; the worktree stays preserved).
+    /// 4. The observation cursor moves to the end of the log, so later ticks
+    ///    only see changes made after the restore.
+    /// 5. This workspace's non-terminal items are loaded, oldest first.
+    ///
+    /// One daemon owns one `belt_home` and therefore one database, so every
+    /// Running row belongs to a dead daemon whatever its workspace: steps
+    /// 1–3 cover all workspaces. Only this workspace's items are loaded into
+    /// memory (step 5); other workspaces' daemons restore their own.
+    pub fn restore_from_store(&mut self) -> Result<usize> {
+        for item in self.db.list_items(Some(QueuePhase::Running), None)? {
+            if let Some(handler) = self.db.running_handler(&item.work_id)? {
+                crate::cancel::stop_leftover_handler(self.killer.as_ref(), &item.work_id, &handler);
+            }
+        }
+
+        for request in self.db.open_cancel_requests()? {
+            self.cancel_unowned(&request)?;
+        }
+
+        for item in self.db.list_items(Some(QueuePhase::Running), None)? {
+            let outcome = self.db.transition(&TransitionRequest {
+                work_id: item.work_id.clone(),
+                expected_from: QueuePhase::Running,
+                to: QueuePhase::Pending,
+                actor: Actor::Daemon,
+                reason: TransitionReason::Rollback,
+                detail: Some("daemon restart: rolled back to Pending".to_string()),
+            })?;
+            match outcome {
+                TransitionOutcome::Applied { .. } => {}
+                // Someone else moved it between the listing and the rollback.
+                TransitionOutcome::Conflict { .. } => {}
+                TransitionOutcome::Busy { .. } | TransitionOutcome::InvalidAction { .. } => {
+                    anyhow::bail!(
+                        "restart rollback of {} was refused: {outcome:?}",
+                        item.work_id
+                    )
+                }
+            }
+        }
+
+        self.store_cursor = self
+            .db
+            .transitions_since(0)?
+            .last()
+            .map_or(0, |entry| entry.seq);
+
+        let mut restored = Vec::new();
+        for phase in [
+            QueuePhase::Pending,
+            QueuePhase::Ready,
+            QueuePhase::Completed,
+            QueuePhase::Hitl,
+            QueuePhase::Failed,
+        ] {
+            restored.extend(self.db.list_items(Some(phase), Some(&self.config.name))?);
+        }
+        restored.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+        self.queue.clear();
+        let count = restored.len();
+        self.queue.extend(restored);
+        Ok(count)
+    }
+
+    /// Match the in-memory copy to the store (tick step 1).
+    ///
+    /// Reads the transition log past the cursor and, for every item it names
+    /// in this workspace, lets the stored row win over a differing copy: a
+    /// copy whose row is Done or Skipped leaves the queue, a copy in another
+    /// phase is replaced by the row, and an open row without a copy is added.
+    /// Running rows without a Running copy are not adopted: only this daemon
+    /// claims, so such a row has no handler behind it.
+    fn observe_store(&mut self) -> Result<()> {
+        let entries = self.db.transitions_since(self.store_cursor)?;
+
+        let mut seen = std::collections::HashSet::new();
+        for entry in &entries {
+            if !seen.insert(entry.work_id.clone()) {
+                continue;
+            }
+            let row = match self.db.get_item(&entry.work_id) {
+                Ok(row) => row,
+                Err(BeltError::ItemNotFound(_)) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            if row.workspace_id != self.config.name {
+                continue;
+            }
+            self.follow_row(row);
+        }
+
+        // The cursor moves only after every entry was followed: an error
+        // above returns before it, so the next tick sees the same changes.
+        if let Some(last) = entries.last() {
+            self.store_cursor = last.seq;
+        }
+        Ok(())
+    }
+
+    fn follow_row(&mut self, row: QueueItem) {
+        let ws_name = self.config.name.clone();
+        let Some(idx) = self.queue.iter().position(|i| i.work_id == row.work_id) else {
+            match row.phase() {
+                QueuePhase::Pending
+                | QueuePhase::Ready
+                | QueuePhase::Completed
+                | QueuePhase::Hitl
+                | QueuePhase::Failed => self.queue.push_back(row),
+                QueuePhase::Running => {
+                    tracing::warn!(work_id = %row.work_id, "stored Running item has no handler; not adopted");
+                }
+                QueuePhase::Done | QueuePhase::Skipped => {}
+            }
+            return;
+        };
+
+        let copy_phase = self.queue[idx].phase();
+        if copy_phase == row.phase() {
+            return;
+        }
+        if let Some(control) = self.in_flight.get(&row.work_id) {
+            // Only this daemon moves a Running row it executes, except the
+            // direct cancel path. The execution must not start another step
+            // for an item it no longer owns; the copy is reconciled when the
+            // handler returns.
+            if row.phase() != QueuePhase::Running && control.stop(StopReason::Superseded) {
+                tracing::warn!(
+                    work_id = %row.work_id,
+                    stored = %row.phase(),
+                    "stored phase left Running under a running handler; execution stopped"
+                );
+            }
+            return;
+        }
+        if copy_phase == QueuePhase::Running {
+            self.tracker.release(&ws_name);
+        }
+        match row.phase() {
+            QueuePhase::Done | QueuePhase::Skipped => {
+                self.queue.remove(idx);
+            }
+            QueuePhase::Running => {
+                tracing::warn!(work_id = %row.work_id, "stored Running item has no handler; copy kept");
+            }
+            QueuePhase::Pending
+            | QueuePhase::Ready
+            | QueuePhase::Completed
+            | QueuePhase::Hitl
+            | QueuePhase::Failed => self.queue[idx] = row,
+        }
     }
 
     // ---------------------------------------------------------------
@@ -409,20 +717,20 @@ impl Daemon {
     /// Auto-transition Pending -> Ready -> Running (respecting concurrency).
     ///
     /// Delegates to [`crate::advancer::Advancer`] which encapsulates all
-    /// advance-phase logic (dependency gates, conflict detection, transition
-    /// event recording, concurrency enforcement).
+    /// advance-phase logic (queue dependency gate, transition event
+    /// recording, concurrency enforcement).
     pub fn advance(&mut self) -> usize {
         use crate::advancer::Advancer;
 
         let ws_name = self.config.name.clone();
         let ws_concurrency = self.config.concurrency;
+        let db = Some(Arc::clone(&self.db));
         let mut advancer = Advancer::new(
             &mut self.queue,
             &mut self.tracker,
-            &self.db,
+            &db,
             &ws_name,
             ws_concurrency,
-            &self.dependency_guard,
         );
         advancer.run()
     }
@@ -433,13 +741,13 @@ impl Daemon {
 
         let ws_name = self.config.name.clone();
         let ws_concurrency = self.config.concurrency;
+        let db = Some(Arc::clone(&self.db));
         let mut advancer = Advancer::new(
             &mut self.queue,
             &mut self.tracker,
-            &self.db,
+            &db,
             &ws_name,
             ws_concurrency,
-            &self.dependency_guard,
         );
         advancer.advance_pending_to_ready();
     }
@@ -457,13 +765,13 @@ impl Daemon {
 
         let ws_name = self.config.name.clone();
         let ws_concurrency = self.config.concurrency;
+        let db = Some(Arc::clone(&self.db));
         let mut advancer = Advancer::new(
             &mut self.queue,
             &mut self.tracker,
-            &self.db,
+            &db,
             &ws_name,
             ws_concurrency,
-            &self.dependency_guard,
         );
         advancer.advance_ready_to_running(ws_concurrency_limits, default_concurrency);
     }
@@ -472,84 +780,244 @@ impl Daemon {
     // Phase 3: Execute running items (parallel)
     // ---------------------------------------------------------------
 
-    /// Execute handlers for all Running items in parallel using `tokio::spawn`.
+    /// Execute every Running item and wait until all handlers in flight end.
     ///
-    /// Running 상태의 아이템들을 `tokio::spawn`으로 동시에 실행하고
-    /// 결과를 수집한다. concurrency 제한은 `advance()`에서 이미 적용되었으므로
-    /// Running 상태인 아이템은 모두 실행 가능하다.
+    /// A convenience over [`Daemon::spawn_running`] and
+    /// [`Daemon::join_handlers`]; the run loop never waits like this.
+    /// Returns the outcomes of the items canceled before their spawn and of
+    /// every execution that ended.
     pub async fn execute_running(&mut self) -> Vec<ItemOutcome> {
-        let running_indices: Vec<usize> = self
+        let mut outcomes = self.spawn_running();
+        outcomes.extend(self.join_handlers().await);
+        outcomes
+    }
+
+    /// Start the handler of every Running item that has none in flight,
+    /// without waiting for it (concurrency was applied when it was claimed).
+    ///
+    /// Right before each spawn the store is asked for an open cancel
+    /// request: a requested item is not spawned and ends Skipped
+    /// (`canceled`). Those outcomes are returned; the rest arrive through
+    /// [`Daemon::join_handlers`] or the run loop.
+    pub fn spawn_running(&mut self) -> Vec<ItemOutcome> {
+        let unstarted: Vec<String> = self
             .queue
             .iter()
-            .enumerate()
-            .filter(|(_, item)| item.phase() == QueuePhase::Running)
-            .map(|(i, _)| i)
+            .filter(|item| {
+                item.phase() == QueuePhase::Running && !self.in_flight.contains(&item.work_id)
+            })
+            .map(|item| item.work_id.clone())
             .collect();
 
-        if running_indices.is_empty() {
-            return Vec::new();
-        }
-
-        // Remove running items from queue (reverse order to preserve indices).
-        let mut running_items: Vec<QueueItem> = Vec::with_capacity(running_indices.len());
-        for &idx in running_indices.iter().rev() {
-            running_items.push(self.queue.remove(idx).unwrap());
-        }
-        running_items.reverse();
-
-        // Spawn parallel tasks.
-        let mut join_set = tokio::task::JoinSet::new();
-        for item in running_items {
-            let executor = Arc::clone(&self.executor);
-            let worktree_mgr = Arc::clone(&self.worktree_mgr);
-            let ws_name = self.config.name.clone();
-            let state_config = self.find_state_config(&item.state).cloned();
-
-            let hook = Self::resolve_hook_static(&self.hook, &self.hook_loader, &ws_name);
-            join_set.spawn(async move {
-                Self::execute_item_parallel(
-                    item,
-                    state_config,
-                    executor,
-                    worktree_mgr,
-                    ws_name,
-                    hook,
-                )
-                .await
-            });
-        }
-
-        // Collect results and apply state updates.
         let mut outcomes = Vec::new();
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(exec_result) => {
-                    let outcome = self.apply_execution_result(exec_result).await;
-                    outcomes.push(outcome);
+        for work_id in unstarted {
+            match self.db.open_cancel_request(&work_id) {
+                Ok(None) => self.spawn_handler(&work_id),
+                Ok(Some(request)) => {
+                    let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id) else {
+                        continue;
+                    };
+                    let item = self.queue.remove(idx).expect("index from position");
+                    outcomes.extend(self.cancel_without_handler(item, &request));
                 }
-                Err(e) => {
-                    tracing::error!("spawned task panicked: {e}");
+                Err(e) => tracing::error!(
+                    work_id,
+                    "cancel requests unreadable; handler not started this tick: {e}"
+                ),
+            }
+        }
+        outcomes
+    }
+
+    fn spawn_handler(&mut self, work_id: &str) {
+        let Some(item) = self.queue.iter().find(|i| i.work_id == work_id).cloned() else {
+            return;
+        };
+        let ws_name = self.config.name.clone();
+        let state_config = self.find_state_config(&item.state).cloned();
+        // The worktree belongs to the item's owner: an inherited one keeps
+        // its original key, any other item gets its own.
+        let worktree_key = self
+            .db
+            .worktree_key(&item.work_id)
+            .map_err(|e| e.to_string());
+        let control = Arc::new(HandlerControl::new(
+            work_id,
+            Arc::clone(&self.db),
+            Arc::clone(&self.killer),
+        ));
+        self.in_flight.insert(work_id, Arc::clone(&control));
+        let deps = ExecutionDeps {
+            executor: Arc::clone(&self.executor),
+            worktree_mgr: Arc::clone(&self.worktree_mgr),
+            hook: Self::resolve_hook_static(&self.hook, &self.hook_loader, &ws_name),
+            control,
+        };
+        let task = self.handlers.spawn(async move {
+            let control = Arc::clone(&deps.control);
+            let result =
+                Self::execute_item_parallel(item, state_config, worktree_key, ws_name, deps).await;
+            control.finish();
+            result
+        });
+        self.handler_tasks.insert(task.id(), work_id.to_string());
+    }
+
+    /// Wait until every handler in flight ends and apply each result.
+    pub async fn join_handlers(&mut self) -> Vec<ItemOutcome> {
+        let mut outcomes = Vec::new();
+        while let Some(joined) = self.handlers.join_next().await {
+            if let Some(outcome) = self.apply_joined(joined).await {
+                outcomes.push(outcome);
+            }
+        }
+        outcomes
+    }
+
+    /// Apply the results of the handlers that already ended, without waiting.
+    async fn reap_finished(&mut self) -> Vec<ItemOutcome> {
+        let mut outcomes = Vec::new();
+        while let Some(joined) = self.handlers.try_join_next() {
+            if let Some(outcome) = self.apply_joined(joined).await {
+                outcomes.push(outcome);
+            }
+        }
+        outcomes
+    }
+
+    /// Number of handler executions in flight.
+    pub fn handlers_in_flight(&self) -> usize {
+        self.in_flight.len()
+    }
+
+    async fn apply_joined(
+        &mut self,
+        joined: Result<ExecutionResult, tokio::task::JoinError>,
+    ) -> Option<ItemOutcome> {
+        match joined {
+            Ok(exec_result) => Some(self.apply_execution_result(exec_result).await),
+            Err(e) => match self.handler_tasks.remove(&e.id()) {
+                Some(work_id) => {
+                    tracing::error!(work_id, "handler task did not finish: {e}");
+                    self.recover_lost_execution(&work_id, format!("handler task died: {e}"))
+                        .await
+                }
+                None => {
+                    tracing::error!("unknown handler task did not finish: {e}");
+                    None
+                }
+            },
+        }
+    }
+
+    /// End an execution whose task died without a result (a panic).
+    ///
+    /// Its process is killed and its slot returned. An accepted or still
+    /// open cancel request wins: the item ends Skipped (`canceled`).
+    /// Otherwise the death counts as a failed attempt and goes through the
+    /// escalation policy, so a handler that panics every time ends in HITL
+    /// or skip instead of being claimed again forever. No on_fail script
+    /// runs: the execution's worktree is not known here.
+    async fn recover_lost_execution(
+        &mut self,
+        work_id: &str,
+        error: String,
+    ) -> Option<ItemOutcome> {
+        let control = self.in_flight.remove(work_id);
+        let stop = control.as_ref().and_then(|c| c.stop_reason());
+        if let Some(control) = &control {
+            control.abandon();
+        }
+        let idx = self.queue.iter().position(|i| i.work_id == work_id)?;
+        let item = self.queue.remove(idx).expect("index from position");
+        let ws_name = self.config.name.clone();
+        match stop {
+            Some(StopReason::Cancel { request_id }) => {
+                return Some(self.finish_canceled(item, request_id));
+            }
+            Some(StopReason::Superseded) => return Some(self.follow_superseded(item, &ws_name)),
+            Some(StopReason::Shutdown) | None => {}
+        }
+        match self.db.open_cancel_request(work_id) {
+            Ok(Some(request)) if self.accept(&request) => {
+                return Some(self.finish_canceled(item, request.id));
+            }
+            Ok(_) => {}
+            Err(e) => tracing::error!(work_id, "cancel requests unreadable: {e}"),
+        }
+        Some(
+            self.apply_failure(item, ws_name, error, None, Vec::new(), None)
+                .await,
+        )
+    }
+
+    fn log_outcomes(outcomes: &[ItemOutcome]) {
+        for outcome in outcomes {
+            match outcome {
+                ItemOutcome::Completed(item) => {
+                    tracing::info!("completed: {}", item.work_id);
+                }
+                ItemOutcome::Canceled(item) => tracing::info!("canceled: {}", item.work_id),
+                ItemOutcome::Failed {
+                    item,
+                    error,
+                    escalation,
+                } => {
+                    tracing::warn!(
+                        "failed: {} (escalation={:?}, error={})",
+                        item.work_id,
+                        escalation,
+                        error
+                    );
+                }
+                ItemOutcome::Skipped(item) => tracing::info!("skipped: {}", item.work_id),
+                ItemOutcome::Conflicted { item, current } => {
+                    tracing::warn!("discarded: {} (stored phase is {})", item.work_id, current)
+                }
+                ItemOutcome::StoreError { item, error } => {
+                    tracing::error!("not recorded: {} ({})", item.work_id, error)
                 }
             }
         }
-
-        outcomes
     }
 
     /// 단일 아이템의 handler를 실행하는 순수 async 함수.
     /// `&mut self` 의존 없이 `tokio::spawn`으로 실행 가능하다.
+    ///
+    /// 모든 프로세스는 `deps.control`에 pid를 보고하고, stop이 오면 다음
+    /// 단계(on_enter actions, handler chain)를 시작하지 않는다.
     async fn execute_item_parallel(
         mut item: QueueItem,
         state_config: Option<StateConfig>,
-        executor: Arc<ActionExecutor>,
-        worktree_mgr: Arc<dyn WorktreeManager>,
+        worktree_key: Result<String, String>,
         ws_name: String,
-        hook: Arc<dyn LifecycleHook>,
+        deps: ExecutionDeps,
     ) -> ExecutionResult {
+        let ExecutionDeps {
+            executor,
+            worktree_mgr,
+            hook,
+            control,
+        } = deps;
+        let sink: Arc<dyn ProcessSink> = Arc::clone(&control) as Arc<dyn ProcessSink>;
+        let worktree_key = match worktree_key {
+            Ok(key) => key,
+            Err(e) => {
+                return ExecutionResult {
+                    item,
+                    outcome: ExecutionOutcome::WorktreeError {
+                        error: format!("worktree owner lookup failed: {e}"),
+                    },
+                    ws_name,
+                    on_fail_actions: Vec::new(),
+                    worktree: None,
+                    on_enter_result: None,
+                };
+            }
+        };
         let state_config = match state_config {
             Some(cfg) => cfg,
             None => {
-                let _ = item.transit(QueuePhase::Skipped);
                 return ExecutionResult {
                     item,
                     outcome: ExecutionOutcome::Skipped,
@@ -585,10 +1053,9 @@ impl Daemon {
                 );
                 worktree_mgr.clear_preserved(&item.source_id);
                 item.previous_worktree_path = None;
-                match worktree_mgr.create_or_reuse(&ws_name) {
+                match worktree_mgr.create_or_reuse(&worktree_key) {
                     Ok(path) => path,
                     Err(e) => {
-                        let _ = item.transit(QueuePhase::Failed);
                         return ExecutionResult {
                             item,
                             outcome: ExecutionOutcome::WorktreeError {
@@ -604,14 +1071,13 @@ impl Daemon {
             }
         } else {
             let previous_wt = item.previous_worktree_path.as_deref();
-            match worktree_mgr.create_or_reuse_with_previous(&ws_name, previous_wt) {
+            match worktree_mgr.create_or_reuse_with_previous(&worktree_key, previous_wt) {
                 Ok(path) => {
                     // Clear the previous_worktree_path after successful handoff.
                     item.previous_worktree_path = None;
                     path
                 }
                 Err(e) => {
-                    let _ = item.transit(QueuePhase::Failed);
                     return ExecutionResult {
                         item,
                         outcome: ExecutionOutcome::WorktreeError {
@@ -633,7 +1099,6 @@ impl Daemon {
                 work_id = %item.work_id,
                 "lifecycle hook on_enter failed, escalating: {e}"
             );
-            let _ = item.transit(QueuePhase::Failed);
             return ExecutionResult {
                 item,
                 outcome: ExecutionOutcome::Failed {
@@ -648,12 +1113,25 @@ impl Daemon {
         }
 
         let env = ActionEnv::new(&item.work_id, &worktree);
+        let stopped = |item: QueueItem, worktree: PathBuf, on_enter_result| ExecutionResult {
+            item,
+            outcome: ExecutionOutcome::Stopped,
+            ws_name: ws_name.clone(),
+            on_fail_actions: Vec::new(),
+            worktree: Some(worktree),
+            on_enter_result,
+        };
 
         // on_enter
+        if control.is_stopped() {
+            return stopped(item, worktree, None);
+        }
         let on_enter: Vec<Action> = state_config.on_enter.iter().map(Action::from).collect();
-        let on_enter_ok = match executor.execute_all(&on_enter, &env).await {
+        let on_enter_ok = match executor
+            .execute_all_with_sink(&on_enter, &env, Arc::clone(&sink))
+            .await
+        {
             Ok(Some(r)) if !r.success() => {
-                let _ = item.transit(QueuePhase::Failed);
                 return ExecutionResult {
                     item,
                     outcome: ExecutionOutcome::Failed {
@@ -668,7 +1146,6 @@ impl Daemon {
             }
             Err(e) => {
                 tracing::warn!("on_enter failed for {}: {e}", item.work_id);
-                let _ = item.transit(QueuePhase::Failed);
                 return ExecutionResult {
                     item,
                     outcome: ExecutionOutcome::Failed {
@@ -691,7 +1168,10 @@ impl Daemon {
             .map(Action::from)
             .map(|action| inject_lateral_plan(action, item.lateral_plan.as_deref()))
             .collect();
-        let result = executor.execute_all(&handlers, &env).await;
+        if control.is_stopped() {
+            return stopped(item, worktree, on_enter_ok);
+        }
+        let result = executor.execute_all_with_sink(&handlers, &env, sink).await;
 
         match result {
             Ok(Some(r)) if !r.success() => ExecutionResult {
@@ -705,41 +1185,39 @@ impl Daemon {
                 worktree: Some(worktree),
                 on_enter_result: on_enter_ok,
             },
-            Ok(r) => {
-                let _ = item.transit(QueuePhase::Completed);
-                ExecutionResult {
-                    item,
-                    outcome: ExecutionOutcome::Completed { result: r },
-                    ws_name,
-                    on_fail_actions: Vec::new(),
-                    worktree: Some(worktree),
-                    on_enter_result: on_enter_ok,
-                }
-            }
-            Err(e) => {
-                let _ = item.transit(QueuePhase::Failed);
-                ExecutionResult {
-                    item,
-                    outcome: ExecutionOutcome::Failed {
-                        error: e.to_string(),
-                        result: None,
-                    },
-                    ws_name,
-                    on_fail_actions,
-                    worktree: Some(worktree),
-                    on_enter_result: on_enter_ok,
-                }
-            }
+            Ok(r) => ExecutionResult {
+                item,
+                outcome: ExecutionOutcome::Completed { result: r },
+                ws_name,
+                on_fail_actions: Vec::new(),
+                worktree: Some(worktree),
+                on_enter_result: on_enter_ok,
+            },
+            Err(e) => ExecutionResult {
+                item,
+                outcome: ExecutionOutcome::Failed {
+                    error: e.to_string(),
+                    result: None,
+                },
+                ws_name,
+                on_fail_actions,
+                worktree: Some(worktree),
+                on_enter_result: on_enter_ok,
+            },
         }
     }
 
     /// 병렬 실행 결과를 daemon 상태에 반영한다.
     ///
+    /// Running에서 나가는 결과 전이는 그 결과에 반응하는 hook·escalation·시도
+    /// 이력보다 먼저 저장소에 commit한다. 전이가 적용되지 않으면 그 실행은
+    /// 버려지고 저장된 phase를 따른다(토큰 사용량은 이미 기록했다).
+    ///
     /// Q-12: on_fail scripts are only executed when the escalation action
     /// is not a silent retry (`EscalationAction::Retry`).
     async fn apply_execution_result(&mut self, exec_result: ExecutionResult) -> ItemOutcome {
         let ExecutionResult {
-            mut item,
+            item,
             outcome,
             ws_name,
             on_fail_actions,
@@ -747,15 +1225,20 @@ impl Daemon {
             on_enter_result,
         } = exec_result;
 
-        // Record token usage and transition event from on_enter execution if present.
+        // The Running copy waited in the queue while the handler ran; the
+        // result decides where the item goes next.
+        self.queue.retain(|i| i.work_id != item.work_id);
+        self.handler_tasks.retain(|_, w| *w != item.work_id);
+        let control = self.in_flight.remove(&item.work_id);
+        let stop = control.as_ref().and_then(|c| c.stop_reason());
+
+        // Record token usage and the on_enter event from on_enter execution if present.
         if let Some(ref r) = on_enter_result {
             self.try_record_token_usage(&item, r);
             let status = if r.success() { "success" } else { "failure" };
-            Self::record_transition(
+            Self::record_item_event(
                 &self.db,
-                &item.work_id,
-                &item.source_id,
-                QueuePhase::Running,
+                &item,
                 QueuePhase::Running,
                 "on_enter",
                 Some(format!(
@@ -767,35 +1250,54 @@ impl Daemon {
             );
         }
 
+        let record_usage = |daemon: &Self, item: &QueueItem| match &outcome {
+            ExecutionOutcome::Completed { result: Some(r) }
+            | ExecutionOutcome::Failed {
+                result: Some(r), ..
+            } => daemon.try_record_token_usage(item, r),
+            ExecutionOutcome::Completed { result: None }
+            | ExecutionOutcome::Failed { result: None, .. }
+            | ExecutionOutcome::Skipped
+            | ExecutionOutcome::WorktreeError { .. }
+            | ExecutionOutcome::Stopped => {}
+        };
+        match stop {
+            Some(StopReason::Cancel { request_id }) => {
+                record_usage(self, &item);
+                return self.finish_canceled(item, request_id);
+            }
+            Some(StopReason::Superseded) => {
+                record_usage(self, &item);
+                return self.follow_superseded(item, &ws_name);
+            }
+            Some(StopReason::Shutdown) | None => {}
+        }
+
         match outcome {
+            ExecutionOutcome::Stopped => {
+                // Only a shutdown stops an execution without a cancel, and it
+                // discards the results; the Running copy is left for its rollback.
+                let error = "execution stopped without a cancel request".to_string();
+                tracing::error!(work_id = %item.work_id, "{error}; left Running for the shutdown rollback");
+                self.queue.push_back(item.clone());
+                ItemOutcome::StoreError { item, error }
+            }
             ExecutionOutcome::Skipped => {
-                Self::record_transition(
-                    &self.db,
-                    &item.work_id,
-                    &item.source_id,
-                    QueuePhase::Running,
+                let item = match self.commit_result(
+                    item,
+                    &ws_name,
                     QueuePhase::Skipped,
-                    "handler",
                     Some("no state config".to_string()),
-                );
+                ) {
+                    Ok(item) => item,
+                    Err(discarded) => return *discarded,
+                };
+                self.tracker.release(&ws_name);
                 ItemOutcome::Skipped(item)
             }
             ExecutionOutcome::WorktreeError { error } => {
-                Self::record_transition(
-                    &self.db,
-                    &item.work_id,
-                    &item.source_id,
-                    QueuePhase::Running,
-                    QueuePhase::Failed,
-                    "on_fail",
-                    Some(error.clone()),
-                );
-                self.tracker.release(&ws_name);
-                ItemOutcome::Failed {
-                    item,
-                    error,
-                    escalation: EscalationAction::Retry,
-                }
+                self.apply_failure(item, ws_name, error, None, on_fail_actions, worktree)
+                    .await
             }
             ExecutionOutcome::Completed { result } => {
                 if let Some(ref r) = result {
@@ -804,136 +1306,469 @@ impl Daemon {
                 let handler_detail = result
                     .as_ref()
                     .map(|r| format!("status=success duration_ms={}", r.duration.as_millis()));
-                Self::record_transition(
-                    &self.db,
-                    &item.work_id,
-                    &item.source_id,
-                    QueuePhase::Running,
-                    QueuePhase::Completed,
-                    "handler",
-                    handler_detail,
-                );
+                let item =
+                    match self.commit_result(item, &ws_name, QueuePhase::Completed, handler_detail)
+                    {
+                        Ok(item) => item,
+                        Err(discarded) => return *discarded,
+                    };
                 self.record_history(&item, "completed", None);
                 self.record_history_event(&item, "completed", None);
                 self.tracker.release(&ws_name);
                 self.queue.push_back(item.clone());
 
-                // CR-11: Completed 전이 시 자동 force_trigger("evaluate").
-                if let Some(ref mut engine) = self.cron_engine {
-                    engine.force_trigger("evaluate");
-                    tracing::debug!("force_trigger(evaluate) after Completed: {}", item.work_id);
-                }
-
                 ItemOutcome::Completed(item)
             }
             ExecutionOutcome::Failed { error, result } => {
-                if let Some(ref r) = result {
-                    self.try_record_token_usage(&item, r);
+                self.apply_failure(item, ws_name, error, result, on_fail_actions, worktree)
+                    .await
+            }
+        }
+    }
+
+    /// Commit the Running -> `to` result of an execution.
+    ///
+    /// `Err` carries the outcome to return when the transition did not apply.
+    fn commit_result(
+        &mut self,
+        mut item: QueueItem,
+        ws_name: &str,
+        to: QueuePhase,
+        detail: Option<String>,
+    ) -> Result<QueueItem, Box<ItemOutcome>> {
+        match Self::commit_transition(&self.db, &mut item, to, TransitionReason::Advance, detail) {
+            Ok(TransitionOutcome::Applied { .. }) => Ok(item),
+            Ok(TransitionOutcome::Conflict { current }) => {
+                Err(Box::new(self.discard_conflicted(item, ws_name, current)))
+            }
+            Ok(
+                refused
+                @ (TransitionOutcome::Busy { .. } | TransitionOutcome::InvalidAction { .. }),
+            ) => Err(Box::new(self.discard_unrecorded(
+                item,
+                ws_name,
+                format!("result transition refused: {refused:?}"),
+            ))),
+            Err(e) => Err(Box::new(self.discard_unrecorded(
+                item,
+                ws_name,
+                e.to_string(),
+            ))),
+        }
+    }
+
+    /// 실패한 실행을 escalation 결정에 따라 저장소에 반영한다.
+    ///
+    /// 순서는 spec의 실패 경로를 따른다: stagnation 탐지 → 계열 failure_count로
+    /// escalation 결정 → 결과 전이 commit(retry 계열은 파생) → (적용된 경우에만)
+    /// on_escalation → on_fail script → 시도 이력 → on_fail hook. retry는 on_fail을
+    /// 부르지 않는다. 저장소를 읽지 못하면 아무 전이도 하지 않고 오류로 드러낸다.
+    async fn apply_failure(
+        &mut self,
+        mut item: QueueItem,
+        ws_name: String,
+        error: String,
+        result: Option<ActionResult>,
+        on_fail_actions: Vec<Action>,
+        worktree: Option<PathBuf>,
+    ) -> ItemOutcome {
+        if let Some(ref r) = result {
+            self.try_record_token_usage(&item, r);
+        }
+
+        // This run's failure is recorded only after the commit, so it is
+        // counted on top of the lineage's stored failures.
+        let failure_count = match self.db.failure_count(&item.work_id) {
+            Ok(stored) => stored + 1,
+            Err(e) => {
+                return self.discard_unrecorded(item, &ws_name, format!("failure count: {e}"));
+            }
+        };
+
+        // Detect stagnation and generate a lateral plan for the derived item.
+        let lateral_plan =
+            match self.detect_stagnation_and_generate_plan(&item, &error, failure_count) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    return self.discard_unrecorded(
+                        item,
+                        &ws_name,
+                        format!("stagnation history: {e}"),
+                    );
                 }
-                let handler_detail = result.as_ref().map_or_else(
-                    || format!("status=failure error={error}"),
-                    |r| {
-                        format!(
-                            "status=failure duration_ms={} exit_code={} error={}",
-                            r.duration.as_millis(),
-                            r.exit_code,
-                            error,
-                        )
-                    },
-                );
-                Self::record_transition(
-                    &self.db,
-                    &item.work_id,
-                    &item.source_id,
-                    QueuePhase::Running,
-                    QueuePhase::Failed,
-                    "handler",
-                    Some(handler_detail),
-                );
-                Self::record_transition(
-                    &self.db,
-                    &item.work_id,
-                    &item.source_id,
-                    QueuePhase::Running,
-                    QueuePhase::Failed,
-                    "on_fail",
-                    Some(error.clone()),
-                );
+            };
 
-                let failure_count = self.count_failures(&item.source_id, &item.state);
-                let escalation = self.resolve_escalation(&item.state, failure_count + 1);
+        let escalation = self.resolve_escalation(failure_count);
 
-                // Q-12: Execute on_fail scripts only when escalation is not a silent retry.
-                if escalation.should_run_on_fail() {
-                    if let Some(ref wt) = worktree {
-                        let env = ActionEnv::new(&item.work_id, wt);
-                        match self.executor.execute_all(&on_fail_actions, &env).await {
-                            Ok(Some(ref r)) => {
-                                self.try_record_token_usage(&item, r);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    work_id = %item.work_id,
-                                    "on_fail script execution error: {e}"
-                                );
-                            }
-                            _ => {}
-                        }
+        let hitl_notes = match escalation {
+            EscalationAction::Hitl | EscalationAction::Replan => {
+                match crate::escalation_path::lineage_hitl_notes(
+                    &self.db,
+                    &item,
+                    lateral_plan.as_deref(),
+                ) {
+                    Ok(notes) => notes,
+                    Err(e) => {
+                        return self.discard_unrecorded(
+                            item,
+                            &ws_name,
+                            format!("lineage stagnation history: {e}"),
+                        );
                     }
-                } else {
-                    tracing::debug!(
-                        work_id = %item.work_id,
-                        escalation = ?escalation,
-                        "skipping on_fail execution for silent retry"
-                    );
                 }
+            }
+            EscalationAction::Retry
+            | EscalationAction::RetryWithComment
+            | EscalationAction::Skip => None,
+        };
 
-                self.record_history(&item, "failed", Some(&error));
-                self.record_history_event(&item, "failed", Some(error.clone()));
-
-                // Lifecycle hook: on_fail — log only, do not interrupt flow.
-                let hook_ctx = self.build_hook_context(&item, worktree.as_ref());
-                let fail_hook = self.resolve_hook(&ws_name);
-                if let Err(e) = fail_hook.on_fail(&hook_ctx).await {
-                    tracing::warn!(
-                        work_id = %item.work_id,
-                        "lifecycle hook on_fail error (ignored): {e}"
-                    );
-                }
-
-                // Q-10: Mark worktree as preserved for Failed items.
-                item.mark_worktree_preserved();
-
-                // Register preserved worktree by source_id for reuse on retry/restart.
-                if let Some(ref wt) = worktree {
-                    self.worktree_mgr
-                        .register_preserved(&item.source_id, wt.clone());
-                }
-                tracing::info!(
-                    work_id = %item.work_id,
-                    source_id = %item.source_id,
-                    phase = "failed",
-                    "worktree preserved for failed item"
-                );
-
-                // Detect stagnation and generate a lateral plan for retry injection.
-                let lateral_plan = self.detect_stagnation_and_generate_plan(
-                    &item.work_id,
-                    &item.source_id,
-                    &item.state,
-                    &error,
-                );
-
-                self.handle_escalation(&mut item, escalation, lateral_plan);
-                self.tracker.release(&ws_name);
-
-                ItemOutcome::Failed {
+        use crate::escalation_path::{Committed, EscalationCommit};
+        let committed = match crate::escalation_path::commit(
+            &self.hitl,
+            &item.work_id,
+            escalation,
+            hitl_notes.clone(),
+            &self.hitl_expiry(),
+        ) {
+            Ok(EscalationCommit::Applied(committed)) => committed,
+            Ok(EscalationCommit::Conflict { current }) => {
+                item.set_phase_unchecked(current);
+                return self.discard_conflicted(item, &ws_name, current);
+            }
+            Ok(EscalationCommit::Rejected(refused)) => {
+                return self.discard_unrecorded(
                     item,
-                    error,
-                    escalation,
+                    &ws_name,
+                    format!("escalation transition refused: {refused:?}"),
+                );
+            }
+            Err(e) => return self.discard_unrecorded(item, &ws_name, e.to_string()),
+        };
+
+        // Q-10: the worktree outlives a failed run (handed over or preserved)
+        // unless the lineage ends here with a skip.
+        let ends_lineage = matches!(committed, Committed::Skipped);
+        if !ends_lineage {
+            item.mark_worktree_preserved();
+        }
+        match committed {
+            Committed::Derived { work_id } => {
+                item.set_phase_unchecked(QueuePhase::Skipped);
+                self.enqueue_derived(&work_id, lateral_plan);
+            }
+            Committed::Skipped => item.set_phase_unchecked(QueuePhase::Skipped),
+            Committed::Hitl => {
+                item.set_phase_unchecked(QueuePhase::Hitl);
+                self.queue.push_back(item.clone());
+            }
+        }
+
+        // Hooks react to the committed result; their failure changes nothing.
+        let hook_ctx = self.build_hook_context(&item, worktree.as_ref(), failure_count);
+        let hook = self.resolve_hook(&ws_name);
+        if let Err(e) = hook.on_escalation(&hook_ctx, escalation).await {
+            tracing::warn!(
+                work_id = %item.work_id,
+                "lifecycle hook on_escalation error (ignored): {e}"
+            );
+        }
+
+        // Q-12: Execute on_fail scripts only when escalation is not a silent retry.
+        if escalation.should_run_on_fail() {
+            if let Some(ref wt) = worktree {
+                let env = ActionEnv::new(&item.work_id, wt);
+                match self.executor.execute_all(&on_fail_actions, &env).await {
+                    Ok(Some(ref r)) => {
+                        self.try_record_token_usage(&item, r);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            work_id = %item.work_id,
+                            "on_fail script execution error: {e}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        } else {
+            tracing::debug!(
+                work_id = %item.work_id,
+                escalation = ?escalation,
+                "skipping on_fail execution for silent retry"
+            );
+        }
+
+        self.record_history(&item, "failed", Some(&error));
+        self.record_history_event(&item, "failed", Some(error.clone()));
+
+        // Lifecycle hook: on_fail — not for a silent retry, log only on failure.
+        if escalation.should_run_on_fail()
+            && let Err(e) = hook.on_fail(&hook_ctx).await
+        {
+            tracing::warn!(
+                work_id = %item.work_id,
+                "lifecycle hook on_fail error (ignored): {e}"
+            );
+        }
+
+        if ends_lineage {
+            self.worktree_mgr.clear_preserved(&item.source_id);
+            self.cleanup_owned_worktree(&item.work_id);
+        } else {
+            // Register preserved worktree by source_id for reuse on retry/restart.
+            if let Some(ref wt) = worktree {
+                self.worktree_mgr
+                    .register_preserved(&item.source_id, wt.clone());
+            }
+            tracing::info!(
+                work_id = %item.work_id,
+                source_id = %item.source_id,
+                phase = "failed",
+                "worktree preserved for failed item"
+            );
+        }
+
+        self.tracker.release(&ws_name);
+
+        ItemOutcome::Failed {
+            item,
+            error,
+            escalation,
+        }
+    }
+
+    /// The stored phase differs from the expected one: follow it and drop the execution.
+    ///
+    /// `item` must already carry the stored phase. Items still in play stay in
+    /// the queue so the next observation can reconcile them.
+    fn discard_conflicted(
+        &mut self,
+        item: QueueItem,
+        ws_name: &str,
+        current: QueuePhase,
+    ) -> ItemOutcome {
+        tracing::warn!(
+            work_id = %item.work_id,
+            current = ?current,
+            "result transition conflicted; following stored phase, execution discarded"
+        );
+        self.tracker.release(ws_name);
+        match current {
+            QueuePhase::Done | QueuePhase::Skipped => {}
+            QueuePhase::Pending
+            | QueuePhase::Ready
+            | QueuePhase::Running
+            | QueuePhase::Completed
+            | QueuePhase::Hitl
+            | QueuePhase::Failed => self.queue.push_back(item.clone()),
+        }
+        ItemOutcome::Conflicted { item, current }
+    }
+
+    /// Drop an execution stopped because its row left Running elsewhere:
+    /// follow the stored phase, with no hook, escalation or attempt history.
+    fn follow_superseded(&mut self, mut item: QueueItem, ws_name: &str) -> ItemOutcome {
+        match self.db.get_item(&item.work_id) {
+            Ok(row) => {
+                let current = row.phase();
+                item.set_phase_unchecked(current);
+                self.discard_conflicted(item, ws_name, current)
+            }
+            Err(e) => self.discard_unrecorded(item, ws_name, format!("stored phase: {e}")),
+        }
+    }
+
+    /// The store refused or failed to record the result: surface it, keep the stored phase.
+    fn discard_unrecorded(&mut self, item: QueueItem, ws_name: &str, error: String) -> ItemOutcome {
+        tracing::error!(work_id = %item.work_id, "failed to record execution result: {error}");
+        self.tracker.release(ws_name);
+        ItemOutcome::StoreError { item, error }
+    }
+
+    /// Queue the item an escalation retry derived, carrying the lateral plan.
+    ///
+    /// The derivation is already committed. If its row cannot be read now,
+    /// the next store observation adds it (without the in-memory lateral
+    /// plan), so the read error is reported but not returned.
+    fn enqueue_derived(&mut self, work_id: &str, lateral_plan: Option<String>) {
+        match self.db.get_item(work_id) {
+            Ok(mut derived) => {
+                derived.lateral_plan = lateral_plan;
+                self.queue.push_back(derived);
+            }
+            Err(e) => tracing::error!(
+                work_id,
+                error = %e,
+                "derived item committed but not readable; the next observation adds it"
+            ),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Cancellation (see crate::cancel)
+    // ---------------------------------------------------------------
+
+    /// Handle every open cancel request of this workspace (tick step 0).
+    ///
+    /// A Running item with a handler in flight: accept, then stop the
+    /// handler group; the item ends Skipped when the handler returns
+    /// ([`Daemon::finish_canceled`]). A Running item without one ends Skipped
+    /// now. An item no longer Running closes the request `too_late`.
+    ///
+    /// # Errors
+    /// When the open requests cannot be listed.
+    fn process_cancel_requests(&mut self) -> Result<()> {
+        for request in self.db.open_cancel_requests()? {
+            let row = match self.db.get_item(&request.work_id) {
+                Ok(row) => row,
+                Err(e) => {
+                    tracing::warn!(work_id = %request.work_id, "cancel request skipped, item unreadable: {e}");
+                    continue;
+                }
+            };
+            if row.workspace_id != self.config.name {
+                continue;
+            }
+            match row.phase() {
+                QueuePhase::Running => {}
+                QueuePhase::Pending
+                | QueuePhase::Ready
+                | QueuePhase::Completed
+                | QueuePhase::Hitl
+                | QueuePhase::Done
+                | QueuePhase::Skipped
+                | QueuePhase::Failed => {
+                    self.close_request(request.id, CancelResult::TooLate);
+                    continue;
+                }
+            }
+            if let Some(control) = self.in_flight.get(&request.work_id) {
+                if control.canceled_request().is_none() {
+                    control.cancel(&request);
+                }
+                continue;
+            }
+            match self.queue.iter().position(|i| i.work_id == request.work_id) {
+                Some(idx) => {
+                    let item = self.queue.remove(idx).expect("index from position");
+                    let outcome = self.cancel_without_handler(item, &request);
+                    Self::log_outcomes(&outcome.into_iter().collect::<Vec<_>>());
+                }
+                None => {
+                    // A Running row this daemon never claimed: nothing runs for it.
+                    if self.accept(&request) {
+                        self.cancel_unowned(&request)?;
+                    }
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Mark `request` accepted by the daemon. `false` when it can no longer
+    /// be acted on (closed meanwhile, or the store failed).
+    fn accept(&self, request: &CancelRequestRecord) -> bool {
+        crate::cancel::accept_request(&self.db, request)
+    }
+
+    fn close_request(&self, request_id: i64, result: CancelResult) {
+        match self.db.close_cancel(request_id, result, &Actor::Daemon) {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(request_id, "cancel request was already closed"),
+            Err(e) => tracing::error!(request_id, ?result, "cancel request not closed: {e}"),
+        }
+    }
+
+    /// Cancel a Running item whose handler was not spawned: it never runs.
+    ///
+    /// `item` is the Running copy, already taken out of the queue. Returns
+    /// `None` when the request could not be accepted; the copy then goes
+    /// back to the queue for the next tick.
+    fn cancel_without_handler(
+        &mut self,
+        item: QueueItem,
+        request: &CancelRequestRecord,
+    ) -> Option<ItemOutcome> {
+        if !self.accept(request) {
+            self.queue.push_back(item);
+            return None;
+        }
+        Some(self.finish_canceled(item, request.id))
+    }
+
+    /// End a canceled execution of this daemon: Running→Skipped (`canceled`),
+    /// close the request, record the attempt as `skipped` and clean the
+    /// worktree (Skipped rule). No hook or escalation runs.
+    ///
+    /// `item` is the Running copy, out of the queue, holding a concurrency slot.
+    fn finish_canceled(&mut self, mut item: QueueItem, request_id: i64) -> ItemOutcome {
+        let ws_name = self.config.name.clone();
+        let outcome = Self::commit_transition(
+            &self.db,
+            &mut item,
+            QueuePhase::Skipped,
+            TransitionReason::Canceled,
+            Some(format!("cancel request {request_id}")),
+        );
+        match outcome {
+            Ok(TransitionOutcome::Applied { .. }) => {
+                self.close_request(request_id, CancelResult::Canceled);
+                self.record_history(&item, "skipped", None);
+                self.record_history_event(&item, "skipped", None);
+                self.worktree_mgr.clear_preserved(&item.source_id);
+                self.cleanup_owned_worktree(&item.work_id);
+                self.tracker.release(&ws_name);
+                ItemOutcome::Canceled(item)
+            }
+            Ok(TransitionOutcome::Conflict { current }) => {
+                self.close_request(request_id, CancelResult::TooLate);
+                self.discard_conflicted(item, &ws_name, current)
+            }
+            Ok(
+                refused
+                @ (TransitionOutcome::Busy { .. } | TransitionOutcome::InvalidAction { .. }),
+            ) => self.discard_unrecorded(
+                item,
+                &ws_name,
+                format!("cancel transition refused: {refused:?}"),
+            ),
+            Err(e) => self.discard_unrecorded(item, &ws_name, e.to_string()),
+        }
+    }
+
+    /// Close `request` for an item no handler of this daemon runs (restart,
+    /// or a Running row never claimed here): a Running item goes to Skipped
+    /// (`canceled`), any other closes `too_late`.
+    fn cancel_unowned(&mut self, request: &CancelRequestRecord) -> Result<()> {
+        if self.db.get_item(&request.work_id)?.phase() != QueuePhase::Running {
+            self.close_request(request.id, CancelResult::TooLate);
+            return Ok(());
+        }
+        let outcome = self.db.transition(&TransitionRequest {
+            work_id: request.work_id.clone(),
+            expected_from: QueuePhase::Running,
+            to: QueuePhase::Skipped,
+            actor: Actor::Daemon,
+            reason: TransitionReason::Canceled,
+            detail: Some(format!("cancel request {}", request.id)),
+        })?;
+        match outcome {
+            TransitionOutcome::Applied { .. } => {
+                self.close_request(request.id, CancelResult::Canceled);
+                let item = self.db.get_item(&request.work_id)?;
+                self.record_history(&item, "skipped", None);
+                self.record_history_event(&item, "skipped", None);
+                self.worktree_mgr.clear_preserved(&item.source_id);
+                self.cleanup_owned_worktree(&item.work_id);
+            }
+            TransitionOutcome::Conflict { .. } | TransitionOutcome::InvalidAction { .. } => {
+                self.close_request(request.id, CancelResult::TooLate);
+            }
+            TransitionOutcome::Busy { .. } => {
+                anyhow::bail!("cancel of {} was refused: {outcome:?}", request.work_id)
+            }
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------------
@@ -947,17 +1782,18 @@ impl Daemon {
             .iter_mut()
             .find(|it| it.work_id == work_id)
             .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-        let from = transit(item, QueuePhase::Completed)?;
-        Self::record_transition(
+        let from = item.phase();
+        let outcome = Self::commit_transition(
             &self.db,
-            work_id,
-            &item.source_id,
-            from,
+            item,
             QueuePhase::Completed,
-            "phase_enter",
+            TransitionReason::Advance,
             None,
-        );
-        Ok(())
+        )?;
+        if Self::lost_to_finished_row(&outcome) {
+            self.queue.retain(|it| it.work_id != work_id);
+        }
+        Self::require_applied(outcome, from, QueuePhase::Completed)
     }
 
     /// Mark a Completed item as Done.
@@ -970,19 +1806,24 @@ impl Daemon {
             .iter_mut()
             .find(|it| it.work_id == work_id)
             .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-        let from = transit(item, QueuePhase::Done)?;
-        Self::record_transition(
+        let from = item.phase();
+        let outcome = Self::commit_transition(
             &self.db,
-            work_id,
-            &item.source_id,
-            from,
+            item,
             QueuePhase::Done,
-            "phase_enter",
+            TransitionReason::Advance,
             None,
-        );
+        )?;
+        let finished = Self::lost_to_finished_row(&outcome);
+        if let Err(e) = Self::require_applied(outcome, from, QueuePhase::Done) {
+            if finished {
+                self.queue.retain(|it| it.work_id != work_id);
+            }
+            return Err(e);
+        }
 
         // Lifecycle hook: on_done — fire and forget, log only on failure.
-        let worktree_path = self.worktree_mgr.path(&item.work_id);
+        let worktree_path = Self::owner_worktree_path(&self.db, &*self.worktree_mgr, &item.work_id);
         let hook_ctx = Self::build_hook_context_static(item, &worktree_path, &self.config.name);
         let hook = self.resolve_hook(&self.config.name);
         Self::spawn_hook(async move {
@@ -994,398 +1835,84 @@ impl Daemon {
             }
         });
 
-        if let Err(e) = self.worktree_mgr.cleanup(work_id) {
-            tracing::warn!(work_id, error = %e, "worktree cleanup failed on mark_done, continuing");
-        }
+        self.cleanup_owned_worktree(work_id);
 
         Ok(())
     }
 
+    /// Path of the worktree `work_id` works in (its owner's, see
+    /// [`Database::worktree_key`]).
+    ///
+    /// Hooks only observe the path, so an unreadable owner is logged and the
+    /// item's own key is used instead of failing the transition.
+    fn owner_worktree_path(
+        db: &Database,
+        worktree_mgr: &dyn WorktreeManager,
+        work_id: &str,
+    ) -> PathBuf {
+        match db.worktree_key(work_id) {
+            Ok(key) => worktree_mgr.path(&key),
+            Err(e) => {
+                tracing::warn!(work_id, error = %e, "worktree owner lookup failed for hook context");
+                worktree_mgr.path(work_id)
+            }
+        }
+    }
+
+    /// Clean up the worktree a finished (Done or lineage-ending Skipped) item owns.
+    ///
+    /// The worktree is keyed by its owner: a derived item cleans the worktree
+    /// it was handed. Failures are logged; cleanup never fails the transition.
+    fn cleanup_owned_worktree(&self, work_id: &str) {
+        let key = match self.db.worktree_key(work_id) {
+            Ok(key) => key,
+            Err(e) => {
+                tracing::warn!(work_id, error = %e, "worktree owner lookup failed, not cleaned");
+                return;
+            }
+        };
+        if let Err(e) = self.worktree_mgr.cleanup(&key) {
+            tracing::warn!(work_id, worktree = %key, error = %e, "worktree cleanup failed, continuing");
+        }
+    }
+
     /// Mark a Completed item as Hitl (human-in-the-loop) with reason and optional notes.
+    ///
+    /// Opens the HITL request together with the phase change in the store.
     pub fn mark_hitl(
         &mut self,
         work_id: &str,
         reason: HitlReason,
         notes: Option<String>,
     ) -> Result<(), BeltError> {
+        let expiry = self.hitl_expiry();
         let item = self
             .queue
             .iter_mut()
             .find(|it| it.work_id == work_id)
             .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-        let from = transit(item, QueuePhase::Hitl)?;
-        item.hitl_created_at = Some(Utc::now().to_rfc3339());
-        item.hitl_reason = Some(reason);
-        item.hitl_notes = notes.clone();
-        Self::record_transition(
-            &self.db,
-            work_id,
-            &item.source_id,
-            from,
-            QueuePhase::Hitl,
-            "phase_enter",
-            Some(format!("reason: {reason}")),
-        );
-        Ok(())
-    }
-
-    /// Mark a Hitl item as Skipped.
-    pub fn mark_skipped(&mut self, work_id: &str) -> Result<(), BeltError> {
-        let item = self
-            .queue
-            .iter_mut()
-            .find(|it| it.work_id == work_id)
-            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-        let from = transit(item, QueuePhase::Skipped)?;
-        Self::record_transition(
-            &self.db,
-            work_id,
-            &item.source_id,
-            from,
-            QueuePhase::Skipped,
-            "phase_enter",
-            None,
-        );
-        Ok(())
-    }
-
-    /// Retry a Hitl item by sending it back to Pending.
-    pub fn retry_from_hitl(&mut self, work_id: &str) -> Result<(), BeltError> {
-        let item = self
-            .queue
-            .iter_mut()
-            .find(|it| it.work_id == work_id)
-            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-        let from = transit(item, QueuePhase::Pending)?;
-        Self::record_transition(
-            &self.db,
-            work_id,
-            &item.source_id,
-            from,
-            QueuePhase::Pending,
-            "phase_enter",
-            Some("retry from hitl".to_string()),
-        );
-        Ok(())
-    }
-
-    /// Maximum number of replan attempts before failing permanently.
-    const MAX_REPLAN_COUNT: u32 = 3;
-
-    /// Respond to a HITL item with a user action.
-    ///
-    /// Applies the given [`HitlRespondAction`] and records the respondent.
-    ///
-    /// For `Replan`, the item is rolled back to Pending with an incremented
-    /// `replan_count`, and a new HITL item is created to delegate spec
-    /// modification to the Claw agent. If `replan_count` exceeds
-    /// [`Self::MAX_REPLAN_COUNT`], the item transitions to Failed instead.
-    pub async fn respond_hitl(
-        &mut self,
-        work_id: &str,
-        action: HitlRespondAction,
-        respondent: Option<String>,
-        notes: Option<String>,
-    ) -> Result<(), BeltError> {
-        let idx = self
-            .queue
-            .iter()
-            .position(|it| it.work_id == work_id)
-            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
-
-        {
-            let item = &self.queue[idx];
-            if item.phase() != QueuePhase::Hitl {
-                return Err(BeltError::InvalidTransition {
-                    from: item.phase(),
-                    to: QueuePhase::Done, // placeholder
-                });
-            }
-        }
-
-        let item = &mut self.queue[idx];
-        item.hitl_respondent = respondent;
-        if let Some(n) = notes {
-            item.hitl_notes = Some(n);
-        }
-
-        // Capture spec-completion metadata before match borrows item.
-        let is_spec_completion = item.state == "spec_completion";
-        let is_spec_conflict = item.hitl_reason == Some(HitlReason::SpecConflict);
-        let spec_id = item.source_id.clone();
-        let source_id_clone = spec_id.clone();
-
-        match action {
-            HitlRespondAction::Done => {
-                // Remove item from queue to call execute_on_done (which needs
-                // &mut self + &mut QueueItem without borrow conflict).
-                let mut item = self.queue.remove(idx).unwrap();
-
-                // Execute on_done scripts; transitions to Done on success,
-                // Failed on script failure.
-                match self.execute_on_done(&mut item).await {
-                    Ok(true) => {
-                        Self::record_transition(
-                            &self.db,
-                            work_id,
-                            &source_id_clone,
-                            QueuePhase::Hitl,
-                            QueuePhase::Done,
-                            "handler",
-                            Some("hitl respond: done".to_string()),
-                        );
-                        if is_spec_completion {
-                            self.apply_spec_completion_transition(&spec_id);
-                        }
-                        if is_spec_conflict {
-                            self.apply_spec_conflict_approved(&spec_id);
-                        }
-                    }
-                    Ok(false) => {
-                        Self::record_transition(
-                            &self.db,
-                            work_id,
-                            &source_id_clone,
-                            QueuePhase::Hitl,
-                            QueuePhase::Failed,
-                            "handler",
-                            Some("hitl respond: done (on_done script failed)".to_string()),
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            work_id,
-                            "on_done execution error during hitl respond: {e}"
-                        );
-                        let _ = transit(&mut item, QueuePhase::Failed);
-                        Self::record_transition(
-                            &self.db,
-                            work_id,
-                            &source_id_clone,
-                            QueuePhase::Hitl,
-                            QueuePhase::Failed,
-                            "handler",
-                            Some(format!("hitl respond: on_done error: {e}")),
-                        );
-                    }
-                }
-
-                // Put item back into queue so callers can inspect final state.
-                self.queue.push_back(item);
+        let from = item.phase();
+        let outcome = self.hitl.open(&OpenHitlRequest {
+            work_id: work_id.to_string(),
+            expected_from: from,
+            reason,
+            notes: notes.clone(),
+            actor: Actor::Daemon,
+            transition_reason: TransitionReason::Advance,
+            timeout_at: expiry.timeout_at,
+            terminal_action: expiry.terminal_action,
+        })?;
+        match outcome {
+            OpenHitlOutcome::Opened { .. } => {
+                transit(item, QueuePhase::Hitl)?;
                 Ok(())
             }
-            HitlRespondAction::Retry => {
-                let from = transit(item, QueuePhase::Pending)?;
-                Self::record_transition(
-                    &self.db,
-                    work_id,
-                    &source_id_clone,
-                    from,
-                    QueuePhase::Pending,
-                    "handler",
-                    Some("hitl respond: retry".to_string()),
-                );
-                if is_spec_completion {
-                    self.apply_spec_active_revert(&spec_id);
+            OpenHitlOutcome::Rejected(refused) => {
+                if let TransitionOutcome::Conflict { current } = refused {
+                    item.set_phase_unchecked(current);
                 }
-                Ok(())
+                Self::require_applied(refused, from, QueuePhase::Hitl)
             }
-            HitlRespondAction::Skip => {
-                let from = transit(item, QueuePhase::Skipped)?;
-                Self::record_transition(
-                    &self.db,
-                    work_id,
-                    &source_id_clone,
-                    from,
-                    QueuePhase::Skipped,
-                    "handler",
-                    Some("hitl respond: skip".to_string()),
-                );
-                if is_spec_completion {
-                    self.apply_spec_active_revert(&spec_id);
-                }
-                if is_spec_conflict {
-                    self.apply_spec_conflict_rejected(&spec_id);
-                }
-                Ok(())
-            }
-            HitlRespondAction::Replan => {
-                let new_replan_count = item.replan_count + 1;
-
-                if new_replan_count > Self::MAX_REPLAN_COUNT {
-                    tracing::warn!(
-                        work_id,
-                        replan_count = new_replan_count,
-                        max = Self::MAX_REPLAN_COUNT,
-                        "replan limit exceeded, transitioning to Failed"
-                    );
-                    item.replan_count = new_replan_count;
-                    let from = transit(item, QueuePhase::Failed)?;
-                    Self::record_transition(
-                        &self.db,
-                        work_id,
-                        &source_id_clone,
-                        from,
-                        QueuePhase::Failed,
-                        "handler",
-                        Some("replan limit exceeded".to_string()),
-                    );
-                    return Ok(());
-                }
-
-                // Capture metadata before mutating the item for the new HITL item.
-                let failure_reason = item
-                    .hitl_notes
-                    .clone()
-                    .unwrap_or_else(|| "unknown failure".to_string());
-                let source_id = item.source_id.clone();
-                let workspace_id = item.workspace_id.clone();
-                let state = item.state.clone();
-
-                // Roll back item to Pending with incremented replan_count.
-                item.replan_count = new_replan_count;
-                let from = transit(item, QueuePhase::Pending)?;
-                Self::record_transition(
-                    &self.db,
-                    work_id,
-                    &source_id_clone,
-                    from,
-                    QueuePhase::Pending,
-                    "handler",
-                    Some(format!("replan attempt {new_replan_count}")),
-                );
-
-                // Create a new HITL item for spec modification proposal.
-                let replan_work_id = format!("{work_id}:replan-{new_replan_count}");
-                let mut replan_item =
-                    QueueItem::new(replan_work_id, source_id, workspace_id, state);
-                // The replan item starts at Pending and moves to Hitl to await
-                // human review of the Claw agent's spec modification proposal.
-                transit(&mut replan_item, QueuePhase::Ready)?;
-                transit(&mut replan_item, QueuePhase::Running)?;
-                transit(&mut replan_item, QueuePhase::Completed)?;
-                transit(&mut replan_item, QueuePhase::Hitl)?;
-                replan_item.hitl_created_at = Some(Utc::now().to_rfc3339());
-                replan_item.hitl_reason = Some(HitlReason::SpecModificationProposed);
-                replan_item.hitl_notes = Some(format!(
-                    "Claw replan delegation (attempt {new_replan_count}): {failure_reason}"
-                ));
-                replan_item.title = Some(format!(
-                    "spec-modification-proposed (replan #{new_replan_count})"
-                ));
-                self.queue.push_back(replan_item);
-
-                tracing::info!(
-                    work_id,
-                    replan_count = new_replan_count,
-                    "replan: item rolled back to Pending, spec modification HITL item created"
-                );
-
-                Ok(())
-            }
-        }
-    }
-
-    /// Transition a spec from Completing to Completed in the database.
-    ///
-    /// Called when a `spec_completion` HITL item is approved (Done).
-    /// Logs a warning and continues if the database is unavailable or the
-    /// transition fails -- the queue item has already moved to Done.
-    fn apply_spec_completion_transition(&self, spec_id: &str) {
-        if let Some(db) = &self.db {
-            match db.update_spec_status(spec_id, belt_core::spec::SpecStatus::Completed) {
-                Ok(()) => {
-                    tracing::info!(
-                        spec_id = %spec_id,
-                        "spec transitioned from Completing to Completed via HITL approval"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        spec_id = %spec_id,
-                        error = %e,
-                        "failed to transition spec to Completed after HITL approval"
-                    );
-                }
-            }
-        } else {
-            tracing::warn!(
-                spec_id = %spec_id,
-                "no database configured — cannot transition spec to Completed"
-            );
-        }
-    }
-
-    /// Revert a spec from Completing to Active in the database.
-    ///
-    /// Called when a `spec_completion` HITL item is rejected (Skip) or
-    /// needs additional modifications (Retry).
-    fn apply_spec_active_revert(&self, spec_id: &str) {
-        if let Some(db) = &self.db {
-            match db.update_spec_status(spec_id, belt_core::spec::SpecStatus::Active) {
-                Ok(()) => {
-                    tracing::info!(
-                        spec_id = %spec_id,
-                        "spec reverted from Completing to Active via HITL rejection/retry"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        spec_id = %spec_id,
-                        error = %e,
-                        "failed to revert spec to Active after HITL rejection/retry"
-                    );
-                }
-            }
-        } else {
-            tracing::warn!(
-                spec_id = %spec_id,
-                "no database configured — cannot revert spec to Active"
-            );
-        }
-    }
-
-    /// Handle approval of a spec conflict HITL item.
-    ///
-    /// When the user approves conflicting specs to proceed in parallel,
-    /// this method logs the decision. The item has already been transitioned
-    /// to Done, so the conflicting spec's queue item will proceed normally
-    /// on the next `advance()` cycle.
-    fn apply_spec_conflict_approved(&self, spec_id: &str) {
-        tracing::info!(
-            spec_id = %spec_id,
-            "spec conflict approved — conflicting specs will proceed in parallel"
-        );
-    }
-
-    /// Handle rejection of a spec conflict HITL item.
-    ///
-    /// When the user rejects the later spec due to conflict, this method
-    /// pauses the conflicting spec in the database so it no longer competes
-    /// for the overlapping entry points. The queue item has already been
-    /// transitioned to Skipped.
-    fn apply_spec_conflict_rejected(&self, spec_id: &str) {
-        if let Some(db) = &self.db {
-            match db.update_spec_status(spec_id, belt_core::spec::SpecStatus::Paused) {
-                Ok(()) => {
-                    tracing::info!(
-                        spec_id = %spec_id,
-                        "spec paused due to conflict rejection"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        spec_id = %spec_id,
-                        error = %e,
-                        "failed to pause spec after conflict rejection"
-                    );
-                }
-            }
-        } else {
-            tracing::warn!(
-                spec_id = %spec_id,
-                "no database configured — cannot pause spec after conflict rejection"
-            );
         }
     }
 
@@ -1402,17 +1929,22 @@ impl Daemon {
         let source_id = item.source_id.clone();
         let state = item.state.clone();
 
-        let from = transit(item, QueuePhase::Failed)?;
-        item.mark_worktree_preserved();
-        Self::record_transition(
+        let from = item.phase();
+        let outcome = Self::commit_transition(
             &self.db,
-            work_id,
-            &source_id,
-            from,
+            item,
             QueuePhase::Failed,
-            "on_fail",
+            TransitionReason::Advance,
             Some(error.clone()),
-        );
+        )?;
+        let finished = Self::lost_to_finished_row(&outcome);
+        if let Err(e) = Self::require_applied(outcome, from, QueuePhase::Failed) {
+            if finished {
+                self.queue.retain(|it| it.work_id != work_id);
+            }
+            return Err(e);
+        }
+        item.mark_worktree_preserved();
 
         // Register preserved worktree by source_id for potential reuse.
         let ws_name = &self.config.name;
@@ -1422,7 +1954,12 @@ impl Daemon {
         }
         tracing::info!(work_id, source_id = %source_id, "worktree preserved for failed item");
 
-        let attempt = self.count_failures(&source_id, &state) + 1;
+        let attempt = self
+            .history_events
+            .iter()
+            .filter(|h| h.source_id == source_id && h.state == state && h.status == "failed")
+            .count() as u32
+            + 1;
 
         self.history_events.push(HistoryEvent {
             work_id: work_id.to_string(),
@@ -1438,80 +1975,164 @@ impl Daemon {
         Ok(())
     }
 
-    /// Apply escalation logic based on accumulated failure count.
-    pub fn apply_escalation(&mut self, work_id: &str, source_id: &str, state: &str) {
-        let failure_count = self.count_failures(source_id, state);
-
-        match failure_count {
-            0 => {}
-            1 => {
-                tracing::info!(work_id, source_id, state, "first failure recorded");
-            }
-            2 => {
-                tracing::warn!(work_id, source_id, state, "second failure recorded");
-            }
-            _ => {
-                tracing::error!(
-                    work_id,
-                    source_id,
-                    state,
-                    failure_count,
-                    "escalating to HITL after repeated failures"
-                );
-                let _ = self.mark_hitl(
-                    work_id,
-                    HitlReason::RetryMaxExceeded,
-                    Some("escalation: repeated failures".to_string()),
-                );
-            }
-        }
-    }
-
     // ---------------------------------------------------------------
     // on_done / tick / run (async execution loop)
     // ---------------------------------------------------------------
 
-    /// Execute on_done scripts. Transition to Done on success, Failed on failure.
-    pub async fn execute_on_done(&mut self, item: &mut QueueItem) -> Result<bool> {
-        let state_config = self.find_state_config(&item.state).cloned();
-        let state_config = match state_config {
-            Some(cfg) => cfg,
-            None => {
-                let _ = transit(item, QueuePhase::Done);
-                return Ok(true);
-            }
-        };
+    /// Run the on_done scripts of the item's state.
+    ///
+    /// Returns `true` when they succeed or none are configured. on_done is a
+    /// precondition of Done: the caller moves the item to Done only on `true`.
+    async fn run_on_done_scripts(&mut self, item: &QueueItem) -> Result<bool> {
+        match self.run_on_done_steps(item).await? {
+            OnDoneRun::Passed => Ok(true),
+            OnDoneRun::ScriptFailed => Ok(false),
+            OnDoneRun::ScriptError(e) => Err(anyhow::anyhow!(e)),
+        }
+    }
 
+    /// Run the on_done scripts, telling store and worktree failures (`Err`,
+    /// the scripts never ran) apart from what the scripts did.
+    async fn run_on_done_steps(&mut self, item: &QueueItem) -> Result<OnDoneRun> {
+        let Some(state_config) = self.find_state_config(&item.state).cloned() else {
+            return Ok(OnDoneRun::Passed);
+        };
         if state_config.on_done.is_empty() {
-            let _ = transit(item, QueuePhase::Done);
-            self.record_history(item, "done", None);
-            let _ = self.worktree_mgr.cleanup(&item.work_id);
-            self.worktree_mgr.clear_preserved(&item.source_id);
-            return Ok(true);
+            return Ok(OnDoneRun::Passed);
         }
 
-        let worktree = self.worktree_mgr.create_or_reuse(&item.work_id)?;
+        let key = self.db.worktree_key(&item.work_id)?;
+        let worktree = self.worktree_mgr.create_or_reuse(&key)?;
         let env = ActionEnv::new(&item.work_id, &worktree);
         let on_done: Vec<Action> = state_config.on_done.iter().map(Action::from).collect();
-        let result = self.executor.execute_all(&on_done, &env).await?;
+        let result = match self.executor.execute_all(&on_done, &env).await {
+            Ok(result) => result,
+            Err(e) => return Ok(OnDoneRun::ScriptError(e.to_string())),
+        };
 
         // Record token usage from on_done handler execution.
         if let Some(ref r) = result {
             self.try_record_token_usage(item, r);
         }
 
-        match result {
-            Some(r) if !r.success() => {
-                let _ = transit(item, QueuePhase::Failed);
-                self.record_history(item, "failed", Some("on_done script failed"));
-                Ok(false)
+        Ok(if matches!(result, Some(ref r) if !r.success()) {
+            OnDoneRun::ScriptFailed
+        } else {
+            OnDoneRun::Passed
+        })
+    }
+
+    /// Attempt history and worktree cleanup after the on_done outcome is settled.
+    fn settle_on_done(&mut self, item: &QueueItem, succeeded: bool) {
+        if succeeded {
+            self.record_history(item, "done", None);
+            self.cleanup_owned_worktree(&item.work_id);
+            self.worktree_mgr.clear_preserved(&item.source_id);
+        } else {
+            self.record_history(item, "failed", Some("on_done script failed"));
+        }
+    }
+
+    /// Finish an evaluated Completed item: run on_done, then commit Done (or
+    /// Failed when on_done fails) through the store.
+    ///
+    /// When the store does not apply the transition (someone else moved the
+    /// item) the judgement is discarded and the item follows the stored phase.
+    async fn finish_completed(&mut self, item: &mut QueueItem) -> Result<OnDoneOutcome> {
+        let succeeded = self.run_on_done_scripts(item).await?;
+        let to = if succeeded {
+            QueuePhase::Done
+        } else {
+            QueuePhase::Failed
+        };
+        let outcome = Self::commit_transition(
+            &self.db,
+            item,
+            to,
+            TransitionReason::Advance,
+            (!succeeded).then(|| "on_done script failed".to_string()),
+        )?;
+        match outcome {
+            TransitionOutcome::Applied { .. } => {
+                self.settle_on_done(item, succeeded);
+                Ok(if succeeded {
+                    OnDoneOutcome::Done
+                } else {
+                    OnDoneOutcome::ScriptFailed
+                })
             }
-            _ => {
-                let _ = transit(item, QueuePhase::Done);
-                self.record_history(item, "done", None);
-                let _ = self.worktree_mgr.cleanup(&item.work_id);
-                self.worktree_mgr.clear_preserved(&item.source_id);
-                Ok(true)
+            TransitionOutcome::Conflict { .. } => Ok(OnDoneOutcome::Discarded),
+            refused
+            @ (TransitionOutcome::Busy { .. } | TransitionOutcome::InvalidAction { .. }) => {
+                anyhow::bail!("on_done transition refused: {refused:?}")
+            }
+        }
+    }
+
+    /// Move an evaluated item into HITL with reason `evaluate_failure`.
+    ///
+    /// The phase change and the HITL request are committed together. A
+    /// conflict discards the decision and the item follows the stored phase.
+    fn open_evaluate_hitl(&mut self, work_id: &str, notes: String, preserve_worktree: bool) {
+        let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id) else {
+            return;
+        };
+        let expiry = self.hitl_expiry();
+        let item = &mut self.queue[idx];
+        let from = item.phase();
+        let outcome = self.hitl.open(&OpenHitlRequest {
+            work_id: work_id.to_string(),
+            expected_from: from,
+            reason: HitlReason::EvaluateFailure,
+            notes: Some(notes.clone()),
+            actor: Actor::Daemon,
+            transition_reason: TransitionReason::Advance,
+            timeout_at: expiry.timeout_at,
+            terminal_action: expiry.terminal_action,
+        });
+        match outcome {
+            Ok(OpenHitlOutcome::Opened { .. }) => {
+                if let Err(e) = transit(item, QueuePhase::Hitl) {
+                    tracing::error!(work_id, "in-memory transit after applied hitl failed: {e}");
+                    return;
+                }
+                if preserve_worktree {
+                    // Q-10: Mark worktree as preserved for HITL items.
+                    item.mark_worktree_preserved();
+                    tracing::info!(
+                        work_id = %item.work_id,
+                        phase = "hitl",
+                        "worktree preserved for HITL item"
+                    );
+                }
+                let now = Utc::now().to_rfc3339();
+                self.history.push(HistoryEntry {
+                    source_id: item.source_id.clone(),
+                    work_id: item.work_id.clone(),
+                    state: item.state.clone(),
+                    status: belt_core::context::HistoryStatus::Hitl,
+                    attempt: self.evaluator.eval_failure_count(work_id),
+                    summary: None,
+                    error: Some(notes),
+                    created_at: now,
+                });
+            }
+            Ok(OpenHitlOutcome::Rejected(TransitionOutcome::Conflict { current })) => {
+                tracing::warn!(
+                    work_id,
+                    current = ?current,
+                    "evaluate hitl decision conflicted; following stored phase, decision discarded"
+                );
+                item.set_phase_unchecked(current);
+                if matches!(current, QueuePhase::Done | QueuePhase::Skipped) {
+                    self.queue.remove(idx);
+                }
+            }
+            Ok(OpenHitlOutcome::Rejected(refused)) => {
+                tracing::error!(work_id, "evaluate hitl transition refused: {refused:?}");
+            }
+            Err(e) => {
+                tracing::error!(work_id, "failed to record evaluate hitl: {e}");
             }
         }
     }
@@ -1547,7 +2168,22 @@ impl Daemon {
         let eval_result = {
             // Use the first completed item's worktree for the evaluate env.
             let eval_env = if let Some(work_id) = completed.first() {
-                self.worktree_mgr.create_or_reuse(work_id).ok().map(|wt| {
+                let worktree = match self
+                    .db
+                    .worktree_key(work_id)
+                    .and_then(|key| self.worktree_mgr.create_or_reuse(&key))
+                {
+                    Ok(worktree) => Some(worktree),
+                    Err(e) => {
+                        tracing::warn!(
+                            work_id = %work_id,
+                            error = %e,
+                            "evaluate worktree unavailable; falling back to the subprocess evaluator"
+                        );
+                        None
+                    }
+                };
+                worktree.map(|wt| {
                     ActionEnv::new(work_id, &wt)
                         .with_var("WORKSPACE", &self.config.name)
                         .with_var("BELT_HOME", &self.belt_home.to_string_lossy())
@@ -1601,11 +2237,9 @@ impl Daemon {
                 );
                 for work_id in &completed {
                     if let Some(item) = self.queue.iter().find(|i| i.work_id == *work_id) {
-                        Self::record_transition(
+                        Self::record_item_event(
                             &self.db,
-                            &item.work_id,
-                            &item.source_id,
-                            QueuePhase::Completed,
+                            item,
                             QueuePhase::Completed,
                             "evaluate",
                             Some(eval_detail.clone()),
@@ -1620,10 +2254,27 @@ impl Daemon {
                 for work_id in completed {
                     if let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id) {
                         let mut item = self.queue.remove(idx).unwrap();
-                        match self.execute_on_done(&mut item).await {
-                            Ok(true) => tracing::info!("done: {}", item.work_id),
-                            Ok(false) => tracing::warn!("on_done failed: {}", item.work_id),
-                            Err(e) => tracing::error!("on_done error for {}: {e}", item.work_id),
+                        match self.finish_completed(&mut item).await {
+                            Ok(OnDoneOutcome::Done) => tracing::info!("done: {}", item.work_id),
+                            Ok(OnDoneOutcome::ScriptFailed) => {
+                                tracing::warn!("on_done failed: {}", item.work_id)
+                            }
+                            Ok(OnDoneOutcome::Discarded) => {
+                                tracing::warn!(
+                                    "evaluation discarded for {}: stored phase is {}",
+                                    item.work_id,
+                                    item.phase()
+                                );
+                                if !matches!(item.phase(), QueuePhase::Done | QueuePhase::Skipped) {
+                                    self.queue.push_back(item);
+                                }
+                            }
+                            Err(e) => {
+                                // The stored phase is still Completed: keep the item
+                                // queued so the next tick evaluates it again.
+                                tracing::error!("on_done error for {}: {e}", item.work_id);
+                                self.queue.push_back(item);
+                            }
                         }
                     }
                 }
@@ -1656,11 +2307,9 @@ impl Daemon {
                 );
                 for work_id in &completed {
                     if let Some(item) = self.queue.iter().find(|i| i.work_id == *work_id) {
-                        Self::record_transition(
+                        Self::record_item_event(
                             &self.db,
-                            &item.work_id,
-                            &item.source_id,
-                            QueuePhase::Completed,
+                            item,
                             QueuePhase::Completed,
                             "evaluate",
                             Some(eval_detail.clone()),
@@ -1683,29 +2332,11 @@ impl Daemon {
                     })
                     .collect();
 
-                let now = chrono::Utc::now().to_rfc3339();
                 for (work_id, decision) in decisions {
                     match decision {
                         crate::evaluator::EvalDecision::Hitl { reason } => {
                             // N회 실패 -> HITL 에스컬레이션.
-                            if let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id)
-                                && let Some(item) = self.queue.get_mut(idx)
-                            {
-                                let _ = transit(item, QueuePhase::Hitl);
-                                item.hitl_created_at = Some(now.clone());
-                                item.hitl_reason = Some(HitlReason::EvaluateFailure);
-                                item.hitl_notes = Some(reason.clone());
-                                self.history.push(HistoryEntry {
-                                    source_id: item.source_id.clone(),
-                                    work_id: item.work_id.clone(),
-                                    state: item.state.clone(),
-                                    status: belt_core::context::HistoryStatus::Hitl,
-                                    attempt: self.evaluator.eval_failure_count(&work_id),
-                                    summary: None,
-                                    error: Some(reason),
-                                    created_at: now.clone(),
-                                });
-                            }
+                            self.open_evaluate_hitl(&work_id, reason, false);
                         }
                         crate::evaluator::EvalDecision::Retry => {
                             // Completed 유지, 다음 tick에서 재시도.
@@ -1730,11 +2361,9 @@ impl Daemon {
                 let eval_detail = format!("status=failure error={e}");
                 for work_id in &completed {
                     if let Some(item) = self.queue.iter().find(|i| i.work_id == *work_id) {
-                        Self::record_transition(
+                        Self::record_item_event(
                             &self.db,
-                            &item.work_id,
-                            &item.source_id,
-                            QueuePhase::Completed,
+                            item,
                             QueuePhase::Completed,
                             "evaluate",
                             Some(eval_detail.clone()),
@@ -1755,33 +2384,9 @@ impl Daemon {
                     })
                     .collect();
 
-                let now = chrono::Utc::now().to_rfc3339();
                 for (work_id, decision) in decisions {
-                    if let crate::evaluator::EvalDecision::Hitl { reason } = decision
-                        && let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id)
-                        && let Some(item) = self.queue.get_mut(idx)
-                    {
-                        let _ = transit(item, QueuePhase::Hitl);
-                        // Q-10: Mark worktree as preserved for HITL items.
-                        item.mark_worktree_preserved();
-                        tracing::info!(
-                            work_id = %item.work_id,
-                            phase = "hitl",
-                            "worktree preserved for HITL item"
-                        );
-                        item.hitl_created_at = Some(now.clone());
-                        item.hitl_reason = Some(HitlReason::EvaluateFailure);
-                        item.hitl_notes = Some(reason.clone());
-                        self.history.push(HistoryEntry {
-                            source_id: item.source_id.clone(),
-                            work_id: item.work_id.clone(),
-                            state: item.state.clone(),
-                            status: belt_core::context::HistoryStatus::Hitl,
-                            attempt: self.evaluator.eval_failure_count(&work_id),
-                            summary: None,
-                            error: Some(reason),
-                            created_at: now.clone(),
-                        });
+                    if let crate::evaluator::EvalDecision::Hitl { reason } = decision {
+                        self.open_evaluate_hitl(&work_id, reason, true);
                     }
                 }
             }
@@ -1791,58 +2396,62 @@ impl Daemon {
         self.tracker.release_evaluate();
     }
 
-    /// Daemon tick: collect -> advance -> execute -> evaluate.
+    /// Daemon tick: ended handlers -> cancel requests -> observe store -> collect -> HITL
+    /// post-processing -> HITL opened hooks -> apply ended handlers ->
+    /// advance -> start handlers -> evaluate -> cron.
+    ///
+    /// A tick never waits for a handler: handlers run in the background and
+    /// their results are applied by a later tick or by the run loop as they
+    /// end ([`Daemon::join_handlers`] waits for them explicitly).
     ///
     /// shutdown이 요청되면 collect/advance를 건너뛰고 실행 중인
     /// 아이템의 완료 처리만 수행한다.
     pub async fn tick(&mut self) -> Result<()> {
+        // A handler that already returned has a result that stands: apply it
+        // before the cancel step, which then closes a late request
+        // `too_late` instead of accepting it.
+        let ended = self.reap_finished().await;
+        Self::log_outcomes(&ended);
+
+        // A failed cancel step must not stop the rest of the tick.
+        if let Err(e) = self.process_cancel_requests() {
+            tracing::error!("cancel requests not processed: {e}");
+        }
+
+        self.observe_store()?;
+
         if !self.shutdown_requested {
             let collected = self.collect().await?;
             if collected > 0 {
                 tracing::info!("collected {collected} items");
             }
+        }
 
+        let post_processed = self.run_post_processing().await?;
+        if post_processed > 0 {
+            tracing::info!("post-processed {post_processed} HITL requests");
+        }
+        self.observe_hitl_opened().await?;
+        self.run_notifications().await;
+
+        // Ended handlers free their concurrency slots before the claim.
+        let ended = self.reap_finished().await;
+        Self::log_outcomes(&ended);
+
+        if !self.shutdown_requested {
             let advanced = self.advance();
             if advanced > 0 {
                 tracing::debug!("advanced {advanced} items");
             }
         }
 
-        let outcomes = self.execute_running().await;
-        let mut has_completed = false;
-        for outcome in &outcomes {
-            match outcome {
-                ItemOutcome::Completed(item) => {
-                    tracing::info!("completed: {}", item.work_id);
-                    has_completed = true;
-                }
-                ItemOutcome::Failed {
-                    item,
-                    error,
-                    escalation,
-                } => {
-                    tracing::warn!(
-                        "failed: {} (escalation={:?}, error={})",
-                        item.work_id,
-                        escalation,
-                        error
-                    );
-                }
-                ItemOutcome::Skipped(item) => tracing::info!("skipped: {}", item.work_id),
-            }
-        }
-
-        // handler 성공 → Completed 전이 후 force_trigger("evaluate") (D-10).
-        // force_trigger는 cron의 last_run_at을 리셋하여 다음 tick에서 즉시 실행.
-        if has_completed && let Some(ref mut engine) = self.cron_engine {
-            engine.force_trigger("evaluate");
-            tracing::debug!("force_trigger(evaluate) after handler completion");
-        }
+        let canceled_before_spawn = self.spawn_running();
+        Self::log_outcomes(&canceled_before_spawn);
 
         // Evaluator로 Completed 아이템 평가 (Done vs HITL).
         self.evaluate_completed().await;
 
-        // Cron jobs: HITL timeout, daily report, log cleanup, evaluate 등.
+        // Cron jobs: HITL timeout, daily report, log cleanup 등.
         if let Some(ref mut engine) = self.cron_engine {
             engine.tick();
         }
@@ -1857,7 +2466,14 @@ impl Daemon {
     /// 2. Running 아이템 완료를 최대 30초 대기 (`drain_with_timeout`).
     /// 3. timeout 초과 시 Running -> Pending 롤백 (worktree 보존).
     /// 4. drain 중 두 번째 SIGINT 시 즉시 종료 (Running -> Failed 강제 전이).
-    pub async fn run(&mut self, tick_interval_secs: u64) {
+    ///
+    /// # Errors
+    /// Returns an error, before the loop starts, when the store cannot be
+    /// read to restore the queue.
+    pub async fn run(&mut self, tick_interval_secs: u64) -> Result<()> {
+        let restored = self.restore_from_store()?;
+        tracing::info!("restored {restored} items from the store");
+
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(tick_interval_secs));
         tracing::info!("belt daemon started (tick={}s)", tick_interval_secs);
 
@@ -1868,6 +2484,7 @@ impl Daemon {
             .await;
 
         tracing::info!("belt daemon stopped");
+        Ok(())
     }
 
     /// Handle a cron-trigger notification by performing a full sync of custom
@@ -1875,8 +2492,8 @@ impl Daemon {
     /// triggered jobs) and running an immediate tick.
     async fn handle_cron_trigger_signal(&mut self, source: &str) {
         tracing::info!(source, "syncing custom cron jobs from DB...");
-        if let (Some(engine), Some(db)) = (&mut self.cron_engine, &self.db) {
-            engine.sync_custom_jobs_from_db(db);
+        if let Some(engine) = &mut self.cron_engine {
+            engine.sync_custom_jobs_from_db(&self.db);
         }
         // Run an immediate tick so the triggered job executes now.
         if let Err(e) = self.tick().await {
@@ -1884,7 +2501,77 @@ impl Daemon {
         }
     }
 
+    /// Start the IPC listener on a task of its own and return the wake
+    /// signals it forwards.
+    ///
+    /// The task acts on a cancel wake itself before forwarding it: it
+    /// accepts the requests of executions in flight and stops their
+    /// handlers ([`accept_in_flight_cancels`]), so a cancel never waits for
+    /// a busy tick. Without a listener the receiver never yields.
+    async fn start_ipc_wakes(
+        &self,
+    ) -> (
+        Option<AbortOnDrop>,
+        tokio::sync::mpsc::UnboundedReceiver<belt_infra::ipc::DaemonSignal>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let listener = match belt_infra::ipc::IpcListener::bind(&self.belt_home).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                // The daemon still runs, but wakes reach it only at the next
+                // tick: a cancel caller gets no answer within its wait limit.
+                tracing::warn!(
+                    belt_home = %self.belt_home.display(),
+                    "IPC listener not started; wake signals are unavailable: {e}"
+                );
+                return (None, rx);
+            }
+        };
+        let db = Arc::clone(&self.db);
+        let in_flight = Arc::clone(&self.in_flight);
+        let task = tokio::spawn(async move {
+            loop {
+                let Some(signal) = listener.recv().await else {
+                    continue;
+                };
+                match signal {
+                    belt_infra::ipc::DaemonSignal::CancelRequested => {
+                        if let Err(e) = accept_in_flight_cancels(&db, &in_flight) {
+                            tracing::error!("cancel requests not read on a wake: {e}");
+                        }
+                    }
+                    belt_infra::ipc::DaemonSignal::CronSync => {}
+                }
+                if tx.send(signal).is_err() {
+                    break;
+                }
+            }
+        });
+        (Some(AbortOnDrop(task)), rx)
+    }
+
+    /// Act on an IPC wake signal forwarded by the listener task. A cancel
+    /// wake (whose in-flight handlers that task already stopped) runs a tick
+    /// at once, whose first step handles the remaining open cancel requests;
+    /// it is kept apart from a cron sync so it never waits for one.
+    async fn handle_ipc_signal(&mut self, signal: belt_infra::ipc::DaemonSignal) {
+        match signal {
+            belt_infra::ipc::DaemonSignal::CronSync => {
+                self.handle_cron_trigger_signal("IPC").await;
+            }
+            belt_infra::ipc::DaemonSignal::CancelRequested => {
+                tracing::info!("cancel requested, ticking now");
+                if let Err(e) = self.tick().await {
+                    tracing::error!("tick error after a cancel wake: {e}");
+                }
+            }
+        }
+    }
+
     /// Select loop with SIGUSR1 + IPC support (unix).
+    ///
+    /// Ended handlers are applied as they end, next to the tick and the
+    /// wake signals, so nothing here waits for a running handler.
     #[cfg(unix)]
     async fn run_select_loop(&mut self, tick: &mut tokio::time::Interval) {
         let mut sigusr1 =
@@ -1893,12 +2580,14 @@ impl Daemon {
 
         // Also start the IPC listener so that the TCP-based notification
         // path works on Unix too (useful for testing and uniformity).
-        let ipc = belt_infra::ipc::IpcListener::bind(&self.belt_home)
-            .await
-            .ok();
+        let (_ipc_task, mut wakes) = self.start_ipc_wakes().await;
 
         loop {
             tokio::select! {
+                Some(joined) = self.handlers.join_next() => {
+                    let outcome = self.apply_joined(joined).await;
+                    Self::log_outcomes(&outcome.into_iter().collect::<Vec<_>>());
+                }
                 _ = tick.tick() => {
                     if let Err(e) = self.tick().await {
                         tracing::error!("tick error: {e}");
@@ -1907,17 +2596,8 @@ impl Daemon {
                 _ = sigusr1.recv() => {
                     self.handle_cron_trigger_signal("SIGUSR1").await;
                 }
-                Some(signal) = async {
-                    match &ipc {
-                        Some(l) => l.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match signal {
-                        belt_infra::ipc::DaemonSignal::CronSync => {
-                            self.handle_cron_trigger_signal("IPC").await;
-                        }
-                    }
+                Some(signal) = wakes.recv() => {
+                    self.handle_ipc_signal(signal).await;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("received SIGINT, initiating graceful shutdown...");
@@ -1931,28 +2611,21 @@ impl Daemon {
     /// Select loop with IPC support (non-unix).
     #[cfg(not(unix))]
     async fn run_select_loop(&mut self, tick: &mut tokio::time::Interval) {
-        let ipc = belt_infra::ipc::IpcListener::bind(&self.belt_home)
-            .await
-            .ok();
+        let (_ipc_task, mut wakes) = self.start_ipc_wakes().await;
 
         loop {
             tokio::select! {
+                Some(joined) = self.handlers.join_next() => {
+                    let outcome = self.apply_joined(joined).await;
+                    Self::log_outcomes(&outcome.into_iter().collect::<Vec<_>>());
+                }
                 _ = tick.tick() => {
                     if let Err(e) = self.tick().await {
                         tracing::error!("tick error: {e}");
                     }
                 }
-                Some(signal) = async {
-                    match &ipc {
-                        Some(l) => l.recv().await,
-                        None => std::future::pending().await,
-                    }
-                } => {
-                    match signal {
-                        belt_infra::ipc::DaemonSignal::CronSync => {
-                            self.handle_cron_trigger_signal("IPC").await;
-                        }
-                    }
+                Some(signal) = wakes.recv() => {
+                    self.handle_ipc_signal(signal).await;
                 }
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("received SIGINT, initiating graceful shutdown...");
@@ -1963,56 +2636,115 @@ impl Daemon {
         }
     }
 
-    /// Running 아이템 완료 대기.
+    /// Graceful shutdown: wait up to `timeout` for the Running items.
     ///
-    /// - timeout 초과 시 Running -> Failed (강제 전이) + 에러 로깅.
-    /// - 두 번째 SIGINT 시 Running -> Pending 롤백 (worktree 보존).
-    async fn drain_with_timeout(&mut self, timeout: std::time::Duration) {
-        let running_count = self.items_in_phase(QueuePhase::Running).len();
-        if running_count == 0 {
+    /// Claimed items whose handler has not started yet are started first.
+    /// Every handler runs in its own process group, so the daemon's SIGINT
+    /// does not reach it; the daemon stops it itself:
+    ///
+    /// - all handlers end in time: their results are applied as usual.
+    /// - timeout: the handler groups are killed, then Running → Pending
+    ///   (worktree preserved). An execution already canceled by request
+    ///   ends Skipped (`canceled`) instead.
+    /// - a second SIGINT: the handler groups are killed, then Running →
+    ///   Failed.
+    pub async fn drain_with_timeout(&mut self, timeout: std::time::Duration) {
+        self.drain_until_interrupted(timeout, async {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::error!("SIGINT not observable during the drain: {e}");
+                std::future::pending::<()>().await;
+            }
+        })
+        .await;
+    }
+
+    /// [`Daemon::drain_with_timeout`] with the second interrupt given as
+    /// `interrupt` instead of a SIGINT: when it completes first, the handler
+    /// groups are killed and Running → Failed (an execution canceled by
+    /// request ends Skipped `canceled`).
+    pub async fn drain_until_interrupted(
+        &mut self,
+        timeout: std::time::Duration,
+        interrupt: impl std::future::Future<Output = ()>,
+    ) {
+        tokio::pin!(interrupt);
+        let canceled = self.spawn_running();
+        Self::log_outcomes(&canceled);
+        if self.in_flight.is_empty() {
+            if self.running_count() > 0 {
+                self.rollback_running_to_pending();
+            }
             return;
         }
 
         tracing::info!(
-            "draining {} running items (timeout={}s)...",
-            running_count,
+            "draining {} running handlers (timeout={}s)...",
+            self.in_flight.len(),
             timeout.as_secs()
         );
-
         let deadline = tokio::time::Instant::now() + timeout;
-        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
 
         loop {
             tokio::select! {
-                _ = tick.tick() => {
-                    let outcomes = self.execute_running().await;
-                    for outcome in &outcomes {
-                        if let ItemOutcome::Completed(item) = outcome {
-                            tracing::info!("drain: completed {}", item.work_id);
-                        }
-                    }
-
-                    let remaining = self.items_in_phase(QueuePhase::Running).len();
-                    if remaining == 0 {
-                        tracing::info!("all running items drained successfully");
-                        return;
+                joined = self.handlers.join_next() => {
+                    let Some(joined) = joined else {
+                        break;
+                    };
+                    let outcome = self.apply_joined(joined).await;
+                    Self::log_outcomes(&outcome.into_iter().collect::<Vec<_>>());
+                    if self.handlers.is_empty() {
+                        tracing::info!("all running handlers drained");
+                        break;
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
-                    let remaining = self.items_in_phase(QueuePhase::Running).len();
                     tracing::warn!(
-                        "drain timeout ({}s) exceeded, rolling back {} running items to pending",
+                        "drain timeout ({}s) exceeded, stopping {} handlers and rolling back to pending",
                         timeout.as_secs(),
-                        remaining
+                        self.in_flight.len()
                     );
+                    self.stop_all_handlers().await;
                     self.rollback_running_to_pending();
                     return;
                 }
-                _ = tokio::signal::ctrl_c() => {
+                () = &mut interrupt => {
                     tracing::warn!("received second SIGINT, force-failing running items");
+                    self.stop_all_handlers().await;
                     self.force_fail_running();
                     return;
                 }
+            }
+        }
+        if self.running_count() > 0 {
+            self.rollback_running_to_pending();
+        }
+    }
+
+    /// Kill every handler group in flight and drop the executions.
+    ///
+    /// The results are discarded; an execution canceled by request still
+    /// ends Skipped (`canceled`), the others stay Running for the caller.
+    async fn stop_all_handlers(&mut self) {
+        self.in_flight.stop_all(StopReason::Shutdown);
+        self.handlers.abort_all();
+        while self.handlers.join_next().await.is_some() {}
+        self.handler_tasks.clear();
+
+        let canceled: Vec<(String, i64)> = self
+            .in_flight
+            .drain()
+            .into_iter()
+            .filter_map(|(work_id, control)| {
+                control
+                    .canceled_request()
+                    .map(|request_id| (work_id, request_id))
+            })
+            .collect();
+        for (work_id, request_id) in canceled {
+            if let Some(idx) = self.queue.iter().position(|i| i.work_id == work_id) {
+                let item = self.queue.remove(idx).expect("index from position");
+                let outcome = self.finish_canceled(item, request_id);
+                Self::log_outcomes(&[outcome]);
             }
         }
     }
@@ -2052,6 +2784,7 @@ impl Daemon {
     /// 재사용할 수 있게 한다.
     pub fn rollback_running_to_pending(&mut self) {
         let ws_name = self.config.name.clone();
+        let mut finished_by_others = Vec::new();
         for item in self.queue.iter_mut() {
             if item.phase() == QueuePhase::Running {
                 // Register preserved worktree before rollback so it can be reused.
@@ -2073,48 +2806,50 @@ impl Daemon {
                 // Persist the worktree path so it survives daemon restart.
                 item.previous_worktree_path = wt_path_str;
 
-                let from_phase = item.phase();
-                if let Err(e) = transit(item, QueuePhase::Pending) {
-                    tracing::error!("failed to rollback {}: {e}", item.work_id);
-                    continue;
+                match Self::commit_transition(
+                    &self.db,
+                    item,
+                    QueuePhase::Pending,
+                    TransitionReason::Rollback,
+                    Some("graceful shutdown timeout: rolled back to Pending".to_string()),
+                ) {
+                    Ok(TransitionOutcome::Applied { .. }) => {}
+                    Ok(TransitionOutcome::Conflict { current }) => {
+                        tracing::warn!(
+                            work_id = %item.work_id,
+                            current = ?current,
+                            "rollback conflicted; following stored phase"
+                        );
+                        if matches!(current, QueuePhase::Done | QueuePhase::Skipped) {
+                            finished_by_others.push(item.work_id.clone());
+                        }
+                        self.tracker.release(&ws_name);
+                        continue;
+                    }
+                    Ok(
+                        refused @ (TransitionOutcome::Busy { .. }
+                        | TransitionOutcome::InvalidAction { .. }),
+                    ) => {
+                        tracing::error!("failed to rollback {}: refused {refused:?}", item.work_id);
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to rollback {}: {e}", item.work_id);
+                        continue;
+                    }
                 }
 
-                // Record the shutdown rollback in transition_events for auditability.
-                Self::record_transition(
-                    &self.db,
-                    &item.work_id,
-                    &item.source_id,
-                    from_phase,
-                    QueuePhase::Pending,
-                    "shutdown_rollback",
-                    Some("graceful shutdown timeout: rolled back to Pending".to_string()),
-                );
-
                 // Persist worktree state to DB so it survives restart.
-                // Items collected from DataSource live in-memory only and may
-                // not yet exist in the DB. Ensure the row exists before updating.
-                if let Some(db) = &self.db {
-                    if db.get_item(&item.work_id).is_err()
-                        && let Err(e) = db.insert_item(item)
-                    {
-                        tracing::warn!(
-                            work_id = %item.work_id,
-                            error = %e,
-                            "failed to insert item into DB during rollback"
-                        );
-                    }
-                    if let Err(e) = db.update_item_worktree_state(
-                        &item.work_id,
-                        QueuePhase::Pending,
-                        item.worktree_preserved,
-                        item.previous_worktree_path.as_deref(),
-                    ) {
-                        tracing::warn!(
-                            work_id = %item.work_id,
-                            error = %e,
-                            "failed to persist worktree state to DB during rollback"
-                        );
-                    }
+                if let Err(e) = self.db.update_item_worktree_state(
+                    &item.work_id,
+                    item.worktree_preserved,
+                    item.previous_worktree_path.as_deref(),
+                ) {
+                    tracing::warn!(
+                        work_id = %item.work_id,
+                        error = %e,
+                        "failed to persist worktree state to DB during rollback"
+                    );
                 }
 
                 self.tracker.release(&ws_name);
@@ -2125,6 +2860,8 @@ impl Daemon {
                 );
             }
         }
+        self.queue
+            .retain(|item| !finished_by_others.contains(&item.work_id));
     }
 
     /// Shutdown이 요청되었는지 확인.
@@ -2150,106 +2887,270 @@ impl Daemon {
         None
     }
 
-    /// Count failures for a given source_id **and** state.
-    pub fn count_failures(&self, source_id: &str, state: &str) -> u32 {
-        let from_entries = self
-            .history
-            .iter()
-            .filter(|h| h.state == state && h.status == belt_core::context::HistoryStatus::Failed)
-            .count() as u32;
-
-        let from_events = self
-            .history_events
-            .iter()
-            .filter(|h| h.source_id == source_id && h.state == state && h.status == "failed")
-            .count() as u32;
-
-        from_entries + from_events
-    }
-
-    fn resolve_escalation(&self, _state: &str, failure_count: u32) -> EscalationAction {
-        let policy = self
-            .config
-            .sources
-            .values()
-            .next()
-            .map(|s| &s.escalation)
-            .cloned()
-            .unwrap_or_default();
-        policy.resolve(failure_count)
-    }
-
-    /// Handle an escalation action for a queue item.
+    /// The escalation action for the `failure_count`-th failure of a lineage.
     ///
-    /// Delegates to [`crate::hitl_service::HitlService`] which encapsulates
-    /// all HITL escalation routing logic.
-    fn handle_escalation(
-        &mut self,
-        item: &mut QueueItem,
-        action: EscalationAction,
-        lateral_plan: Option<String>,
-    ) {
-        let hook_ctx = self.build_hook_context(item, None);
-        let resolved_hook = self.resolve_hook(&self.config.name);
-        let mut svc = crate::hitl_service::HitlService::new(
-            &mut self.queue,
-            &self.db,
-            &resolved_hook,
-            &self.worktree_mgr,
-        );
-        svc.handle_escalation(item, action, lateral_plan, hook_ctx);
+    /// Past the highest configured level the highest level is reused
+    /// ([`belt_core::escalation::EscalationPolicy::resolve`]).
+    ///
+    /// A workspace without sources has no policy to consult; the item goes to
+    /// a human instead of being retried without bound.
+    fn resolve_escalation(&self, failure_count: u32) -> EscalationAction {
+        match self.escalation_policy() {
+            Some(policy) => policy.resolve(failure_count),
+            None => {
+                tracing::warn!("no source defines an escalation policy; escalating to HITL");
+                EscalationAction::Hitl
+            }
+        }
+    }
+
+    fn escalation_policy(&self) -> Option<&EscalationPolicy> {
+        self.config.sources.values().next().map(|s| &s.escalation)
+    }
+
+    /// Expiry terms of a HITL request opened now: the default HITL timeout
+    /// and the workspace's `terminal` action.
+    fn hitl_expiry(&self) -> HitlExpiry {
+        HitlExpiry::after_hours(
+            HITL_TIMEOUT_HOURS,
+            self.escalation_policy()
+                .and_then(EscalationPolicy::terminal_action)
+                .copied(),
+            Utc::now(),
+        )
+    }
+
+    /// Call `on_hitl_opened` once for every open HITL request not yet
+    /// observed, whichever path opened it. Returns how many were observed.
+    ///
+    /// The request is claimed in the store before the hook runs, so a hook
+    /// failure is logged and never retried, and a request confirmed before
+    /// observation is skipped. The item's phase is never touched.
+    ///
+    /// # Errors
+    /// An error when the store cannot be read; requests claimed before the
+    /// failure stay claimed.
+    pub async fn observe_hitl_opened(&mut self) -> Result<usize> {
+        let claimed = self.hitl.claim_opened()?;
+        for request in &claimed {
+            if let Some(notifier) = &self.notifier
+                && let Err(e) = notifier.register_deliveries(&request.hitl_id)
+            {
+                tracing::error!(
+                    hitl_id = %request.hitl_id,
+                    "HITL request delivery not registered: {e}"
+                );
+            }
+            let item = match self.db.get_item(&request.work_id) {
+                Ok(item) => item,
+                Err(e) => {
+                    tracing::warn!(
+                        work_id = %request.work_id,
+                        hitl_id = %request.hitl_id,
+                        "on_hitl_opened skipped, item unreadable: {e}"
+                    );
+                    continue;
+                }
+            };
+            let failure_count = self.db.failure_count(&item.work_id).unwrap_or_else(|e| {
+                tracing::warn!(work_id = %item.work_id, "failure count unreadable for hook context: {e}");
+                0
+            });
+            let ctx = self.build_hook_context(&item, None, failure_count);
+            let hook = self.resolve_hook(&item.workspace_id);
+            if let Err(e) = hook.on_hitl_opened(&ctx).await {
+                tracing::warn!(
+                    work_id = %item.work_id,
+                    hitl_id = %request.hitl_id,
+                    "lifecycle hook on_hitl_opened error (ignored, not retried): {e}"
+                );
+            }
+        }
+        Ok(claimed.len())
+    }
+
+    /// Deliver due HITL requests, poll the channels for responses and
+    /// announce progress (tick steps 4 to 6).
+    ///
+    /// Notification is best-effort: a store error is logged and never stops
+    /// the tick, and every result value is traced. Delivery and notification
+    /// failures are also recorded in the store by the notifier.
+    async fn run_notifications(&mut self) {
+        let Some(notifier) = self.notifier.as_mut() else {
+            return;
+        };
+
+        if let Err(e) = notifier.register_open_deliveries() {
+            tracing::error!("HITL request deliveries not registered: {e}");
+        }
+        match notifier.deliver_due().await {
+            Ok(reports) => {
+                for report in reports {
+                    match report.result {
+                        DeliveryResult::Sent => tracing::info!(
+                            hitl_id = %report.hitl_id,
+                            channel = %report.channel,
+                            "HITL request delivered"
+                        ),
+                        DeliveryResult::Retrying { attempts } => tracing::warn!(
+                            hitl_id = %report.hitl_id,
+                            channel = %report.channel,
+                            attempts,
+                            "HITL request delivery failed, retrying next tick"
+                        ),
+                        DeliveryResult::GaveUp { attempts } => tracing::error!(
+                            hitl_id = %report.hitl_id,
+                            channel = %report.channel,
+                            attempts,
+                            "HITL request delivery given up"
+                        ),
+                        DeliveryResult::NoAddress => tracing::info!(
+                            hitl_id = %report.hitl_id,
+                            channel = %report.channel,
+                            "channel has no address for the item; HITL request shown on the dashboard only"
+                        ),
+                    }
+                }
+            }
+            Err(e) => tracing::error!("HITL request delivery not run: {e}"),
+        }
+
+        match notifier.poll_responses().await {
+            Ok(reports) => {
+                for report in reports {
+                    match report.result {
+                        PollResult::Failed { error } => tracing::warn!(
+                            channel = %report.channel,
+                            %error,
+                            "channel polling failed, polling again next tick"
+                        ),
+                        PollResult::Polled(responses) => {
+                            for response in responses {
+                                tracing::info!(
+                                    channel = %report.channel,
+                                    external_id = %response.external_id,
+                                    respondent = %response.respondent,
+                                    outcome = ?response.outcome,
+                                    reply = ?response.reply,
+                                    "external response processed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::error!("channel polling not run: {e}"),
+        }
+
+        match notifier.notify_progress().await {
+            Ok(notices) => {
+                let failed = notices
+                    .iter()
+                    .filter(|n| matches!(n.result, ChannelSend::Failed { .. }))
+                    .count();
+                if !notices.is_empty() {
+                    tracing::debug!(sent = notices.len() - failed, failed, "progress announced");
+                }
+            }
+            Err(e) => tracing::error!("progress notification not run: {e}"),
+        }
+    }
+
+    /// Apply every confirmed HITL request of this workspace (tick step 3):
+    /// the only way an item leaves Hitl. See [`crate::post_processing`].
+    ///
+    /// Returns how many requests were finished (result transition
+    /// committed, including those given up to Failed); the in-memory queue
+    /// follows each of them.
+    ///
+    /// # Errors
+    /// An error when the pending requests cannot be listed. A failure of one
+    /// request is counted on that request and retried on the next call.
+    pub async fn run_post_processing(&mut self) -> Result<usize> {
+        let db = Arc::clone(&self.db);
+        let applied = crate::post_processing::run(&db, self).await?;
+        for result in &applied {
+            match result {
+                crate::post_processing::Applied::Left {
+                    work_id,
+                    lateral_plan,
+                    ..
+                } => {
+                    self.follow_stored(work_id);
+                    if let Some(plan) = lateral_plan
+                        && let Some(copy) = self.queue.iter_mut().find(|i| i.work_id == *work_id)
+                    {
+                        copy.lateral_plan = Some(plan.clone());
+                    }
+                }
+                crate::post_processing::Applied::Derived {
+                    work_id,
+                    derived,
+                    lateral_plan,
+                } => {
+                    self.follow_stored(work_id);
+                    self.enqueue_derived(derived, lateral_plan.clone());
+                }
+            }
+        }
+        Ok(applied.len())
+    }
+
+    /// Let the stored row of `work_id` win over the in-memory copy now.
+    ///
+    /// An unreadable row is left to the next store observation.
+    fn follow_stored(&mut self, work_id: &str) {
+        match self.db.get_item(work_id) {
+            Ok(row) => self.follow_row(row),
+            Err(e) => tracing::warn!(
+                work_id,
+                error = %e,
+                "stored row unreadable; the next observation follows it"
+            ),
+        }
     }
 
     /// Detect stagnation from failure history and generate a lateral plan directive.
     ///
-    /// Collects error messages from `history_events` for the given source/state,
+    /// Collects the stored failure messages of the item's `(source_id, state)`,
     /// runs them through a `StagnationDetector` (spinning + oscillation detection via
     /// `CompositeSimilarity`), and if a pattern is detected, selects a persona via
     /// `LateralAnalyzer` and builds a directive-based lateral plan string.
+    /// `failure_count` is this failure's position in the lineage.
+    ///
+    /// # Errors
+    /// `BeltError` when the stored history cannot be read. There is no
+    /// in-memory substitute: the store is the only failure history.
     fn detect_stagnation_and_generate_plan(
         &self,
-        work_id: &str,
-        source_id: &str,
-        state: &str,
+        item: &QueueItem,
         current_error: &str,
-    ) -> Option<String> {
+        failure_count: u32,
+    ) -> Result<Option<String>, BeltError> {
+        let (work_id, source_id, state) = (&item.work_id, &item.source_id, &item.state);
+
         // Respect stagnation.enabled configuration flag.
         if !self.config.stagnation.enabled {
-            return None;
+            return Ok(None);
         }
 
         // Respect lateral.enabled configuration flag.
         if !self.config.stagnation.lateral.enabled {
-            return None;
+            return Ok(None);
         }
 
         // Collect recent failure error messages for this source_id + state.
-        // Prefer DB query (R-018); fall back to in-memory history_events when DB
-        // is unavailable or the query fails.
         let errors: Vec<String> = self
             .db
-            .as_ref()
-            .and_then(|db| db.get_history(source_id).ok())
-            .map(|db_events| {
-                db_events
-                    .into_iter()
-                    .filter(|h| h.state == state && h.status == "failed")
-                    .filter_map(|h| h.error)
-                    .collect()
-            })
-            .unwrap_or_else(|| {
-                self.history_events
-                    .iter()
-                    .filter(|h| {
-                        h.source_id == source_id && h.state == state && h.status == "failed"
-                    })
-                    .filter_map(|h| h.error.clone())
-                    .collect()
-            });
+            .get_history(source_id)?
+            .into_iter()
+            .filter(|h| h.state == *state && h.status == "failed")
+            .filter_map(|h| h.error)
+            .collect();
 
         // Need at least one prior failure to detect stagnation.
         if errors.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         // Build outputs list: prior errors + current error.
@@ -2287,13 +3188,15 @@ impl Daemon {
             )),
         ]);
 
-        let detection = detector.detect(&outputs)?;
+        let Some(detection) = detector.detect(&outputs) else {
+            return Ok(None);
+        };
 
         // Collect previously attempted personas from lateral_plan history in queue.
         let attempted: Vec<Persona> = self
             .queue
             .iter()
-            .filter(|q| q.source_id == source_id && q.state == state)
+            .filter(|q| q.source_id == *source_id && q.state == *state)
             .filter_map(|q| q.lateral_plan.as_deref())
             .filter_map(|plan| {
                 // Extract persona name from the plan text.
@@ -2312,9 +3215,9 @@ impl Daemon {
             .collect();
 
         let analyzer = LateralAnalyzer::new();
-        let persona = analyzer.select_persona(detection.pattern, &attempted)?;
-
-        let failure_count = self.count_failures(source_id, state) + 1;
+        let Some(persona) = analyzer.select_persona(detection.pattern, &attempted) else {
+            return Ok(None);
+        };
 
         let plan = format!(
             "\n\n## Lateral Plan\n\
@@ -2347,7 +3250,7 @@ impl Daemon {
             "stagnation detected, generated lateral plan"
         );
 
-        Some(plan)
+        Ok(Some(plan))
     }
 
     /// Token usage가 있으면 DB에 기록한다. DB가 없거나 기록 실패 시 경고만 출력.
@@ -2356,25 +3259,23 @@ impl Daemon {
             return;
         };
 
-        if let Some(ref db) = self.db {
-            let model = result.model.as_deref().unwrap_or("unknown");
-            if let Err(e) = db.record_token_usage(
-                &item.work_id,
-                &self.config.name,
-                runtime_name,
-                model,
-                usage,
-                Some(result.duration.as_millis() as u64),
-            ) {
-                tracing::warn!("failed to record token usage for {}: {e}", item.work_id);
-            } else {
-                tracing::debug!(
-                    "recorded token usage for {}: input={}, output={}",
-                    item.work_id,
-                    usage.input_tokens,
-                    usage.output_tokens
-                );
-            }
+        let model = result.model.as_deref().unwrap_or("unknown");
+        if let Err(e) = self.db.record_token_usage(
+            &item.work_id,
+            &self.config.name,
+            runtime_name,
+            model,
+            usage,
+            Some(result.duration.as_millis() as u64),
+        ) {
+            tracing::warn!("failed to record token usage for {}: {e}", item.work_id);
+        } else {
+            tracing::debug!(
+                "recorded token usage for {}: input={}, output={}",
+                item.work_id,
+                usage.input_tokens,
+                usage.output_tokens
+            );
         }
     }
 
@@ -2388,28 +3289,26 @@ impl Daemon {
         item: &QueueItem,
         ipc_usage: &crate::evaluator::IpcTokenUsage,
     ) {
-        if let Some(ref db) = self.db {
-            let model = ipc_usage.model.as_deref().unwrap_or("unknown");
-            if let Err(e) = db.record_token_usage(
-                &item.work_id,
-                &self.config.name,
-                &ipc_usage.runtime_name,
-                model,
-                &ipc_usage.token_usage,
-                ipc_usage.duration_ms,
-            ) {
-                tracing::warn!(
-                    "failed to record evaluate IPC token usage for {}: {e}",
-                    item.work_id
-                );
-            } else {
-                tracing::debug!(
-                    "recorded evaluate IPC token usage for {}: input={}, output={}",
-                    item.work_id,
-                    ipc_usage.token_usage.input_tokens,
-                    ipc_usage.token_usage.output_tokens
-                );
-            }
+        let model = ipc_usage.model.as_deref().unwrap_or("unknown");
+        if let Err(e) = self.db.record_token_usage(
+            &item.work_id,
+            &self.config.name,
+            &ipc_usage.runtime_name,
+            model,
+            &ipc_usage.token_usage,
+            ipc_usage.duration_ms,
+        ) {
+            tracing::warn!(
+                "failed to record evaluate IPC token usage for {}: {e}",
+                item.work_id
+            );
+        } else {
+            tracing::debug!(
+                "recorded evaluate IPC token usage for {}: input={}, output={}",
+                item.work_id,
+                ipc_usage.token_usage.input_tokens,
+                ipc_usage.token_usage.output_tokens
+            );
         }
     }
 
@@ -2432,11 +3331,15 @@ impl Daemon {
     /// Constructs a minimal `ItemContext` from the item's own fields and
     /// the workspace config.  This avoids calling `DataSource::get_context()`
     /// at every transition point (which would require async I/O).
-    fn build_hook_context(&self, item: &QueueItem, worktree: Option<&PathBuf>) -> HookContext {
-        let failure_count = self.count_failures(&item.source_id, &item.state);
-        let worktree_path = worktree
-            .cloned()
-            .unwrap_or_else(|| self.worktree_mgr.path(&item.work_id));
+    fn build_hook_context(
+        &self,
+        item: &QueueItem,
+        worktree: Option<&PathBuf>,
+        failure_count: u32,
+    ) -> HookContext {
+        let worktree_path = worktree.cloned().unwrap_or_else(|| {
+            Self::owner_worktree_path(&self.db, &*self.worktree_mgr, &item.work_id)
+        });
         HookContext {
             work_id: item.work_id.clone(),
             worktree: worktree_path,
@@ -2448,6 +3351,7 @@ impl Daemon {
                     phase: format!("{}", item.phase()),
                     state: item.state.clone(),
                     source_id: item.source_id.clone(),
+                    derived_from: item.derived_from.clone(),
                 },
                 source: SourceContext {
                     source_type: String::new(),
@@ -2479,6 +3383,7 @@ impl Daemon {
                     phase: format!("{}", item.phase()),
                     state: item.state.clone(),
                     source_id: item.source_id.clone(),
+                    derived_from: item.derived_from.clone(),
                 },
                 source: SourceContext {
                     source_type: String::new(),
@@ -2520,7 +3425,9 @@ impl Daemon {
         let attempt = self
             .history_events
             .iter()
-            .filter(|h| h.source_id == item.source_id && h.state == item.state)
+            .filter(|h| {
+                h.source_id == item.source_id && h.state == item.state && h.status == "failed"
+            })
             .count() as u32
             + 1;
         let event = HistoryEvent {
@@ -2535,20 +3442,18 @@ impl Daemon {
         };
 
         // Persist to DB when available (R-018: DB is the source of truth).
-        if let Some(ref db) = self.db {
-            let db_event = belt_infra::db::HistoryEvent {
-                work_id: event.work_id.clone(),
-                source_id: event.source_id.clone(),
-                state: event.state.clone(),
-                status: event.status.clone(),
-                attempt: event.attempt as i32,
-                summary: event.summary.clone(),
-                error: event.error.clone(),
-                created_at: event.created_at.to_rfc3339(),
-            };
-            if let Err(e) = db.append_history(&db_event) {
-                tracing::warn!(error = %e, "failed to persist history event to DB");
-            }
+        let db_event = belt_infra::db::HistoryEvent {
+            work_id: event.work_id.clone(),
+            source_id: event.source_id.clone(),
+            state: event.state.clone(),
+            status: event.status.clone(),
+            attempt: event.attempt as i32,
+            summary: event.summary.clone(),
+            error: event.error.clone(),
+            created_at: event.created_at.to_rfc3339(),
+        };
+        if let Err(e) = self.db.append_history(&db_event) {
+            tracing::warn!(error = %e, "failed to persist history event to DB");
         }
 
         self.history_events.push(event);
@@ -2578,9 +3483,48 @@ impl Daemon {
         &self.history_events
     }
 
-    /// Push an item onto the queue.
+    /// Push a pre-built item onto the queue (test seam; production items enter
+    /// through [`Daemon::collect`] and [`Daemon::restore_from_store`]).
+    ///
+    /// A new Pending item is created through the collection contract, so the
+    /// store must issue the same `work_id` the item carries. An item at any
+    /// other phase has no collection path; its row is written as given.
+    ///
+    /// # Panics
+    /// When the store rejects the row or cannot be read.
+    #[doc(hidden)]
     pub fn push_item(&mut self, item: QueueItem) {
+        Self::ensure_row(&self.db, &item);
         self.queue.push_back(item);
+    }
+
+    /// Make sure the store has a row for `item`, so claim transitions find it.
+    fn ensure_row(db: &Database, item: &QueueItem) {
+        match db.get_item(&item.work_id) {
+            Ok(_) => {}
+            Err(BeltError::ItemNotFound(_)) if item.phase() == QueuePhase::Pending => {
+                let outcome = db.insert_collected(&NewItem {
+                    source_id: item.source_id.clone(),
+                    workspace_id: item.workspace_id.clone(),
+                    state: item.state.clone(),
+                    title: item.title.clone(),
+                    actor: Actor::Daemon,
+                });
+                match outcome {
+                    Ok(CollectOutcome::Inserted { work_id }) if work_id == item.work_id => {}
+                    other => panic!(
+                        "push_item({}) was not accepted as a new collected item: {other:?}",
+                        item.work_id
+                    ),
+                }
+            }
+            Err(BeltError::ItemNotFound(_)) => {
+                if let Err(e) = db.insert_item(item) {
+                    panic!("push_item({}) could not persist the row: {e}", item.work_id);
+                }
+            }
+            Err(e) => panic!("push_item({}) could not read the store: {e}", item.work_id),
+        }
     }
 
     /// Look up a queue item by work_id.
@@ -2601,9 +3545,47 @@ impl Daemon {
             .count()
     }
 
-    /// Return a reference to the database, if configured.
-    pub fn db(&self) -> Option<&Database> {
-        self.db.as_deref()
+    /// Return a reference to the database that owns the queue state.
+    pub fn db(&self) -> &Database {
+        &self.db
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::post_processing::PostProcessingEffects for Daemon {
+    fn owns(&self, item: &QueueItem) -> bool {
+        item.workspace_id == self.config.name
+    }
+
+    fn record_attempt(&mut self, item: &QueueItem, status: &str, error: Option<&str>) {
+        self.record_history(item, status, error);
+        self.record_history_event(item, status, error.map(str::to_string));
+    }
+
+    async fn run_on_done(&mut self, item: &QueueItem) -> Result<OnDoneRun> {
+        self.run_on_done_steps(item).await
+    }
+
+    async fn on_hitl_resolved(
+        &self,
+        item: &QueueItem,
+        action: belt_core::hitl::HitlAction,
+    ) -> Result<()> {
+        let failure_count = self.db.failure_count(&item.work_id).unwrap_or_else(|e| {
+            tracing::warn!(work_id = %item.work_id, "failure count unreadable for hook context: {e}");
+            0
+        });
+        let ctx = self.build_hook_context(item, None, failure_count);
+        self.resolve_hook(&item.workspace_id)
+            .on_hitl_resolved(&ctx, action)
+            .await
+    }
+
+    fn cleanup_worktree(&self, item: &QueueItem) -> Result<(), BeltError> {
+        let key = self.db.worktree_key(&item.work_id)?;
+        self.worktree_mgr.cleanup(&key)?;
+        self.worktree_mgr.clear_preserved(&item.source_id);
+        Ok(())
     }
 }
 
@@ -2645,6 +3627,7 @@ sources:
       1: retry
       2: retry_with_comment
       3: hitl
+      terminal: skip
 "#;
         serde_yaml::from_str(yaml).unwrap()
     }
@@ -2661,7 +3644,27 @@ sources:
             Arc::new(registry),
             Box::new(worktree_mgr),
             4,
+            Database::open_in_memory().unwrap(),
         )
+    }
+
+    #[test]
+    fn escalation_without_any_source_goes_to_hitl() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_workspace_config();
+        config.sources.clear();
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(MockRuntime::new("mock", vec![])));
+        let daemon = Daemon::new(
+            config,
+            vec![Box::new(MockDataSource::new("github"))],
+            Arc::new(registry),
+            Box::new(MockWorktreeManager::new(tmp.path().to_path_buf())),
+            4,
+            Database::open_in_memory().unwrap(),
+        );
+
+        assert_eq!(daemon.resolve_escalation(1), EscalationAction::Hitl);
     }
 
     // --- Safe state transition tests ---
@@ -2731,8 +3734,8 @@ sources:
         );
     }
 
-    #[test]
-    fn complete_to_hitl_and_retry() {
+    #[tokio::test]
+    async fn complete_to_hitl_and_retry() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
@@ -2758,7 +3761,29 @@ sources:
             QueuePhase::Hitl
         );
 
-        assert!(daemon.retry_from_hitl("s1:analyze").is_ok());
+        // Leaving Hitl goes through the HITL contract: respond, then post-process.
+        let outcome = daemon
+            .hitl()
+            .respond(&crate::hitl::HitlResponse {
+                target: belt_infra::db::HitlTarget::Item("s1:analyze".into()),
+                action: belt_core::hitl::HitlAction::Retry,
+                by: "reviewer".into(),
+                via: "cli".into(),
+                path: belt_core::hitl::ConfirmPath::Direct,
+                notes: None,
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            belt_core::hitl::RespondOutcome::Won { .. }
+        ));
+        assert_eq!(
+            daemon.get_item("s1:analyze").unwrap().phase(),
+            QueuePhase::Hitl,
+            "a response alone does not leave Hitl"
+        );
+
+        assert_eq!(daemon.run_post_processing().await.unwrap(), 1);
         assert_eq!(
             daemon.get_item("s1:analyze").unwrap().phase(),
             QueuePhase::Pending
@@ -2903,11 +3928,10 @@ sources:
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
-        let mut item = test_item("github:org/repo#1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Completed);
+        let mut item = completed_in_store(&daemon, test_item("github:org/repo#1", "analyze"));
 
-        let success = daemon.execute_on_done(&mut item).await.unwrap();
-        assert!(success);
+        let outcome = daemon.finish_completed(&mut item).await.unwrap();
+        assert!(matches!(outcome, OnDoneOutcome::Done));
         assert_eq!(item.phase(), QueuePhase::Done);
     }
 
@@ -3387,159 +4411,6 @@ sources:
     }
 
     // ---------------------------------------------------------------
-    // count_failures tests
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn count_failures_returns_zero_with_no_history() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let daemon = setup_daemon(&tmp, source, vec![]);
-
-        assert_eq!(daemon.count_failures("src1", "analyze"), 0);
-    }
-
-    #[test]
-    fn count_failures_includes_history_events() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("src1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Running);
-        daemon.push_item(item);
-
-        daemon
-            .mark_failed("src1:analyze", "first failure".into())
-            .unwrap();
-
-        assert_eq!(daemon.count_failures("src1", "analyze"), 1);
-    }
-
-    #[test]
-    fn count_failures_is_source_and_state_specific() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item1 = test_item("src1", "analyze");
-        item1.set_phase_unchecked(QueuePhase::Running);
-        daemon.push_item(item1);
-
-        daemon
-            .mark_failed("src1:analyze", "failure".into())
-            .unwrap();
-
-        // Different source_id → 0 failures
-        assert_eq!(daemon.count_failures("src2", "analyze"), 0);
-        // Different state → 0 failures
-        assert_eq!(daemon.count_failures("src1", "implement"), 0);
-        // Correct source_id + state → 1 failure
-        assert_eq!(daemon.count_failures("src1", "analyze"), 1);
-    }
-
-    #[test]
-    fn count_failures_accumulates_across_multiple_failures() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        // Record failures via mark_failed using distinct work_ids so each
-        // call finds a fresh Running item (work_id is unique per attempt).
-        for i in 0..3u32 {
-            let mut item = test_item("src1", "analyze");
-            item.work_id = format!("src1:analyze-attempt-{i}");
-            item.set_phase_unchecked(QueuePhase::Running);
-            daemon.push_item(item);
-            daemon
-                .mark_failed(
-                    &format!("src1:analyze-attempt-{i}"),
-                    "repeated failure".into(),
-                )
-                .unwrap();
-        }
-
-        // count_failures filters by source_id + state, not work_id.
-        assert_eq!(daemon.count_failures("src1", "analyze"), 3);
-    }
-
-    // ---------------------------------------------------------------
-    // apply_escalation tests
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn apply_escalation_first_failure_logs_info() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        // No failures recorded yet → count_failures = 0 → no action taken.
-        daemon.apply_escalation("work-1", "src1", "analyze");
-        // No HITL item should be in queue.
-        assert_eq!(daemon.items_in_phase(QueuePhase::Hitl).len(), 0);
-    }
-
-    #[test]
-    fn apply_escalation_after_three_failures_routes_to_hitl() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        // Record 3 failures via mark_failed using distinct work_ids so
-        // each call finds a fresh Running item.
-        for i in 0..3u32 {
-            let mut item = test_item("src1", "analyze");
-            item.work_id = format!("src1:analyze-attempt-{i}");
-            item.set_phase_unchecked(QueuePhase::Running);
-            daemon.push_item(item);
-            daemon
-                .mark_failed(&format!("src1:analyze-attempt-{i}"), "failure".into())
-                .unwrap();
-        }
-
-        // Push a Completed item so mark_hitl (called by apply_escalation) can succeed.
-        let mut item = test_item("src1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Completed);
-        daemon.push_item(item);
-
-        // With 3 recorded failures, apply_escalation sees failure_count >= 3 → HITL.
-        daemon.apply_escalation("src1:analyze", "src1", "analyze");
-
-        assert_eq!(daemon.items_in_phase(QueuePhase::Hitl).len(), 1);
-    }
-
-    // ---------------------------------------------------------------
-    // mark_skipped tests
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn mark_skipped_transitions_hitl_to_skipped() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        daemon.push_item(item);
-
-        assert!(daemon.mark_skipped("s1:analyze").is_ok());
-        assert_eq!(
-            daemon.get_item("s1:analyze").unwrap().phase(),
-            QueuePhase::Skipped
-        );
-    }
-
-    #[test]
-    fn mark_skipped_returns_error_for_unknown_id() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let result = daemon.mark_skipped("does-not-exist");
-        assert!(result.is_err());
-    }
-
-    // ---------------------------------------------------------------
     // mark_failed error path tests
     // ---------------------------------------------------------------
 
@@ -3598,6 +4469,46 @@ sources:
         assert_eq!(events[2].attempt, 3);
     }
 
+    #[test]
+    fn mark_failed_attempt_counts_only_failed_events() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+
+        let done = test_item("s1", "analyze");
+        daemon.record_history_event(&done, "done", None);
+
+        let mut item = test_item("s1", "analyze");
+        item.work_id = "s1:analyze-1".to_string();
+        item.set_phase_unchecked(QueuePhase::Running);
+        daemon.push_item(item);
+        daemon
+            .mark_failed("s1:analyze-1", "boom".to_string())
+            .unwrap();
+
+        let last = daemon.history_events().last().unwrap();
+        assert_eq!(last.status, "failed");
+        assert_eq!(
+            last.attempt, 1,
+            "a prior done event is not an attempt failure"
+        );
+    }
+
+    #[test]
+    fn record_history_event_attempt_counts_only_failed_events() {
+        let tmp = TempDir::new().unwrap();
+        let source = MockDataSource::new("github");
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
+        let item = test_item("s1", "analyze");
+
+        daemon.record_history_event(&item, "completed", None);
+        daemon.record_history_event(&item, "failed", Some("first".to_string()));
+        daemon.record_history_event(&item, "failed", Some("second".to_string()));
+
+        let attempts: Vec<u32> = daemon.history_events().iter().map(|e| e.attempt).collect();
+        assert_eq!(attempts, vec![1, 1, 2]);
+    }
+
     // ---------------------------------------------------------------
     // Deduplication in collect tests
     // ---------------------------------------------------------------
@@ -3623,12 +4534,13 @@ sources:
             Arc::new(registry),
             Box::new(worktree_mgr),
             4,
+            Database::open_in_memory().unwrap(),
         );
 
-        // Both sources report the same work_id; collect() should report 2 total
-        // (1 from each source) but only enqueue 1 unique item.
+        // Both sources offer the same (source_id, state); the store accepts
+        // the first and rejects the second as a duplicate.
         let total_reported = daemon.collect().await.unwrap();
-        assert_eq!(total_reported, 2);
+        assert_eq!(total_reported, 1);
         assert_eq!(daemon.queue_items().len(), 1);
     }
 
@@ -3739,32 +4651,6 @@ sources:
             daemon.get_item("s1:analyze").unwrap().phase(),
             QueuePhase::Pending
         );
-    }
-
-    // ---------------------------------------------------------------
-    // retry_from_hitl tests
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn retry_from_hitl_returns_error_for_unknown_id() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let result = daemon.retry_from_hitl("nonexistent");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn retry_from_hitl_invalid_phase_returns_error() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        // Pending → Pending (retry_from_hitl) is invalid since only Hitl → Pending is valid.
-        daemon.push_item(test_item("s1", "analyze"));
-        let result = daemon.retry_from_hitl("s1:analyze");
-        assert!(result.is_err());
     }
 
     // ---------------------------------------------------------------
@@ -3949,11 +4835,10 @@ sources:
             .worktree_mgr
             .register_preserved("github:org/repo#1", wt_path);
 
-        let mut item = test_item("github:org/repo#1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Completed);
+        let mut item = completed_in_store(&daemon, test_item("github:org/repo#1", "analyze"));
 
-        let success = daemon.execute_on_done(&mut item).await.unwrap();
-        assert!(success);
+        let outcome = daemon.finish_completed(&mut item).await.unwrap();
+        assert!(matches!(outcome, OnDoneOutcome::Done));
 
         // Preserved mapping should be cleared after Done.
         assert!(
@@ -3961,153 +4846,6 @@ sources:
                 .worktree_mgr
                 .lookup_preserved("github:org/repo#1")
                 .is_none()
-        );
-    }
-
-    // ---------------------------------------------------------------
-    // respond_hitl replan tests
-    // ---------------------------------------------------------------
-
-    #[tokio::test]
-    async fn respond_hitl_replan_rolls_back_to_pending_and_creates_hitl_item() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_notes = Some("original failure reason".into());
-        daemon.push_item(item);
-
-        let result = daemon
-            .respond_hitl(
-                "s1:analyze",
-                HitlRespondAction::Replan,
-                Some("reviewer".into()),
-                None,
-            )
-            .await;
-        assert!(result.is_ok());
-
-        // Original item should be rolled back to Pending with replan_count = 1.
-        let original = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(original.phase(), QueuePhase::Pending);
-        assert_eq!(original.replan_count, 1);
-
-        // A new HITL item should have been created for spec modification.
-        let replan_item = daemon.get_item("s1:analyze:replan-1").unwrap();
-        assert_eq!(replan_item.phase(), QueuePhase::Hitl);
-        assert_eq!(
-            replan_item.hitl_reason,
-            Some(HitlReason::SpecModificationProposed)
-        );
-        assert!(
-            replan_item
-                .hitl_notes
-                .as_ref()
-                .unwrap()
-                .contains("original failure reason")
-        );
-        assert!(
-            replan_item
-                .title
-                .as_ref()
-                .unwrap()
-                .contains("spec-modification-proposed")
-        );
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_replan_increments_count_on_successive_replans() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.replan_count = 1; // Already replanned once.
-        daemon.push_item(item);
-
-        let result = daemon
-            .respond_hitl(
-                "s1:analyze",
-                HitlRespondAction::Replan,
-                None,
-                Some("second failure".into()),
-            )
-            .await;
-        assert!(result.is_ok());
-
-        let original = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(original.phase(), QueuePhase::Pending);
-        assert_eq!(original.replan_count, 2);
-
-        let replan_item = daemon.get_item("s1:analyze:replan-2").unwrap();
-        assert_eq!(replan_item.phase(), QueuePhase::Hitl);
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_replan_exceeds_limit_transitions_to_failed() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.replan_count = 3; // Already at max.
-        daemon.push_item(item);
-
-        let result = daemon
-            .respond_hitl("s1:analyze", HitlRespondAction::Replan, None, None)
-            .await;
-        assert!(result.is_ok());
-
-        // Should transition to Failed, not Pending.
-        let original = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(original.phase(), QueuePhase::Failed);
-        assert_eq!(original.replan_count, 4);
-
-        // No replan HITL item should be created.
-        assert!(daemon.get_item("s1:analyze:replan-4").is_none());
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_replan_requires_hitl_phase() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        // Item is in Pending, not Hitl.
-        daemon.push_item(test_item("s1", "analyze"));
-
-        let result = daemon
-            .respond_hitl("s1:analyze", HitlRespondAction::Replan, None, None)
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_done_still_works() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        daemon.push_item(item);
-
-        let result = daemon
-            .respond_hitl(
-                "s1:analyze",
-                HitlRespondAction::Done,
-                Some("reviewer".into()),
-                None,
-            )
-            .await;
-        assert!(result.is_ok());
-        assert_eq!(
-            daemon.get_item("s1:analyze").unwrap().phase(),
-            QueuePhase::Done
         );
     }
 
@@ -4156,9 +4894,9 @@ sources:
         daemon.push_item(test_item("github:org/repo#1", "analyze"));
         assert_eq!(daemon.queue_items().len(), 1);
 
-        // collect() should report 1 collected but not add a duplicate.
+        // The store already has an open item, so nothing is collected.
         let collected = daemon.collect().await.unwrap();
-        assert_eq!(collected, 1);
+        assert_eq!(collected, 0);
         assert_eq!(daemon.queue_items().len(), 1);
     }
 
@@ -4254,26 +4992,32 @@ sources:
     }
 
     // ---------------------------------------------------------------
-    // execute_on_done() additional tests
+    // finish_completed() on_done tests
     // ---------------------------------------------------------------
 
+    /// Store `item` at Completed and return it, ready for `finish_completed`.
+    fn completed_in_store(daemon: &Daemon, mut item: QueueItem) -> QueueItem {
+        item.set_phase_unchecked(QueuePhase::Completed);
+        Daemon::ensure_row(&daemon.db, &item);
+        item
+    }
+
     #[tokio::test]
-    async fn execute_on_done_transitions_to_done_when_no_state_config() {
+    async fn finish_completed_is_done_when_no_state_config() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         // Use a state that has no matching state config.
-        let mut item = test_item("github:org/repo#1", "unknown_state");
-        item.set_phase_unchecked(QueuePhase::Completed);
+        let mut item = completed_in_store(&daemon, test_item("github:org/repo#1", "unknown_state"));
 
-        let success = daemon.execute_on_done(&mut item).await.unwrap();
-        assert!(success);
+        let outcome = daemon.finish_completed(&mut item).await.unwrap();
+        assert!(matches!(outcome, OnDoneOutcome::Done));
         assert_eq!(item.phase(), QueuePhase::Done);
     }
 
     #[tokio::test]
-    async fn execute_on_done_with_empty_on_done_transitions_to_done() {
+    async fn finish_completed_with_empty_on_done_is_done() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
 
@@ -4284,6 +5028,11 @@ concurrency: 2
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     states:
       no_done:
         trigger:
@@ -4301,29 +5050,28 @@ sources:
             Arc::new(registry),
             Box::new(worktree_mgr),
             4,
+            Database::open_in_memory().unwrap(),
         );
 
-        let mut item = test_item("github:org/repo#1", "no_done");
-        item.set_phase_unchecked(QueuePhase::Completed);
+        let mut item = completed_in_store(&daemon, test_item("github:org/repo#1", "no_done"));
 
-        let success = daemon.execute_on_done(&mut item).await.unwrap();
-        assert!(success);
+        let outcome = daemon.finish_completed(&mut item).await.unwrap();
+        assert!(matches!(outcome, OnDoneOutcome::Done));
         assert_eq!(item.phase(), QueuePhase::Done);
     }
 
     #[tokio::test]
-    async fn execute_on_done_records_history_entry() {
+    async fn finish_completed_records_history_entry() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let mut daemon = setup_daemon(&tmp, source, vec![]);
 
-        let mut item = test_item("github:org/repo#1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Completed);
+        let mut item = completed_in_store(&daemon, test_item("github:org/repo#1", "analyze"));
 
         assert_eq!(daemon.history().len(), 0);
 
-        let success = daemon.execute_on_done(&mut item).await.unwrap();
-        assert!(success);
+        let outcome = daemon.finish_completed(&mut item).await.unwrap();
+        assert!(matches!(outcome, OnDoneOutcome::Done));
 
         // History should have a "done" entry.
         assert!(
@@ -4350,10 +5098,10 @@ sources:
         assert_eq!(daemon.queue_items().len(), 0);
         assert_eq!(daemon.history_events().len(), 0);
 
-        // After tick: item is collected, advanced, executed, then evaluated.
-        // The evaluator runs on_done which transitions to Done and may remove
-        // items from the queue, so we verify via history_events instead.
+        // A tick collects, advances and starts the handler without waiting
+        // for it; the result is applied once the handler ends.
         daemon.tick().await.unwrap();
+        daemon.join_handlers().await;
 
         // A "completed" history event proves the pipeline ran successfully.
         assert!(
@@ -4388,6 +5136,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![0, 0]);
 
         daemon.tick().await.unwrap();
+        daemon.join_handlers().await;
 
         // Both items should have produced "completed" history events.
         let completed_events = daemon
@@ -4412,8 +5161,9 @@ sources:
 
         daemon.request_shutdown();
 
-        // tick() should not collect new items but should execute Running ones.
+        // tick() should not collect new items but should start Running ones.
         daemon.tick().await.unwrap();
+        daemon.join_handlers().await;
 
         // The Running item should have been processed.
         assert!(daemon.items_in_phase(QueuePhase::Running).is_empty());
@@ -4434,169 +5184,6 @@ sources:
         assert_eq!(daemon.queue_items().len(), 0);
     }
 
-    // --- spec completion HITL response tests ---
-
-    #[tokio::test]
-    async fn respond_hitl_done_spec_completion_transitions_spec_to_completed() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let daemon = setup_daemon(&tmp, source, vec![]);
-
-        // Set up an in-memory database with a spec in Completing status.
-        let db = Database::open_in_memory().unwrap();
-        let mut spec = belt_core::spec::Spec::new(
-            "spec-42".to_string(),
-            "test-ws".to_string(),
-            "Test Spec".to_string(),
-            "content".to_string(),
-        );
-        spec.status = belt_core::spec::SpecStatus::Completing;
-        db.insert_spec(&spec).unwrap();
-
-        let mut daemon = daemon.with_db(db);
-
-        // Create a spec_completion HITL item.
-        let mut item = QueueItem::new(
-            "spec-completion:spec-42:hitl".to_string(),
-            "spec-42".to_string(),
-            "test-ws".to_string(),
-            "spec_completion".to_string(),
-        );
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_reason = Some(HitlReason::SpecCompletionReview);
-        daemon.push_item(item);
-
-        // Approve (Done) the HITL item.
-        let result = daemon
-            .respond_hitl(
-                "spec-completion:spec-42:hitl",
-                HitlRespondAction::Done,
-                Some("reviewer".into()),
-                None,
-            )
-            .await;
-        assert!(result.is_ok());
-
-        // Queue item should be Done.
-        assert_eq!(
-            daemon
-                .get_item("spec-completion:spec-42:hitl")
-                .unwrap()
-                .phase(),
-            QueuePhase::Done
-        );
-
-        // Spec should have transitioned to Completed.
-        let updated_spec = daemon.db.as_ref().unwrap().get_spec("spec-42").unwrap();
-        assert_eq!(updated_spec.status, belt_core::spec::SpecStatus::Completed);
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_skip_spec_completion_reverts_spec_to_active() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let daemon = setup_daemon(&tmp, source, vec![]);
-
-        let db = Database::open_in_memory().unwrap();
-        let mut spec = belt_core::spec::Spec::new(
-            "spec-43".to_string(),
-            "test-ws".to_string(),
-            "Test Spec".to_string(),
-            "content".to_string(),
-        );
-        spec.status = belt_core::spec::SpecStatus::Completing;
-        db.insert_spec(&spec).unwrap();
-
-        let mut daemon = daemon.with_db(db);
-
-        let mut item = QueueItem::new(
-            "spec-completion:spec-43:hitl".to_string(),
-            "spec-43".to_string(),
-            "test-ws".to_string(),
-            "spec_completion".to_string(),
-        );
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_reason = Some(HitlReason::SpecCompletionReview);
-        daemon.push_item(item);
-
-        // Reject (Skip) the HITL item.
-        let result = daemon
-            .respond_hitl(
-                "spec-completion:spec-43:hitl",
-                HitlRespondAction::Skip,
-                Some("reviewer".into()),
-                None,
-            )
-            .await;
-        assert!(result.is_ok());
-
-        // Queue item should be Skipped.
-        assert_eq!(
-            daemon
-                .get_item("spec-completion:spec-43:hitl")
-                .unwrap()
-                .phase(),
-            QueuePhase::Skipped
-        );
-
-        // Spec should revert to Active after rejection.
-        let updated_spec = daemon.db.as_ref().unwrap().get_spec("spec-43").unwrap();
-        assert_eq!(updated_spec.status, belt_core::spec::SpecStatus::Active);
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_retry_spec_completion_reverts_spec_to_active() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let daemon = setup_daemon(&tmp, source, vec![]);
-
-        let db = Database::open_in_memory().unwrap();
-        let mut spec = belt_core::spec::Spec::new(
-            "spec-44".to_string(),
-            "test-ws".to_string(),
-            "Test Spec".to_string(),
-            "content".to_string(),
-        );
-        spec.status = belt_core::spec::SpecStatus::Completing;
-        db.insert_spec(&spec).unwrap();
-
-        let mut daemon = daemon.with_db(db);
-
-        let mut item = QueueItem::new(
-            "spec-completion:spec-44:hitl".to_string(),
-            "spec-44".to_string(),
-            "test-ws".to_string(),
-            "spec_completion".to_string(),
-        );
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_reason = Some(HitlReason::SpecCompletionReview);
-        daemon.push_item(item);
-
-        // Retry (additional modifications needed) the HITL item.
-        let result = daemon
-            .respond_hitl(
-                "spec-completion:spec-44:hitl",
-                HitlRespondAction::Retry,
-                Some("reviewer".into()),
-                None,
-            )
-            .await;
-        assert!(result.is_ok());
-
-        // Queue item should be Pending (retried).
-        assert_eq!(
-            daemon
-                .get_item("spec-completion:spec-44:hitl")
-                .unwrap()
-                .phase(),
-            QueuePhase::Pending
-        );
-
-        // Spec should revert to Active for additional modifications.
-        let updated_spec = daemon.db.as_ref().unwrap().get_spec("spec-44").unwrap();
-        assert_eq!(updated_spec.status, belt_core::spec::SpecStatus::Active);
-    }
-
     // ---------------------------------------------------------------
     // Token usage auto-save tests
     // ---------------------------------------------------------------
@@ -4604,12 +5191,10 @@ sources:
     #[test]
     fn try_record_token_usage_saves_to_db() {
         use belt_core::runtime::TokenUsage;
-        use belt_infra::db::Database;
 
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
-        let db = Database::open_in_memory().unwrap();
-        let daemon = setup_daemon(&tmp, source, vec![]).with_db(db);
+        let daemon = setup_daemon(&tmp, source, vec![]);
 
         let item = test_item("github:org/repo#1", "analyze");
         let result = ActionResult {
@@ -4632,8 +5217,6 @@ sources:
         // Verify the record was inserted into the DB.
         let rows = daemon
             .db
-            .as_ref()
-            .unwrap()
             .get_token_usage_by_work_id("github:org/repo#1:analyze")
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -4645,12 +5228,9 @@ sources:
 
     #[test]
     fn try_record_token_usage_skips_when_no_usage() {
-        use belt_infra::db::Database;
-
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
-        let db = Database::open_in_memory().unwrap();
-        let daemon = setup_daemon(&tmp, source, vec![]).with_db(db);
+        let daemon = setup_daemon(&tmp, source, vec![]);
 
         let item = test_item("github:org/repo#2", "analyze");
         let result = ActionResult {
@@ -4668,8 +5248,6 @@ sources:
         // No records should be inserted when token_usage is None.
         let rows = daemon
             .db
-            .as_ref()
-            .unwrap()
             .get_token_usage_by_work_id("github:org/repo#2:analyze")
             .unwrap();
         assert_eq!(rows.len(), 0);
@@ -4678,12 +5256,10 @@ sources:
     #[test]
     fn try_record_token_usage_skips_when_no_runtime_name() {
         use belt_core::runtime::TokenUsage;
-        use belt_infra::db::Database;
 
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
-        let db = Database::open_in_memory().unwrap();
-        let daemon = setup_daemon(&tmp, source, vec![]).with_db(db);
+        let daemon = setup_daemon(&tmp, source, vec![]);
 
         let item = test_item("github:org/repo#3", "analyze");
         let result = ActionResult {
@@ -4706,8 +5282,6 @@ sources:
         // No records should be inserted when runtime_name is None.
         let rows = daemon
             .db
-            .as_ref()
-            .unwrap()
             .get_token_usage_by_work_id("github:org/repo#3:analyze")
             .unwrap();
         assert_eq!(rows.len(), 0);
@@ -4716,12 +5290,10 @@ sources:
     #[test]
     fn try_record_token_usage_uses_unknown_model_when_absent() {
         use belt_core::runtime::TokenUsage;
-        use belt_infra::db::Database;
 
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
-        let db = Database::open_in_memory().unwrap();
-        let daemon = setup_daemon(&tmp, source, vec![]).with_db(db);
+        let daemon = setup_daemon(&tmp, source, vec![]);
 
         let item = test_item("github:org/repo#4", "analyze");
         let result = ActionResult {
@@ -4743,8 +5315,6 @@ sources:
 
         let rows = daemon
             .db
-            .as_ref()
-            .unwrap()
             .get_token_usage_by_work_id("github:org/repo#4:analyze")
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -4758,12 +5328,10 @@ sources:
     #[test]
     fn try_record_ipc_token_usage_saves_to_db() {
         use belt_core::runtime::TokenUsage;
-        use belt_infra::db::Database;
 
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
-        let db = Database::open_in_memory().unwrap();
-        let daemon = setup_daemon(&tmp, source, vec![]).with_db(db);
+        let daemon = setup_daemon(&tmp, source, vec![]);
 
         let item = test_item("github:org/repo#10", "analyze");
         let ipc_usage = crate::evaluator::IpcTokenUsage {
@@ -4782,8 +5350,6 @@ sources:
 
         let rows = daemon
             .db
-            .as_ref()
-            .unwrap()
             .get_token_usage_by_work_id("github:org/repo#10:analyze")
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -4796,12 +5362,10 @@ sources:
     #[test]
     fn try_record_ipc_token_usage_uses_unknown_model_when_absent() {
         use belt_core::runtime::TokenUsage;
-        use belt_infra::db::Database;
 
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
-        let db = Database::open_in_memory().unwrap();
-        let daemon = setup_daemon(&tmp, source, vec![]).with_db(db);
+        let daemon = setup_daemon(&tmp, source, vec![]);
 
         let item = test_item("github:org/repo#11", "analyze");
         let ipc_usage = crate::evaluator::IpcTokenUsage {
@@ -4820,8 +5384,6 @@ sources:
 
         let rows = daemon
             .db
-            .as_ref()
-            .unwrap()
             .get_token_usage_by_work_id("github:org/repo#11:analyze")
             .unwrap();
         assert_eq!(rows.len(), 1);
@@ -5061,14 +5623,11 @@ sources:
     #[test]
     fn rollback_running_to_pending_records_shutdown_rollback_transition_event() {
         // When rollback_running_to_pending is called (e.g. drain timeout),
-        // each rolled-back item should have a transition_event with
-        // event_type='shutdown_rollback' recorded in the DB.
+        // each rolled-back item should have a Running -> Pending phase entry
+        // with reason `rollback` in the transition log.
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
-        let daemon = setup_daemon(&tmp, source, vec![]);
-
-        let db = Database::open_in_memory().unwrap();
-        let mut daemon = daemon.with_db(db);
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         for i in 0..2u32 {
             let mut item = test_item(&format!("github:org/repo#{i}"), "analyze");
@@ -5081,23 +5640,24 @@ sources:
 
         assert_eq!(daemon.items_in_phase(QueuePhase::Pending).len(), 2);
 
-        // Verify transition_events were recorded for each item.
-        let db = daemon.db.as_ref().unwrap();
+        let db = &daemon.db;
         for i in 0..2u32 {
             let work_id = format!("github:org/repo#{i}:analyze");
-            let events = db.list_transition_events(&work_id).unwrap();
-            let rollback_events: Vec<_> = events
+            let log = db.transitions_of(&work_id).unwrap();
+            let rollbacks: Vec<_> = log
                 .iter()
-                .filter(|e| e.event_type == "shutdown_rollback")
+                .filter(|e| e.reason.as_deref() == Some("rollback"))
                 .collect();
             assert_eq!(
-                rollback_events.len(),
+                rollbacks.len(),
                 1,
-                "expected one shutdown_rollback event for {work_id}"
+                "expected one rollback entry for {work_id}"
             );
-            let ev = rollback_events[0];
+            let ev = rollbacks[0];
+            assert_eq!(ev.kind, "phase_enter");
+            assert_eq!(ev.actor, "daemon");
             assert_eq!(ev.from_phase.as_deref(), Some("running"));
-            assert_eq!(ev.phase.as_deref(), Some("pending"));
+            assert_eq!(ev.to_phase.as_deref(), Some("pending"));
             assert!(
                 ev.detail
                     .as_ref()
@@ -5111,16 +5671,12 @@ sources:
     // ---------------------------------------------------------------
 
     #[test]
-    fn rollback_inserts_item_into_db_when_not_present() {
-        // Items collected from DataSource live in-memory only.
-        // rollback_running_to_pending must insert the item into the DB
-        // before updating its worktree state so the path survives restart.
+    fn rollback_persists_worktree_state_to_db() {
+        // rollback_running_to_pending must store the preserved worktree path
+        // so it survives a daemon restart.
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
-        let daemon = setup_daemon(&tmp, source, vec![]);
-
-        let db = Database::open_in_memory().unwrap();
-        let mut daemon = daemon.with_db(db);
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
 
         // Create the worktree directory so rollback registers it.
         let ws_path = daemon.worktree_mgr.path("test-ws");
@@ -5130,25 +5686,13 @@ sources:
         item.set_phase_unchecked(QueuePhase::Running);
         daemon.push_item(item);
 
-        // Item is NOT in the DB yet (only in-memory queue).
-        assert!(
-            daemon
-                .db
-                .as_ref()
-                .unwrap()
-                .get_item("github:org/repo#99:analyze")
-                .is_err()
-        );
-
         daemon.rollback_running_to_pending();
 
-        // After rollback, item should exist in DB with previous_worktree_path.
+        // After rollback, the stored item carries previous_worktree_path.
         let db_item = daemon
             .db
-            .as_ref()
-            .unwrap()
             .get_item("github:org/repo#99:analyze")
-            .expect("item should be inserted into DB during rollback");
+            .expect("item row exists");
         assert_eq!(db_item.phase(), QueuePhase::Pending);
         assert!(db_item.worktree_preserved);
         assert_eq!(
@@ -5164,13 +5708,12 @@ sources:
         // duplicate.
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
-        let daemon = setup_daemon(&tmp, source, vec![]);
+        let mut daemon = setup_daemon(&tmp, source, vec![]);
 
-        let db = Database::open_in_memory().unwrap();
         // Pre-insert the item into DB.
-        let pre_item = test_item("github:org/repo#100", "analyze");
-        db.insert_item(&pre_item).unwrap();
-        let mut daemon = daemon.with_db(db);
+        let mut pre_item = test_item("github:org/repo#100", "analyze");
+        pre_item.set_phase_unchecked(QueuePhase::Running);
+        daemon.db.insert_item(&pre_item).unwrap();
 
         // Create the worktree directory so rollback registers it.
         let ws_path = daemon.worktree_mgr.path("test-ws");
@@ -5183,12 +5726,7 @@ sources:
         daemon.rollback_running_to_pending();
 
         // DB should have the updated worktree state.
-        let db_item = daemon
-            .db
-            .as_ref()
-            .unwrap()
-            .get_item("github:org/repo#100:analyze")
-            .unwrap();
+        let db_item = daemon.db.get_item("github:org/repo#100:analyze").unwrap();
         assert_eq!(db_item.phase(), QueuePhase::Pending);
         assert!(db_item.worktree_preserved);
         assert!(db_item.previous_worktree_path.is_some());
@@ -5205,15 +5743,11 @@ sources:
         let source = MockDataSource::new("github");
         let daemon = setup_daemon(&tmp, source, vec![]).with_belt_home(belt_home.clone());
 
-        let db = Database::open_in_memory().unwrap();
-        let daemon = daemon.with_db(db);
-
-        // with_db should initialize cron_engine (which receives report_dir
-        // derived as belt_home.join("reports")). If cron_engine is Some,
-        // report_dir was computed and passed to builtin jobs.
+        // The constructor initializes the cron engine (which receives report_dir
+        // derived as belt_home.join("reports")).
         assert!(
             daemon.cron_engine.is_some(),
-            "with_db must initialize cron_engine with report_dir"
+            "new must initialize cron_engine with report_dir"
         );
     }
 
@@ -5222,11 +5756,6 @@ sources:
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let daemon = setup_daemon(&tmp, source, vec![]);
-
-        // Default belt_home is ".belt" (from env or fallback).
-        // Verify that with_db doesn't panic with the default path.
-        let db = Database::open_in_memory().unwrap();
-        let daemon = daemon.with_db(db);
 
         assert!(daemon.cron_engine.is_some());
     }
@@ -5257,12 +5786,11 @@ sources:
 
         let item = daemon.get_item("s1:analyze").unwrap();
         assert_eq!(item.phase(), QueuePhase::Hitl);
-        assert_eq!(item.hitl_reason, Some(HitlReason::EvaluateFailure));
-        assert_eq!(item.hitl_notes.as_deref(), Some("partial result"));
-        assert!(
-            item.hitl_created_at.is_some(),
-            "hitl_created_at should be set"
-        );
+        let requests = daemon.db().open_hitl_requests().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].work_id, "s1:analyze");
+        assert_eq!(requests[0].reason, Some(HitlReason::EvaluateFailure));
+        assert_eq!(requests[0].notes.as_deref(), Some("partial result"));
     }
 
     #[test]
@@ -5283,148 +5811,10 @@ sources:
 
         let item = daemon.get_item("s1:analyze").unwrap();
         assert_eq!(item.phase(), QueuePhase::Hitl);
-        assert_eq!(item.hitl_reason, Some(HitlReason::Timeout));
-        assert!(item.hitl_notes.is_none());
-    }
-
-    // ---------------------------------------------------------------
-    // retry_from_hitl: transition detail tests
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn retry_from_hitl_resets_phase_to_pending() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_reason = Some(HitlReason::RetryMaxExceeded);
-        item.hitl_notes = Some("needs review".into());
-        item.hitl_created_at = Some(Utc::now().to_rfc3339());
-        daemon.push_item(item);
-
-        daemon.retry_from_hitl("s1:analyze").unwrap();
-
-        let item = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(item.phase(), QueuePhase::Pending);
-    }
-
-    // ---------------------------------------------------------------
-    // respond_hitl: Retry and Skip action tests
-    // ---------------------------------------------------------------
-
-    #[tokio::test]
-    async fn respond_hitl_retry_transitions_to_pending() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        daemon.push_item(item);
-
-        let result = daemon
-            .respond_hitl(
-                "s1:analyze",
-                HitlRespondAction::Retry,
-                Some("reviewer".into()),
-                Some("retrying after fix".into()),
-            )
-            .await;
-        assert!(result.is_ok());
-
-        let item = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(item.phase(), QueuePhase::Pending);
-        assert_eq!(item.hitl_respondent.as_deref(), Some("reviewer"));
-        assert_eq!(item.hitl_notes.as_deref(), Some("retrying after fix"));
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_skip_transitions_to_skipped() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        daemon.push_item(item);
-
-        let result = daemon
-            .respond_hitl(
-                "s1:analyze",
-                HitlRespondAction::Skip,
-                Some("admin".into()),
-                None,
-            )
-            .await;
-        assert!(result.is_ok());
-
-        let item = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(item.phase(), QueuePhase::Skipped);
-        assert_eq!(item.hitl_respondent.as_deref(), Some("admin"));
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_returns_error_for_unknown_id() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let result = daemon
-            .respond_hitl("nonexistent", HitlRespondAction::Done, None, None)
-            .await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_updates_notes_when_provided() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_notes = Some("original notes".into());
-        daemon.push_item(item);
-
-        daemon
-            .respond_hitl(
-                "s1:analyze",
-                HitlRespondAction::Done,
-                None,
-                Some("updated notes".into()),
-            )
-            .await
-            .unwrap();
-
-        let item = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(item.hitl_notes.as_deref(), Some("updated notes"));
-    }
-
-    #[tokio::test]
-    async fn respond_hitl_preserves_notes_when_not_provided() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![]);
-
-        let mut item = test_item("s1", "analyze");
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_notes = Some("original notes".into());
-        daemon.push_item(item);
-
-        daemon
-            .respond_hitl(
-                "s1:analyze",
-                HitlRespondAction::Done,
-                Some("reviewer".into()),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let item = daemon.get_item("s1:analyze").unwrap();
-        assert_eq!(item.hitl_notes.as_deref(), Some("original notes"));
+        let requests = daemon.db().open_hitl_requests().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].reason, Some(HitlReason::Timeout));
+        assert!(requests[0].notes.is_none());
     }
 
     // ---------------------------------------------------------------
@@ -5450,6 +5840,7 @@ sources:
         let mut daemon = setup_daemon(&tmp, source, vec![0]);
 
         daemon.tick().await.unwrap();
+        daemon.join_handlers().await;
 
         let entries = daemon.history();
         assert!(
@@ -5516,6 +5907,10 @@ sources:
             .unwrap();
 
         // Manually reset to Running for second failure.
+        daemon
+            .db
+            .update_phase("s1:analyze", QueuePhase::Running)
+            .unwrap();
         let item = daemon
             .queue
             .iter_mut()
@@ -5632,14 +6027,22 @@ sources:
 
     // --- detect_stagnation_and_generate_plan tests ---
 
+    /// Run stagnation detection for a `src:1`/`implement` item named `work_id`.
+    fn stagnation_plan(daemon: &Daemon, work_id: &str, error: &str) -> Option<String> {
+        let mut item = test_item("src:1", "implement");
+        item.work_id = work_id.to_string();
+        daemon
+            .detect_stagnation_and_generate_plan(&item, error, 1)
+            .unwrap()
+    }
+
     #[test]
     fn detect_stagnation_no_prior_failures_returns_none() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
         let daemon = setup_daemon(&tmp, source, vec![0]);
 
-        let result =
-            daemon.detect_stagnation_and_generate_plan("w:1", "src:1", "implement", "error");
+        let result = stagnation_plan(&daemon, "w:1", "error");
         assert!(result.is_none());
     }
 
@@ -5654,12 +6057,7 @@ sources:
         daemon.record_history_event(&item, "failed", Some("compile error".to_string()));
 
         // Only 2 outputs (1 prior + 1 current), need min_consecutive=2 spinning pairs.
-        let result = daemon.detect_stagnation_and_generate_plan(
-            "w:1",
-            "src:1",
-            "implement",
-            "compile error",
-        );
+        let result = stagnation_plan(&daemon, "w:1", "compile error");
         assert!(result.is_none());
     }
 
@@ -5675,12 +6073,7 @@ sources:
             daemon.record_history_event(&item, "failed", Some("compile error X".to_string()));
         }
 
-        let result = daemon.detect_stagnation_and_generate_plan(
-            "w:1",
-            "src:1",
-            "implement",
-            "compile error X",
-        );
+        let result = stagnation_plan(&daemon, "w:1", "compile error X");
         assert!(
             result.is_some(),
             "expected lateral plan for spinning pattern"
@@ -5703,8 +6096,7 @@ sources:
         daemon.record_history_event(&item, "failed", Some("error B".to_string()));
         daemon.record_history_event(&item, "failed", Some("error C".to_string()));
 
-        let result =
-            daemon.detect_stagnation_and_generate_plan("w:1", "src:1", "implement", "error D");
+        let result = stagnation_plan(&daemon, "w:1", "error D");
         assert!(result.is_none());
     }
 
@@ -5712,31 +6104,18 @@ sources:
     fn detect_stagnation_records_transition_event() {
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
-        let daemon = setup_daemon(&tmp, source, vec![0]);
-
-        let db = Database::open_in_memory().unwrap();
-        let mut daemon = daemon.with_db(db);
+        let mut daemon = setup_daemon(&tmp, source, vec![0]);
 
         let item = test_item("src:1", "implement");
         for _ in 0..3 {
             daemon.record_history_event(&item, "failed", Some("compile error X".to_string()));
         }
 
-        let result = daemon.detect_stagnation_and_generate_plan(
-            &item.work_id,
-            "src:1",
-            "implement",
-            "compile error X",
-        );
+        let result = stagnation_plan(&daemon, &item.work_id, "compile error X");
         assert!(result.is_some(), "expected stagnation detection");
 
         // Verify the stagnation event was recorded in transition_events.
-        let events = daemon
-            .db
-            .as_ref()
-            .unwrap()
-            .list_transition_events(&item.work_id)
-            .unwrap();
+        let events = daemon.db.list_transition_events(&item.work_id).unwrap();
         let stagnation_events: Vec<_> = events
             .iter()
             .filter(|e| e.event_type == "stagnation")
@@ -5766,10 +6145,7 @@ sources:
 
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
-        let daemon = setup_daemon(&tmp, source, vec![0]);
-
-        let db = Database::open_in_memory().unwrap();
-        let mut daemon = daemon.with_db(db);
+        let mut daemon = setup_daemon(&tmp, source, vec![0]);
 
         let item = test_item("src:1", "implement");
         let err = "compile error X";
@@ -5777,16 +6153,10 @@ sources:
             daemon.record_history_event(&item, "failed", Some(err.to_string()));
         }
 
-        let result =
-            daemon.detect_stagnation_and_generate_plan(&item.work_id, "src:1", "implement", err);
+        let result = stagnation_plan(&daemon, &item.work_id, err);
         assert!(result.is_some(), "expected spinning detection");
 
-        let events = daemon
-            .db
-            .as_ref()
-            .unwrap()
-            .list_transition_events(&item.work_id)
-            .unwrap();
+        let events = daemon.db.list_transition_events(&item.work_id).unwrap();
         let detail: serde_json::Value = serde_json::from_str(
             events
                 .iter()
@@ -5825,8 +6195,7 @@ sources:
         daemon.record_history_event(&item, "failed", Some("fix B".to_string()));
         daemon.record_history_event(&item, "failed", Some("fix A".to_string()));
 
-        let result =
-            daemon.detect_stagnation_and_generate_plan("w:1", "src:1", "implement", "fix B");
+        let result = stagnation_plan(&daemon, "w:1", "fix B");
         assert!(
             result.is_some(),
             "expected oscillation pattern to be detected"
@@ -5853,12 +6222,7 @@ sources:
             daemon.record_history_event(&item, "failed", Some("compile error X".to_string()));
         }
 
-        let result = daemon.detect_stagnation_and_generate_plan(
-            "w:1",
-            "src:1",
-            "implement",
-            "compile error X",
-        );
+        let result = stagnation_plan(&daemon, "w:1", "compile error X");
         assert!(
             result.is_none(),
             "stagnation detection should be skipped when disabled"
@@ -5893,12 +6257,7 @@ sources:
             daemon.record_history_event(&item, "failed", Some("compile error X".to_string()));
         }
 
-        let result = daemon.detect_stagnation_and_generate_plan(
-            "w:1",
-            "src:1",
-            "implement",
-            "compile error X",
-        );
+        let result = stagnation_plan(&daemon, "w:1", "compile error X");
         assert!(
             result.is_none(),
             "lateral plan generation should be skipped when lateral.enabled is false"
@@ -5920,14 +6279,9 @@ sources:
 
     #[test]
     fn detect_stagnation_queries_db_history() {
-        use belt_infra::db::Database;
-
         let tmp = TempDir::new().unwrap();
         let source = MockDataSource::new("github");
-        let daemon = setup_daemon(&tmp, source, vec![0]);
-
-        let db = Database::open_in_memory().unwrap();
-        let mut daemon = daemon.with_db(db);
+        let mut daemon = setup_daemon(&tmp, source, vec![0]);
 
         let item = test_item("src:1", "implement");
         // record_history_event now persists to DB as well.
@@ -5938,12 +6292,7 @@ sources:
         // Clear in-memory history to prove detection uses DB.
         daemon.history_events.clear();
 
-        let result = daemon.detect_stagnation_and_generate_plan(
-            &item.work_id,
-            "src:1",
-            "implement",
-            "compile error X",
-        );
+        let result = stagnation_plan(&daemon, &item.work_id, "compile error X");
         assert!(
             result.is_some(),
             "stagnation should be detected from DB history even when in-memory is empty"
@@ -5953,164 +6302,128 @@ sources:
         assert!(plan.contains("Pattern: spinning"));
     }
 
+    // --- store-owned result transitions (mark_* APIs) ---
+
+    fn running_daemon_item(daemon: &mut Daemon) -> String {
+        let mut item = test_item("s1", "analyze");
+        item.set_phase_unchecked(QueuePhase::Running);
+        let work_id = item.work_id.clone();
+        daemon.push_item(item);
+        work_id
+    }
+
     #[test]
-    fn detect_stagnation_falls_back_to_in_memory_without_db() {
+    fn mark_hitl_commits_phase_and_open_request_together() {
         let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![0]);
+        let mut daemon = setup_daemon(&tmp, MockDataSource::new("github"), vec![]);
+        let work_id = running_daemon_item(&mut daemon);
+        daemon.complete_item(&work_id).unwrap();
 
-        // No DB configured — should fall back to in-memory history_events.
-        assert!(daemon.db.is_none());
+        daemon
+            .mark_hitl(
+                &work_id,
+                HitlReason::ManualEscalation,
+                Some("check".to_string()),
+            )
+            .unwrap();
 
-        let item = test_item("src:1", "implement");
-        for _ in 0..3 {
-            daemon.record_history_event(&item, "failed", Some("compile error Y".to_string()));
-        }
-
-        let result = daemon.detect_stagnation_and_generate_plan(
-            &item.work_id,
-            "src:1",
-            "implement",
-            "compile error Y",
+        assert_eq!(
+            daemon.db.get_item(&work_id).unwrap().phase(),
+            QueuePhase::Hitl
         );
-        assert!(
-            result.is_some(),
-            "stagnation should be detected from in-memory fallback"
+        let entering = daemon
+            .db
+            .transitions_of(&work_id)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.to_phase.as_deref() == Some("hitl"))
+            .expect("completed -> hitl must be logged");
+        let request = daemon
+            .db
+            .hitl_request(&belt_core::hitl::HitlId::new(format!(
+                "hitl-{}",
+                entering.seq
+            )))
+            .unwrap()
+            .expect("an open request exists");
+        assert_eq!(request.reason, Some(HitlReason::ManualEscalation));
+        assert_eq!(request.notes.as_deref(), Some("check"));
+    }
+
+    #[test]
+    fn mark_failed_commits_running_to_failed_with_error_detail() {
+        let tmp = TempDir::new().unwrap();
+        let mut daemon = setup_daemon(&tmp, MockDataSource::new("github"), vec![]);
+        let work_id = running_daemon_item(&mut daemon);
+
+        daemon.mark_failed(&work_id, "boom".to_string()).unwrap();
+
+        let log = daemon.db.transitions_of(&work_id).unwrap();
+        let entry = log
+            .iter()
+            .find(|e| e.to_phase.as_deref() == Some("failed"))
+            .expect("running -> failed must be logged");
+        assert_eq!(entry.from_phase.as_deref(), Some("running"));
+        assert_eq!(entry.detail.as_deref(), Some("boom"));
+        assert_eq!(
+            daemon.db.get_item(&work_id).unwrap().phase(),
+            QueuePhase::Failed
         );
     }
 
-    // --- handle_escalation with lateral_plan tests ---
+    #[test]
+    fn mark_done_conflict_follows_the_stored_phase() {
+        let tmp = TempDir::new().unwrap();
+        let mut daemon = setup_daemon(&tmp, MockDataSource::new("github"), vec![]);
+        let work_id = running_daemon_item(&mut daemon);
+        daemon.complete_item(&work_id).unwrap();
+        daemon
+            .db
+            .update_phase(&work_id, QueuePhase::Failed)
+            .unwrap();
+
+        let err = daemon.mark_done(&work_id).unwrap_err();
+
+        assert!(matches!(
+            err,
+            BeltError::InvalidTransition {
+                from: QueuePhase::Failed,
+                to: QueuePhase::Done
+            }
+        ));
+        assert_eq!(
+            daemon.get_item(&work_id).unwrap().phase(),
+            QueuePhase::Failed
+        );
+    }
+
+    // --- derived item queueing ---
 
     #[test]
-    fn handle_escalation_retry_stores_lateral_plan() {
+    fn enqueue_derived_carries_the_lateral_plan() {
         let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![0]);
-
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Failed);
+        let mut daemon = setup_daemon(&tmp, MockDataSource::new("github"), vec![]);
+        let work_id = running_daemon_item(&mut daemon);
+        let crate::escalation_path::EscalationCommit::Applied(
+            crate::escalation_path::Committed::Derived { work_id: derived },
+        ) = crate::escalation_path::commit(
+            &daemon.hitl,
+            &work_id,
+            EscalationAction::Retry,
+            None,
+            &HitlExpiry::default(),
+        )
+        .unwrap()
+        else {
+            panic!("expected a derived item");
+        };
         let plan = Some("\n\n## Lateral Plan\ntest plan".to_string());
 
-        daemon.handle_escalation(&mut item, EscalationAction::Retry, plan.clone());
+        daemon.enqueue_derived(&derived, plan.clone());
 
-        let retry = daemon.queue.back().expect("should have retry item");
-        assert_eq!(retry.phase(), QueuePhase::Pending);
-        assert_eq!(retry.lateral_plan, plan);
-    }
-
-    #[test]
-    fn handle_escalation_retry_without_plan_clears_lateral_plan() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![0]);
-
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Failed);
-        item.lateral_plan = Some("old plan".to_string());
-
-        daemon.handle_escalation(&mut item, EscalationAction::Retry, None);
-
-        let retry = daemon.queue.back().expect("should have retry item");
-        assert!(retry.lateral_plan.is_none());
-    }
-
-    #[test]
-    fn handle_escalation_hitl_does_not_store_lateral_plan() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![0]);
-
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Failed);
-        let plan = Some("some plan".to_string());
-
-        daemon.handle_escalation(&mut item, EscalationAction::Hitl, plan);
-
-        let hitl = daemon.queue.back().expect("should have hitl item");
-        assert_eq!(hitl.phase(), QueuePhase::Hitl);
-        // HITL items retain original lateral_plan (from the cloned item), not the new plan.
-    }
-
-    #[test]
-    fn handle_escalation_hitl_attaches_lateral_notes_from_plan() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![0]);
-
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Failed);
-        let plan = Some("try a different algorithm".to_string());
-
-        daemon.handle_escalation(&mut item, EscalationAction::Hitl, plan);
-
-        let hitl = daemon.queue.back().expect("should have hitl item");
-        assert_eq!(hitl.phase(), QueuePhase::Hitl);
-        let notes = hitl.hitl_notes.as_ref().expect("hitl_notes should be set");
-        assert!(notes.contains("## Lateral Thinking History"));
-        assert!(notes.contains("try a different algorithm"));
-        assert!(notes.contains("Stagnation events: 0"));
-    }
-
-    #[test]
-    fn handle_escalation_hitl_no_notes_without_plan_or_events() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let mut daemon = setup_daemon(&tmp, source, vec![0]);
-
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Failed);
-
-        daemon.handle_escalation(&mut item, EscalationAction::Hitl, None);
-
-        let hitl = daemon.queue.back().expect("should have hitl item");
-        assert_eq!(hitl.phase(), QueuePhase::Hitl);
-        assert!(hitl.hitl_notes.is_none());
-    }
-
-    #[test]
-    fn handle_escalation_hitl_includes_stagnation_events_from_db() {
-        let tmp = TempDir::new().unwrap();
-        let source = MockDataSource::new("github");
-        let daemon = setup_daemon(&tmp, source, vec![0]);
-
-        let db = Database::open_in_memory().unwrap();
-        // Insert a stagnation event for the work_id.
-        let ev = TransitionEvent {
-            id: "ev-stag-1".to_string(),
-            work_id: "src:1:implement".to_string(),
-            source_id: "src:1".to_string(),
-            event_type: "stagnation".to_string(),
-            phase: None,
-            from_phase: None,
-            detail: Some(
-                serde_json::json!({
-                    "pattern_type": "spinning",
-                    "confidence": 0.95,
-                    "reason": "repeated identical errors",
-                    "recommended_persona": "contrarian",
-                    "failure_count": 3
-                })
-                .to_string(),
-            ),
-            created_at: chrono::Utc::now().to_rfc3339(),
-        };
-        db.insert_transition_event(&ev).unwrap();
-
-        let mut daemon = daemon.with_db(db);
-
-        let mut item = test_item("src:1", "implement");
-        item.set_phase_unchecked(QueuePhase::Failed);
-        let plan = Some("use contrarian approach".to_string());
-
-        daemon.handle_escalation(&mut item, EscalationAction::Hitl, plan);
-
-        let hitl = daemon.queue.back().expect("should have hitl item");
-        let notes = hitl.hitl_notes.as_ref().expect("hitl_notes should be set");
-        assert!(notes.contains("## Lateral Thinking History"));
-        assert!(notes.contains("use contrarian approach"));
-        assert!(notes.contains("Stagnation events: 1"));
-        assert!(notes.contains("Pattern: spinning (confidence: 0.95)"));
-        assert!(notes.contains("Persona: contrarian"));
+        let queued = daemon.get_item(&derived).expect("derived item is queued");
+        assert_eq!(queued.phase(), QueuePhase::Pending);
+        assert_eq!(queued.lateral_plan, plan);
     }
 
     // ---------------------------------------------------------------
@@ -6208,6 +6521,7 @@ sources:
                 Arc::new(registry),
                 Box::new(worktree_mgr),
                 4,
+                Database::open_in_memory().unwrap(),
             )
             .with_hook(hook)
         }
@@ -6288,50 +6602,41 @@ sources:
         }
 
         #[tokio::test]
-        async fn on_fail_called_on_execution_failure() {
+        async fn failures_call_on_escalation_and_on_fail_except_for_silent_retry() {
             let tmp = TempDir::new().unwrap();
             let hook = Arc::new(RecordingHook::new());
             // exit code 1 = handler prompt failure (on_enter has no actions for implement)
-            let mut daemon =
-                setup_daemon_with_hook(&tmp, vec![1], Arc::clone(&hook) as Arc<dyn LifecycleHook>);
+            let mut daemon = setup_daemon_with_hook(
+                &tmp,
+                vec![1, 1],
+                Arc::clone(&hook) as Arc<dyn LifecycleHook>,
+            );
 
             let mut item = test_item("s1", "implement");
             item.set_phase_unchecked(QueuePhase::Running);
             item.updated_at = Utc::now().to_rfc3339();
             daemon.push_item(item);
 
+            // First failure: silent retry.
             let outcomes = daemon.execute_running().await;
-
-            assert_eq!(outcomes.len(), 1);
             assert!(
-                matches!(outcomes[0], ItemOutcome::Failed { .. }),
+                matches!(
+                    outcomes[0],
+                    ItemOutcome::Failed {
+                        escalation: EscalationAction::Retry,
+                        ..
+                    }
+                ),
                 "handler should fail with exit code 1"
             );
-            assert!(
-                hook.on_fail_count.load(Ordering::SeqCst) >= 1,
-                "on_fail should be called on execution failure"
-            );
-        }
+            assert_eq!(hook.on_escalation_count.load(Ordering::SeqCst), 1);
+            assert_eq!(hook.on_fail_count.load(Ordering::SeqCst), 0);
 
-        #[tokio::test]
-        async fn on_escalation_called_on_handle_escalation() {
-            let tmp = TempDir::new().unwrap();
-            let hook = Arc::new(RecordingHook::new());
-            let mut daemon =
-                setup_daemon_with_hook(&tmp, vec![0], Arc::clone(&hook) as Arc<dyn LifecycleHook>);
-
-            let mut item = test_item("s1", "implement");
-            item.set_phase_unchecked(QueuePhase::Failed);
-
-            daemon.handle_escalation(&mut item, EscalationAction::Hitl, None);
-
-            // Allow the spawned task to complete.
-            tokio::task::yield_now().await;
-
-            assert!(
-                hook.on_escalation_count.load(Ordering::SeqCst) >= 1,
-                "on_escalation should be called on escalation"
-            );
+            // Second failure of the lineage: retry_with_comment runs on_fail.
+            daemon.advance();
+            daemon.execute_running().await;
+            assert_eq!(hook.on_escalation_count.load(Ordering::SeqCst), 2);
+            assert_eq!(hook.on_fail_count.load(Ordering::SeqCst), 1);
         }
 
         #[test]

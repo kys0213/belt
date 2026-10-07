@@ -1,5 +1,7 @@
+pub mod channels;
 pub mod cipher;
 pub mod db;
+mod db_migrations;
 pub mod hooks;
 pub mod ipc;
 pub mod onboarding;
@@ -7,6 +9,5 @@ pub mod platform;
 pub mod runtimes;
 pub mod script_hook;
 pub mod sources;
-pub mod test_runner;
 pub mod workspace_loader;
 pub mod worktree;
