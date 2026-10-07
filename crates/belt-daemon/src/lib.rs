@@ -15,4 +15,5 @@ pub mod evaluator;
 pub mod executor;
 pub mod hitl;
 pub mod hook_cache;
+pub mod notify;
 pub mod post_processing;
