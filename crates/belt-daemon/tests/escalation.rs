@@ -39,6 +39,7 @@ sources:
       1: retry
       2: retry_with_comment
       3: hitl
+      terminal: skip
 "#;
     serde_yaml::from_str(yaml).unwrap()
 }

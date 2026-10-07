@@ -94,18 +94,50 @@ impl Serialize for EscalationPolicy {
 
 impl<'de> Deserialize<'de> for EscalationPolicy {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+
+        const LEVEL_VALUES: &str = "retry, retry_with_comment, hitl";
+        const TERMINAL_VALUES: &str = "skip, replan";
+
         let raw: BTreeMap<String, EscalationAction> = BTreeMap::deserialize(deserializer)?;
         let mut rules = BTreeMap::new();
         let mut terminal = None;
         for (k, v) in raw {
             if k == "terminal" {
-                terminal = Some(v);
+                match v {
+                    EscalationAction::Skip | EscalationAction::Replan => terminal = Some(v),
+                    EscalationAction::Retry
+                    | EscalationAction::RetryWithComment
+                    | EscalationAction::Hitl => {
+                        return Err(D::Error::custom(format!(
+                            "escalation key `terminal` has invalid value `{v}` (allowed: {TERMINAL_VALUES})"
+                        )));
+                    }
+                }
             } else {
                 let key: u32 = k.parse().map_err(|_| {
-                    serde::de::Error::custom(format!("invalid escalation key: {k}"))
+                    D::Error::custom(format!(
+                        "invalid escalation key: {k} (allowed: failure count number or `terminal`)"
+                    ))
                 })?;
-                rules.insert(key, v);
+                match v {
+                    EscalationAction::Retry
+                    | EscalationAction::RetryWithComment
+                    | EscalationAction::Hitl => {
+                        rules.insert(key, v);
+                    }
+                    EscalationAction::Skip | EscalationAction::Replan => {
+                        return Err(D::Error::custom(format!(
+                            "escalation key `{key}` has invalid value `{v}` (allowed: {LEVEL_VALUES})"
+                        )));
+                    }
+                }
             }
+        }
+        if terminal.is_none() {
+            return Err(D::Error::custom(format!(
+                "escalation key `terminal` is required (allowed: {TERMINAL_VALUES})"
+            )));
         }
         Ok(Self { rules, terminal })
     }
@@ -230,13 +262,53 @@ mod tests {
 
     #[test]
     fn yaml_roundtrip() {
-        let yaml = "1: retry\n2: retry_with_comment\n3: hitl\n";
+        let yaml = "1: retry\n2: retry_with_comment\n3: hitl\nterminal: replan\n";
         let policy: EscalationPolicy = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(policy.resolve(1), EscalationAction::Retry);
         assert_eq!(policy.resolve(2), EscalationAction::RetryWithComment);
         assert_eq!(policy.resolve(3), EscalationAction::Hitl);
         assert_eq!(policy.resolve(4), EscalationAction::Hitl);
-        assert_eq!(policy.terminal_action(), None);
+        assert_eq!(policy.terminal_action(), Some(&EscalationAction::Replan));
+    }
+
+    #[test]
+    fn yaml_rejects_missing_terminal() {
+        let err = serde_yaml::from_str::<EscalationPolicy>("1: retry\n2: hitl\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("terminal"), "{err}");
+        assert!(err.contains("skip, replan"), "{err}");
+    }
+
+    #[test]
+    fn yaml_rejects_terminal_only_values_on_level_keys() {
+        for bad in ["skip", "replan"] {
+            let yaml = format!("1: {bad}\nterminal: skip\n");
+            let err = serde_yaml::from_str::<EscalationPolicy>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("`1`"), "{err}");
+            assert!(err.contains(bad), "{err}");
+            assert!(err.contains("retry, retry_with_comment, hitl"), "{err}");
+        }
+    }
+
+    #[test]
+    fn yaml_rejects_level_values_on_terminal() {
+        for bad in ["retry", "retry_with_comment", "hitl"] {
+            let yaml = format!("1: retry\nterminal: {bad}\n");
+            let err = serde_yaml::from_str::<EscalationPolicy>(&yaml)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("terminal"), "{err}");
+            assert!(err.contains(bad), "{err}");
+            assert!(err.contains("skip, replan"), "{err}");
+        }
+    }
+
+    #[test]
+    fn yaml_rejects_unknown_value() {
+        assert!(serde_yaml::from_str::<EscalationPolicy>("1: nope\nterminal: skip\n").is_err());
     }
 
     #[test]

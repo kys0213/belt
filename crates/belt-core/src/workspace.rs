@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::escalation::EscalationPolicy;
+use crate::notification::NotificationsConfig;
 use crate::stagnation::StagnationConfig;
 
 /// 워크스페이스 설정.
@@ -24,6 +25,9 @@ pub struct WorkspaceConfig {
     /// Stagnation detection configuration.
     #[serde(default)]
     pub stagnation: StagnationConfig,
+    /// 알림 channel 설정. 생략하면 origin channel 기본값만 적용된다.
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
 }
 
 /// Evaluation pipeline configuration.
@@ -228,8 +232,7 @@ sources:
       1: retry
       2: retry_with_comment
       3: hitl
-      4: skip
-      5: replan
+      terminal: skip
 runtime:
   default: claude
 "#;
@@ -241,6 +244,30 @@ runtime:
         assert_eq!(config.concurrency, 2);
         let github = config.sources.get("github").unwrap();
         assert_eq!(github.url, "https://github.com/org/repo");
+    }
+
+    #[test]
+    fn workspace_without_notifications_uses_defaults() {
+        let config: WorkspaceConfig = serde_yaml::from_str(WORKSPACE_YAML).unwrap();
+        assert_eq!(config.notifications, NotificationsConfig::default());
+    }
+
+    #[test]
+    fn workspace_parses_notifications() {
+        let yaml = format!(
+            "{WORKSPACE_YAML}notifications:\n  origin:\n    respond:\n      allow: [octocat]\n"
+        );
+        let config: WorkspaceConfig = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(config.notifications.origin.respond.allow, vec!["octocat"]);
+    }
+
+    #[test]
+    fn workspace_rejects_escalation_without_terminal() {
+        let yaml = "name: ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n";
+        let err = serde_yaml::from_str::<WorkspaceConfig>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("terminal"), "{err}");
     }
 
     #[test]

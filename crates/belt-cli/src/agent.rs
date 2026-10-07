@@ -371,6 +371,7 @@ fn default_agent_config() -> WorkspaceConfig {
         evaluate: None,
         claw_config: None,
         stagnation: Default::default(),
+        notifications: Default::default(),
     }
 }
 
@@ -645,6 +646,7 @@ mod tests {
             evaluate: None,
             claw_config: None,
             stagnation: Default::default(),
+            notifications: Default::default(),
         }
     }
 
@@ -705,6 +707,7 @@ mod tests {
             evaluate: None,
             claw_config: None,
             stagnation: Default::default(),
+            notifications: Default::default(),
         }
     }
 

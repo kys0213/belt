@@ -2718,41 +2718,13 @@ mod tests {
     }
 
     #[test]
-    fn hitl_timeout_defaults_to_failed_when_no_workspace_terminal_action() {
-        let db = Arc::new(Database::open_in_memory().unwrap());
-        let tmp = tempfile::tempdir().unwrap();
-        let worktree_mgr: Arc<dyn WorktreeManager> = Arc::new(
-            belt_infra::worktree::MockWorktreeManager::new(tmp.path().to_path_buf()),
-        );
-
-        // Create a workspace config WITHOUT terminal action in escalation.
-        let ws_config_path = tmp.path().join("workspace.yml");
-        std::fs::write(
-            &ws_config_path,
-            "name: no-terminal-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      2: hitl\n",
-        )
-        .unwrap();
-
-        db.add_workspace("no-terminal-ws", ws_config_path.to_str().unwrap())
-            .unwrap();
-
-        let mut item = belt_core::queue::QueueItem::new(
-            "w-no-term".into(),
-            "github:org/repo#10".into(),
-            "no-terminal-ws".into(),
-            "implement".into(),
-        );
-        item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_timeout_at = Some((Utc::now() - chrono::Duration::minutes(1)).to_rfc3339());
-        db.insert_item(&item).unwrap();
-
-        let job = HitlTimeoutJob::new(Arc::clone(&db), worktree_mgr);
-        let ctx = CronContext { now: Utc::now() };
-        job.execute(&ctx).unwrap();
-
-        // Should default to Failed (safe default).
-        let updated = db.get_item("w-no-term").unwrap();
-        assert_eq!(updated.phase(), QueuePhase::Failed);
+    fn workspace_without_escalation_terminal_fails_to_load() {
+        let yaml = "name: no-terminal-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      2: hitl\n";
+        let err = serde_yaml::from_str::<WorkspaceConfig>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("terminal"), "{err}");
+        assert!(err.contains("skip, replan"), "{err}");
     }
 
     #[test]
@@ -3088,23 +3060,9 @@ mod tests {
     }
 
     #[test]
-    fn resolve_terminal_action_defaults_to_failed_when_no_terminal_set() {
-        let db = Arc::new(Database::open_in_memory().unwrap());
-        let tmp = tempfile::tempdir().unwrap();
-
-        let ws_config_path = tmp.path().join("workspace.yml");
-        std::fs::write(
-            &ws_config_path,
-            "name: ws-noterm\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      2: hitl\n",
-        )
-        .unwrap();
-        db.add_workspace("ws-noterm", ws_config_path.to_str().unwrap())
-            .unwrap();
-
-        let mut cache = HashMap::new();
-        let action =
-            resolve_workspace_terminal_action(&db, "ws-noterm", "github:org/repo#1", &mut cache);
-        assert_eq!(action, ResolvedTerminalAction::Phase(QueuePhase::Failed));
+    fn workspace_with_levels_but_no_terminal_fails_to_load() {
+        let yaml = "name: ws-noterm\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      2: hitl\n";
+        assert!(serde_yaml::from_str::<WorkspaceConfig>(yaml).is_err());
     }
 
     #[test]
