@@ -1640,6 +1640,13 @@ pub mod transition_kind {
     /// A LifecycleHook call failed; `reason` names the callback, `detail`
     /// carries the error. The failure changed no phase.
     pub const HOOK: &str = "hook";
+    /// A cancel request was recorded; `actor` is the path it came through,
+    /// `detail` the requester.
+    pub const CANCEL_REQUESTED: &str = "cancel_requested";
+    /// The daemon accepted a cancel request.
+    pub const CANCEL_ACCEPTED: &str = "cancel_accepted";
+    /// A cancel request was closed; `reason` is the result.
+    pub const CANCEL_CLOSED: &str = "cancel_closed";
     /// A non-fatal step of HITL post-processing failed; post-processing went on.
     pub const POST_PROCESSING_ERROR: &str = "post_processing_error";
     /// HITL post-processing gave up after repeated result-transition
@@ -2908,7 +2915,7 @@ fn transition_in_tx(
             let now = Utc::now().to_rfc3339();
             let changed = tx
                 .execute(
-                    "UPDATE queue_items SET phase = ?1, updated_at = ?2 WHERE work_id = ?3 AND phase = ?4",
+                    "UPDATE queue_items SET phase = ?1, handler_pid = NULL, updated_at = ?2 WHERE work_id = ?3 AND phase = ?4",
                     params![phase_to_str(req.to), now, req.work_id, current],
                 )
                 .map_err(sql_err)?;
@@ -3210,6 +3217,391 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
     item.derived_from = col(row, 11)?;
     item.lineage_root = col(row, 12)?;
     Ok(item)
+}
+
+// ---- Handler process and cancel request store API ---------------------------
+
+/// Lifecycle state of a cancel request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelStatus {
+    Requested,
+    Accepted,
+    Closed,
+}
+
+impl CancelStatus {
+    fn parse(value: &str) -> Result<Self, BeltError> {
+        match value {
+            "requested" => Ok(Self::Requested),
+            "accepted" => Ok(Self::Accepted),
+            "closed" => Ok(Self::Closed),
+            other => Err(BeltError::Database(format!(
+                "unknown cancel request status '{other}'"
+            ))),
+        }
+    }
+}
+
+/// How a cancel request ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelResult {
+    /// The daemon stopped the handler and moved the item Running to Skipped.
+    Canceled,
+    /// The CLI moved the item without a daemon.
+    CanceledDirectly,
+    /// The item had already left Running.
+    TooLate,
+}
+
+impl CancelResult {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Canceled => "canceled",
+            Self::CanceledDirectly => "canceled_directly",
+            Self::TooLate => "too_late",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, BeltError> {
+        match value {
+            "canceled" => Ok(Self::Canceled),
+            "canceled_directly" => Ok(Self::CanceledDirectly),
+            "too_late" => Ok(Self::TooLate),
+            other => Err(BeltError::Database(format!(
+                "unknown cancel request result '{other}'"
+            ))),
+        }
+    }
+}
+
+/// One row of `cancel_requests`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelRequestRecord {
+    pub id: i64,
+    pub work_id: String,
+    pub requester: String,
+    /// Path the request came through: `cli` or `tui`.
+    pub via: String,
+    pub status: CancelStatus,
+    /// `Some` once the request is closed.
+    pub result: Option<CancelResult>,
+    /// RFC 3339.
+    pub requested_at: String,
+    pub accepted_at: Option<String>,
+    pub closed_at: Option<String>,
+}
+
+/// Result of [`Database::request_cancel`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestCancelOutcome {
+    /// A new request was recorded.
+    Opened { id: i64 },
+    /// The item already has an open request; it is the same request.
+    Existing(CancelRequestRecord),
+}
+
+const CANCEL_COLUMNS: &str =
+    "id, work_id, requester, via, status, result, requested_at, accepted_at, closed_at";
+
+impl Database {
+    /// Record the process id of the handler running `work_id`.
+    ///
+    /// The pid is valid only while the item is Running, so it is stored only
+    /// then: returns `false` and stores nothing for any other phase. Every
+    /// applied transition clears it, so a pid never outlives the Running
+    /// phase it was recorded in.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`; `BeltError::Database`
+    /// on I/O failure.
+    pub fn set_handler_process(&self, work_id: &str, pid: u32) -> Result<bool, BeltError> {
+        self.write_tx(|tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE queue_items SET handler_pid = ?1 WHERE work_id = ?2 AND phase = 'running'",
+                    params![i64::from(pid), work_id],
+                )
+                .map_err(sql_err)?;
+            if changed == 0 {
+                source_id_of(tx, work_id)?;
+            }
+            Ok(changed == 1)
+        })
+    }
+
+    /// Forget the handler process id of `work_id`.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`; `BeltError::Database`
+    /// on I/O failure.
+    pub fn clear_handler_process(&self, work_id: &str) -> Result<(), BeltError> {
+        self.write_tx(|tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE queue_items SET handler_pid = NULL WHERE work_id = ?1",
+                    params![work_id],
+                )
+                .map_err(sql_err)?;
+            if changed == 0 {
+                source_id_of(tx, work_id)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// The recorded handler process id of `work_id`, if any.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`; `BeltError::Database`
+    /// on I/O failure or a stored pid out of range.
+    pub fn handler_process(&self, work_id: &str) -> Result<Option<u32>, BeltError> {
+        let conn = self.lock_conn()?;
+        let pid: Option<i64> = conn
+            .query_row(
+                "SELECT handler_pid FROM queue_items WHERE work_id = ?1",
+                params![work_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(sql_err)?
+            .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))?;
+        pid.map(|pid| {
+            u32::try_from(pid)
+                .map_err(|_| BeltError::Database(format!("handler pid {pid} out of range")))
+        })
+        .transpose()
+    }
+
+    /// Record a request to cancel `work_id`, one open request per item.
+    ///
+    /// A second request while one is open (requested or accepted) is the same
+    /// request and is returned unchanged as `Existing`. The item's phase is
+    /// not inspected: whether the request still hits a Running item is
+    /// decided when it is handled, and a late one is closed as `TooLate`.
+    /// `via` is the path the request came through and is logged as the actor.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`; `BeltError::Database`
+    /// on I/O failure.
+    pub fn request_cancel(
+        &self,
+        work_id: &str,
+        requester: &str,
+        via: &Actor,
+    ) -> Result<RequestCancelOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let source_id = source_id_of(tx, work_id)?;
+            let open = read_cancels(
+                tx,
+                "WHERE work_id = ?1 AND status IN ('requested', 'accepted')",
+                params![work_id],
+            )?;
+            if let Some(existing) = open.into_iter().next() {
+                return Ok(RequestCancelOutcome::Existing(existing));
+            }
+            let via = actor_str(via);
+            tx.execute(
+                "INSERT INTO cancel_requests (work_id, requester, via, status, requested_at)
+                 VALUES (?1, ?2, ?3, 'requested', ?4)",
+                params![work_id, requester, via, Utc::now().to_rfc3339()],
+            )
+            .map_err(sql_err)?;
+            let id = tx.last_insert_rowid();
+            append_log(
+                tx,
+                &LogRecord {
+                    work_id,
+                    source_id: &source_id,
+                    kind: transition_kind::CANCEL_REQUESTED,
+                    from_phase: None,
+                    to_phase: None,
+                    actor: &via,
+                    reason: None,
+                    detail: Some(requester),
+                },
+            )?;
+            Ok(RequestCancelOutcome::Opened { id })
+        })
+    }
+
+    /// Mark a requested cancel as accepted by `actor` (the daemon).
+    ///
+    /// Compare-and-set on `requested`: returns `false` and changes nothing
+    /// when the request is unknown, already accepted or closed.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn accept_cancel(&self, id: i64, actor: &Actor) -> Result<bool, BeltError> {
+        self.write_tx(|tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE cancel_requests SET status = 'accepted', accepted_at = ?1
+                     WHERE id = ?2 AND status = 'requested'",
+                    params![Utc::now().to_rfc3339(), id],
+                )
+                .map_err(sql_err)?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            log_cancel_event(tx, id, transition_kind::CANCEL_ACCEPTED, actor, None)?;
+            Ok(true)
+        })
+    }
+
+    /// Close an open cancel request with `result`.
+    ///
+    /// Compare-and-set on `requested` or `accepted`: returns `false` and
+    /// changes nothing when the request is unknown or already closed. After
+    /// the close the item has no open request, so a new one can be made.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn close_cancel(
+        &self,
+        id: i64,
+        result: CancelResult,
+        actor: &Actor,
+    ) -> Result<bool, BeltError> {
+        self.write_tx(|tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE cancel_requests SET status = 'closed', result = ?1, closed_at = ?2
+                     WHERE id = ?3 AND status IN ('requested', 'accepted')",
+                    params![result.as_str(), Utc::now().to_rfc3339(), id],
+                )
+                .map_err(sql_err)?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            log_cancel_event(
+                tx,
+                id,
+                transition_kind::CANCEL_CLOSED,
+                actor,
+                Some(result.as_str()),
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Every open (requested or accepted) cancel request, oldest first.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn open_cancel_requests(&self) -> Result<Vec<CancelRequestRecord>, BeltError> {
+        let conn = self.lock_conn()?;
+        read_cancels(
+            &conn,
+            "WHERE status IN ('requested', 'accepted') ORDER BY id",
+            [],
+        )
+    }
+}
+
+fn source_id_of(tx: &Transaction<'_>, work_id: &str) -> Result<String, BeltError> {
+    tx.query_row(
+        "SELECT source_id FROM queue_items WHERE work_id = ?1",
+        params![work_id],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(sql_err)?
+    .ok_or_else(|| BeltError::ItemNotFound(work_id.to_string()))
+}
+
+fn read_cancels(
+    conn: &Connection,
+    filter: &str,
+    args: impl rusqlite::Params,
+) -> Result<Vec<CancelRequestRecord>, BeltError> {
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {CANCEL_COLUMNS} FROM cancel_requests {filter}"
+        ))
+        .map_err(sql_err)?;
+    let rows = stmt
+        .query_map(args, |row| {
+            Ok(CancelRow {
+                id: row.get(0)?,
+                work_id: row.get(1)?,
+                requester: row.get(2)?,
+                via: row.get(3)?,
+                status: row.get(4)?,
+                result: row.get(5)?,
+                requested_at: row.get(6)?,
+                accepted_at: row.get(7)?,
+                closed_at: row.get(8)?,
+            })
+        })
+        .map_err(sql_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(sql_err)?;
+    rows.into_iter().map(CancelRow::into_record).collect()
+}
+
+/// Raw `cancel_requests` row, before status and result are parsed.
+struct CancelRow {
+    id: i64,
+    work_id: String,
+    requester: String,
+    via: String,
+    status: String,
+    result: Option<String>,
+    requested_at: String,
+    accepted_at: Option<String>,
+    closed_at: Option<String>,
+}
+
+impl CancelRow {
+    fn into_record(self) -> Result<CancelRequestRecord, BeltError> {
+        Ok(CancelRequestRecord {
+            id: self.id,
+            work_id: self.work_id,
+            requester: self.requester,
+            via: self.via,
+            status: CancelStatus::parse(&self.status)?,
+            result: self
+                .result
+                .as_deref()
+                .map(CancelResult::parse)
+                .transpose()?,
+            requested_at: self.requested_at,
+            accepted_at: self.accepted_at,
+            closed_at: self.closed_at,
+        })
+    }
+}
+
+/// Append a `cancel_*` event for the item of request `id`.
+fn log_cancel_event(
+    tx: &Transaction<'_>,
+    id: i64,
+    kind: &str,
+    actor: &Actor,
+    reason: Option<&str>,
+) -> Result<(), BeltError> {
+    let work_id: String = tx
+        .query_row(
+            "SELECT work_id FROM cancel_requests WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .map_err(sql_err)?;
+    let source_id = source_id_of(tx, &work_id)?;
+    append_log(
+        tx,
+        &LogRecord {
+            work_id: &work_id,
+            source_id: &source_id,
+            kind,
+            from_phase: None,
+            to_phase: None,
+            actor: &actor_str(actor),
+            reason,
+            detail: None,
+        },
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -6468,5 +6860,249 @@ mod tests {
             db.record_post_processing_failure(&HitlId::new("missing"))
                 .is_err()
         );
+    }
+
+    // ---- Handler process and cancel requests -------------------------------
+
+    fn kinds_of(db: &Database, work_id: &str) -> Vec<String> {
+        db.transitions_of(work_id)
+            .unwrap()
+            .into_iter()
+            .map(|row| row.kind)
+            .collect()
+    }
+
+    fn leave_running(db: &Database, work_id: &str, to: QueuePhase) {
+        let req = TransitionRequest {
+            work_id: work_id.to_string(),
+            expected_from: QueuePhase::Running,
+            to,
+            actor: Actor::Daemon,
+            reason: TransitionReason::Manual,
+            detail: None,
+        };
+        assert!(matches!(
+            db.transition(&req).unwrap(),
+            TransitionOutcome::Applied { .. }
+        ));
+    }
+
+    #[test]
+    fn handler_pid_is_recorded_while_running_and_cleared_on_leaving() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#900");
+        assert_eq!(db.handler_process(&id).unwrap(), None);
+
+        assert!(db.set_handler_process(&id, 4242).unwrap());
+        assert_eq!(db.handler_process(&id).unwrap(), Some(4242));
+
+        leave_running(&db, &id, QueuePhase::Completed);
+        assert_eq!(db.handler_process(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn handler_pid_is_refused_outside_running() {
+        let db = test_db();
+        let id = inserted_id(collect(&db, "gh:org/repo#901", "analyze"));
+
+        assert!(!db.set_handler_process(&id, 4242).unwrap());
+        assert_eq!(db.handler_process(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn clear_handler_process_forgets_the_pid() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#902");
+        db.set_handler_process(&id, 4242).unwrap();
+
+        db.clear_handler_process(&id).unwrap();
+
+        assert_eq!(db.handler_process(&id).unwrap(), None);
+    }
+
+    #[test]
+    fn handler_process_calls_on_unknown_items_are_errors() {
+        let db = test_db();
+        assert!(matches!(
+            db.set_handler_process("nope", 1),
+            Err(BeltError::ItemNotFound(_))
+        ));
+        assert!(matches!(
+            db.clear_handler_process("nope"),
+            Err(BeltError::ItemNotFound(_))
+        ));
+        assert!(matches!(
+            db.handler_process("nope"),
+            Err(BeltError::ItemNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn duplicate_cancel_request_is_the_same_request() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#903");
+
+        let first = db.request_cancel(&id, "alice", &Actor::Cli).unwrap();
+        let RequestCancelOutcome::Opened { id: request_id } = first else {
+            panic!("expected Opened, got {first:?}");
+        };
+        let second = db.request_cancel(&id, "bob", &Actor::Tui).unwrap();
+
+        let RequestCancelOutcome::Existing(existing) = second else {
+            panic!("expected Existing, got {second:?}");
+        };
+        assert_eq!(existing.id, request_id);
+        assert_eq!(existing.requester, "alice");
+        assert_eq!(existing.via, "cli");
+        assert_eq!(existing.status, CancelStatus::Requested);
+        assert_eq!(db.open_cancel_requests().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_request_stays_the_same_request_after_it_is_accepted() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#904");
+        let RequestCancelOutcome::Opened { id: request_id } =
+            db.request_cancel(&id, "alice", &Actor::Cli).unwrap()
+        else {
+            panic!("expected Opened");
+        };
+        assert!(db.accept_cancel(request_id, &Actor::Daemon).unwrap());
+
+        let again = db.request_cancel(&id, "alice", &Actor::Cli).unwrap();
+
+        let RequestCancelOutcome::Existing(existing) = again else {
+            panic!("expected Existing, got {again:?}");
+        };
+        assert_eq!(existing.id, request_id);
+        assert_eq!(existing.status, CancelStatus::Accepted);
+        assert!(existing.accepted_at.is_some());
+    }
+
+    #[test]
+    fn accept_cancel_is_a_compare_and_set_on_requested() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#905");
+        let RequestCancelOutcome::Opened { id: request_id } =
+            db.request_cancel(&id, "alice", &Actor::Cli).unwrap()
+        else {
+            panic!("expected Opened");
+        };
+
+        assert!(db.accept_cancel(request_id, &Actor::Daemon).unwrap());
+        assert!(!db.accept_cancel(request_id, &Actor::Daemon).unwrap());
+        assert!(!db.accept_cancel(request_id + 100, &Actor::Daemon).unwrap());
+    }
+
+    #[test]
+    fn close_cancel_leaves_no_open_request_and_allows_a_new_one() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#906");
+        let RequestCancelOutcome::Opened { id: request_id } =
+            db.request_cancel(&id, "alice", &Actor::Cli).unwrap()
+        else {
+            panic!("expected Opened");
+        };
+
+        assert!(
+            db.close_cancel(request_id, CancelResult::TooLate, &Actor::Cli)
+                .unwrap()
+        );
+
+        assert!(db.open_cancel_requests().unwrap().is_empty());
+        assert!(
+            !db.close_cancel(request_id, CancelResult::Canceled, &Actor::Daemon)
+                .unwrap()
+        );
+        assert!(matches!(
+            db.request_cancel(&id, "alice", &Actor::Cli).unwrap(),
+            RequestCancelOutcome::Opened { .. }
+        ));
+    }
+
+    #[test]
+    fn every_close_result_is_stored_and_closing_after_accept_works() {
+        let db = test_db();
+        for (n, result) in [
+            CancelResult::Canceled,
+            CancelResult::CanceledDirectly,
+            CancelResult::TooLate,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = running_item(&db, &format!("gh:org/repo#91{n}"));
+            let RequestCancelOutcome::Opened { id: request_id } =
+                db.request_cancel(&id, "alice", &Actor::Cli).unwrap()
+            else {
+                panic!("expected Opened");
+            };
+            db.accept_cancel(request_id, &Actor::Daemon).unwrap();
+            assert!(db.close_cancel(request_id, result, &Actor::Daemon).unwrap());
+
+            let conn = db.conn.lock().unwrap();
+            let rows = read_cancels(&conn, "WHERE id = ?1", params![request_id]).unwrap();
+            assert_eq!(rows[0].status, CancelStatus::Closed);
+            assert_eq!(rows[0].result, Some(result));
+            assert!(rows[0].closed_at.is_some());
+        }
+    }
+
+    #[test]
+    fn open_cancel_requests_lists_open_ones_oldest_first() {
+        let db = test_db();
+        let a = running_item(&db, "gh:org/repo#920");
+        let b = running_item(&db, "gh:org/repo#921");
+        let c = running_item(&db, "gh:org/repo#922");
+        for id in [&b, &a, &c] {
+            db.request_cancel(id, "alice", &Actor::Tui).unwrap();
+        }
+        let RequestCancelOutcome::Existing(for_a) =
+            db.request_cancel(&a, "alice", &Actor::Tui).unwrap()
+        else {
+            panic!("expected Existing");
+        };
+        db.close_cancel(for_a.id, CancelResult::Canceled, &Actor::Daemon)
+            .unwrap();
+
+        let open = db.open_cancel_requests().unwrap();
+
+        assert_eq!(
+            open.iter().map(|r| r.work_id.as_str()).collect::<Vec<_>>(),
+            vec![b.as_str(), c.as_str()]
+        );
+    }
+
+    #[test]
+    fn cancel_request_on_unknown_item_is_an_error() {
+        let db = test_db();
+        assert!(matches!(
+            db.request_cancel("nope", "alice", &Actor::Cli),
+            Err(BeltError::ItemNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn cancel_lifecycle_is_logged_without_a_phase_change() {
+        let db = test_db();
+        let id = running_item(&db, "gh:org/repo#930");
+        let RequestCancelOutcome::Opened { id: request_id } =
+            db.request_cancel(&id, "alice", &Actor::Cli).unwrap()
+        else {
+            panic!("expected Opened");
+        };
+        db.accept_cancel(request_id, &Actor::Daemon).unwrap();
+        db.close_cancel(request_id, CancelResult::Canceled, &Actor::Daemon)
+            .unwrap();
+
+        let kinds = kinds_of(&db, &id);
+
+        assert_eq!(
+            &kinds[kinds.len() - 3..],
+            ["cancel_requested", "cancel_accepted", "cancel_closed"]
+        );
+        let closed = db.transitions_of(&id).unwrap().pop().unwrap();
+        assert_eq!(closed.reason.as_deref(), Some("canceled"));
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Running);
     }
 }
