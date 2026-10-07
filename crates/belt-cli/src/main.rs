@@ -3166,6 +3166,11 @@ name: test-ws
 sources:
   github:
     url: "https://github.com/test/repo"
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 300
     states:
       implement:
@@ -3228,6 +3233,11 @@ name: test-ws
 sources:
   github:
     url: "https://github.com/test/repo"
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 300
     states:
       implement:
@@ -3288,6 +3298,11 @@ name: test-ws
 sources:
   github:
     url: "https://github.com/test/repo"
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 300
     states:
       implement:
@@ -3391,6 +3406,11 @@ name: test-ws
 sources:
   github:
     url: "https://github.com/test/repo"
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 300
     states:
       implement:
@@ -3462,6 +3482,11 @@ name: test-ws
 sources:
   github:
     url: "https://github.com/test/repo"
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 300
     states:
       implement:
@@ -3573,6 +3598,11 @@ name: test-ws
 sources:
   github:
     url: "https://github.com/test/repo"
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 300
     states:
       implement:

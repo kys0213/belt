@@ -202,9 +202,19 @@ concurrency: 2
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 300
   slack:
     url: https://slack.com/workspace
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
 
     #[test]
@@ -283,12 +293,22 @@ name: project-a
 sources:
   github:
     url: https://github.com/org/repo-a
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
         let yaml_b = r#"
 name: project-b
 sources:
   github:
     url: https://github.com/org/repo-b
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
         let tmp_a = write_workspace_yaml(yaml_a);
         let tmp_b = write_workspace_yaml(yaml_b);
@@ -327,6 +347,11 @@ concurrency: 2
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
         let tmp = write_workspace_yaml(yaml);
         let result = onboard_workspace(&db, tmp.path(), belt_home.path());
@@ -342,10 +367,25 @@ name: three-source-project
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
   slack:
     url: https://slack.com/workspace
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
   jira:
     url: https://jira.example.com
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
         let tmp = write_workspace_yaml(yaml);
         let result = onboard_workspace(&db, tmp.path(), belt_home.path()).unwrap();
@@ -658,8 +698,8 @@ sources:
     fn multiple_workspaces_get_separate_claw_dirs() {
         let db = test_db();
         let belt_home = test_belt_home();
-        let yaml_a = "name: project-a\nsources:\n  github:\n    url: https://github.com/org/a\n";
-        let yaml_b = "name: project-b\nsources:\n  github:\n    url: https://github.com/org/b\n";
+        let yaml_a = "name: project-a\nsources:\n  github:\n    url: https://github.com/org/a\n    escalation:\n      1: retry\n      terminal: skip\n";
+        let yaml_b = "name: project-b\nsources:\n  github:\n    url: https://github.com/org/b\n    escalation:\n      1: retry\n      terminal: skip\n";
         let tmp_a = write_workspace_yaml(yaml_a);
         let tmp_b = write_workspace_yaml(yaml_b);
 

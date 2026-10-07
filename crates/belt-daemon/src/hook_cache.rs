@@ -330,6 +330,11 @@ name: test-ws
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
         let yaml_path = write_workspace_yaml(&tmp, "test-ws", yaml);
         register_workspace(&db, "test-ws", yaml_path.to_str().unwrap());
@@ -352,7 +357,7 @@ sources:
         let db = Arc::new(test_db());
         let shell: Arc<dyn ShellExecutor> = Arc::new(StubShell);
 
-        let yaml = "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let yaml = "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n";
         let yaml_path = write_workspace_yaml(&tmp, "test-ws", yaml);
         register_workspace(&db, "test-ws", yaml_path.to_str().unwrap());
 
@@ -373,7 +378,7 @@ sources:
         let db = Arc::new(test_db());
         let shell: Arc<dyn ShellExecutor> = Arc::new(StubShell);
 
-        let yaml = "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let yaml = "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n";
         let yaml_path = write_workspace_yaml(&tmp, "test-ws", yaml);
         register_workspace(&db, "test-ws", yaml_path.to_str().unwrap());
 
@@ -403,6 +408,11 @@ name: script-ws
 sources:
   custom:
     url: https://example.com
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     states:
       implement:
         trigger: {}
@@ -429,7 +439,7 @@ sources:
         let db = Arc::new(test_db());
         let shell: Arc<dyn ShellExecutor> = Arc::new(StubShell);
 
-        let yaml = "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let yaml = "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n";
         let yaml_path = write_workspace_yaml(&tmp, "test-ws", yaml);
         register_workspace(&db, "test-ws", yaml_path.to_str().unwrap());
 
@@ -447,8 +457,8 @@ sources:
         let db = Arc::new(test_db());
         let shell: Arc<dyn ShellExecutor> = Arc::new(StubShell);
 
-        let yaml1 = "name: ws1\nsources:\n  github:\n    url: https://github.com/org/repo1\n";
-        let yaml2 = "name: ws2\nsources:\n  github:\n    url: https://github.com/org/repo2\n";
+        let yaml1 = "name: ws1\nsources:\n  github:\n    url: https://github.com/org/repo1\n    escalation:\n      1: retry\n      terminal: skip\n";
+        let yaml2 = "name: ws2\nsources:\n  github:\n    url: https://github.com/org/repo2\n    escalation:\n      1: retry\n      terminal: skip\n";
         let path1 = write_workspace_yaml(&tmp, "ws1", yaml1);
         let path2 = write_workspace_yaml(&tmp, "ws2", yaml2);
         register_workspace(&db, "ws1", path1.to_str().unwrap());
@@ -473,7 +483,7 @@ sources:
         for i in 1..=3 {
             let name = format!("ws{i}");
             let yaml = format!(
-                "name: {name}\nsources:\n  github:\n    url: https://github.com/org/repo{i}\n"
+                "name: {name}\nsources:\n  github:\n    url: https://github.com/org/repo{i}\n    escalation:\n      1: retry\n      terminal: skip\n"
             );
             let path = write_workspace_yaml(&tmp, &name, &yaml);
             register_workspace(&db, &name, path.to_str().unwrap());

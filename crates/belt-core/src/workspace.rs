@@ -12,7 +12,7 @@ pub struct WorkspaceConfig {
     pub name: String,
     #[serde(default = "default_concurrency")]
     pub concurrency: u32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_sources")]
     pub sources: HashMap<String, SourceConfig>,
     #[serde(default)]
     pub runtime: RuntimeConfig,
@@ -92,8 +92,47 @@ pub struct SourceConfig {
     pub scan_interval_secs: u64,
     #[serde(default)]
     pub states: HashMap<String, StateConfig>,
-    #[serde(default)]
+    /// 실패 횟수별 escalation 정책. 기본값 없는 필수 블록이다.
     pub escalation: EscalationPolicy,
+}
+
+/// `escalation` 누락을 `sources.<type>.escalation` 경로와 예시로 보고하기 위한
+/// 역직렬화 전용 중간 형태.
+#[derive(Deserialize)]
+struct RawSourceConfig {
+    url: String,
+    #[serde(default = "default_scan_interval")]
+    scan_interval_secs: u64,
+    #[serde(default)]
+    states: HashMap<String, StateConfig>,
+    escalation: Option<EscalationPolicy>,
+}
+
+fn deserialize_sources<'de, D>(deserializer: D) -> Result<HashMap<String, SourceConfig>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let raw: HashMap<String, RawSourceConfig> = HashMap::deserialize(deserializer)?;
+    raw.into_iter()
+        .map(|(name, source)| {
+            let escalation = source.escalation.ok_or_else(|| {
+                D::Error::custom(format!(
+                    "sources.{name}.escalation is required (example: `escalation: {{1: retry, 2: retry_with_comment, 3: hitl, terminal: skip}}`; levels: retry, retry_with_comment, hitl; terminal: skip, replan)"
+                ))
+            })?;
+            Ok((
+                name,
+                SourceConfig {
+                    url: source.url,
+                    scan_interval_secs: source.scan_interval_secs,
+                    states: source.states,
+                    escalation,
+                },
+            ))
+        })
+        .collect()
 }
 
 fn default_scan_interval() -> u64 {
@@ -271,6 +310,16 @@ runtime:
     }
 
     #[test]
+    fn workspace_rejects_source_without_escalation_block() {
+        let yaml = "name: ws\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let err = serde_yaml::from_str::<WorkspaceConfig>(yaml)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sources.github.escalation"), "{err}");
+        assert!(err.contains("terminal: skip"), "{err}");
+    }
+
+    #[test]
     fn parse_states() {
         let config: WorkspaceConfig = serde_yaml::from_str(WORKSPACE_YAML).unwrap();
         let github = config.sources.get("github").unwrap();
@@ -302,7 +351,7 @@ runtime:
 
     #[test]
     fn defaults() {
-        let yaml = "name: minimal\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let yaml = "name: minimal\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n";
         let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.concurrency, 1);
         let github = config.sources.get("github").unwrap();
@@ -333,6 +382,11 @@ name: review-ws
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     states:
       fix_review:
         trigger:
@@ -356,7 +410,7 @@ sources:
 
     #[test]
     fn claw_config_defaults_to_none() {
-        let yaml = "name: minimal\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let yaml = "name: minimal\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n";
         let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.claw_config.is_none());
     }
@@ -368,6 +422,11 @@ name: with-claw
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 claw_config:
   auto_approve: true
   hitl_policy: custom-hitl.md
@@ -389,6 +448,11 @@ name: with-rules
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 claw_config:
   rules_path: /custom/rules
 "#;
@@ -404,6 +468,11 @@ name: no-rules
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 claw_config:
   auto_approve: false
 "#;
@@ -419,6 +488,11 @@ name: with-turns
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 claw_config:
   max_conversation_turns: 25
 "#;
@@ -434,6 +508,11 @@ name: no-turns
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 claw_config:
   auto_approve: false
 "#;
@@ -444,7 +523,7 @@ claw_config:
 
     #[test]
     fn evaluate_defaults_to_none() {
-        let yaml = "name: minimal\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let yaml = "name: minimal\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n";
         let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.evaluate.is_none());
     }
@@ -456,6 +535,11 @@ name: with-eval
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 evaluate:
   mechanical:
     - "cargo test"
@@ -475,6 +559,11 @@ name: empty-eval
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 evaluate: {}
 "#;
         let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
@@ -484,7 +573,7 @@ evaluate: {}
 
     #[test]
     fn stagnation_defaults_to_enabled() {
-        let yaml = "name: minimal\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let yaml = "name: minimal\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n";
         let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.stagnation.enabled);
     }
@@ -496,6 +585,11 @@ name: stag-off
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 stagnation:
   enabled: false
 "#;
@@ -510,6 +604,11 @@ name: stag-on
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 stagnation:
   enabled: true
 "#;
@@ -519,7 +618,7 @@ stagnation:
 
     #[test]
     fn lateral_defaults_to_enabled() {
-        let yaml = "name: minimal\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let yaml = "name: minimal\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n";
         let config: WorkspaceConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(config.stagnation.lateral.enabled);
     }
@@ -531,6 +630,11 @@ name: lat-off
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 stagnation:
   lateral:
     enabled: false
@@ -550,6 +654,11 @@ name: lat-on
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 stagnation:
   lateral:
     enabled: true

@@ -31,6 +31,11 @@ concurrency: 2
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 300
 "#;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
@@ -72,6 +77,11 @@ concurrency: 2
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -107,8 +117,7 @@ sources:
     #[test]
     fn load_minimal_config_applies_defaults() {
         // Only `name` and one source `url` are required; everything else should default.
-        let yaml =
-            "name: minimal-project\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let yaml = "name: minimal-project\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n";
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
 
@@ -130,12 +139,27 @@ name: multi-source
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 60
   slack:
     url: https://slack.com/workspace
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 120
   jira:
     url: https://jira.example.com
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -158,6 +182,11 @@ name: runtime-project
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 runtime:
   default: gemini
 "#;

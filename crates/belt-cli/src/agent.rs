@@ -623,8 +623,9 @@ async fn run_interactive_session(config: &WorkspaceConfig) -> Result<i32> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
 
+    use belt_core::escalation::{EscalationAction, EscalationPolicy};
     use belt_core::workspace::{
         HandlerConfig, RuntimeConfig, RuntimeInstanceConfig, SourceConfig, StateConfig,
         WorkspaceConfig,
@@ -695,7 +696,14 @@ mod tests {
                 url: "https://github.com/org/repo".to_string(),
                 scan_interval_secs: 300,
                 states,
-                escalation: Default::default(),
+                escalation: EscalationPolicy::with_terminal(
+                    BTreeMap::from([
+                        (1, EscalationAction::Retry),
+                        (2, EscalationAction::RetryWithComment),
+                        (3, EscalationAction::Hitl),
+                    ]),
+                    EscalationAction::Skip,
+                ),
             },
         );
 

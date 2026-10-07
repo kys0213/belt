@@ -579,6 +579,11 @@ name: test-ws
 sources:
   github:
     url: {url}
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     states:
       {state}:
         trigger:
@@ -971,6 +976,11 @@ name: test-ws
 sources:
   github:
     url: {url}
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     states:
       {state}:
         trigger:

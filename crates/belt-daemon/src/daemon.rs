@@ -4139,6 +4139,11 @@ concurrency: 2
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     states:
       no_done:
         trigger:
