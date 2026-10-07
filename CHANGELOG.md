@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.11](https://github.com/kys0213/belt/compare/v0.1.10...v0.1.11) (2026-10-07)
+
+
+### Features
+
+* **daemon:** wire stagnation detection, populate source_data, fix agent subprocess calls ([#879](https://github.com/kys0213/belt/issues/879)) ([d8ef6ec](https://github.com/kys0213/belt/commit/d8ef6ec1cc9105dd482bbc782e7cda6d387856f2))
+
 ## [0.1.10](https://github.com/kys0213/belt/compare/v0.1.9...v0.1.10) (2026-04-22)
 
 
