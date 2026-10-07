@@ -474,6 +474,70 @@ fn hitl_list_and_show_read_the_request_a_daemon_opened() {
 }
 
 #[test]
+fn hitl_show_reports_the_delivery_state_per_channel() {
+    use belt_infra::db::DeliveryAttempt;
+
+    let (tmp, db) = setup_belt_home();
+    let (id, hitl_id) = open_daemon_style_hitl(&db);
+    let hitl_id = belt_core::hitl::HitlId::new(&hitl_id);
+    db.ensure_delivery(&hitl_id, "origin").unwrap();
+    db.mark_delivery(
+        &hitl_id,
+        "origin",
+        &DeliveryAttempt::Sent {
+            message_ref: Some("c-7".to_string()),
+        },
+    )
+    .unwrap();
+    db.ensure_delivery(&hitl_id, "chat").unwrap();
+    db.mark_delivery(
+        &hitl_id,
+        "chat",
+        &DeliveryAttempt::Failed {
+            error: "channel down".to_string(),
+        },
+    )
+    .unwrap();
+
+    let show = run_belt(tmp.path(), &["hitl", "show", &id, "--format", "json"]);
+    assert!(show.status.success(), "{show:?}");
+    let v = stdout_json(&show);
+    let rows = v["deliveries"].as_array().expect("deliveries array");
+    let by_channel = |name: &str| rows.iter().find(|r| r["channel"] == name).unwrap();
+    assert_eq!(by_channel("origin")["status"], "sent");
+    assert_eq!(by_channel("chat")["status"], "pending");
+    assert_eq!(by_channel("chat")["attempts"], 1);
+    assert_eq!(by_channel("chat")["last_error"], "channel down");
+
+    let text = run_belt(tmp.path(), &["hitl", "show", &id]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("origin") && text.contains("sent"), "{text}");
+    assert!(
+        text.contains("chat") && text.contains("channel down"),
+        "{text}"
+    );
+}
+
+#[test]
+fn start_refuses_an_unsupported_channel_type() {
+    let tmp = TempDir::new().unwrap();
+    let config = tmp.path().join("workspace.yaml");
+    std::fs::write(
+        &config,
+        "name: p\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\nnotifications:\n  channels:\n    - name: team\n      type: slack\n      events: [failed]\n",
+    )
+    .unwrap();
+
+    let out = run_belt(tmp.path(), &["start", "--config", config.to_str().unwrap()]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("slack") && stderr.contains("allowed"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn hitl_show_reports_the_confirmed_response() {
     let (tmp, db) = setup_belt_home();
     let (id, _) = open_daemon_style_hitl(&db);

@@ -436,16 +436,49 @@ enum DependencyCommands {
     },
 }
 
+/// Build the notifier from the workspace's `notifications` section.
+///
+/// The origin channel talks to the repository of the GitHub source. A
+/// workspace without one has no origin implementation: progress and HITL
+/// requests then show on the dashboard only.
+fn build_notifier(
+    config: &belt_core::workspace::WorkspaceConfig,
+    db: Arc<Database>,
+    runtime: Arc<dyn belt_core::runtime::AgentRuntime>,
+) -> anyhow::Result<belt_daemon::notify::Notifier> {
+    use belt_core::notification::NotificationChannel;
+
+    let mut channels: Vec<Arc<dyn NotificationChannel>> = Vec::new();
+    let github_repo = config
+        .sources
+        .iter()
+        .find(|(name, source)| name.as_str() == "github" || source.url.contains("github.com"))
+        .and_then(|(_, source)| GitHubDataSource::extract_repo_name(&source.url));
+    match github_repo {
+        Some(repo) => {
+            let shell: Arc<dyn belt_core::platform::ShellExecutor> =
+                Arc::from(belt_infra::platform::default_shell_executor());
+            channels.push(Arc::new(belt_infra::channels::GitHubOriginChannel::new(
+                belt_infra::channels::GitHubChannelConfig::new(&repo),
+                shell,
+            )));
+        }
+        None => tracing::warn!(
+            "no GitHub source: notifications are shown on the dashboard only (no origin channel)"
+        ),
+    }
+    let interpreter = belt_daemon::notify::NlInterpreter::new(runtime, PathBuf::from("."));
+    belt_daemon::notify::Notifier::new(db, config.notifications.clone(), channels, interpreter)
+}
+
 /// Load workspace config and start the daemon loop.
 async fn start_daemon(
     config_path: &str,
     tick_interval_secs: u64,
     max_concurrent: u32,
 ) -> anyhow::Result<()> {
-    let config_content = std::fs::read_to_string(config_path)
-        .map_err(|e| anyhow::anyhow!("failed to read config file '{}': {}", config_path, e))?;
-    let config: belt_core::workspace::WorkspaceConfig = serde_yaml::from_str(&config_content)
-        .map_err(|e| anyhow::anyhow!("failed to parse config file '{}': {}", config_path, e))?;
+    let config =
+        belt_infra::workspace_loader::load_workspace_config(std::path::Path::new(config_path))?;
 
     let belt_home = belt_home()?;
 
@@ -463,6 +496,13 @@ async fn start_daemon(
     registry.register(Arc::new(GeminiRuntime::new(None)));
     registry.register(Arc::new(CodexRuntime::new(None)));
 
+    let default_runtime = registry.default_runtime().ok_or_else(|| {
+        anyhow::anyhow!(
+            "default runtime `{}` is not registered",
+            registry.default_name()
+        )
+    })?;
+
     // Worktree manager.
     let worktree_base = belt_home.join("worktrees");
     std::fs::create_dir_all(&worktree_base)?;
@@ -478,7 +518,8 @@ async fn start_daemon(
     // Capture PID file path before belt_home is moved into the daemon.
     let pid_path = belt_home.join("daemon.pid");
 
-    let mut daemon = Daemon::new(
+    let config_for_notifier = config.clone();
+    let daemon = Daemon::new(
         config,
         sources,
         Arc::new(registry),
@@ -487,6 +528,12 @@ async fn start_daemon(
         db,
     )
     .with_belt_home(belt_home);
+    let notifier = build_notifier(
+        &config_for_notifier,
+        Arc::clone(daemon.database()),
+        default_runtime,
+    )?;
+    let mut daemon = daemon.with_notifier(notifier);
 
     // Write PID file so `belt stop` can find the daemon process.
     std::fs::write(&pid_path, std::process::id().to_string())
@@ -2111,6 +2158,7 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
     };
 
     let (rec_action, rec_explanation) = recommended_action(request.reason.as_ref());
+    let deliveries = db.deliveries_of(&request.hitl_id)?;
 
     match format {
         "json" => {
@@ -2119,6 +2167,7 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
                 &mut value,
                 serde_json::json!({
                     "hitl_request": hitl_request_json(&request),
+                    "deliveries": deliveries.iter().map(delivery_json).collect::<Vec<_>>(),
                     "recommended": {
                         "action": rec_action,
                         "explanation": rec_explanation,
@@ -2161,6 +2210,9 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
             }
             if let Some(notes) = &request.resolution_notes {
                 println!("Resp. Notes:  {notes}");
+            }
+            for d in &deliveries {
+                println!("Delivery:     {}", delivery_line(d));
             }
             println!();
             println!("Recommended:  {rec_action}");
@@ -2215,6 +2267,37 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
         serde_json::json!({}),
         String::new(),
     )
+}
+
+fn delivery_status_label(status: belt_infra::db::DeliveryStatus) -> &'static str {
+    use belt_infra::db::DeliveryStatus;
+    match status {
+        DeliveryStatus::Pending => "pending",
+        DeliveryStatus::Sent => "sent",
+        DeliveryStatus::Failed => "failed",
+    }
+}
+
+fn delivery_json(d: &belt_infra::db::Delivery) -> serde_json::Value {
+    serde_json::json!({
+        "channel": d.channel,
+        "status": delivery_status_label(d.status),
+        "attempts": d.attempts,
+        "message_ref": d.message_ref,
+        "last_error": d.last_error,
+        "updated_at": d.updated_at,
+    })
+}
+
+fn delivery_line(d: &belt_infra::db::Delivery) -> String {
+    let mut line = format!("{} {}", d.channel, delivery_status_label(d.status));
+    if d.attempts > 0 {
+        line.push_str(&format!(" (failed attempts: {})", d.attempts));
+    }
+    if let Some(error) = &d.last_error {
+        line.push_str(&format!(" - {error}"));
+    }
+    line
 }
 
 /// `belt hitl timeout set|ls` -- manage HITL timeouts.
