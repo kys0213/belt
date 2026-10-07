@@ -530,6 +530,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn poll_ignores_marker_imitations_by_others() {
+        // Starting a comment with the marker only hides the writer's own
+        // comment; it cannot speak for anyone else, so ignoring it is intended.
+        let imitation = format!("{OWN_MARKER}\n/belt done");
+        let json = comments_json(&[
+            ("1", "mallory", &imitation, "2026-10-07T01:00:00Z"),
+            ("2", "alice", "/belt skip", "2026-10-07T02:00:00Z"),
+        ]);
+        let shell = RecordingShell::ok(&json);
+        let rs = channel(&shell)
+            .poll(&[target("h-1", WID, SINCE)])
+            .await
+            .unwrap();
+        assert_eq!(rs.len(), 1);
+        assert_eq!(rs[0].respondent, "alice");
+    }
+
+    #[tokio::test]
     async fn poll_skips_comments_without_an_author() {
         // A deleted account shows as a null author (or an empty login).
         let mut null_author = comment_json("1", "x", "/belt done", "2026-10-07T01:00:00Z");
