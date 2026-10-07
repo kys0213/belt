@@ -98,7 +98,7 @@ Step 2: 요약 표시
   ● daemon running (uptime 2h 15m)
 
   Workspaces:
-    auth-project — queue: 1R 1C 2D | specs: auth-v2 60%
+    auth-project — queue: 1R 1C 2D
 
   ⚠ HITL 대기: 1건
     → #44 Session adapter — 3회 실패
@@ -119,7 +119,7 @@ Step 3: 자연어 대화
 "큐 막힌 거 있어?"     → belt queue list --json → 분석
 "HITL 대기 목록"       → belt hitl list --json
 "실패한 거 있어?"      → belt queue list --phase failed --json
-"cron 일시정지"        → belt cron pause gap-detection
+"cron 일시정지"        → belt cron pause knowledge-extract
 "뭐 하면 좋을까?"     → status + hitl + queue(failed) 종합 → 추천
 ```
 
@@ -136,7 +136,6 @@ Step 3: 자연어 대화
 │   └── auto-approve-policy.md        # 자동 승인 기준
 ├── commands/
 └── skills/
-    ├── gap-detect/
     └── prioritize/
 ```
 
@@ -147,9 +146,8 @@ Per-workspace 오버라이드: `~/.belt/workspaces/<name>/agent/system/`
 ## Plugin slash command 통합
 
 ```
-슬래시 커맨드 3개:
+슬래시 커맨드 2개:
   /auto   — 데몬 제어 (start/stop/setup/config/dashboard/update)
-  /spec   — 스펙 CRUD (add/update/list/status/remove/pause/resume)
   /agent  — 대화 세션 (조회/조작/모니터링을 자연어로, 읽기 전용 CLI 흡수)
 ```
 
@@ -158,7 +156,6 @@ Per-workspace 오버라이드: `~/.belt/workspaces/<name>/agent/system/`
 | Command | 실행 위치 | 설명 |
 |---------|----------|------|
 | `/auto` | 어디서든 | Daemon 제어, workspace 등록 |
-| `/spec` | 레포의 Claude 세션 | 해당 레포의 스펙 CRUD |
 | `/agent` | 어디서든 | 대화형 에이전트 (전체 workspace 조회/조작) |
 
 ---
@@ -235,5 +232,5 @@ Evaluator의 SemanticStage가 내부적으로 `belt agent -p`를 호출한다. �
 
 - [DESIGN](../DESIGN.md) — QueuePhase 상태 머신 + evaluate 위치
 - [CLI 레퍼런스](./cli-reference.md) — CLI 전체 커맨드 트리
-- [Cron 엔진](./cron-engine.md) — 품질 루프 (gap-detection 등)
+- [Cron 엔진](./cron-engine.md) — 주기 작업 (knowledge-extract, hitl-timeout 등)
 - [Data Model](./data-model.md) — 컨텍스트 모델 (belt context 출력)

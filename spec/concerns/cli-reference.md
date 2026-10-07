@@ -7,8 +7,8 @@
 ## 아키텍처 (3-layer)
 
 ```
-Layer 1: Slash Command (3개, thin wrapper)
-  /auto, /spec, /agent
+Layer 1: Slash Command (2개, thin wrapper)
+  /auto, /agent
 
 Layer 2: DataSource + AgentRuntime (OCP 확장점)
   → 외부 시스템 워크플로우 + LLM 실행 추상화
@@ -33,17 +33,11 @@ belt
 ├── dashboard
 ├── workspace
 │   ├── add / list / show / update / remove / config
-├── spec
-│   ├── add / list / show / update
-│   ├── pause / resume / complete / remove
-│   ├── link / unlink
-│   ├── status <id> / verify <id>
 ├── queue
-│   ├── list [--phase <phase>] / show
+│   ├── list [--phase <phase>] / show <work_id>      ← 전이 이력(거절 기록·파생 원본 포함) 출력
 │   ├── skip <work_id>                      ← phase별 의미: Running이면 취소, 그 밖은 Skipped
 │   ├── done <work_id>                      ← evaluate가 호출: Completed → Done (on_done 실행)
 │   ├── hitl <work_id> [--reason <msg>]     ← evaluate가 호출: Completed → HITL
-│   ├── retry-script <work_id>              ← Failed 아이템의 on_done script 재실행
 │   └── dependency add / remove
 ├── context <work_id> [--json]               ← script용 정보 조회
 ├── hitl
@@ -114,7 +108,7 @@ belt hitl respond <hitl_id|work_id> --action <done|retry|skip|replan> [--respond
 | `not_found` | 대응하는 HITL 요청이 없다 | non-zero | `reason: "not_found"` |
 | `invalid_action` | 허용되지 않는 액션 | non-zero | `reason: "invalid_action"` |
 
-- `work_id`를 주면 그 아이템의 열린 HITL 요청에 응답한다. 같은 아이템이 HITL에 재진입했으면 `hitl_id`로 요청을 특정할 수 있다.
+- `work_id`를 주면 그 아이템의 open HITL 요청에 응답한다. 아이템당 open 요청은 최대 하나다. 과거 요청을 특정하려면 `hitl_id`를 쓴다.
 - CLI 응답에는 allowlist를 적용하지 않는다. 경로(via)는 이력에 `cli`로 기록되고, 응답자(by)는 `--respondent` 값으로 기록된다. 생략하면 OS 사용자 이름이다. 결과와 `already_handled` 출력은 경로와 응답자를 따로 보여준다.
 - daemon이 꺼져 있어도 응답은 확정된다. 후처리는 daemon이 다시 시작된 뒤 수행된다.
 
@@ -130,6 +124,7 @@ flowchart TD
     R1 --> R1a{"결과"}
     R1a -- "daemon이 handler 종료 후 Skipped" --> C1["canceled"]
     R1a -- "이미 Running을 벗어남" --> TL["too_late"]
+    R1a -- "수락됐으나 제한 시간 안에 종결 없음" --> AC["accepted"]
     D -- "아니오 (부재·무응답)" --> R2["CLI가 직접 Skipped + 남은 handler 프로세스 정리"]
     R2 --> C2["canceled_directly"]
     P -- "Pending / Ready / Failed" --> K["Skipped (기존 skip 의미)"]
@@ -141,6 +136,7 @@ flowchart TD
 |------|------|------|-----------------|
 | `canceled` | daemon이 handler를 종료하고 Running→Skipped | 0 | — (`result: "canceled"`) |
 | `canceled_directly` | daemon이 없거나 응답하지 않아 CLI가 직접 Running→Skipped로 바꾸고 handler 프로세스를 정리 | 0 | — (`result: "canceled_directly"`) |
+| `accepted` | daemon이 수락했고 종결은 비동기다. 직접 경로로 넘어가지 않는다. 최종 결과는 `belt queue show`로 확인한다 | 0 | — (`result: "accepted"`) |
 | `too_late` | 처리 전에 handler가 이미 끝나 Running을 벗어남. phase는 handler 결과를 따른다 | non-zero | `too_late` |
 | `busy` | HITL 후처리 중이라 취소·변경 불가 | non-zero | `busy` |
 | `already_handled` | 열린 HITL 요청에서 다른 응답이 먼저 확정됨 | non-zero | `already_handled` |
@@ -161,6 +157,26 @@ flowchart TD
 | `hitl` | 처리 중 | `busy` |
 | `hitl` | 이미 Hitl | `invalid_action` |
 | `done` / `hitl` / `skip` | Done · Skipped · Failed 등 전이 간선이 없는 종료 phase (Failed → Skipped skip은 허용) | `invalid_action` |
+
+Failed 아이템을 Done으로 바꾸는 명령은 없다. Failed에서 나가는 전이는 Failed → Skipped뿐이다.
+
+### `belt queue show`
+
+```bash
+belt queue show <work_id> [--json]
+```
+
+아이템의 현재 상태와 전이 이력을 보여준다.
+
+| 항목 | 내용 |
+|------|------|
+| 현재 phase | 아이템의 phase |
+| 파생 원본·계열 | 파생 원본(직전 아이템의 `work_id`)과 같은 계열의 아이템 |
+| 처리 중 여부 | handler 실행 또는 HITL 후처리 중인지 |
+| 전이 이력 | 시간순. 요청자와 경로(cli/tui/channel 이름)를 포함한다 |
+| 거절 기록 | `busy` · `conflict` · `invalid_action` · `unauthorized` · `already_handled` · `not_found` 종류별 |
+
+allowlist 밖 외부 응답은 거절 기록(`unauthorized`)으로 여기서만 확인한다.
 
 ### 실패 결과와 exit code
 
