@@ -979,16 +979,102 @@ fn queue_skip_failed_is_applied() {
 }
 
 #[test]
-fn queue_skip_running_is_busy() {
+fn queue_skip_running_without_daemon_is_canceled_directly() {
     let (tmp, db) = setup_belt_home();
     let id = seed_item(&db, "1", QueuePhase::Running);
 
     let out = run_belt(tmp.path(), &["queue", "skip", &id, "--json"]);
-    assert!(!out.status.success());
+    assert!(out.status.success(), "{out:?}");
     let v = stdout_json(&out);
-    assert_eq!(v["success"], false);
-    assert_eq!(v["reason"], "busy");
-    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Running);
+    assert_eq!(v["success"], true);
+    assert_eq!(v["result"], "canceled_directly");
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Skipped);
+    assert!(db.open_cancel_request(&id).unwrap().is_none());
+}
+
+/// A `sleep` in its own process group, as handlers are spawned.
+#[cfg(unix)]
+struct SleepHandler(std::process::Child);
+
+#[cfg(unix)]
+impl SleepHandler {
+    fn spawn() -> Self {
+        use std::os::unix::process::CommandExt;
+        let child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn sleep");
+        Self(child)
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+
+    /// Whether the process exits soon; reaps it.
+    fn exits(&mut self) -> bool {
+        for _ in 0..50 {
+            if self.0.try_wait().expect("try_wait").is_some() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        false
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SleepHandler {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn queue_skip_running_without_daemon_stops_the_recorded_handler() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Running);
+    let mut handler = SleepHandler::spawn();
+    assert!(db.set_handler_process(&id, handler.pid()).unwrap());
+
+    let out = run_belt(tmp.path(), &["queue", "skip", &id, "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(stdout_json(&out)["result"], "canceled_directly");
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Skipped);
+    assert!(handler.exits(), "the handler process should be stopped");
+}
+
+#[test]
+fn queue_skip_running_with_a_stale_daemon_pid_file_is_canceled_directly() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Running);
+    // No process holds this pid, so there is no daemon to answer.
+    std::fs::write(tmp.path().join("daemon.pid"), "4194304").unwrap();
+
+    let out = run_belt(tmp.path(), &["queue", "skip", &id, "--json"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(stdout_json(&out)["result"], "canceled_directly");
+}
+
+#[test]
+fn queue_skip_hitl_awaiting_post_processing_is_busy_and_records_no_request() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Hitl);
+    assert!(
+        run_belt(tmp.path(), &["queue", "skip", &id])
+            .status
+            .success()
+    );
+    assert_eq!(db.pending_post_processing().unwrap().len(), 1);
+
+    let out = run_belt(tmp.path(), &["queue", "skip", &id, "--json"]);
+    assert!(!out.status.success());
+    assert_eq!(stdout_json(&out)["reason"], "busy");
+    assert!(db.open_cancel_request(&id).unwrap().is_none());
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
 }
 
 #[test]
@@ -1194,7 +1280,7 @@ fn refusals_exit_with_the_refused_code() {
     let running = seed_item(&db, "1", QueuePhase::Running);
     let done = seed_item(&db, "2", QueuePhase::Done);
 
-    let busy = run_belt(tmp.path(), &["queue", "skip", &running, "--json"]);
+    let busy = run_belt(tmp.path(), &["queue", "done", &running, "--json"]);
     assert_eq!(stdout_json(&busy)["reason"], "busy");
     assert_eq!(busy.status.code(), Some(EXIT_REFUSED));
 
@@ -1240,7 +1326,7 @@ fn queue_show_json_has_transition_history_with_rejections() {
     let id = seed_item(&db, "1", QueuePhase::Running);
     // A refused CLI request is recorded in the history.
     assert!(
-        !run_belt(tmp.path(), &["queue", "skip", &id])
+        !run_belt(tmp.path(), &["queue", "done", &id])
             .status
             .success()
     );
@@ -1264,7 +1350,7 @@ fn queue_show_json_has_transition_history_with_rejections() {
     );
     let last = history.last().unwrap();
     assert_eq!(last["actor"], "cli");
-    assert_eq!(last["to_phase"], "skipped");
+    assert_eq!(last["to_phase"], "done");
 }
 
 #[test]

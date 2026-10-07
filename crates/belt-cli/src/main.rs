@@ -8,6 +8,7 @@ use belt_infra::db::Database;
 
 mod agent;
 mod bootstrap;
+mod cancel;
 mod dashboard;
 mod status;
 
@@ -1369,14 +1370,28 @@ fn cmd_queue_hitl(work_id: &str, reason: Option<&str>, json: bool) -> anyhow::Re
 
 /// `belt queue skip` -- skip an item through the transition contract.
 ///
-/// A Running item is refused as `busy` until execution cancel exists.
+/// A Running item is canceled through [`cancel::CancelFlow`]. A Ready item
+/// that lost the race to the daemon's claim is judged once more, so it is
+/// canceled when it turned Running.
 fn cmd_queue_skip(work_id: &str, json: bool) -> anyhow::Result<i32> {
+    use belt_core::transition::TransitionOutcome;
+
     let db = Arc::new(open_db()?);
     let hitl = belt_daemon::hitl::HitlService::new(Arc::clone(&db));
     let Some(item) = find_item(&db, work_id)? else {
         return emit_refusal(work_id, json, Refusal::not_found());
     };
+    if item.phase() == QueuePhase::Running {
+        return cancel_running_item(&db, work_id, json);
+    }
     let outcome = request_manual_transition(&hitl, &item, QueuePhase::Skipped, None)?;
+    if matches!(
+        outcome,
+        ManualOutcome::Refused(TransitionOutcome::Conflict { .. })
+    ) && find_item(&db, work_id)?.is_some_and(|i| i.phase() == QueuePhase::Running)
+    {
+        return cancel_running_item(&db, work_id, json);
+    }
     if matches!(outcome, ManualOutcome::Applied) {
         cleanup_worktree(&worktree_manager()?, work_id, "queue skip");
     }
@@ -1388,6 +1403,63 @@ fn cmd_queue_skip(work_id: &str, json: bool) -> anyhow::Result<i32> {
         serde_json::json!({}),
         format!("Skipped {work_id}."),
     )
+}
+
+/// Cancel a Running item as the CLI and render the result.
+fn cancel_running_item(db: &Database, work_id: &str, json: bool) -> anyhow::Result<i32> {
+    use cancel::CancelOutcome;
+
+    let belt_home = belt_home()?;
+    let killer = belt_infra::platform::default_process_killer();
+    let outcome = cancel::CancelFlow {
+        db,
+        daemon: &cancel::LocalDaemon {
+            belt_home: belt_home.clone(),
+        },
+        killer: killer.as_ref(),
+        actor: belt_core::transition::Actor::Cli,
+        requester: cli_respondent(),
+        wait_limit: cancel::CANCEL_WAIT_LIMIT,
+        poll_interval: cancel::CANCEL_POLL_INTERVAL,
+    }
+    .cancel(work_id)?;
+    match outcome {
+        CancelOutcome::Canceled => emit_success(
+            work_id,
+            json,
+            outcome.result(),
+            serde_json::json!({ "phase": "skipped" }),
+            format!("Canceled {work_id}."),
+        ),
+        CancelOutcome::CanceledDirectly => {
+            cleanup_worktree(&worktree_manager()?, work_id, "queue skip");
+            emit_success(
+                work_id,
+                json,
+                outcome.result(),
+                serde_json::json!({ "phase": "skipped" }),
+                format!("Canceled {work_id} directly: no daemon answered."),
+            )
+        }
+        CancelOutcome::Accepted => emit_success(
+            work_id,
+            json,
+            outcome.result(),
+            serde_json::json!({}),
+            format!(
+                "The daemon accepted the cancel of {work_id}; check `belt queue show {work_id}` for the result."
+            ),
+        ),
+        CancelOutcome::TooLate { current } => emit_refusal(
+            work_id,
+            json,
+            Refusal::new(
+                "too_late",
+                serde_json::json!({ "current": current.as_str() }),
+                format!("too_late: the item already left Running (now {current})"),
+            ),
+        ),
+    }
 }
 
 /// `belt queue dependency add` -- add a dependency between queue items.

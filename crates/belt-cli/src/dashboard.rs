@@ -39,6 +39,11 @@ use belt_core::hitl::{ConfirmPath, HitlAction, HitlStatus, RespondOutcome};
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
 use belt_daemon::hitl::{HitlResponse, HitlService};
+
+use crate::cancel::{
+    CANCEL_POLL_INTERVAL, CANCEL_WAIT_LIMIT, CancelFlow, CancelOutcome, LocalDaemon,
+};
+use belt_core::transition::Actor;
 use belt_infra::db::{
     Database, HistoryEvent, HitlRequest, HitlTarget, ScriptExecStats, TransitionEvent,
 };
@@ -374,6 +379,19 @@ fn run_loop(
         by: tui_respondent(),
     };
     let mut state = DashboardState::new();
+    let local_daemon = LocalDaemon {
+        belt_home: crate::belt_home()?,
+    };
+    let killer = belt_infra::platform::default_process_killer();
+    let cancel_flow = CancelFlow {
+        db,
+        daemon: &local_daemon,
+        killer: killer.as_ref(),
+        actor: Actor::Tui,
+        requester: tui_respondent(),
+        wait_limit: CANCEL_WAIT_LIMIT,
+        poll_interval: CANCEL_POLL_INTERVAL,
+    };
 
     loop {
         // Collect data for all tabs.
@@ -528,7 +546,7 @@ fn run_loop(
                 .constraints([Constraint::Length(3), Constraint::Min(5)])
                 .split(frame.area());
 
-            let tab_bar = render_tab_bar(state.active_tab);
+            let tab_bar = render_tab_bar(state.active_tab, state.toast.as_deref());
             frame.render_widget(tab_bar, outer_chunks[0]);
 
             match state.active_tab {
@@ -617,8 +635,23 @@ fn run_loop(
                 continue;
             }
 
+            // A toast stays until the next key.
+            state.toast = None;
+
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Char('x') => {
+                    let selected = selected_work_id(
+                        &state,
+                        &running_items,
+                        &recent_items,
+                        &workspaces,
+                        db,
+                        &board_columns,
+                        &per_ws_kanban_columns,
+                    );
+                    handle_cancel_key(&mut state, selected.as_deref(), db, &cancel_flow);
+                }
                 KeyCode::Char('h') => {
                     state.toast = None;
                     state.overlay = OverlayMode::Hitl {
@@ -1069,6 +1102,30 @@ fn handle_enter(
     board_columns: &[Vec<&QueueItem>],
     per_ws_kanban_columns: &[Vec<&QueueItem>],
 ) {
+    if let Some(work_id) = selected_work_id(
+        state,
+        running_items,
+        recent_items,
+        workspaces,
+        db,
+        board_columns,
+        per_ws_kanban_columns,
+    ) {
+        state.overlay = OverlayMode::ItemDetail(work_id);
+    }
+    let _ = all_items;
+}
+
+/// The item under the selection of the active tab, if any.
+fn selected_work_id(
+    state: &DashboardState,
+    running_items: &[QueueItem],
+    recent_items: &[QueueItem],
+    workspaces: &[(String, String, String)],
+    db: &Database,
+    board_columns: &[Vec<&QueueItem>],
+    per_ws_kanban_columns: &[Vec<&QueueItem>],
+) -> Option<String> {
     match state.active_tab {
         DashboardTab::Dashboard => {
             let panel = state
@@ -1080,42 +1137,85 @@ fn handle_enter(
                 ActivePanel::Running => running_items,
                 ActivePanel::Recent => recent_items,
             };
-            if let Some(item) = items.get(idx) {
-                state.overlay = OverlayMode::ItemDetail(item.work_id.clone());
-            }
+            items.get(idx).map(|item| item.work_id.clone())
         }
         DashboardTab::PerWorkspace => {
             if state.per_ws_view == PerWorkspaceView::Kanban {
-                if let Some(col) = per_ws_kanban_columns.get(state.per_ws_kanban_col)
-                    && let Some(item) = col.get(state.per_ws_kanban_row)
-                {
-                    state.overlay = OverlayMode::ItemDetail(item.work_id.clone());
-                }
-            } else if let Some(ws) = workspaces.get(state.selected_workspace) {
-                let ws_items: Vec<_> = db
-                    .list_items(None, Some(&ws.0))
+                per_ws_kanban_columns
+                    .get(state.per_ws_kanban_col)
+                    .and_then(|col| col.get(state.per_ws_kanban_row))
+                    .map(|item| item.work_id.clone())
+            } else {
+                let ws = workspaces.get(state.selected_workspace)?;
+                let idx = state.current_tab_state().selected_index;
+                db.list_items(None, Some(&ws.0))
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|i| state.status_filter.matches(&i.phase()))
-                    .collect();
-                let idx = state.current_tab_state().selected_index;
-                if let Some(item) = ws_items.get(idx) {
-                    state.overlay = OverlayMode::ItemDetail(item.work_id.clone());
-                }
+                    .nth(idx)
+                    .map(|item| item.work_id)
             }
         }
-        DashboardTab::DataSource | DashboardTab::Scripts => {
-            // No overlay on Enter for DataSource/Scripts tabs.
+        DashboardTab::DataSource | DashboardTab::Scripts => None,
+        DashboardTab::Board => board_columns
+            .get(state.board_selected_col)
+            .and_then(|col| col.get(state.board_selected_row))
+            .map(|item| item.work_id.clone()),
+    }
+}
+
+/// Toast text of a cancel attempt on `work_id`.
+fn describe_cancel(work_id: &str, outcome: &CancelOutcome) -> String {
+    match outcome {
+        CancelOutcome::Canceled => format!("canceled: {work_id}"),
+        CancelOutcome::CanceledDirectly => {
+            format!("canceled_directly: {work_id} (no daemon answered)")
         }
-        DashboardTab::Board => {
-            if let Some(col) = board_columns.get(state.board_selected_col)
-                && let Some(item) = col.get(state.board_selected_row)
-            {
-                state.overlay = OverlayMode::ItemDetail(item.work_id.clone());
-            }
+        CancelOutcome::Accepted => {
+            format!("accepted: the daemon is canceling {work_id}; see `belt queue show`")
+        }
+        CancelOutcome::TooLate { current } => {
+            format!("too_late: {work_id} already left Running (now {current})")
         }
     }
-    let _ = all_items;
+}
+
+/// Handle the cancel key: cancel the selected item when it is Running.
+///
+/// An item in Hitl whose confirmed response awaits post-processing is
+/// refused as `busy`; any other phase has nothing running to cancel. The
+/// result is shown as the toast.
+fn handle_cancel_key(
+    state: &mut DashboardState,
+    selected: Option<&str>,
+    db: &Database,
+    flow: &CancelFlow<'_>,
+) {
+    let Some(work_id) = selected else {
+        return;
+    };
+    state.toast = Some(match cancel_selected(work_id, db, flow) {
+        Ok(text) => text,
+        Err(e) => format!("error: {work_id}: {e}"),
+    });
+}
+
+fn cancel_selected(work_id: &str, db: &Database, flow: &CancelFlow<'_>) -> anyhow::Result<String> {
+    let item = db.get_item(work_id)?;
+    match item.phase() {
+        QueuePhase::Running => Ok(describe_cancel(work_id, &flow.cancel(work_id)?)),
+        QueuePhase::Hitl
+            if db
+                .pending_post_processing()?
+                .iter()
+                .any(|r| r.work_id == work_id) =>
+        {
+            Ok(format!(
+                "busy: {work_id} is being processed (post_processing)"
+            ))
+        }
+        phase => Ok(format!("not running: {work_id} is {phase}")),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,7 +1223,9 @@ fn handle_enter(
 // ---------------------------------------------------------------------------
 
 /// Render the tab bar showing available tabs with the active one highlighted.
-fn render_tab_bar(active: DashboardTab) -> Paragraph<'static> {
+///
+/// A toast, when present, is shown in the title.
+fn render_tab_bar(active: DashboardTab, toast: Option<&str>) -> Paragraph<'static> {
     let tabs = [
         ("d", "Dashboard", DashboardTab::Dashboard),
         ("w", "Workspace", DashboardTab::PerWorkspace),
@@ -1154,9 +1256,13 @@ fn render_tab_bar(active: DashboardTab) -> Paragraph<'static> {
         Style::default().fg(Color::DarkGray),
     ));
 
+    let title = match toast {
+        Some(toast) => format!(" Belt TUI | {toast} "),
+        None => " Belt TUI ".to_string(),
+    };
     Paragraph::new(Line::from(spans)).block(
         Block::default()
-            .title(" Belt TUI ")
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
     )
@@ -2348,6 +2454,10 @@ fn render_help_overlay(frame: &mut ratatui::Frame) {
         Line::from(vec![
             Span::styled("  Enter   ", Style::default().fg(Color::Cyan)),
             Span::raw("Open item detail overlay"),
+        ]),
+        Line::from(vec![
+            Span::styled("  x       ", Style::default().fg(Color::Cyan)),
+            Span::raw("Cancel the selected running item"),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -4896,6 +5006,137 @@ mod tests {
         }
     }
 
+    fn tui_flow(db: &Database) -> CancelFlow<'_> {
+        use crate::cancel::testing::{NoDaemon, NoKill};
+        CancelFlow {
+            db,
+            daemon: &NoDaemon,
+            killer: &NoKill,
+            actor: Actor::Tui,
+            requester: "alice".to_string(),
+            wait_limit: Duration::from_millis(50),
+            poll_interval: Duration::from_millis(10),
+        }
+    }
+
+    #[test]
+    fn cancel_key_cancels_the_selected_running_item_and_toasts_the_result() {
+        let db = make_db();
+        let work_id = crate::cancel::testing::running_item(&db);
+        let mut state = DashboardState::new();
+
+        handle_cancel_key(&mut state, Some(&work_id), &db, &tui_flow(&db));
+
+        let toast = state.toast.unwrap();
+        assert!(toast.contains("canceled_directly"), "{toast}");
+        assert_eq!(db.get_item(&work_id).unwrap().phase(), QueuePhase::Skipped);
+        let via_tui = db
+            .transitions_of(&work_id)
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "cancel_requested" && e.actor == "tui");
+        assert!(via_tui, "the request is recorded as coming from the tui");
+    }
+
+    #[test]
+    fn cancel_key_on_an_item_awaiting_post_processing_is_busy() {
+        let db = Arc::new(make_db());
+        open_hitl_item(&db, "1", None);
+        let work_id = db.list_items(Some(QueuePhase::Hitl), None).unwrap()[0]
+            .work_id
+            .clone();
+        let service = HitlService::new(Arc::clone(&db));
+        service
+            .respond(&HitlResponse {
+                target: HitlTarget::Item(work_id.clone()),
+                action: HitlAction::Skip,
+                by: "alice".to_string(),
+                via: "tui".to_string(),
+                path: ConfirmPath::Direct,
+                notes: None,
+            })
+            .unwrap();
+        let mut state = DashboardState::new();
+
+        handle_cancel_key(&mut state, Some(&work_id), &db, &tui_flow(&db));
+
+        let toast = state.toast.unwrap();
+        assert!(toast.contains("busy"), "{toast}");
+        assert!(db.open_cancel_request(&work_id).unwrap().is_none());
+        assert_eq!(db.get_item(&work_id).unwrap().phase(), QueuePhase::Hitl);
+    }
+
+    #[test]
+    fn cancel_key_on_a_pending_item_does_nothing_but_say_so() {
+        let db = make_db();
+        let item = make_item_with_phase("w-pending", QueuePhase::Pending, "2026-01-01T00:00:00Z");
+        db.insert_item(&item).unwrap();
+        let mut state = DashboardState::new();
+
+        handle_cancel_key(&mut state, Some("w-pending"), &db, &tui_flow(&db));
+
+        assert!(state.toast.unwrap().contains("not running"));
+        assert_eq!(
+            db.get_item("w-pending").unwrap().phase(),
+            QueuePhase::Pending
+        );
+    }
+
+    #[test]
+    fn cancel_key_without_a_selection_changes_nothing() {
+        let db = make_db();
+        let mut state = DashboardState::new();
+
+        handle_cancel_key(&mut state, None, &db, &tui_flow(&db));
+
+        assert!(state.toast.is_none());
+    }
+
+    #[test]
+    fn an_open_overlay_keeps_the_cancel_key_to_itself() {
+        let db = make_db();
+        let work_id = crate::cancel::testing::running_item(&db);
+        let service = HitlService::new(Arc::new(make_db()));
+        let responder = responder_for(&service, "alice");
+
+        for overlay in [OverlayMode::Help, OverlayMode::ItemDetail(work_id.clone())] {
+            let mut state = DashboardState::new();
+            state.overlay = overlay;
+            assert!(handle_overlay_key(
+                &mut state,
+                KeyCode::Char('x'),
+                &[],
+                &responder
+            ));
+            assert!(state.toast.is_none());
+        }
+        let mut state = hitl_state();
+        assert!(handle_overlay_key(
+            &mut state,
+            KeyCode::Char('x'),
+            &[],
+            &responder
+        ));
+        assert!(state.toast.is_none());
+        assert_eq!(db.get_item(&work_id).unwrap().phase(), QueuePhase::Running);
+    }
+
+    #[test]
+    fn selected_work_id_follows_the_dashboard_selection() {
+        let db = make_db();
+        let state = DashboardState::new();
+        let running = vec![QueueItem::new(
+            "w-run1".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        )];
+
+        let selected = selected_work_id(&state, &running, &[], &[], &db, &[], &[]);
+
+        assert_eq!(selected.as_deref(), Some("w-run1"));
+    }
+
     fn press(
         state: &mut DashboardState,
         code: KeyCode,
@@ -5312,7 +5553,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(160, 3)).unwrap();
         terminal
             .draw(|frame| {
-                frame.render_widget(render_tab_bar(DashboardTab::Dashboard), frame.area())
+                frame.render_widget(render_tab_bar(DashboardTab::Dashboard, None), frame.area())
             })
             .unwrap();
         let rendered: String = terminal
@@ -5440,7 +5681,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                frame.render_widget(render_tab_bar(DashboardTab::Dashboard), frame.area());
+                frame.render_widget(render_tab_bar(DashboardTab::Dashboard, None), frame.area());
             })
             .unwrap();
         let text: String = terminal
@@ -6375,7 +6616,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                let bar = render_tab_bar(DashboardTab::Dashboard);
+                let bar = render_tab_bar(DashboardTab::Dashboard, None);
                 frame.render_widget(bar, frame.area());
             })
             .unwrap();
