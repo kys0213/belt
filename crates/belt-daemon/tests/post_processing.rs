@@ -359,6 +359,76 @@ async fn done_with_a_failing_on_done_ends_failed_and_keeps_the_worktree() {
     );
 }
 
+#[tokio::test]
+async fn done_records_a_non_failure_attempt_and_leaves_the_failure_count() {
+    let tmp = TempDir::new().unwrap();
+    let mut daemon = daemon(&tmp, "echo done");
+    let (work_id, hitl_id) = hitl_item(&mut daemon, None);
+    failed_attempt(daemon.db(), &work_id);
+    respond(daemon.hitl(), &hitl_id, HitlAction::Done, None);
+
+    daemon.run_post_processing().await.unwrap();
+
+    let statuses: Vec<String> = daemon
+        .db()
+        .get_history(SOURCE)
+        .unwrap()
+        .into_iter()
+        .map(|h| h.status)
+        .collect();
+    assert_eq!(statuses, vec!["failed", "done"]);
+    assert_eq!(daemon.db().failure_count(&work_id).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn a_failing_on_done_script_records_a_failed_attempt() {
+    let tmp = TempDir::new().unwrap();
+    let mut daemon = daemon(&tmp, "exit 1");
+    let (work_id, hitl_id) = hitl_item(&mut daemon, None);
+    respond(daemon.hitl(), &hitl_id, HitlAction::Done, None);
+
+    daemon.run_post_processing().await.unwrap();
+
+    let history = daemon.db().get_history(SOURCE).unwrap();
+    assert_eq!(history.len(), 1, "{history:?}");
+    assert_eq!(history[0].status, "failed");
+    assert_eq!(history[0].error.as_deref(), Some("on_done script failed"));
+    assert_eq!(daemon.db().failure_count(&work_id).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn an_on_done_that_cannot_start_is_retried_instead_of_failing_the_item() {
+    let tmp = TempDir::new().unwrap();
+    let mut daemon = daemon(&tmp, "echo done");
+    let (work_id, hitl_id) = hitl_item(&mut daemon, None);
+    respond(daemon.hitl(), &hitl_id, HitlAction::Done, None);
+    // The checkout cannot be created: the scripts never start.
+    let base = tmp.path().join("worktrees");
+    std::fs::remove_dir_all(&base).unwrap();
+    std::fs::write(&base, "not a directory").unwrap();
+
+    daemon.run_post_processing().await.unwrap();
+
+    assert_eq!(stored_phase(&daemon, &work_id), QueuePhase::Hitl);
+    assert!(!processed(&daemon, &hitl_id));
+    assert_eq!(
+        daemon
+            .db()
+            .hitl_request(&hitl_id)
+            .unwrap()
+            .unwrap()
+            .post_processing_failures,
+        1
+    );
+    assert!(daemon.db().get_history(SOURCE).unwrap().is_empty());
+
+    // The next tick succeeds once the checkout can be created again.
+    std::fs::remove_file(&base).unwrap();
+    daemon.run_post_processing().await.unwrap();
+    assert_eq!(stored_phase(&daemon, &work_id), QueuePhase::Done);
+    assert!(processed(&daemon, &hitl_id));
+}
+
 // ---- retry -----------------------------------------------------------------
 
 #[tokio::test]

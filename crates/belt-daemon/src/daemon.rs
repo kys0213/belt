@@ -34,6 +34,7 @@ use crate::evaluator::Evaluator;
 use crate::executor::{ActionEnv, ActionExecutor, ActionResult};
 use crate::hitl::{HitlExpiry, HitlService};
 use crate::hook_cache::DynamicHookLoader;
+use crate::post_processing::OnDoneRun;
 
 /// Safely transition a [`QueueItem`] to a new phase.
 ///
@@ -1522,25 +1523,42 @@ impl Daemon {
     /// Returns `true` when they succeed or none are configured. on_done is a
     /// precondition of Done: the caller moves the item to Done only on `true`.
     async fn run_on_done_scripts(&mut self, item: &QueueItem) -> Result<bool> {
+        match self.run_on_done_steps(item).await? {
+            OnDoneRun::Passed => Ok(true),
+            OnDoneRun::ScriptFailed => Ok(false),
+            OnDoneRun::ScriptError(e) => Err(anyhow::anyhow!(e)),
+        }
+    }
+
+    /// Run the on_done scripts, telling store and worktree failures (`Err`,
+    /// the scripts never ran) apart from what the scripts did.
+    async fn run_on_done_steps(&mut self, item: &QueueItem) -> Result<OnDoneRun> {
         let Some(state_config) = self.find_state_config(&item.state).cloned() else {
-            return Ok(true);
+            return Ok(OnDoneRun::Passed);
         };
         if state_config.on_done.is_empty() {
-            return Ok(true);
+            return Ok(OnDoneRun::Passed);
         }
 
         let key = self.db.worktree_key(&item.work_id)?;
         let worktree = self.worktree_mgr.create_or_reuse(&key)?;
         let env = ActionEnv::new(&item.work_id, &worktree);
         let on_done: Vec<Action> = state_config.on_done.iter().map(Action::from).collect();
-        let result = self.executor.execute_all(&on_done, &env).await?;
+        let result = match self.executor.execute_all(&on_done, &env).await {
+            Ok(result) => result,
+            Err(e) => return Ok(OnDoneRun::ScriptError(e.to_string())),
+        };
 
         // Record token usage from on_done handler execution.
         if let Some(ref r) = result {
             self.try_record_token_usage(item, r);
         }
 
-        Ok(!matches!(result, Some(ref r) if !r.success()))
+        Ok(if matches!(result, Some(ref r) if !r.success()) {
+            OnDoneRun::ScriptFailed
+        } else {
+            OnDoneRun::Passed
+        })
     }
 
     /// Attempt history and worktree cleanup after the on_done outcome is settled.
@@ -2873,8 +2891,13 @@ impl crate::post_processing::PostProcessingEffects for Daemon {
         item.workspace_id == self.config.name
     }
 
-    async fn run_on_done(&mut self, item: &QueueItem) -> Result<bool> {
-        self.run_on_done_scripts(item).await
+    fn record_attempt(&mut self, item: &QueueItem, status: &str, error: Option<&str>) {
+        self.record_history(item, status, error);
+        self.record_history_event(item, status, error.map(str::to_string));
+    }
+
+    async fn run_on_done(&mut self, item: &QueueItem) -> Result<OnDoneRun> {
+        self.run_on_done_steps(item).await
     }
 
     async fn on_hitl_resolved(

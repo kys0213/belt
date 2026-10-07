@@ -7,7 +7,7 @@
 //!
 //! | action | steps before the result transition | result | worktree |
 //! |---|---|---|---|
-//! | done | on_done → on_hitl_resolved | Done (Failed when on_done fails) | cleaned on Done, kept on Failed |
+//! | done | on_done → on_hitl_resolved | Done (Failed when an on_done script fails) | cleaned on Done, kept on Failed |
 //! | retry | failure-count reset point → on_hitl_resolved | Pending, same item, instruction as lateral plan | kept |
 //! | skip | on_hitl_resolved | Skipped | cleaned |
 //! | replan | on_hitl_resolved → derive | origin Skipped + derived Pending with the failure context | origin's cleaned, derived gets a new one |
@@ -26,7 +26,8 @@
 //! to log-cleanup, which removes Done and Skipped worktrees.
 //!
 //! Hook and cleanup failures are non-fatal and recorded (`hook`,
-//! `post_processing_error`). A failed result transition is retried on the
+//! `post_processing_error`). A failed result transition, or an on_done that
+//! could not start because the store or checkout failed, is retried on the
 //! next tick; after [`POST_PROCESSING_FAILURE_LIMIT`] failures the item
 //! leaves Hitl for Failed with a `post_processing_failed` record.
 
@@ -55,15 +56,29 @@ pub(crate) trait PostProcessingEffects: Send {
     /// Whether this runner post-processes `item` (it knows the item's workspace).
     fn owns(&self, item: &QueueItem) -> bool;
 
-    /// Run the on_done scripts of the item's state. `Ok(true)` when they
-    /// succeed or none are configured.
-    async fn run_on_done(&mut self, item: &QueueItem) -> anyhow::Result<bool>;
+    /// Run the on_done scripts of the item's state. `Err` means the scripts
+    /// could not be started (store or checkout failure), not that they failed.
+    async fn run_on_done(&mut self, item: &QueueItem) -> anyhow::Result<OnDoneRun>;
+
+    /// Append the attempt history of an item that ended `done` or `failed`.
+    fn record_attempt(&mut self, item: &QueueItem, status: &str, error: Option<&str>);
 
     /// Call the item's `on_hitl_resolved` hook.
     async fn on_hitl_resolved(&self, item: &QueueItem, action: HitlAction) -> anyhow::Result<()>;
 
     /// Remove the worktree the item works in.
     fn cleanup_worktree(&self, item: &QueueItem) -> Result<(), BeltError>;
+}
+
+/// What the on_done scripts did once they ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OnDoneRun {
+    /// They succeeded, or none are configured.
+    Passed,
+    /// A script exited unsuccessfully.
+    ScriptFailed,
+    /// A script could not be executed.
+    ScriptError(String),
 }
 
 /// A request whose result transition was committed.
@@ -137,6 +152,7 @@ pub(crate) async fn run<E: PostProcessingEffects>(
             Ok(Attempt::NotPending) => {}
             Err(error) => {
                 if let Some(gave_up) = fail_attempt(db, &request, Some((&item, action)), &error) {
+                    effects.record_attempt(&item, "failed", Some(&error));
                     applied.push(gave_up);
                 }
             }
@@ -156,27 +172,26 @@ async fn attempt<E: PostProcessingEffects>(
 ) -> Result<Attempt, String> {
     match action {
         HitlAction::Done => {
-            let on_done = effects.run_on_done(item).await;
+            // A store or checkout failure is an attempt failure retried on the
+            // next tick; only what the scripts themselves did can fail the item.
+            let on_done = effects
+                .run_on_done(item)
+                .await
+                .map_err(|e| format!("on_done could not run: {e}"))?;
             resolved(db, effects, item, action).await;
-            match on_done {
-                Ok(true) => complete(db, request, action, QueuePhase::Done, None, None),
-                Ok(false) => complete(
-                    db,
-                    request,
-                    action,
+            let (to, detail) = match on_done {
+                OnDoneRun::Passed => (QueuePhase::Done, None),
+                OnDoneRun::ScriptFailed => (
                     QueuePhase::Failed,
                     Some("on_done script failed".to_string()),
-                    None,
                 ),
-                Err(e) => complete(
-                    db,
-                    request,
-                    action,
-                    QueuePhase::Failed,
-                    Some(format!("on_done error: {e}")),
-                    None,
-                ),
-            }
+                OnDoneRun::ScriptError(e) => {
+                    (QueuePhase::Failed, Some(format!("on_done error: {e}")))
+                }
+            };
+            let result = complete(db, request, action, to, detail.clone(), None);
+            record_result(effects, item, &result, detail.as_deref());
+            result
         }
         HitlAction::Retry => {
             db.record_reset(&item.work_id)
@@ -197,17 +212,20 @@ async fn attempt<E: PostProcessingEffects>(
         }
         HitlAction::Replan if item.replan_count >= REPLAN_LIMIT => {
             resolved(db, effects, item, action).await;
-            complete(
+            let detail = format!(
+                "replan limit reached: the lineage was replanned {} times (max {REPLAN_LIMIT})",
+                item.replan_count
+            );
+            let result = complete(
                 db,
                 request,
                 action,
                 QueuePhase::Failed,
-                Some(format!(
-                    "replan limit reached: the lineage was replanned {} times (max {REPLAN_LIMIT})",
-                    item.replan_count
-                )),
+                Some(detail.clone()),
                 None,
-            )
+            );
+            record_result(effects, item, &result, Some(&detail));
+            result
         }
         HitlAction::Replan => {
             let context = replan_context(db, request, item);
@@ -235,6 +253,23 @@ async fn attempt<E: PostProcessingEffects>(
                     Err(format!("replan derivation refused: {refused:?}"))
                 }
             }
+        }
+    }
+}
+
+/// Append the attempt history of a committed Done or Failed result, with the
+/// same statuses a normal completion records (`done`, `failed`).
+fn record_result<E: PostProcessingEffects>(
+    effects: &mut E,
+    item: &QueueItem,
+    result: &Result<Attempt, String>,
+    error: Option<&str>,
+) {
+    if let Ok(Attempt::Applied(Applied::Left { to, .. })) = result {
+        match to {
+            QueuePhase::Done => effects.record_attempt(item, "done", None),
+            QueuePhase::Failed => effects.record_attempt(item, "failed", error),
+            _ => {}
         }
     }
 }
