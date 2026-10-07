@@ -563,3 +563,262 @@ fn builtin_jobs_exclude_evaluate_and_gap_detection() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// HitlTimeoutJob: expiry joins the HITL response race
+// ---------------------------------------------------------------------------
+
+mod hitl_timeout {
+    use super::*;
+    use belt_core::escalation::EscalationAction;
+    use belt_core::hitl::{ConfirmPath, HitlAction, HitlId, HitlStatus, RespondOutcome};
+    use belt_core::phase::QueuePhase;
+    use belt_core::queue::HitlReason;
+    use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
+    use belt_daemon::hitl::{HitlExpiry, HitlResponse, HitlService};
+    use belt_infra::db::{CollectOutcome, HitlTarget, NewItem, OpenHitlOutcome, OpenHitlRequest};
+    use chrono::Duration as ChronoDuration;
+
+    fn step(db: &Database, work_id: &str, from: QueuePhase, to: QueuePhase) {
+        let outcome = db
+            .transition(&TransitionRequest {
+                work_id: work_id.to_string(),
+                expected_from: from,
+                to,
+                actor: Actor::Daemon,
+                reason: TransitionReason::Manual,
+                detail: None,
+            })
+            .unwrap();
+        assert!(
+            matches!(outcome, TransitionOutcome::Applied { .. }),
+            "{from:?} -> {to:?}: {outcome:?}"
+        );
+    }
+
+    fn running_item(db: &Database, workspace: &str, tag: &str) -> String {
+        let outcome = db
+            .insert_collected(&NewItem {
+                source_id: format!("github:org/repo#{tag}"),
+                workspace_id: workspace.to_string(),
+                state: "analyze".to_string(),
+                title: None,
+                actor: Actor::Daemon,
+            })
+            .unwrap();
+        let CollectOutcome::Inserted { work_id } = outcome else {
+            panic!("expected a new item, got {outcome:?}");
+        };
+        step(db, &work_id, QueuePhase::Pending, QueuePhase::Ready);
+        step(db, &work_id, QueuePhase::Ready, QueuePhase::Running);
+        work_id
+    }
+
+    fn open_hitl(
+        service: &HitlService,
+        work_id: &str,
+        timeout_at: Option<String>,
+        terminal_action: Option<EscalationAction>,
+    ) -> HitlId {
+        let outcome = service
+            .open(&OpenHitlRequest {
+                work_id: work_id.to_string(),
+                expected_from: QueuePhase::Running,
+                reason: HitlReason::EvaluateFailure,
+                notes: None,
+                actor: Actor::Daemon,
+                transition_reason: TransitionReason::Escalation(EscalationAction::Hitl),
+                timeout_at,
+                terminal_action,
+            })
+            .unwrap();
+        match outcome {
+            OpenHitlOutcome::Opened { hitl_id, .. } => hitl_id,
+            other => panic!("expected Opened, got {other:?}"),
+        }
+    }
+
+    fn past() -> String {
+        (Utc::now() - ChronoDuration::minutes(5)).to_rfc3339()
+    }
+
+    fn future() -> String {
+        (Utc::now() + ChronoDuration::hours(1)).to_rfc3339()
+    }
+
+    fn run_job(db: &Arc<Database>) {
+        let job = belt_daemon::cron::HitlTimeoutJob::new(Arc::clone(db));
+        job.execute(&CronContext { now: Utc::now() }).unwrap();
+    }
+
+    fn status_of(db: &Database, id: &HitlId) -> HitlStatus {
+        db.hitl_request(id).unwrap().unwrap().status
+    }
+
+    #[test]
+    fn overdue_request_is_expired_and_phase_stays_hitl() {
+        let db = test_db();
+        let service = HitlService::new(Arc::clone(&db));
+        let work_id = running_item(&db, "ws", "1");
+        let id = open_hitl(
+            &service,
+            &work_id,
+            Some(past()),
+            Some(EscalationAction::Skip),
+        );
+
+        run_job(&db);
+
+        let request = db.hitl_request(&id).unwrap().unwrap();
+        assert_eq!(request.status, HitlStatus::Expired);
+        let resolution = request.resolution.expect("expiry is recorded");
+        assert_eq!(resolution.action, HitlAction::Skip);
+        assert_eq!(resolution.by, "system");
+        assert_eq!(resolution.via, "timeout");
+        assert!(request.post_processed_at.is_none());
+        assert_eq!(db.get_item(&work_id).unwrap().phase(), QueuePhase::Hitl);
+    }
+
+    #[test]
+    fn request_before_deadline_is_untouched() {
+        let db = test_db();
+        let service = HitlService::new(Arc::clone(&db));
+        let work_id = running_item(&db, "ws", "2");
+        let id = open_hitl(
+            &service,
+            &work_id,
+            Some(future()),
+            Some(EscalationAction::Skip),
+        );
+        let no_deadline = running_item(&db, "ws", "3");
+        let open_forever = open_hitl(&service, &no_deadline, None, Some(EscalationAction::Skip));
+
+        run_job(&db);
+
+        assert_eq!(status_of(&db, &id), HitlStatus::Open);
+        assert_eq!(status_of(&db, &open_forever), HitlStatus::Open);
+    }
+
+    #[test]
+    fn answered_request_is_left_as_it_was() {
+        let db = test_db();
+        let service = HitlService::new(Arc::clone(&db));
+        let work_id = running_item(&db, "ws", "4");
+        let id = open_hitl(
+            &service,
+            &work_id,
+            Some(past()),
+            Some(EscalationAction::Skip),
+        );
+        let outcome = service
+            .respond(&HitlResponse {
+                target: HitlTarget::Id(id.clone()),
+                action: HitlAction::Retry,
+                by: "alice".to_string(),
+                via: "cli".to_string(),
+                path: ConfirmPath::Direct,
+                notes: None,
+            })
+            .unwrap();
+        assert!(matches!(outcome, RespondOutcome::Won { .. }));
+        let before = db.hitl_request(&id).unwrap().unwrap();
+
+        run_job(&db);
+
+        let after = db.hitl_request(&id).unwrap().unwrap();
+        assert_eq!(after.status, HitlStatus::Resolved);
+        assert_eq!(after.resolution, before.resolution);
+        assert_eq!(db.get_item(&work_id).unwrap().phase(), QueuePhase::Hitl);
+    }
+
+    #[test]
+    fn each_request_uses_its_own_terminal_action() {
+        let db = test_db();
+        let service = HitlService::new(Arc::clone(&db));
+        let skip_item = running_item(&db, "ws", "5");
+        let replan_item = running_item(&db, "ws", "6");
+        let skip_id = open_hitl(
+            &service,
+            &skip_item,
+            Some(past()),
+            Some(EscalationAction::Skip),
+        );
+        let replan_id = open_hitl(
+            &service,
+            &replan_item,
+            Some(past()),
+            Some(EscalationAction::Replan),
+        );
+
+        run_job(&db);
+
+        let action = |id: &HitlId| {
+            db.hitl_request(id)
+                .unwrap()
+                .unwrap()
+                .resolution
+                .unwrap()
+                .action
+        };
+        assert_eq!(action(&skip_id), HitlAction::Skip);
+        assert_eq!(action(&replan_id), HitlAction::Replan);
+    }
+
+    #[test]
+    fn request_without_terminal_uses_workspace_terminal() {
+        let db = test_db();
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("workspace.yml");
+        std::fs::write(
+            &config,
+            "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      2: hitl\n      terminal: replan\n",
+        )
+        .unwrap();
+        db.add_workspace("test-ws", config.to_str().unwrap())
+            .unwrap();
+        let service = HitlService::new(Arc::clone(&db));
+        let work_id = running_item(&db, "test-ws", "7");
+        let id = open_hitl(&service, &work_id, Some(past()), None);
+
+        run_job(&db);
+
+        let request = db.hitl_request(&id).unwrap().unwrap();
+        assert_eq!(request.status, HitlStatus::Expired);
+        assert_eq!(request.resolution.unwrap().action, HitlAction::Replan);
+    }
+
+    #[test]
+    fn unresolvable_terminal_leaves_request_open() {
+        let db = test_db();
+        let service = HitlService::new(Arc::clone(&db));
+        let work_id = running_item(&db, "unregistered-ws", "8");
+        let id = open_hitl(&service, &work_id, Some(past()), None);
+
+        run_job(&db);
+
+        assert_eq!(status_of(&db, &id), HitlStatus::Open);
+    }
+
+    #[test]
+    fn deadline_set_when_the_daemon_opens_the_request_comes_due() {
+        let db = test_db();
+        let service = HitlService::new(Arc::clone(&db));
+        let work_id = running_item(&db, "ws", "9");
+        // Same deadline shape the daemon writes: `after_hours` from its clock.
+        let expiry = HitlExpiry::after_hours(
+            24,
+            Some(EscalationAction::Skip),
+            Utc::now() - ChronoDuration::hours(25),
+        );
+        let id = open_hitl(
+            &service,
+            &work_id,
+            expiry.timeout_at,
+            expiry.terminal_action,
+        );
+
+        run_job(&db);
+
+        assert_eq!(status_of(&db, &id), HitlStatus::Expired);
+    }
+}
