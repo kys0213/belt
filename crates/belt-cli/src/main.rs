@@ -978,15 +978,23 @@ impl Refusal {
     }
 }
 
+/// The `--json` body of a refusal.
+fn refusal_value(work_id: &str, refusal: &Refusal) -> serde_json::Value {
+    let mut value = serde_json::json!({
+        "success": false,
+        "reason": refusal.reason,
+        "work_id": work_id,
+    });
+    merge_json(&mut value, refusal.fields.clone());
+    value
+}
+
 fn emit_refusal(work_id: &str, json: bool, refusal: Refusal) -> anyhow::Result<i32> {
     if json {
-        let mut value = serde_json::json!({
-            "success": false,
-            "reason": refusal.reason,
-            "work_id": work_id,
-        });
-        merge_json(&mut value, refusal.fields);
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&refusal_value(work_id, &refusal))?
+        );
     } else {
         eprintln!("{work_id}: {}", refusal.text);
     }
@@ -1082,6 +1090,23 @@ fn request_manual_transition(
     })
 }
 
+/// The refusal for a HITL response that lost the race to `resolution`.
+fn already_handled_refusal(resolution: &belt_core::hitl::HitlResolution) -> Refusal {
+    Refusal::new(
+        "already_handled",
+        serde_json::json!({
+            "by": resolution.by,
+            "via": resolution.via,
+            "action": resolution.action.to_string(),
+            "at": resolution.at,
+        }),
+        format!(
+            "already_handled: '{}' was chosen by {} via {} at {}",
+            resolution.action, resolution.by, resolution.via, resolution.at
+        ),
+    )
+}
+
 /// Render a [`ManualOutcome`]; `applied_fields` extends the applied JSON.
 fn emit_manual_outcome(
     work_id: &str,
@@ -1097,6 +1122,15 @@ fn emit_manual_outcome(
         ManualOutcome::Applied => {
             let mut fields = serde_json::json!({ "phase": to.as_str() });
             merge_json(&mut fields, applied_fields);
+            if to == QueuePhase::Failed {
+                // The item did move, but the request (`queue done`) failed:
+                // callers such as the evaluator judge the exit code.
+                return emit_refusal(
+                    work_id,
+                    json,
+                    Refusal::new("on_done_failed", fields, applied_text),
+                );
+            }
             emit_success(work_id, json, "applied", fields, applied_text)
         }
         ManualOutcome::Refused(refused) => {
@@ -1110,23 +1144,9 @@ fn emit_manual_outcome(
                 serde_json::json!({ "action": action.to_string(), "hitl_id": hitl_id.as_str() }),
                 format!("Recorded HITL response '{action}' for {work_id}; the daemon applies it."),
             ),
-            RespondOutcome::AlreadyHandled(r) => emit_refusal(
-                work_id,
-                json,
-                Refusal::new(
-                    "already_handled",
-                    serde_json::json!({
-                        "by": r.by,
-                        "via": r.via,
-                        "action": r.action.to_string(),
-                        "at": r.at,
-                    }),
-                    format!(
-                        "already_handled: '{}' was chosen by {} via {} at {}",
-                        r.action, r.by, r.via, r.at
-                    ),
-                ),
-            ),
+            RespondOutcome::AlreadyHandled(r) => {
+                emit_refusal(work_id, json, already_handled_refusal(&r))
+            }
             RespondOutcome::NotFound => emit_refusal(work_id, json, Refusal::not_found()),
             RespondOutcome::InvalidAction => emit_refusal(
                 work_id,
@@ -2996,6 +3016,54 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn already_handled_refusal_reports_who_how_what_and_when() {
+        use belt_core::hitl::{ConfirmPath, HitlAction, HitlResolution, RespondOutcome};
+
+        let resolution = HitlResolution {
+            action: HitlAction::Skip,
+            by: "alice".to_string(),
+            via: "tui".to_string(),
+            at: "2026-01-02T03:04:05+00:00".to_string(),
+            path: ConfirmPath::Direct,
+        };
+
+        let value = refusal_value("w1", &already_handled_refusal(&resolution));
+        assert_eq!(value["success"], false);
+        assert_eq!(value["reason"], "already_handled");
+        assert_eq!(value["work_id"], "w1");
+        assert_eq!(value["by"], "alice");
+        assert_eq!(value["via"], "tui");
+        assert_eq!(value["action"], "skip");
+        assert_eq!(value["at"], "2026-01-02T03:04:05+00:00");
+
+        let code = emit_manual_outcome(
+            "w1",
+            true,
+            QueuePhase::Done,
+            ManualOutcome::HitlResponse {
+                action: HitlAction::Done,
+                outcome: RespondOutcome::AlreadyHandled(resolution),
+            },
+            serde_json::json!({}),
+            String::new(),
+        )
+        .unwrap();
+        assert_eq!(code, EXIT_REFUSED);
+    }
+
+    #[test]
+    fn conflict_refusal_exits_with_refused_code_and_current_phase() {
+        let refusal =
+            Refusal::from_transition(belt_core::transition::TransitionOutcome::Conflict {
+                current: QueuePhase::Done,
+            });
+        let value = refusal_value("w1", &refusal);
+        assert_eq!(value["reason"], "conflict");
+        assert_eq!(value["current"], "done");
+        assert_eq!(emit_refusal("w1", true, refusal).unwrap(), EXIT_REFUSED);
+    }
 
     #[test]
     fn agent_without_session_subcommand_fails_to_parse() {

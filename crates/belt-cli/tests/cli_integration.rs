@@ -546,12 +546,66 @@ sources:
         prompt: "implement"
 "#;
 
+/// Workspace whose `implement` state runs `on_done_script` when finished.
+fn workspace_yaml_with_on_done(on_done_script: &str) -> String {
+    format!("{WORKSPACE_YAML}        on_done:\n          - script: \"{on_done_script}\"\n")
+}
+
 /// Register a workspace so `queue done` can load the item's state config.
 fn register_workspace(tmp: &TempDir, db: &Database) {
     let config_path = tmp.path().join("workspace.yaml");
     std::fs::write(&config_path, WORKSPACE_YAML).expect("write workspace yaml");
     db.add_workspace("ws-queue", config_path.to_str().unwrap())
         .expect("add workspace");
+}
+
+/// Register a workspace whose `implement` state has an `on_done` script.
+fn register_workspace_with_on_done(tmp: &TempDir, db: &Database, script: &str) {
+    let config_path = tmp.path().join("workspace.yaml");
+    std::fs::write(&config_path, workspace_yaml_with_on_done(script))
+        .expect("write workspace yaml");
+    db.add_workspace("ws-queue", config_path.to_str().unwrap())
+        .expect("add workspace");
+}
+
+/// A throwaway repository to run `belt` in: `queue done` with on_done
+/// scripts creates a worktree of the current directory's repository.
+fn scratch_repo() -> TempDir {
+    let repo = TempDir::new().expect("repo dir");
+    let run = |args: &[&str]| {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(repo.path())
+            .status()
+            .expect("run vcs");
+        assert!(status.success(), "{args:?}");
+    };
+    run(&["init", "-q"]);
+    run(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.com",
+        "commit",
+        "-q",
+        "--allow-empty",
+        "-m",
+        "init",
+    ]);
+    repo
+}
+
+fn run_belt_in(
+    cwd: &std::path::Path,
+    belt_home: &std::path::Path,
+    args: &[&str],
+) -> std::process::Output {
+    Command::new(belt_bin())
+        .args(args)
+        .env("BELT_HOME", belt_home.as_os_str())
+        .current_dir(cwd)
+        .output()
+        .expect("failed to execute belt binary")
 }
 
 fn daemon_move(db: &Database, work_id: &str, from: QueuePhase, to: QueuePhase) {
@@ -725,6 +779,41 @@ fn queue_done_completed_without_on_done_is_applied() {
 }
 
 #[test]
+fn queue_done_with_succeeding_on_done_is_done() {
+    let (tmp, db) = setup_belt_home();
+    register_workspace_with_on_done(&tmp, &db, "exit 0");
+    let id = seed_item(&db, "1", QueuePhase::Completed);
+    let repo = scratch_repo();
+
+    let out = run_belt_in(repo.path(), tmp.path(), &["queue", "done", &id, "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = stdout_json(&out);
+    assert_eq!(v["success"], true);
+    assert_eq!(v["result"], "applied");
+    assert_eq!(v["phase"], "done");
+    assert_eq!(v["scripts_run"], true);
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Done);
+}
+
+#[test]
+fn queue_done_with_failing_on_done_is_failed_and_refused() {
+    let (tmp, db) = setup_belt_home();
+    register_workspace_with_on_done(&tmp, &db, "exit 3");
+    let id = seed_item(&db, "1", QueuePhase::Completed);
+    let repo = scratch_repo();
+
+    let out = run_belt_in(repo.path(), tmp.path(), &["queue", "done", &id, "--json"]);
+    assert_eq!(out.status.code(), Some(EXIT_REFUSED), "{out:?}");
+    let v = stdout_json(&out);
+    assert_eq!(v["success"], false);
+    assert_eq!(v["reason"], "on_done_failed");
+    assert_eq!(v["phase"], "failed");
+    assert_eq!(v["scripts_run"], true);
+    assert_eq!(v["exit_code"], 3);
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Failed);
+}
+
+#[test]
 fn queue_hitl_completed_opens_request() {
     let (tmp, db) = setup_belt_home();
     let id = seed_item(&db, "1", QueuePhase::Completed);
@@ -778,6 +867,32 @@ fn queue_done_open_hitl_wins_response_race() {
     let out = run_belt(tmp.path(), &["queue", "done", &id, "--json"]);
     assert!(out.status.success(), "{out:?}");
     assert_eq!(stdout_json(&out)["action"], "done");
+
+    // Confirmed, not applied: the item leaves Hitl only by daemon post-processing.
+    assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+    assert_eq!(db.pending_post_processing().unwrap().len(), 1);
+}
+
+/// Exit code of a refused request; mirrors `EXIT_REFUSED` in the binary.
+const EXIT_REFUSED: i32 = 1;
+
+#[test]
+fn refusals_exit_with_the_refused_code() {
+    let (tmp, db) = setup_belt_home();
+    let running = seed_item(&db, "1", QueuePhase::Running);
+    let done = seed_item(&db, "2", QueuePhase::Done);
+
+    let busy = run_belt(tmp.path(), &["queue", "skip", &running, "--json"]);
+    assert_eq!(stdout_json(&busy)["reason"], "busy");
+    assert_eq!(busy.status.code(), Some(EXIT_REFUSED));
+
+    let invalid = run_belt(tmp.path(), &["queue", "skip", &done, "--json"]);
+    assert_eq!(stdout_json(&invalid)["reason"], "invalid_action");
+    assert_eq!(invalid.status.code(), Some(EXIT_REFUSED));
+
+    let missing = run_belt(tmp.path(), &["queue", "skip", "no-such-item", "--json"]);
+    assert_eq!(stdout_json(&missing)["reason"], "not_found");
+    assert_eq!(missing.status.code(), Some(EXIT_REFUSED));
 }
 
 #[test]
