@@ -11,7 +11,8 @@ use belt_core::escalation::EscalationAction;
 use belt_core::hitl::{HitlAction, HitlId};
 use belt_core::notification::{
     ChannelEvent, HitlRef, InboundBody, InboundResponse, MessageKind, MessageRef,
-    NotificationChannel, NotificationsConfig, OutboundMessage, PollTarget, ResponseInbox,
+    NotificationChannel, NotificationsConfig, NotifyOutcome, OutboundMessage, PollTarget,
+    ResponseInbox,
 };
 use belt_core::phase::QueuePhase;
 use belt_core::queue::HitlReason;
@@ -59,13 +60,16 @@ impl NotificationChannel for RecordingChannel {
         "origin"
     }
 
-    async fn notify(&self, msg: &OutboundMessage) -> anyhow::Result<Option<MessageRef>> {
+    async fn notify(&self, msg: &OutboundMessage) -> anyhow::Result<NotifyOutcome> {
         if self.send_fails {
             anyhow::bail!("channel down");
         }
         let mut sent = self.sent.lock().unwrap();
         sent.push(msg.clone());
-        Ok(Some(MessageRef(format!("msg-{}", sent.len()))))
+        Ok(NotifyOutcome::Sent(Some(MessageRef(format!(
+            "msg-{}",
+            sent.len()
+        )))))
     }
 
     fn inbox(&self) -> Option<&dyn ResponseInbox> {

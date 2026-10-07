@@ -1,5 +1,7 @@
-//! GitHub origin channel — progress and HITL messages as issue comments,
-//! responses read back from the same issue.
+//! GitHub origin channel — progress and HITL messages as comments on the
+//! item's issue (`github:owner/repo#N`) or pull request (`github:owner/repo!N`),
+//! responses read back from the same conversation. Items of other sources or
+//! repositories have no address here ([`NotifyOutcome::NoAddress`]).
 //!
 //! The channel never touches labels (the lifecycle hook owns them).
 //!
@@ -28,8 +30,8 @@ use serde::Deserialize;
 
 use belt_core::hitl::{HitlAction, HitlId};
 use belt_core::notification::{
-    HitlRef, InboundBody, InboundResponse, MessageRef, NotificationChannel, ORIGIN_CHANNEL,
-    OutboundMessage, PollTarget, ResponseInbox,
+    HitlRef, InboundBody, InboundResponse, MessageRef, NotificationChannel, NotifyOutcome,
+    ORIGIN_CHANNEL, OutboundMessage, PollTarget, ResponseInbox,
 };
 use belt_core::platform::ShellExecutor;
 
@@ -68,16 +70,26 @@ impl GitHubOriginChannel {
         Self { config, shell }
     }
 
-    /// Issue number of a `github:owner/repo#NUMBER[:state]` work_id of this
-    /// channel's repository. `None` when the item belongs to another source.
-    fn issue_number<'a>(&self, work_id: &'a str) -> Option<&'a str> {
+    /// Issue or pull request of a `github:owner/repo#N[:state...]` (issue) or
+    /// `github:owner/repo!N[:state...]` (pull request) work_id of this
+    /// channel's repository. `None` when the item has no address here.
+    fn origin<'a>(&self, work_id: &'a str) -> Option<Origin<'a>> {
         let rest = work_id.strip_prefix("github:")?;
-        let (repo, after) = rest.split_once('#')?;
+        let at = rest.find(['#', '!'])?;
+        let (repo, after) = (&rest[..at], &rest[at + 1..]);
         if repo != self.config.repo {
             return None;
         }
         let number = after.split(':').next()?;
-        (!number.is_empty() && number.chars().all(|c| c.is_ascii_digit())).then_some(number)
+        if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        let kind = if rest[at..].starts_with('#') {
+            OriginKind::Issue
+        } else {
+            OriginKind::PullRequest
+        };
+        Some(Origin { kind, number })
     }
 
     /// The configured repository, checked to be a plain `owner/name`.
@@ -116,14 +128,42 @@ impl GitHubOriginChannel {
     /// Post `body` as a comment. The body goes through a file, never through
     /// the command line: platform shells interpret it differently (`cmd.exe`
     /// treats `<`, `>`, `&` as operators even inside single quotes).
-    async fn post_comment(&self, number: &str, body: &str) -> Result<String> {
+    async fn post_comment(&self, origin: &Origin<'_>, body: &str) -> Result<String> {
         let repo = self.repo()?;
         let dir = BodyDir::create(body)?;
-        let command = format!("gh issue comment {number} --repo {repo} --body-file {BODY_FILE}");
+        let Origin { kind, number } = origin;
+        let command = format!(
+            "gh {} comment {number} --repo {repo} --body-file {BODY_FILE}",
+            kind.gh_noun()
+        );
         let result = self.gh(&command, dir.path()).await;
         dir.remove();
         result
     }
+}
+
+/// Kind of GitHub object an item comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OriginKind {
+    Issue,
+    PullRequest,
+}
+
+impl OriginKind {
+    /// `gh` command group for this kind.
+    fn gh_noun(self) -> &'static str {
+        match self {
+            OriginKind::Issue => "issue",
+            OriginKind::PullRequest => "pr",
+        }
+    }
+}
+
+/// The issue or pull request an item comes from; `number` is digits only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Origin<'a> {
+    kind: OriginKind,
+    number: &'a str,
 }
 
 /// File name of the comment body inside its [`BodyDir`].
@@ -183,16 +223,15 @@ impl NotificationChannel for GitHubOriginChannel {
         ORIGIN_CHANNEL
     }
 
-    async fn notify(&self, msg: &OutboundMessage) -> Result<Option<MessageRef>> {
-        let number = self.issue_number(&msg.work_id).with_context(|| {
-            format!(
-                "work_id is not a {} issue: {}",
-                self.config.repo, msg.work_id
-            )
-        })?;
-        let stdout = self.post_comment(number, &comment_body(msg)).await?;
+    async fn notify(&self, msg: &OutboundMessage) -> Result<NotifyOutcome> {
+        let Some(origin) = self.origin(&msg.work_id) else {
+            return Ok(NotifyOutcome::NoAddress);
+        };
+        let stdout = self.post_comment(&origin, &comment_body(msg)).await?;
         let url = stdout.trim();
-        Ok((!url.is_empty()).then(|| MessageRef(url.to_string())))
+        Ok(NotifyOutcome::Sent(
+            (!url.is_empty()).then(|| MessageRef(url.to_string())),
+        ))
     }
 
     fn inbox(&self) -> Option<&dyn ResponseInbox> {
@@ -200,6 +239,8 @@ impl NotificationChannel for GitHubOriginChannel {
     }
 }
 
+/// `gh issue view --json comments` and `gh pr view --json comments` share
+/// this shape.
 #[derive(Deserialize)]
 struct IssueComments {
     comments: Vec<Comment>,
@@ -244,31 +285,32 @@ fn parse_time(s: &str) -> Result<DateTime<FixedOffset>> {
     DateTime::parse_from_rfc3339(s).with_context(|| format!("invalid RFC 3339 timestamp: {s}"))
 }
 
-type IssueTargets<'a> = Vec<(&'a PollTarget, DateTime<FixedOffset>)>;
+type OriginTargets<'a> = Vec<(&'a PollTarget, DateTime<FixedOffset>)>;
 
 #[async_trait]
 impl ResponseInbox for GitHubOriginChannel {
     async fn poll(&self, targets: &[PollTarget]) -> Result<Vec<InboundResponse>> {
         // Targets of other sources are not this channel's business.
-        let mut by_issue: Vec<(&str, IssueTargets)> = Vec::new();
+        let mut by_origin: Vec<(Origin, OriginTargets)> = Vec::new();
         for target in targets {
-            let Some(number) = self.issue_number(&target.work_id) else {
+            let Some(origin) = self.origin(&target.work_id) else {
                 continue;
             };
             let since = parse_time(&target.since)?;
-            match by_issue.iter_mut().find(|(n, _)| *n == number) {
+            match by_origin.iter_mut().find(|(o, _)| *o == origin) {
                 Some((_, group)) => group.push((target, since)),
-                None => by_issue.push((number, vec![(target, since)])),
+                None => by_origin.push((origin, vec![(target, since)])),
             }
         }
 
         let mut responses = Vec::new();
-        for (number, group) in by_issue {
+        for (Origin { kind, number }, group) in by_origin {
             let repo = self.repo()?;
-            let command = format!("gh issue view {number} --repo {repo} --json comments");
+            let noun = kind.gh_noun();
+            let command = format!("gh {noun} view {number} --repo {repo} --json comments");
             let stdout = self.gh(&command, Path::new(".")).await?;
             let issue: IssueComments = serde_json::from_str(&stdout)
-                .with_context(|| format!("unexpected gh output for issue #{number}"))?;
+                .with_context(|| format!("unexpected gh output for {noun} {number}"))?;
 
             for comment in issue.comments {
                 if comment.body.starts_with(OWN_MARKER) {
@@ -427,7 +469,7 @@ mod tests {
             .notify(&msg(WID, Some("h-1"), "needs a human"))
             .await
             .unwrap();
-        assert_eq!(r, Some(MessageRef(url.to_string())));
+        assert_eq!(r, NotifyOutcome::Sent(Some(MessageRef(url.to_string()))));
         assert_eq!(
             shell.commands(),
             vec!["gh issue comment 42 --repo org/repo --body-file body.md"]
@@ -447,7 +489,7 @@ mod tests {
             .notify(&msg(WID, None, "started"))
             .await
             .unwrap();
-        assert_eq!(r, None);
+        assert_eq!(r, NotifyOutcome::Sent(None));
         let cmd = &shell.commands()[0];
         assert!(!cmd.contains("--add-label") && !cmd.contains("issue edit"));
         let body = shell.body_files()[0].clone().unwrap();
@@ -500,13 +542,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notify_fails_for_foreign_work_id_without_calling_gh() {
+    async fn notify_reports_no_address_for_foreign_work_ids_without_calling_gh() {
         let shell = RecordingShell::ok("");
-        let err = channel(&shell)
-            .notify(&msg("github:other/repo#1:x", None, "t"))
-            .await;
-        assert!(err.is_err());
+        let c = channel(&shell);
+        for wid in [
+            "github:other/repo#1:x",
+            "github:other/repo!1:x",
+            "jira:PROJ-1:x",
+            "github:org/repo#abc:x",
+            "github:org/repo:x",
+        ] {
+            let r = c.notify(&msg(wid, None, "t")).await.unwrap();
+            assert_eq!(r, NotifyOutcome::NoAddress, "{wid}");
+        }
         assert!(shell.commands().is_empty());
+    }
+
+    #[tokio::test]
+    async fn notify_comments_on_pull_request_origin() {
+        let shell = RecordingShell::ok("https://github.com/org/repo/pull/7#issuecomment-3\n");
+        let r = channel(&shell)
+            .notify(&msg("github:org/repo!7:review", Some("h-1"), "look"))
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            NotifyOutcome::Sent(Some(MessageRef(
+                "https://github.com/org/repo/pull/7#issuecomment-3".to_string()
+            )))
+        );
+        assert_eq!(
+            shell.commands(),
+            vec!["gh pr comment 7 --repo org/repo --body-file body.md"]
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_reads_pull_request_comments_separately_from_the_same_numbered_issue() {
+        let json = comments_json(&[("1", "alice", "/belt done", "2026-10-07T01:00:00Z")]);
+        let shell = RecordingShell::ok(&json);
+        let rs = channel(&shell)
+            .poll(&[
+                target("h-1", "github:org/repo!7:review", SINCE),
+                target("h-2", "github:org/repo#7:implement", SINCE),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            shell.commands(),
+            vec![
+                "gh pr view 7 --repo org/repo --json comments",
+                "gh issue view 7 --repo org/repo --json comments",
+            ]
+        );
+        let refs: Vec<_> = rs.iter().map(|r| r.hitl_ref.clone()).collect();
+        assert_eq!(
+            refs,
+            vec![
+                Some(HitlRef::Token(HitlId::new("h-1"))),
+                Some(HitlRef::Token(HitlId::new("h-2"))),
+            ]
+        );
     }
 
     #[tokio::test]

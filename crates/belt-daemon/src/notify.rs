@@ -27,7 +27,8 @@ use belt_core::hitl::{
 };
 use belt_core::notification::{
     ChannelEvent, HitlRef, InboundBody, InboundResponse, MessageKind, MessageRef,
-    NotificationChannel, NotificationsConfig, ORIGIN_CHANNEL, OutboundMessage, PollTarget, route,
+    NotificationChannel, NotificationsConfig, NotifyOutcome, ORIGIN_CHANNEL, OutboundMessage,
+    PollTarget, route,
 };
 use belt_core::runtime::{AgentRuntime, RuntimeRequest, StructuredOutputConfig};
 use belt_core::transition::Actor;
@@ -64,6 +65,9 @@ pub enum ChannelSend {
     },
     /// The route names a channel without an implementation (dashboard only).
     NoImplementation,
+    /// The channel has no address for the item (e.g. an item of another
+    /// source). Not a failure: nothing is recorded.
+    NoAddress,
 }
 
 /// One progress notification attempt.
@@ -89,6 +93,9 @@ pub enum DeliveryResult {
     GaveUp {
         attempts: u32,
     },
+    /// The channel has no address for the request's item. Not a failure:
+    /// nothing is recorded and the delivery stays `pending`.
+    NoAddress,
 }
 
 /// One HITL request delivery attempt.
@@ -504,9 +511,17 @@ impl Notifier {
                         text: hitl_request_text(&request),
                     };
                     match channel.notify(&message).await {
-                        Ok(message_ref) => DeliveryAttempt::Sent {
+                        Ok(NotifyOutcome::Sent(message_ref)) => DeliveryAttempt::Sent {
                             message_ref: message_ref.map(|m| m.0),
                         },
+                        Ok(NotifyOutcome::NoAddress) => {
+                            reports.push(DeliveryReport {
+                                hitl_id: delivery.hitl_id,
+                                channel: delivery.channel,
+                                result: DeliveryResult::NoAddress,
+                            });
+                            continue;
+                        }
                         Err(e) => DeliveryAttempt::Failed {
                             error: format!("{e:#}"),
                         },
@@ -963,7 +978,8 @@ impl Notifier {
 /// Send one best-effort message; a failure is a value.
 async fn send(channel: &dyn NotificationChannel, message: &OutboundMessage) -> ChannelSend {
     match channel.notify(message).await {
-        Ok(_) => ChannelSend::Sent,
+        Ok(NotifyOutcome::Sent(_)) => ChannelSend::Sent,
+        Ok(NotifyOutcome::NoAddress) => ChannelSend::NoAddress,
         Err(e) => ChannelSend::Failed {
             error: format!("{e:#}"),
         },

@@ -3001,6 +3001,11 @@ impl Daemon {
                             attempts,
                             "HITL request delivery given up"
                         ),
+                        DeliveryResult::NoAddress => tracing::info!(
+                            hitl_id = %report.hitl_id,
+                            channel = %report.channel,
+                            "channel has no address for the item; HITL request shown on the dashboard only"
+                        ),
                     }
                 }
             }

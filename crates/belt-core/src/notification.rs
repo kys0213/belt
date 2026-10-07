@@ -215,17 +215,28 @@ pub struct PollTarget {
     pub since: String,
 }
 
+/// 한 번의 발송 결과. 발송 실패는 `Err`로 따로 돌려준다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotifyOutcome {
+    /// 보냈다. 외부 참조를 줄 수 없는 channel이면 `None`.
+    Sent(Option<MessageRef>),
+    /// 이 channel에는 아이템의 주소가 없다(예: origin channel과 다른 출처의 아이템).
+    /// 실패가 아니며 재시도해도 결과가 같다.
+    NoAddress,
+}
+
 /// 사람 대상 메시지 발송 seam. 구현은 infra, 선택과 재시도 정책은 daemon이 가진다.
 #[async_trait]
 pub trait NotificationChannel: Send + Sync {
     /// 설정의 channel 이름(origin은 [`ORIGIN_CHANNEL`]).
     fn name(&self) -> &str;
 
-    /// 메시지를 보내고 외부 참조를 돌려준다. 참조를 줄 수 없는 channel은 `None`.
+    /// 메시지를 보내고 결과를 돌려준다. 아이템에 이 channel의 주소가 없으면
+    /// 보내지 않고 [`NotifyOutcome::NoAddress`].
     ///
     /// # Errors
     /// 발송 실패. 재시도 여부는 호출자가 정한다.
-    async fn notify(&self, msg: &OutboundMessage) -> anyhow::Result<Option<MessageRef>>;
+    async fn notify(&self, msg: &OutboundMessage) -> anyhow::Result<NotifyOutcome>;
 
     /// 수신을 지원하지 않으면 `None`(발송 전용).
     fn inbox(&self) -> Option<&dyn ResponseInbox>;

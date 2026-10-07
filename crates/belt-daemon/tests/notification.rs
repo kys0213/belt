@@ -11,7 +11,8 @@ use belt_core::escalation::EscalationAction;
 use belt_core::hitl::{ConfirmPath, HitlAction, HitlId, HitlStatus, RespondOutcome};
 use belt_core::notification::{
     ChannelEvent, HitlRef, InboundBody, InboundResponse, MessageKind, MessageRef,
-    NotificationChannel, NotificationsConfig, OutboundMessage, PollTarget, ResponseInbox,
+    NotificationChannel, NotificationsConfig, NotifyOutcome, OutboundMessage, PollTarget,
+    ResponseInbox,
 };
 use belt_core::phase::QueuePhase;
 use belt_core::queue::HitlReason;
@@ -40,6 +41,8 @@ struct RecordingChannel {
     polled: Mutex<Vec<Vec<PollTarget>>>,
     poll_fails: Mutex<bool>,
     receives: bool,
+    /// Every item lacks an address on this channel.
+    no_address: bool,
 }
 
 impl RecordingChannel {
@@ -52,7 +55,15 @@ impl RecordingChannel {
             polled: Mutex::new(Vec::new()),
             poll_fails: Mutex::new(false),
             receives: true,
+            no_address: false,
         })
+    }
+
+    /// A channel on which no item has an address (e.g. items of another source).
+    fn addressless(name: &str) -> Arc<Self> {
+        let mut channel = Arc::try_unwrap(Self::new(name)).ok().unwrap();
+        channel.no_address = true;
+        Arc::new(channel)
     }
 
     fn failing(name: &str, times: u32) -> Arc<Self> {
@@ -87,7 +98,10 @@ impl NotificationChannel for RecordingChannel {
         &self.name
     }
 
-    async fn notify(&self, msg: &OutboundMessage) -> anyhow::Result<Option<MessageRef>> {
+    async fn notify(&self, msg: &OutboundMessage) -> anyhow::Result<NotifyOutcome> {
+        if self.no_address {
+            return Ok(NotifyOutcome::NoAddress);
+        }
         {
             let mut left = self.failures_left.lock().unwrap();
             if *left > 0 {
@@ -97,7 +111,10 @@ impl NotificationChannel for RecordingChannel {
         }
         let mut sent = self.sent.lock().unwrap();
         sent.push(msg.clone());
-        Ok(Some(MessageRef(format!("msg-{}", sent.len()))))
+        Ok(NotifyOutcome::Sent(Some(MessageRef(format!(
+            "msg-{}",
+            sent.len()
+        )))))
     }
 
     fn inbox(&self) -> Option<&dyn ResponseInbox> {
@@ -431,6 +448,35 @@ async fn failed_progress_notification_is_recorded_and_not_retried() {
     );
     assert_eq!(db.get_item(&work_id).unwrap().phase(), QueuePhase::Running);
     assert!(notifier.notify_progress().await.unwrap().is_empty());
+    assert!(origin.sent().is_empty());
+}
+
+#[tokio::test]
+async fn item_without_an_address_on_the_channel_is_neither_failed_nor_retried() {
+    let db = db();
+    let origin = RecordingChannel::addressless("origin");
+    let mut notifier = notifier(
+        &db,
+        NotificationsConfig::default(),
+        vec![origin.clone()],
+        ScriptedRuntime::new(&[]),
+    );
+    let (work_id, hitl_id) = open_hitl(&db, "1");
+    notifier.register_deliveries(&hitl_id).unwrap();
+
+    let notices = notifier.notify_progress().await.unwrap();
+    assert!(!notices.is_empty());
+    assert!(notices.iter().all(|n| n.result == ChannelSend::NoAddress));
+
+    for _ in 0..6 {
+        let reports = notifier.deliver_due().await.unwrap();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].result, DeliveryResult::NoAddress);
+    }
+    let stored = db.delivery(&hitl_id, "origin").unwrap().unwrap();
+    assert_eq!(stored.status, DeliveryStatus::Pending);
+    assert_eq!(stored.attempts, 0);
+    assert!(events_of(&db, &work_id, transition_kind::NOTIFICATION_FAILED).is_empty());
     assert!(origin.sent().is_empty());
 }
 
