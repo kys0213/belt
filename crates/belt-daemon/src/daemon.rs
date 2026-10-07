@@ -2382,7 +2382,7 @@ impl Daemon {
         self.tracker.release_evaluate();
     }
 
-    /// Daemon tick: cancel requests -> observe store -> collect -> HITL
+    /// Daemon tick: ended handlers -> cancel requests -> observe store -> collect -> HITL
     /// post-processing -> HITL opened hooks -> apply ended handlers ->
     /// advance -> start handlers -> evaluate -> cron.
     ///
@@ -2393,6 +2393,12 @@ impl Daemon {
     /// shutdown이 요청되면 collect/advance를 건너뛰고 실행 중인
     /// 아이템의 완료 처리만 수행한다.
     pub async fn tick(&mut self) -> Result<()> {
+        // A handler that already returned has a result that stands: apply it
+        // before the cancel step, which then closes a late request
+        // `too_late` instead of accepting it.
+        let ended = self.reap_finished().await;
+        Self::log_outcomes(&ended);
+
         // A failed cancel step must not stop the rest of the tick.
         if let Err(e) = self.process_cancel_requests() {
             tracing::error!("cancel requests not processed: {e}");

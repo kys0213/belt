@@ -1799,6 +1799,46 @@ sources:
         );
     }
 
+    /// A handler that returned before the tick is applied first: its success
+    /// stands and the cancel closes `too_late` in the same tick.
+    #[tokio::test]
+    async fn a_cancel_after_the_handler_returned_but_before_its_result_is_applied_is_too_late() {
+        let mut h = harness(
+            &[("github:org/repo#1", "fast")],
+            2,
+            Database::open_in_memory().unwrap(),
+        );
+        let work_id = "github:org/repo#1:fast";
+        h.daemon.collect().await.unwrap();
+        h.daemon.advance();
+        h.daemon.spawn_running();
+        // Let the handler task run to its end; its result is not applied yet.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(phase(&h.daemon, work_id), QueuePhase::Running);
+
+        request(h.daemon.db(), work_id);
+        tick_quickly(&mut h.daemon).await;
+
+        assert_eq!(
+            closed_result(h.daemon.db(), work_id).as_deref(),
+            Some("too_late")
+        );
+        assert_ne!(phase(&h.daemon, work_id), QueuePhase::Skipped);
+        assert_eq!(
+            history_statuses(h.daemon.db(), "github:org/repo#1"),
+            vec!["completed".to_string()]
+        );
+        assert!(
+            !h.daemon
+                .db()
+                .transitions_of(work_id)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "cancel_accepted"),
+            "a late request is not accepted"
+        );
+    }
+
     #[tokio::test]
     async fn a_cancel_for_an_item_in_hitl_is_too_late_and_leaves_the_hitl_alone() {
         let mut h = harness(
