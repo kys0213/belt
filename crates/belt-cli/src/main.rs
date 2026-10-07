@@ -2137,19 +2137,46 @@ fn cmd_hitl_timeout(command: HitlTimeoutCommands) -> anyhow::Result<()> {
             item_id,
             duration,
             action,
-            json: _,
+            json,
         } => {
             let Some(request) = open_request_of(&db, &item_id)? else {
                 anyhow::bail!("item '{item_id}' has no open HITL request");
             };
-            // The deadline and terminal action belong on `request`, which the
-            // store cannot update yet; the legacy `queue_items` columns are not
-            // a substitute because nothing reads them any more.
-            anyhow::bail!(
-                "setting a timeout on HITL request {} (duration {duration}s, action {}) is not supported yet",
-                request.hitl_id,
-                action.as_deref().unwrap_or("workspace default"),
-            )
+            let terminal = action
+                .as_deref()
+                .map(|a| a.parse::<belt_core::escalation::EscalationAction>())
+                .transpose()
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let seconds = i64::try_from(duration)
+                .map_err(|_| anyhow::anyhow!("duration {duration}s is too large"))?;
+            let timeout_at = chrono::Duration::try_seconds(seconds)
+                .and_then(|d| chrono::Utc::now().checked_add_signed(d))
+                .ok_or_else(|| anyhow::anyhow!("duration {duration}s is too large"))?
+                .to_rfc3339();
+            if !db.set_hitl_expiry(&request.hitl_id, &timeout_at, terminal)? {
+                anyhow::bail!(
+                    "HITL request {} is no longer open; its timeout was not changed",
+                    request.hitl_id
+                );
+            }
+            let action = terminal.map(|a| a.to_string());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "work_id": request.work_id,
+                        "hitl_id": request.hitl_id.as_str(),
+                        "timeout_at": timeout_at,
+                        "action": action,
+                    }))?
+                );
+            } else {
+                println!(
+                    "Timeout of {} set to {timeout_at} (action: {}).",
+                    request.work_id,
+                    action.as_deref().unwrap_or("workspace default"),
+                );
+            }
         }
         HitlTimeoutCommands::Ls { json } => {
             let mut rows = Vec::new();

@@ -500,13 +500,12 @@ fn hitl_timeout_set_rejects_terminal_actions_other_than_skip_and_replan() {
 }
 
 #[test]
-fn hitl_timeout_set_with_allowed_action_reports_storage_unsupported() {
-    // Storing a request's deadline needs a store API that does not exist yet;
-    // the command must refuse loudly instead of writing the legacy columns.
+fn hitl_timeout_set_stores_the_deadline_and_action_on_the_open_request() {
     let (tmp, db) = setup_belt_home();
     let id = seed_item(&db, "1", QueuePhase::Hitl);
 
     for action in ["skip", "replan"] {
+        let before = chrono::Utc::now();
         let out = run_belt(
             tmp.path(),
             &[
@@ -520,10 +519,39 @@ fn hitl_timeout_set_with_allowed_action_reports_storage_unsupported() {
                 action,
             ],
         );
-        assert!(!out.status.success());
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("not supported"), "{stderr}");
+        assert!(out.status.success(), "{action}: {out:?}");
+        let after = chrono::Utc::now();
+
+        let ls = run_belt(tmp.path(), &["hitl", "timeout", "ls", "--json"]);
+        let v = stdout_json(&ls);
+        let entry = &v.as_array().expect("array")[0];
+        assert_eq!(entry["work_id"], id);
+        assert_eq!(entry["action"], action);
+        let timeout_at =
+            chrono::DateTime::parse_from_rfc3339(entry["timeout_at"].as_str().expect("timeout_at"))
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+        assert!(timeout_at >= before + chrono::Duration::seconds(3600));
+        assert!(timeout_at <= after + chrono::Duration::seconds(3600));
     }
+}
+
+#[test]
+fn hitl_timeout_set_without_action_clears_the_stored_action() {
+    let (tmp, db) = setup_belt_home();
+    let id = seed_item(&db, "1", QueuePhase::Hitl);
+    let set = |extra: &[&str]| {
+        let mut args = vec!["hitl", "timeout", "set", id.as_str(), "--duration", "60"];
+        args.extend_from_slice(extra);
+        let out = run_belt(tmp.path(), &args);
+        assert!(out.status.success(), "{out:?}");
+    };
+    set(&["--action", "replan"]);
+    set(&[]);
+
+    let ls = run_belt(tmp.path(), &["hitl", "timeout", "ls", "--json"]);
+    let v = stdout_json(&ls);
+    assert!(v.as_array().expect("array")[0]["action"].is_null());
 }
 
 #[test]

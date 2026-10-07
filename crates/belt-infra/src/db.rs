@@ -2447,6 +2447,35 @@ impl Database {
         })
     }
 
+    /// Replace the deadline and terminal action of an open request.
+    ///
+    /// `terminal_action = None` clears the stored action, so the expiry uses
+    /// the workspace default. Returns `false` when the request is unknown or
+    /// already confirmed; those rows are left untouched.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn set_hitl_expiry(
+        &self,
+        hitl_id: &HitlId,
+        timeout_at: &str,
+        terminal_action: Option<EscalationAction>,
+    ) -> Result<bool, BeltError> {
+        let conn = self.lock_conn()?;
+        let rows = conn
+            .execute(
+                "UPDATE hitl_requests SET timeout_at = ?1, terminal_action = ?2
+                 WHERE hitl_id = ?3 AND status = 'open'",
+                params![
+                    timeout_at,
+                    terminal_action.map(|a| a.to_string()),
+                    hitl_id.as_str()
+                ],
+            )
+            .map_err(sql_err)?;
+        Ok(rows == 1)
+    }
+
     /// One request by id, or `None`.
     ///
     /// # Errors
@@ -5965,6 +5994,75 @@ mod tests {
         let stored = db.hitl_request(&hitl_id).unwrap().unwrap();
         assert_eq!(stored.status, HitlStatus::Resolved);
         assert_eq!(stored.resolution, Some(human));
+    }
+
+    #[test]
+    fn set_hitl_expiry_replaces_deadline_and_terminal_of_an_open_request() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        let updated = db
+            .set_hitl_expiry(
+                &hitl_id,
+                "2099-02-02T00:00:00+00:00",
+                Some(EscalationAction::Replan),
+            )
+            .unwrap();
+
+        assert!(updated);
+        let request = db.hitl_request(&hitl_id).unwrap().unwrap();
+        assert_eq!(
+            request.timeout_at.as_deref(),
+            Some("2099-02-02T00:00:00+00:00")
+        );
+        assert_eq!(request.terminal_action, Some(EscalationAction::Replan));
+        assert_eq!(request.status, HitlStatus::Open);
+    }
+
+    #[test]
+    fn set_hitl_expiry_without_terminal_leaves_it_to_the_workspace_default() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        assert!(
+            db.set_hitl_expiry(&hitl_id, "2099-02-02T00:00:00+00:00", None)
+                .unwrap()
+        );
+
+        let request = db.hitl_request(&hitl_id).unwrap().unwrap();
+        assert_eq!(request.terminal_action, None);
+    }
+
+    #[test]
+    fn set_hitl_expiry_leaves_confirmed_and_unknown_requests_alone() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id.clone()),
+            &resolution(HitlAction::Skip, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+
+        let updated = db
+            .set_hitl_expiry(
+                &hitl_id,
+                "2099-02-02T00:00:00+00:00",
+                Some(EscalationAction::Replan),
+            )
+            .unwrap();
+
+        assert!(!updated);
+        let request = db.hitl_request(&hitl_id).unwrap().unwrap();
+        assert_eq!(request.timeout_at.as_deref(), Some("2099-01-01T00:00:00Z"));
+        assert_eq!(request.terminal_action, Some(EscalationAction::Skip));
+        assert!(
+            !db.set_hitl_expiry(&HitlId::new("missing"), "2099-02-02T00:00:00+00:00", None)
+                .unwrap()
+        );
     }
 
     #[test]
