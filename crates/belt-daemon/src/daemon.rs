@@ -724,6 +724,12 @@ impl Daemon {
             let worktree_mgr = Arc::clone(&self.worktree_mgr);
             let ws_name = self.config.name.clone();
             let state_config = self.find_state_config(&item.state).cloned();
+            // The worktree belongs to the item's owner: an inherited one keeps
+            // its original key, any other item gets its own.
+            let worktree_key = self
+                .db
+                .worktree_key(&item.work_id)
+                .map_err(|e| e.to_string());
 
             let hook = Self::resolve_hook_static(&self.hook, &self.hook_loader, &ws_name);
             join_set.spawn(async move {
@@ -732,6 +738,7 @@ impl Daemon {
                     state_config,
                     executor,
                     worktree_mgr,
+                    worktree_key,
                     ws_name,
                     hook,
                 )
@@ -763,9 +770,25 @@ impl Daemon {
         state_config: Option<StateConfig>,
         executor: Arc<ActionExecutor>,
         worktree_mgr: Arc<dyn WorktreeManager>,
+        worktree_key: Result<String, String>,
         ws_name: String,
         hook: Arc<dyn LifecycleHook>,
     ) -> ExecutionResult {
+        let worktree_key = match worktree_key {
+            Ok(key) => key,
+            Err(e) => {
+                return ExecutionResult {
+                    item,
+                    outcome: ExecutionOutcome::WorktreeError {
+                        error: format!("worktree owner lookup failed: {e}"),
+                    },
+                    ws_name,
+                    on_fail_actions: Vec::new(),
+                    worktree: None,
+                    on_enter_result: None,
+                };
+            }
+        };
         let state_config = match state_config {
             Some(cfg) => cfg,
             None => {
@@ -804,7 +827,7 @@ impl Daemon {
                 );
                 worktree_mgr.clear_preserved(&item.source_id);
                 item.previous_worktree_path = None;
-                match worktree_mgr.create_or_reuse(&ws_name) {
+                match worktree_mgr.create_or_reuse(&worktree_key) {
                     Ok(path) => path,
                     Err(e) => {
                         return ExecutionResult {
@@ -822,7 +845,7 @@ impl Daemon {
             }
         } else {
             let previous_wt = item.previous_worktree_path.as_deref();
-            match worktree_mgr.create_or_reuse_with_previous(&ws_name, previous_wt) {
+            match worktree_mgr.create_or_reuse_with_previous(&worktree_key, previous_wt) {
                 Ok(path) => {
                     // Clear the previous_worktree_path after successful handoff.
                     item.previous_worktree_path = None;
@@ -1140,8 +1163,12 @@ impl Daemon {
             Err(e) => return self.discard_unrecorded(item, &ws_name, e.to_string()),
         };
 
-        // Q-10: the worktree outlives a failed run (handed over or preserved).
-        item.mark_worktree_preserved();
+        // Q-10: the worktree outlives a failed run (handed over or preserved)
+        // unless the lineage ends here with a skip.
+        let ends_lineage = matches!(committed, Committed::Skipped);
+        if !ends_lineage {
+            item.mark_worktree_preserved();
+        }
         match committed {
             Committed::Derived { work_id } => {
                 item.set_phase_unchecked(QueuePhase::Skipped);
@@ -1205,17 +1232,22 @@ impl Daemon {
             );
         }
 
-        // Register preserved worktree by source_id for reuse on retry/restart.
-        if let Some(ref wt) = worktree {
-            self.worktree_mgr
-                .register_preserved(&item.source_id, wt.clone());
+        if ends_lineage {
+            self.worktree_mgr.clear_preserved(&item.source_id);
+            self.cleanup_owned_worktree(&item.work_id);
+        } else {
+            // Register preserved worktree by source_id for reuse on retry/restart.
+            if let Some(ref wt) = worktree {
+                self.worktree_mgr
+                    .register_preserved(&item.source_id, wt.clone());
+            }
+            tracing::info!(
+                work_id = %item.work_id,
+                source_id = %item.source_id,
+                phase = "failed",
+                "worktree preserved for failed item"
+            );
         }
-        tracing::info!(
-            work_id = %item.work_id,
-            source_id = %item.source_id,
-            phase = "failed",
-            "worktree preserved for failed item"
-        );
 
         self.tracker.release(&ws_name);
 
@@ -1349,7 +1381,7 @@ impl Daemon {
         Ok(())
     }
 
-    /// Clean up the worktree a finished (Done) item owns.
+    /// Clean up the worktree a finished (Done or lineage-ending Skipped) item owns.
     ///
     /// The worktree is keyed by its owner: a derived item cleans the worktree
     /// it was handed. Failures are logged; cleanup never fails the transition.

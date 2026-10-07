@@ -865,6 +865,73 @@ mod store_results {
     }
 
     #[tokio::test]
+    async fn skip_escalation_cleans_up_the_worktree_it_owned() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_workspace_config();
+        config.sources.get_mut("github").unwrap().escalation =
+            EscalationPolicy::new(BTreeMap::from([(1, EscalationAction::Skip)]));
+        let daemon = failing_daemon(&tmp, vec![1], config);
+        let hook = RecordingHook::new(Arc::clone(daemon.database()));
+        let mut daemon = daemon.with_hook(hook.clone());
+
+        daemon.collect().await.unwrap();
+        run_once(&mut daemon).await;
+
+        let worktree = hook.worktree_of(ORIGIN);
+        assert!(
+            !worktree.exists(),
+            "a lineage-ending skip removes the worktree"
+        );
+    }
+
+    #[tokio::test]
+    async fn derived_skip_keeps_the_worktree_it_handed_over() {
+        let tmp = TempDir::new().unwrap();
+        let daemon = failing_daemon(&tmp, vec![1], test_workspace_config());
+        let hook = RecordingHook::new(Arc::clone(daemon.database()));
+        let mut daemon = daemon.with_hook(hook.clone());
+
+        daemon.collect().await.unwrap();
+        let outcome = run_once(&mut daemon).await;
+        assert_eq!(escalation_of(&outcome), EscalationAction::Retry);
+
+        assert!(
+            hook.worktree_of(ORIGIN).exists(),
+            "the worktree survives a Skipped that ended in derivation"
+        );
+    }
+
+    #[tokio::test]
+    async fn items_of_one_workspace_get_separate_worktrees() {
+        let tmp = TempDir::new().unwrap();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+        source.add_item(test_item("github:org/repo#2", "analyze"));
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(MockRuntime::new("mock", vec![0, 0])));
+        let daemon = Daemon::new(
+            test_workspace_config(),
+            vec![Box::new(source)],
+            Arc::new(registry),
+            Box::new(MockWorktreeManager::new(tmp.path().join("worktrees"))),
+            4,
+            Database::open_in_memory().unwrap(),
+        );
+        let hook = RecordingHook::new(Arc::clone(daemon.database()));
+        let mut daemon = daemon.with_hook(hook.clone());
+
+        daemon.collect().await.unwrap();
+        daemon.advance();
+        let outcomes = daemon.execute_running().await;
+        assert_eq!(outcomes.len(), 2, "both items run in the same step");
+
+        let first = hook.worktree_of("github:org/repo#1:analyze");
+        let second = hook.worktree_of("github:org/repo#2:analyze");
+        assert_ne!(first, second);
+        assert!(first.exists() && second.exists());
+    }
+
+    #[tokio::test]
     async fn unreadable_failure_history_surfaces_instead_of_falling_back() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("belt.db");
