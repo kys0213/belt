@@ -264,6 +264,11 @@ mod tests {
         assert!(result.stdout.contains("hi"));
         assert_eq!(sink.pids().len(), 1);
         assert!(sink.pids()[0] > 1);
+        assert_eq!(
+            sink.exits(),
+            sink.pids(),
+            "the exit is reported once waited for"
+        );
     }
 
     #[tokio::test]

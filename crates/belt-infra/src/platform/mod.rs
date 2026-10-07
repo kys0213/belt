@@ -94,7 +94,8 @@ pub fn probe_handler(pid: u32, running_since: chrono::DateTime<chrono::Utc>) -> 
 }
 
 /// Spawns `cmd` as the leader of a new process group, reports its pid to
-/// `sink` right after the spawn, and collects its output.
+/// `sink` right after the spawn, collects its output, and reports the exit
+/// once the process was waited for.
 ///
 /// The dedicated group lets [`ProcessKiller::kill_group`] terminate the
 /// process together with its children. Every handler spawn goes through this
@@ -114,10 +115,16 @@ pub(crate) async fn output_in_new_group(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = cmd.spawn()?;
-    if let Some(pid) = child.id() {
+    let pid = child.id();
+    if let Some(pid) = pid {
         sink.spawned(pid);
     }
-    child.wait_with_output().await
+    let output = child.wait_with_output().await;
+    // A failed wait proves no exit: the pid stays killable.
+    if let (Some(pid), Ok(_)) = (pid, &output) {
+        sink.exited(pid);
+    }
+    output
 }
 
 /// Test doubles shared by the platform and runtime tests.
@@ -127,21 +134,30 @@ pub(crate) mod testing {
 
     use belt_core::platform::ProcessSink;
 
-    /// Records every reported pid.
+    /// Records every reported pid and exit.
     #[derive(Default)]
     pub struct RecordingSink {
         pids: Mutex<Vec<u32>>,
+        exits: Mutex<Vec<u32>>,
     }
 
     impl RecordingSink {
         pub fn pids(&self) -> Vec<u32> {
             self.pids.lock().unwrap().clone()
         }
+
+        pub fn exits(&self) -> Vec<u32> {
+            self.exits.lock().unwrap().clone()
+        }
     }
 
     impl ProcessSink for RecordingSink {
         fn spawned(&self, pid: u32) {
             self.pids.lock().unwrap().push(pid);
+        }
+
+        fn exited(&self, pid: u32) {
+            self.exits.lock().unwrap().push(pid);
         }
     }
 

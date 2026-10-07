@@ -34,7 +34,7 @@ pub(crate) enum StopReason {
 
 #[derive(Debug, Default)]
 struct ControlState {
-    /// The last process the execution spawned, until the execution ends.
+    /// The process the execution runs now; cleared as soon as it exits.
     pid: Option<u32>,
     stop: Option<StopReason>,
     /// The execution returned; its processes have all been waited for.
@@ -66,16 +66,16 @@ impl HandlerControl {
     }
 
     /// Stop the execution: kill its process group now, or as soon as a
-    /// process is reported. Returns `false` when it was already stopping.
+    /// process is reported. Returns `false` when it was already stopping or
+    /// already returned: a finished execution's result stands, so the stop
+    /// is not recorded.
     pub(crate) fn stop(&self, reason: StopReason) -> bool {
         let mut state = self.lock();
-        if state.stop.is_some() {
+        if state.stop.is_some() || state.finished {
             return false;
         }
         state.stop = Some(reason);
-        if !state.finished
-            && let Some(pid) = state.pid
-        {
+        if let Some(pid) = state.pid {
             self.kill(pid);
         }
         true
@@ -131,14 +131,27 @@ impl ProcessSink for HandlerControl {
             self.kill(pid);
         }
     }
+
+    fn exited(&self, pid: u32) {
+        let mut state = self.lock();
+        // Only the current process: an older one's exit must not erase it.
+        if state.pid != Some(pid) {
+            return;
+        }
+        state.pid = None;
+        if let Err(e) = self.db.clear_handler_process(&self.work_id) {
+            tracing::error!(work_id = %self.work_id, pid, "exited handler pid not cleared: {e}");
+        }
+    }
 }
 
 /// What happened to a handler process a previous daemon left behind.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeftoverHandler {
-    /// It was the recorded handler and its group was killed.
+    /// It was the recorded handler and its group was killed (or, with the
+    /// leader already gone, what was left of the group).
     Killed,
-    /// It had already exited.
+    /// It had already exited and left nothing in its group.
     Gone,
     /// It was not killed; the reason says why (a reused pid, an unverifiable
     /// platform, or a failed kill).
@@ -161,7 +174,13 @@ pub fn stop_leftover_handler(
             Ok(()) => LeftoverHandler::Killed,
             Err(e) => LeftoverHandler::Spared(format!("kill failed: {e}")),
         },
-        HandlerProbe::Gone => LeftoverHandler::Gone,
+        // The leader is gone but its children may still hold the group.
+        // The group id cannot be handed to a new process while any member
+        // lives, so the kill reaches only them; with none left it fails.
+        HandlerProbe::Gone => match killer.kill_group(pid) {
+            Ok(()) => LeftoverHandler::Killed,
+            Err(_) => LeftoverHandler::Gone,
+        },
         HandlerProbe::Reused(reason) | HandlerProbe::Unknown(reason) => {
             LeftoverHandler::Spared(reason)
         }
@@ -203,4 +222,168 @@ pub fn cancel_directly(
         stop_leftover_handler(killer, &format!("cancel request {request_id}"), handler);
     }
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belt_core::phase::QueuePhase;
+    use belt_core::queue::QueueItem;
+
+    /// Records every group it is asked to kill.
+    #[derive(Default)]
+    struct RecordingKiller {
+        killed: Mutex<Vec<u32>>,
+    }
+
+    impl RecordingKiller {
+        fn killed(&self) -> Vec<u32> {
+            self.killed.lock().unwrap().clone()
+        }
+    }
+
+    impl ProcessKiller for RecordingKiller {
+        fn kill_group(&self, pid: u32) -> Result<(), BeltError> {
+            self.killed.lock().unwrap().push(pid);
+            Ok(())
+        }
+    }
+
+    const WORK_ID: &str = "w-1";
+
+    fn control() -> (HandlerControl, Arc<RecordingKiller>, Arc<Database>) {
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        let mut item = QueueItem::new(
+            WORK_ID.to_string(),
+            "github:org/repo#1".to_string(),
+            "ws".to_string(),
+            "implement".to_string(),
+        );
+        item.set_phase_unchecked(QueuePhase::Running);
+        db.insert_item(&item).unwrap();
+        let killer = Arc::new(RecordingKiller::default());
+        let control = HandlerControl::new(
+            WORK_ID,
+            Arc::clone(&db),
+            Arc::clone(&killer) as Arc<dyn ProcessKiller>,
+        );
+        (control, killer, db)
+    }
+
+    const CANCEL: StopReason = StopReason::Cancel { request_id: 7 };
+
+    #[test]
+    fn a_stop_before_the_spawn_kills_the_process_as_soon_as_it_is_reported() {
+        let (control, killer, _db) = control();
+
+        assert!(control.stop(CANCEL));
+        assert!(killer.killed().is_empty(), "nothing to kill yet");
+        control.spawned(42);
+
+        assert_eq!(killer.killed(), vec![42]);
+        assert_eq!(control.canceled_request(), Some(7));
+    }
+
+    #[test]
+    fn a_stop_while_a_process_runs_kills_it_once() {
+        let (control, killer, _db) = control();
+        control.spawned(42);
+
+        assert!(control.stop(CANCEL));
+        assert!(!control.stop(StopReason::Shutdown), "already stopping");
+
+        assert_eq!(killer.killed(), vec![42]);
+        assert_eq!(control.canceled_request(), Some(7));
+    }
+
+    #[test]
+    fn a_stop_after_the_execution_finished_is_refused() {
+        let (control, killer, _db) = control();
+        control.spawned(42);
+        control.finish();
+
+        assert!(!control.stop(CANCEL), "the result already stands");
+
+        assert!(killer.killed().is_empty());
+        assert_eq!(control.canceled_request(), None);
+        assert!(!control.is_stopped());
+    }
+
+    #[test]
+    fn an_exited_process_is_forgotten_in_memory_and_in_the_store() {
+        let (control, killer, db) = control();
+        control.spawned(42);
+        assert_eq!(db.handler_process(WORK_ID).unwrap(), Some(42));
+
+        control.exited(42);
+
+        assert_eq!(db.handler_process(WORK_ID).unwrap(), None);
+        assert!(control.stop(CANCEL), "the execution itself still runs");
+        assert!(
+            killer.killed().is_empty(),
+            "an exited pid may be reused and is never signaled"
+        );
+    }
+
+    #[test]
+    fn the_exit_of_an_older_process_keeps_the_current_one() {
+        let (control, killer, db) = control();
+        control.spawned(42);
+        control.spawned(43);
+
+        control.exited(42);
+
+        assert_eq!(db.handler_process(WORK_ID).unwrap(), Some(43));
+        control.stop(CANCEL);
+        assert_eq!(killer.killed(), vec![43]);
+    }
+
+    /// A handler whose leader exited but left a child in its group.
+    #[cfg(unix)]
+    #[test]
+    fn a_leftover_group_without_its_leader_is_still_killed() {
+        use std::os::unix::process::CommandExt;
+
+        let alive = |pid: u32| {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let output = std::process::Command::new("bash")
+            .args(["-c", "sleep 30 >/dev/null 2>&1 & echo $!"])
+            .process_group(0)
+            .output()
+            .unwrap();
+        let child: u32 = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        // The leader was reaped by `output`; only its child holds the group.
+        let ps = std::process::Command::new("ps")
+            .args(["-o", "pgid=", "-p", &child.to_string()])
+            .output()
+            .unwrap();
+        let leader = HandlerProcess {
+            pid: String::from_utf8_lossy(&ps.stdout).trim().parse().unwrap(),
+            running_since: chrono::Utc::now() - chrono::Duration::seconds(5),
+        };
+        assert!(alive(child));
+        let killer = belt_infra::platform::default_process_killer();
+
+        let outcome = stop_leftover_handler(killer.as_ref(), WORK_ID, &leader);
+
+        let mut gone = false;
+        for _ in 0..50 {
+            if !alive(child) {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(gone, "the child left in the group is killed");
+        assert_eq!(outcome, LeftoverHandler::Killed);
+    }
 }

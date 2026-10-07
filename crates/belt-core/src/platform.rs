@@ -71,6 +71,13 @@ pub trait ShellExecutor: Send + Sync {
 pub trait ProcessSink: Send + Sync {
     /// Called exactly once per spawned process, right after the spawn.
     fn spawned(&self, pid: u32);
+
+    /// Called once after the process reported to [`spawned`](Self::spawned)
+    /// was waited for. From then on the pid may name another process, so
+    /// it must not be signaled any more.
+    fn exited(&self, pid: u32) {
+        let _ = pid;
+    }
 }
 
 /// A [`ProcessSink`] that ignores the pid.
