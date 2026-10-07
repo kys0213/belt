@@ -416,3 +416,52 @@ fn spec_subcommand_does_not_exist() {
         "expected clap rejection, got: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// status: no spec section in any output format
+// ---------------------------------------------------------------------------
+
+/// Run `belt status --format <format>` against a seeded database and return stdout.
+fn status_stdout(format: &str) -> String {
+    let (tmp, db) = setup_belt_home();
+    insert_hitl_item(&db, "work-status-1");
+    drop(db);
+
+    let output = run_belt(tmp.path(), &["status", "--format", format]);
+    assert!(
+        output.status.success(),
+        "belt status --format {format} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Assert that the rendered status carries no spec-related key or label.
+fn assert_no_spec_section(stdout: &str, format: &str) {
+    let lowered = stdout.to_lowercase();
+    for needle in ["spec", "next evaluate", "next_evaluate", "linked issue"] {
+        assert!(
+            !lowered.contains(needle),
+            "`belt status --format {format}` must not mention {needle:?}:\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn status_json_has_no_spec_section() {
+    let stdout = status_stdout("json");
+    let value: serde_json::Value =
+        serde_json::from_str(&stdout).expect("status json output should parse");
+    assert!(value.is_object(), "status json should be an object");
+    assert_no_spec_section(&stdout, "json");
+}
+
+#[test]
+fn status_text_has_no_spec_section() {
+    assert_no_spec_section(&status_stdout("text"), "text");
+}
+
+#[test]
+fn status_rich_has_no_spec_section() {
+    assert_no_spec_section(&status_stdout("rich"), "rich");
+}
