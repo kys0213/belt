@@ -26,7 +26,7 @@ DataSource.collect(): trigger 조건 매칭 (예: belt:analyze 라벨)
     ▼
   Pending → Ready → Running (자동 전이, concurrency 제한)
     │
-    │  ① worktree 생성 (인프라, 또는 retry 시 기존 보존분 재사용)
+    │  ① worktree 생성 (인프라, 또는 인계받은 worktree·롤백 보존분 재사용)
     │  ② hook.on_enter() 트리거 (workspace의 LifecycleHook)
     │  ③ handlers 순차 실행:
     │       prompt → AgentRuntime.invoke() (worktree 안에서)

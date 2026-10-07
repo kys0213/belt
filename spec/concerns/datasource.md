@@ -305,10 +305,10 @@ escalation:
 
 ### on_fail 실행 조건
 
-`retry`만 `on_fail`을 트리거하지 않는다. 나머지(`retry_with_comment`, `hitl`)는 `on_fail` 트리거 후 해당 액션을 수행한다.
+`retry`만 `on_fail`을 호출하지 않는다. 나머지(`retry_with_comment`, `hitl`)는 결과 전이가 applied로 commit된 뒤 `on_escalation`, `on_fail` 순서로 호출한다. hook 실패는 이미 commit된 상태를 되돌리지 않는다.
 
 ```
-1회 실패 → retry           → 조용히 재시도 (worktree 보존)
+1회 실패 → retry           → 조용히 재시도 (worktree 인계)
 2회 실패 → retry_with_comment → 외부 시스템에 실패 알림 + 재시도
 3회 실패 → hitl            → 외부 시스템에 알림 + 사람 대기
                               └── 사람 응답: done / retry / skip / replan

@@ -19,7 +19,7 @@ handler 전부 성공 → Completed
 Evaluator (Daemon tick에서 Executor보다 먼저 실행):
   Progressive Pipeline:
     Stage 1: Mechanical (cargo test 등, 비용 0)
-      → 실패 시 Retry (LLM 안 부름)
+      → 실패 시 Retry (LLM 안 부름, Completed에 머물고 다음 evaluate에서 재판정)
     Stage 2: Semantic (LLM 1회, belt agent -p)
       → LLM이 belt context로 컨텍스트 조회 후 판정
     │

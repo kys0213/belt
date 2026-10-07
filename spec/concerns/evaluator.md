@@ -41,7 +41,7 @@ evaluator.evaluate():
         match decision:
             Done → hook.on_done(), transit(Done)
             Hitl → create_hitl_event()
-            NeedMoreWork → transit(Ready)  // 재실행 필요
+            Retry → 유지  // Completed에 머물고 다음 evaluate에서 재판정 (handler는 다시 실행하지 않음)
 
     // 2. Ready 아이템 → 사전 검증 (이력 기반)
     for item in queue.get(Ready):
@@ -64,7 +64,7 @@ evaluator.evaluate():
 ┌─ Stage 1: Mechanical (비용 $0) ─────────────────────────────┐
 │                                                              │
 │  cargo test, cargo clippy, lint 등 결정적 검증               │
-│  → 실패 시 즉시 retry (LLM 안 부름)                          │
+│  → 실패 시 Retry (LLM 안 부름, Completed 유지)                │
 │  → 성공 시 Stage 2로                                         │
 └──────────────────────────────────────────────────────────────┘
                           │
@@ -104,7 +104,7 @@ pub trait EvaluationStage: Send + Sync {
 pub enum EvalDecision {
     Done,                     // 충분 — hook.on_done() 트리거
     Hitl { reason: String },  // 사람 필요 — HITL 이벤트 생성
-    Retry,                    // Stage 1 실패 — handler 재실행
+    Retry,                    // Stage 1 실패 — Completed에 머물고 다음 evaluate에서 재판정
     Inconclusive,             // 이 단계에서 판정 불가 — 다음 단계로
 }
 ```
@@ -153,7 +153,7 @@ impl EvaluationStage for MechanicalStage {
         for cmd in &self.commands {
             let result = execute_in_worktree(cmd, &ctx.worktree);
             if result.failed {
-                return Ok(EvalDecision::Retry);  // 빌드/테스트 실패 → 재시도
+                return Ok(EvalDecision::Retry);  // 빌드/테스트 실패 → Completed 유지, 다음 evaluate에서 재판정
             }
         }
         Ok(EvalDecision::Inconclusive)  // 기계적으로는 통과 → Semantic으로

@@ -193,8 +193,8 @@ flowchart TD
     S -- "handler 또는 on_enter 실패" --> A["Stagnation 분석 + 사고 전환"]
     A --> F{"escalation (failure_count)"}
     F -- "retry" --> RT["원 아이템 Skipped (파생됨), 파생 아이템 Pending, lateral plan 주입"]
-    F -- "retry_with_comment" --> RC["on_fail 실행 후 원 아이템 Skipped (파생됨), 파생 아이템 Pending"]
-    F -- "hitl" --> H["on_fail 실행 후 HITL 요청"]
+    F -- "retry_with_comment" --> RC["원 아이템 Skipped (파생됨), 파생 아이템 Pending, 결과 전이 commit 후 on_escalation과 on_fail 실행"]
+    F -- "hitl" --> H["Hitl 전이 commit 후 on_escalation과 on_fail 실행, HITL 요청"]
     C --> E{"Evaluator 판정"}
     E -- "완료" --> OD["on_done 실행"]
     E -- "사람 필요" --> H

@@ -36,7 +36,7 @@ Stagnation 분석 (같은 source_id + state에서 실패 이력이 있으면 항
 
 현재 실제로 감지되는 패턴은 **SPINNING**(A→A→A, 동일/유사 출력 반복)과 **OSCILLATION**(A→B→A→B, 두 출력 사이를 교대로 반복)이다. 예: 같은 컴파일 에러가 반복되면 SPINNING, 서로 다른 두 수정안을 번갈아 시도하면 OSCILLATION.
 
-패턴 유형 전체 정의(enum)는 [Data Model](./data-model.md#stagnationpattern) 참조. SPINNING·OSCILLATION 외 패턴(NO_DRIFT, DIMINISHING_RETURNS)의 확장 로드맵은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
+패턴 유형 전체 정의(enum)는 [Data Model](./data-model.md#stagnation-패턴과-페르소나) 참조. SPINNING·OSCILLATION 외 패턴(NO_DRIFT, DIMINISHING_RETURNS)의 확장 로드맵은 [source_data와 stagnation 로드맵](../../plans/source-data-and-stagnation-roadmap.md) 참조.
 
 ---
 

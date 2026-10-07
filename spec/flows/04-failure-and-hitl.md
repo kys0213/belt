@@ -206,9 +206,9 @@ flowchart TD
     D1 -- "실패" --> FAIL["Failed, worktree 보존"]
     A -- "retry" --> RT["같은 아이템 Pending, 사용자 지시를 lateral plan으로 주입, failure_count 리셋, worktree 보존"]
     A -- "skip" --> SK["Skipped, worktree 정리"]
-    A -- "replan" --> RP{"계열 replan 3회 이내?"}
-    RP -- "이내" --> RP1["원 아이템 Skipped (worktree 정리), 파생 아이템 Pending (실패 맥락 주입, 새 worktree)"]
-    RP -- "초과" --> RP2["Failed, worktree 보존"]
+    A -- "replan" --> RP{"이미 replan 3회 파생된 계열인가"}
+    RP -- "아니오" --> RP1["원 아이템 Skipped (worktree 정리), 파생 아이템 Pending (실패 맥락 주입, 새 worktree)"]
+    RP -- "예" --> RP2["Failed, worktree 보존"]
 ```
 
 - done의 on_done이 실패하면 Failed다. 그 밖의 후처리 단계가 실패해도 결과 전이에는 도달하고, dashboard에 경고가 남는다.
@@ -222,9 +222,9 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    R["replan (사람 응답 또는 timeout terminal replan)"] --> C{"계열 replan 3회 이내?"}
-    C -- "초과" --> X["Failed (worktree 보존)"]
-    C -- "이내" --> S["원 아이템 Skipped"]
+    R["replan (사람 응답 또는 timeout terminal replan)"] --> C{"이미 replan 3회 파생된 계열인가"}
+    C -- "예" --> X["Failed (worktree 보존)"]
+    C -- "아니오" --> S["원 아이템 Skipped"]
     S --> N["같은 출처로 새 work_id의 파생 아이템 생성, 파생 원본 기록"]
     N --> I["실패 맥락 (이전 시도, lateral 이력, HITL 메모)을 주입하고 계획부터 다시 수행"]
     I --> P["Pending, 파이프라인 재진입"]
@@ -345,7 +345,7 @@ flowchart TD
 | HITL done 응답 | 사용자 done 선택 | "해결됨 · 처리 중" 뒤 Done | on_done 성공 후 Done, worktree 정리 |
 | HITL retry 응답 | 사용자 retry + 지시 | Pending (같은 아이템) | 사용자 지시를 lateral plan으로 주입, worktree 보존 |
 | HITL skip 응답 | 사용자 skip 선택 | Skipped (terminal) | worktree 정리 |
-| HITL replan 응답 | 사용자 replan 선택 (상한 3회 이내) | 원 아이템 Skipped + 파생 아이템 Pending | 실패 맥락 주입, 새 worktree, 원 아이템 worktree 정리 |
+| HITL replan 응답 | 사용자 replan 선택 (이미 3회 파생된 계열이 아님) | 원 아이템 Skipped + 파생 아이템 Pending | 실패 맥락 주입, 새 worktree, 원 아이템 worktree 정리 |
 | HITL replan 응답, 상한 초과 | 사용자 replan 선택 (이미 3회 replan) | Failed | worktree 보존 (Failed 규칙) |
 | HITL timeout | 24시간 무응답 | terminal 액션 적용 | skip→Skipped, replan→원 아이템 Skipped + 파생 아이템 Pending, 상한 초과→Failed |
 | GitHub·CLI 동시 응답 | 두 경로가 거의 동시에 응답 | 먼저 확정된 응답의 결과 | 하나만 승리, 나머지는 `already_handled`, GitHub에는 "이미 처리됨" 회신, DB 에러 없음 |

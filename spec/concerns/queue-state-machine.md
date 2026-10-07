@@ -193,6 +193,7 @@ stateDiagram-v2
 | (ii) 후처리 | phase가 Hitl이고 그 HITL 요청이 확정(resolved 또는 expired)됐으나 후처리 미완료 | daemon 후처리 | Hitl에서 나가는 결과 전이 (Done, Failed, Skipped, Pending) |
 
 - **Completed는 잠금이 아니다.** evaluator가 전이 계약으로 전이하는 정당한 행위자이기 때문이다. 평가 중 사람의 조작이 이기면 evaluator의 판정은 `conflict`로 버려진다.
+- Completed에 머문 채 다음 evaluate에서 다시 판정되는 것(evaluator의 Retry 결과)은 전이가 아니다. handler는 다시 실행되지 않는다.
 - **잠금 무효**: 소유자 daemon이 없거나 응답하지 않으면 처리 중 (i) 잠금은 무효다. 무효 판정은 [실행 중 취소](#실행-중-취소) 경로에서만 쓰고, 그 밖의 외부 전이는 여전히 `busy`다.
 
 | 판정 | 기준 |
@@ -448,12 +449,12 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 ### Escalation 정책
 
 - [ ] failure_count=1일 때 `retry`가 적용되면 on_fail을 실행하지 않고, 원 아이템은 Skipped(파생됨)가 되며 새 `work_id`의 파생 아이템으로 재시도한다
-- [ ] failure_count=2일 때 `retry_with_comment`가 적용되면 on_fail 실행 후 같은 방식으로 파생 아이템으로 재시도한다
+- [ ] failure_count=2일 때 `retry_with_comment`가 적용되면 결과 전이 commit 후 on_fail을 실행하고, 같은 방식으로 파생 아이템으로 재시도한다
 - [ ] escalation retry의 worktree는 정리되지 않고 파생 아이템에 인계된다
 - [ ] HITL retry 뒤 다음 실패는 escalation 1단계부터 다시 적용된다
 - [ ] replan 상한 3회는 계열 단위이고, 초과하면 Failed이며 worktree를 보존한다
 - [ ] 설정의 escalation 레벨 값이 허용 범위 밖이면 로드 시 거부된다. 실패 횟수가 최고 레벨을 넘으면 최고 레벨을 재사용한다
-- [ ] failure_count=3일 때 `hitl`이 적용되면 on_fail 실행 후 HITL 요청이 생성된다
+- [ ] failure_count=3일 때 `hitl`이 적용되면 Hitl 전이 commit 후 on_fail이 실행되고, HITL 요청이 생성된다
 - [ ] on_enter 실패도 failure_count에 포함된다
 - [ ] 모든 실패에서 stagnation 분석이 실행되고, 패턴 감지 시 lateral_plan이 retry에 주입된다
 
