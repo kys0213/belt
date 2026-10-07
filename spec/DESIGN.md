@@ -1,7 +1,5 @@
 # Belt Spec — Design
 
-> 버전 마이그레이션 배경과 변경 이력은 [plans/2026-04-v6-migration.md](../plans/2026-04-v6-migration.md) 참고.
-
 ---
 
 ## 목표
@@ -31,7 +29,7 @@ stagnation이 감지      = 실패 패턴을 분석하고, 사고를 전환하�
 | **LLM Agent** | handler prompt를 실행하는 AI (Claude, Gemini, Codex) | Daemon이 subprocess로 호출, worktree 안에서 실행 |
 | **GitHub** | 이슈/PR 소스 시스템 | 이슈 조회, on_done script가 PR 생성, 코멘트로 HITL 응답 가능 (respond.allow 설정 시) |
 | **응답자** | HITL 요청에 응답하는 사람 | dashboard, CLI, agent 세션, 설정된 channel(allowlist)에서 응답 |
-| **Cron Engine** | 주기 작업 스케줄러 | evaluate, gap-detection, hitl-timeout 등 내부 주기 실행 |
+| **Cron Engine** | 주기 작업 스케줄러 | hitl-timeout, knowledge-extract, log-cleanup 등 내부 주기 실행 |
 | **Reviewer** | PR을 리뷰하는 사람 또는 Bot | changes_requested → DataSource가 감지 → 파이프라인 재진입 |
 
 ---
@@ -43,7 +41,7 @@ Belt는 외부 시스템을 trait으로 추상화한다. 코어는 구체적 시
 | 경계 | 추상화 | 사용 지점 |
 |------|--------|----------|
 | **이슈 소스** | `DataSource` | 수집, 컨텍스트 조회 — 읽기 |
-| **상태 반응** | `LifecycleHook` | on_enter/on_done/on_fail/on_escalation/on_hitl_resolved — 출처 시스템에 쓰기 |
+| **상태 반응** | `LifecycleHook` | on_enter/on_done/on_fail/on_escalation/on_hitl_opened/on_hitl_resolved — 출처 시스템에 쓰기 |
 | **사람 알림·응답** | `NotificationChannel` | 진행 알림과 HITL 요청 발송, 응답 수신 — 사람과의 대화 |
 | **LLM 실행** | `AgentRuntime` | handler prompt, evaluate, lateral plan |
 | **상태 저장** | SQLite | 큐 상태와 전이 이력의 단일 권위 |
@@ -89,7 +87,7 @@ flowchart LR
 
 ### 1. 컨베이어 벨트
 
-아이템은 한 방향으로 흐른다. 되돌아가지 않는다. 부족하면 Cron이 새 아이템을 만들어서 다시 벨트에 태운다. 경합이나 처리 중 변경 요청은 오류가 아니라 거절 값(`busy`, `conflict`, `invalid_action`)으로 돌아온다.
+아이템은 한 방향으로 흐른다. 되돌아가지 않는다. 다시 시도할 일은 기존 아이템을 되돌리지 않고 새 아이템(파생 아이템)으로 벨트에 태운다. 경합이나 처리 중 변경 요청은 오류가 아니라 거절 값(`busy`, `conflict`, `invalid_action`)으로 돌아온다.
 
 ### 2. Workspace = 1 Repo
 
@@ -117,7 +115,7 @@ Daemon tick은 execute 이후 evaluate 순서로 동작한다. evaluate는 방�
 
 ### 8. 아이템 계보 (Lineage)
 
-같은 외부 엔티티에서 파생된 아이템은 `source_id`로 연결. 아이템의 사건은 전이 이력에, 시도 결과는 시도 이력에 append-only로 쌓인다.
+같은 외부 엔티티에서 파생된 아이템은 `source_id`로 연결된다. escalation retry와 replan은 원 아이템을 끝내고 새 work_id의 파생 아이템을 만들어 파생 원본으로 잇는다. 아이템의 사건은 전이 이력에, 시도 결과는 시도 이력에 append-only로 쌓인다.
 
 ### 9. 환경변수 최소화
 
@@ -127,13 +125,13 @@ Daemon tick은 execute 이후 evaluate 순서로 동작한다. evaluate는 방�
 
 workspace.concurrency (workspace yaml 루트) + daemon.max_concurrent 2단계. evaluate LLM 호출도 slot 소비. 상세: [Daemon](./concerns/daemon.md)
 
-### 11. Cron은 품질 루프
+### 11. Cron은 주기 작업
 
-파이프라인은 1회성, 품질은 Cron이 지속 감시. gap-detection이 새 이슈 생성 → 파이프라인 재진입. 상세: [Cron 엔진](./concerns/cron-engine.md)
+HITL timeout 만료, 지식 추출, 정리 같은 주기 작업을 실행한다. 상세: [Cron 엔진](./concerns/cron-engine.md)
 
 ### 12. SQLite가 단일 권위, 모든 전이는 이력
 
-큐 상태는 SQLite 한 곳이 권위이고 모든 전이는 이력으로 남는다. daemon의 메모리는 작업용 사본일 뿐 DB와 다르면 DB를 따른다. 모든 phase 전이는 하나의 전이 계약을 거치고, 결과는 `applied`·`busy`·`conflict` 값으로 돌아온다. 상세: [QueuePhase 상태 머신](./concerns/queue-state-machine.md)
+큐 상태는 SQLite 한 곳이 권위이고 모든 전이는 이력으로 남는다. daemon의 메모리는 작업용 사본일 뿐 DB와 다르면 DB를 따른다. 모든 phase 전이는 하나의 전이 계약을 거치고, 결과는 `applied`·`busy`·`conflict`·`invalid_action` 값으로 돌아온다. 상세: [QueuePhase 상태 머신](./concerns/queue-state-machine.md)
 
 ### 13. 처리 중인 아이템은 그 처리의 결과로만 바뀐다
 
@@ -159,14 +157,13 @@ handler가 실행 중이거나 HITL 해결 후처리가 진행 중인 아이템�
 stateDiagram-v2
     [*] --> Pending: DataSource 수집
     Pending --> Ready: 자동 전이
-    Ready --> Running: 점유 (dependency gate, spec 충돌 gate, concurrency)
-    Ready --> Hitl: spec 충돌 감지
+    Ready --> Running: 점유 (큐 의존 gate, concurrency)
     Ready --> Done: 이력 기반 사전 판정
 
     Running --> Completed: handler 전부 성공
-    Running --> Failed: handler 또는 on_enter 실패 (escalation 적용)
+    Running --> Failed: escalation 대상이 아닌 실패 (인프라 오류, 예를 들어 worktree 생성 실패)
     Running --> Hitl: escalation hitl
-    Running --> Skipped: 실행 중 취소
+    Running --> Skipped: 실행 중 취소 또는 escalation retry로 파생됨
     Running --> Pending: shutdown 또는 재시작 롤백
 
     Completed --> Done: evaluate 완료 판정 + on_done 성공
@@ -174,8 +171,8 @@ stateDiagram-v2
     Completed --> Hitl: evaluate 사람 필요
 
     Hitl --> Done: 해결 후처리 done 성공
-    Hitl --> Skipped: 해결 후처리 skip
-    Hitl --> Pending: 해결 후처리 retry 또는 replan
+    Hitl --> Skipped: 해결 후처리 skip 또는 replan으로 파생됨
+    Hitl --> Pending: 해결 후처리 retry
     Hitl --> Failed: on_done 실패, replan 상한 초과 또는 후처리 실패
 
     Failed --> Skipped: skip
@@ -195,8 +192,8 @@ flowchart TD
     S -- "전부 성공" --> C["Completed"]
     S -- "handler 또는 on_enter 실패" --> A["Stagnation 분석 + 사고 전환"]
     A --> F{"escalation (failure_count)"}
-    F -- "retry" --> RT["새 아이템 Pending, lateral plan 주입"]
-    F -- "retry_with_comment" --> RC["on_fail 실행 후 새 아이템 Pending"]
+    F -- "retry" --> RT["원 아이템 Skipped (파생됨), 파생 아이템 Pending, lateral plan 주입"]
+    F -- "retry_with_comment" --> RC["on_fail 실행 후 원 아이템 Skipped (파생됨), 파생 아이템 Pending"]
     F -- "hitl" --> H["on_fail 실행 후 HITL 요청"]
     C --> E{"Evaluator 판정"}
     E -- "완료" --> OD["on_done 실행"]
@@ -206,7 +203,8 @@ flowchart TD
     H --> HR["사람 응답 또는 timeout, 이후 daemon 후처리"]
     HR --> D
     HR --> SK["Skipped"]
-    HR --> PE["Pending"]
+    HR --> PE["Pending (retry)"]
+    HR --> PD["파생 아이템 Pending (replan)"]
 ```
 
 ### Tick 순서
@@ -230,13 +228,13 @@ flowchart LR
 
 | Phase | 소유 모듈 | 핵심 동작 | Hook 트리거 |
 |-------|----------|----------|------------|
-| Pending | Advancer | spec dependency gate | — |
+| Pending | Advancer | — | — |
 | Ready | Advancer | queue dependency gate + concurrency check | — |
 | Running (처리 중) | Executor | worktree + handlers (lateral plan 주입) | on_enter |
 | Running → 실패 | StagnationDetector + LateralAnalyzer | 유사도 분석 → 사고 전환 → escalation | on_escalation + on_fail |
 | Completed | Evaluator | Progressive Pipeline: Mechanical → Semantic → (Consensus) | — |
 | Done | — | worktree 정리 | on_done |
-| Hitl (open) | HitlService | 응답 대기 / timeout 만료 판정 | — |
+| Hitl (open) | HitlService | 응답 대기 / timeout 만료 판정 | on_hitl_opened |
 | Hitl (해결됨, 처리 중) | Daemon 후처리 | 액션별 후처리와 결과 전이 | on_done, on_hitl_resolved |
 | Failed | — | on_done 실패, 인프라 오류, 후처리 실패 | — |
 | Skipped | — | terminal | — |
@@ -248,13 +246,13 @@ flowchart LR
 ```mermaid
 flowchart TD
     subgraph DAEMON["Daemon (CPU): 상태 머신 + 언제 어떤 hook을 트리거할지만 안다"]
-        ADV["Advancer: 전이, dependency gate, spec 충돌 gate, concurrency"]
+        ADV["Advancer: 전이, 큐 의존 gate, concurrency"]
         EXE["Executor: on_enter, handler 실행, 실패 시 escalation 결정"]
         STG["StagnationDetector + LateralAnalyzer: 패턴 감지, lateral plan"]
         EVA["Evaluator: Completed → Done 또는 HITL"]
         HIT["HitlService: HITL 열기, 응답과 timeout 판정"]
         POST["HITL 후처리: 액션별 작업과 결과 전이"]
-        CRON["CronEngine: 품질 루프, hitl-timeout"]
+        CRON["CronEngine: hitl-timeout, knowledge-extract"]
     end
     DB[("SQLite")]
     HK["LifecycleHook (출처 상태 반영)"]
@@ -291,7 +289,7 @@ flowchart TD
 | 레이어 | 책임 | 토큰 |
 |--------|------|------|
 | Daemon | CPU — DB 관찰 + handler·HITL 후처리의 단일 실행자 + hook 트리거 + cron 스케줄링 | 0 |
-| Advancer | Pending→Ready→Running 전이, dependency gate, spec 충돌 검출 | 0 |
+| Advancer | Pending→Ready→Running 전이, 큐 의존 gate | 0 |
 | Executor | handler 실행, escalation 결정, hook 트리거 | handler별 |
 | StagnationDetector | 정체 패턴(SPINNING, OSCILLATION) 감지 | 0 |
 | LateralAnalyzer | 내장 페르소나로 대안 접근법 분석, lateral plan 생성 | 0 |
@@ -303,7 +301,7 @@ flowchart TD
 | NotificationChannel | 진행 알림·HITL 요청 발송, 응답 수신·정규화 | 0 |
 | AgentRuntime | LLM 실행 추상화 | handler별 |
 | Agent | `belt agent` / `/agent` 대화형 에이전트 | 세션 시 |
-| Cron | 주기 작업, 품질 루프, HITL timeout 만료 경합 | job별 |
+| Cron | 주기 작업, HITL timeout 만료 경합 | job별 |
 
 ---
 
@@ -315,13 +313,13 @@ flowchart TD
 새 LLM            = AgentRuntime 구현 추가                    → 코어 변경 0
 새 파이프라인 단계  = workspace yaml 수정                       → 코어 변경 0
 새 lifecycle 반응  = LifecycleHook 구현 추가/변경              → 코어 변경 0
-새 품질 검사       = Cron 등록                                 → 코어 변경 0
+새 주기 작업       = Cron 등록                                 → 코어 변경 0
 새 OS/플랫폼      = ShellExecutor 구현 추가                   → 코어 변경 0
 새 유사도 알고리즘  = SimilarityJudge 구현 추가                → 코어 변경 0
 ```
 
 > **자유 스키마 확장점**: 아이템 컨텍스트의 `source_data`는 DataSource별 자유 스키마 확장을 위한 필드다.
-> 각 DataSource는 원본 응답을 소스 종류별 키(예: GitHub는 `issue`) 아래에 담아 소스 간 데이터가 서로 충돌하지 않게 한다. 활용 계획은 [source_data와 stagnation 로드맵](../plans/source-data-and-stagnation-roadmap.md) 참조.
+> 각 DataSource는 원본 응답을 소스 종류별 키(예: GitHub는 `issue`) 아래에 담아 소스 간 데이터가 서로 충돌하지 않게 한다.
 
 ---
 
@@ -338,8 +336,8 @@ flowchart TD
 | [DataSource](./concerns/datasource.md) | 수집/컨텍스트, context 스키마 (source_data), 워크플로우 yaml, escalation |
 | [AgentRuntime](./concerns/agent-runtime.md) | LLM 실행 추상화, RuntimeRegistry |
 | [Agent](./concerns/agent-workspace.md) | 대화형 에이전트, per-item evaluate, slash command |
-| [Cron 엔진](./concerns/cron-engine.md) | 품질 루프, per-item evaluate, force trigger, hitl-timeout |
+| [Cron 엔진](./concerns/cron-engine.md) | 주기 작업, force trigger, hitl-timeout |
 | [CLI 레퍼런스](./concerns/cli-reference.md) | 3-layer SSOT, belt context, 전체 커맨드, HITL 응답과 큐 조작 |
 | [Cross-Platform](./concerns/cross-platform.md) | OS 추상화 (ShellExecutor, DaemonNotifier) |
-| [Data Model](./concerns/data-model.md) | 전이 이력, HITL 요청, 취소 요청, source_data, stagnation 타입 |
+| [Data Model](./concerns/data-model.md) | 전이 이력, HITL 요청, 취소 요청, 파생 아이템, source_data, stagnation 타입 |
 | [workspace.yaml 스키마](./concerns/workspace-schema.md) | workspace 설정과 `notifications` 필드 |
