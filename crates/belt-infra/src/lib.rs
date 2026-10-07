@@ -1,3 +1,4 @@
+pub mod channels;
 pub mod cipher;
 pub mod db;
 mod db_migrations;
