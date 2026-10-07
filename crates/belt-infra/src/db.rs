@@ -13,9 +13,12 @@ use serde::{Deserialize, Serialize};
 
 use belt_core::error::BeltError;
 use belt_core::escalation::EscalationAction;
+use belt_core::hitl::{
+    ConfirmPath, HitlAction, HitlId, HitlResolution, HitlStatus, RespondOutcome,
+};
 use belt_core::lineage::{AttemptStatus, CollectDecision, collect_decision, count_since_reset};
 use belt_core::phase::QueuePhase;
-use belt_core::queue::QueueItem;
+use belt_core::queue::{HitlReason, HitlRespondAction, QueueItem};
 use belt_core::runtime::TokenUsage;
 use belt_core::transition::{
     Actor, GuardDecision, ItemSnapshot, Processing, TransitionOutcome, TransitionReason,
@@ -1873,6 +1876,83 @@ pub enum DeriveOutcome {
     Rejected(TransitionOutcome),
 }
 
+/// Request to enter Hitl and open a HITL request for `work_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenHitlRequest {
+    pub work_id: String,
+    pub expected_from: QueuePhase,
+    pub reason: HitlReason,
+    pub notes: Option<String>,
+    pub actor: Actor,
+    /// Recorded on the `X -> Hitl` transition (e.g. `Escalation(Hitl)`).
+    pub transition_reason: TransitionReason,
+    /// Absolute expiry time (RFC 3339), if the request can expire.
+    pub timeout_at: Option<String>,
+    /// Action applied on expiry; `skip` or `replan`.
+    pub terminal_action: Option<EscalationAction>,
+}
+
+/// Result of [`Database::open_hitl`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenHitlOutcome {
+    Opened {
+        hitl_id: HitlId,
+        /// `transition_log.seq` of the `X -> Hitl` transition.
+        seq: u64,
+    },
+    /// The `X -> Hitl` transition was refused; no request was created.
+    Rejected(TransitionOutcome),
+}
+
+/// Which request a response addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HitlTarget {
+    /// One specific request instance.
+    Id(HitlId),
+    /// The current request of an item: its open request, else its latest one.
+    Item(String),
+}
+
+/// One row of `hitl_requests`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HitlRequest {
+    pub hitl_id: HitlId,
+    pub work_id: String,
+    pub status: HitlStatus,
+    pub reason: Option<HitlReason>,
+    pub notes: Option<String>,
+    /// RFC 3339.
+    pub opened_at: String,
+    pub timeout_at: Option<String>,
+    pub terminal_action: Option<EscalationAction>,
+    /// The winning response or expiry; `None` while open.
+    pub resolution: Option<HitlResolution>,
+    pub resolution_notes: Option<String>,
+    pub post_processed_at: Option<String>,
+    pub post_processing_failures: u32,
+}
+
+/// Result of [`Database::complete_post_processing`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompleteOutcome {
+    Completed {
+        /// `transition_log.seq` of the result transition.
+        seq: u64,
+    },
+    /// The request is still open or was already post-processed.
+    NotPending,
+    /// The result transition was refused; the request stays pending.
+    Rejected(TransitionOutcome),
+}
+
+/// `resolution.by` / `resolution.via` recorded when a request expires.
+const EXPIRY_BY: &str = "system";
+const EXPIRY_VIA: &str = "timeout";
+
+const HITL_COLUMNS: &str = "hitl_id, work_id, status, reason, notes, opened_at, timeout_at, \
+     terminal_action, action, respondent, via, confirm_path, resolved_at, resolution_notes, \
+     post_processed_at, post_processing_failures";
+
 /// What a transition attempt inside a transaction decided.
 enum Step {
     Applied {
@@ -1905,8 +1985,9 @@ impl Database {
     /// `invalid_action` leaves no row. Refusals are values, not errors.
     ///
     /// A request that leaves Hitl without being a daemon post-processing
-    /// transition corresponds to a HITL response; until the HITL API exists
-    /// it is reported as `InvalidAction { current: Hitl }` and changes nothing.
+    /// transition corresponds to a HITL response. This method does not decide
+    /// that race: it reports `InvalidAction { current: Hitl }` and changes
+    /// nothing; the caller answers through [`Database::resolve_hitl`].
     ///
     /// # Errors
     /// `BeltError::ItemNotFound` for an unknown `work_id`, `BeltError::Database`
@@ -2202,6 +2283,415 @@ impl Database {
             .map_err(sql_err)?;
         Ok(rows)
     }
+}
+
+impl Database {
+    /// Enter Hitl and open a HITL request, in one transaction.
+    ///
+    /// Runs the `expected_from -> Hitl` transition through the transition
+    /// contract and, only if it is applied, inserts the open request. A
+    /// request cannot exist without the phase change or vice versa. An item
+    /// that already has an open request is in Hitl, so a second open is
+    /// refused by the transition contract (`InvalidAction { Hitl }`).
+    ///
+    /// The `hitl_id` is `hitl-{seq}` with the `transition_log.seq` of the
+    /// entering transition: unique for the lifetime of the database and
+    /// disjoint from migrated `hitl-legacy-{n}` ids.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `work_id`; `BeltError::Database`
+    /// on I/O failure or a violated request constraint (everything is rolled back).
+    pub fn open_hitl(&self, req: &OpenHitlRequest) -> Result<OpenHitlOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let entering = TransitionRequest {
+                work_id: req.work_id.clone(),
+                expected_from: req.expected_from,
+                to: QueuePhase::Hitl,
+                actor: req.actor.clone(),
+                reason: req.transition_reason.clone(),
+                detail: Some(req.reason.to_string()),
+            };
+            let (_, step) = transition_in_tx(tx, &entering)?;
+            let seq = match step {
+                Step::Applied { seq } => seq,
+                Step::Rejected(outcome) => return Ok(OpenHitlOutcome::Rejected(outcome)),
+                Step::HitlResponse => {
+                    return Ok(OpenHitlOutcome::Rejected(
+                        TransitionOutcome::InvalidAction {
+                            current: QueuePhase::Hitl,
+                        },
+                    ));
+                }
+            };
+            let hitl_id = HitlId::new(format!("hitl-{seq}"));
+            tx.execute(
+                "INSERT INTO hitl_requests
+                 (hitl_id, work_id, status, reason, notes, opened_at, timeout_at, terminal_action)
+                 VALUES (?1, ?2, 'open', ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    hitl_id.as_str(),
+                    req.work_id,
+                    req.reason.to_string(),
+                    req.notes,
+                    Utc::now().to_rfc3339(),
+                    req.timeout_at,
+                    req.terminal_action.map(|a| a.to_string()),
+                ],
+            )
+            .map_err(sql_err)?;
+            Ok(OpenHitlOutcome::Opened { hitl_id, seq })
+        })
+    }
+
+    /// Confirm a response, first response wins.
+    ///
+    /// Only an open request can be resolved. A request that is already
+    /// resolved or expired yields `AlreadyHandled` carrying the winning
+    /// response, so a loser is a value and never a database error. The item's
+    /// phase is untouched: it leaves Hitl only through
+    /// [`Database::complete_post_processing`].
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn resolve_hitl(
+        &self,
+        target: &HitlTarget,
+        resolution: &HitlResolution,
+        notes: Option<&str>,
+    ) -> Result<RespondOutcome, BeltError> {
+        self.write_tx(|tx| confirm_in_tx(tx, target, resolution, notes))
+    }
+
+    /// Expire an open request by timeout, applying `terminal`.
+    ///
+    /// Races with [`Database::resolve_hitl`] on the same open-state
+    /// compare-and-set: whichever is confirmed first wins and the other gets
+    /// `AlreadyHandled`. The expiry is recorded as a resolution by `system`
+    /// via `timeout` with the terminal action. Only `skip` and `replan` are
+    /// terminal actions; any other value is `InvalidAction`.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn expire_hitl(
+        &self,
+        hitl_id: &HitlId,
+        terminal: EscalationAction,
+    ) -> Result<RespondOutcome, BeltError> {
+        let action = match terminal {
+            EscalationAction::Skip => HitlAction::Skip,
+            EscalationAction::Replan => HitlAction::Replan,
+            EscalationAction::Retry
+            | EscalationAction::RetryWithComment
+            | EscalationAction::Hitl => return Ok(RespondOutcome::InvalidAction),
+        };
+        let expiry = HitlResolution {
+            action,
+            by: EXPIRY_BY.to_string(),
+            via: EXPIRY_VIA.to_string(),
+            at: Utc::now().to_rfc3339(),
+            path: ConfirmPath::Direct,
+        };
+        self.write_tx(|tx| {
+            let Some(current) = find_hitl(tx, &HitlTarget::Id(hitl_id.clone()))? else {
+                return Ok(RespondOutcome::NotFound);
+            };
+            match current.status {
+                HitlStatus::Open => {
+                    confirm_open(tx, &current.hitl_id, HitlStatus::Expired, &expiry, None)?;
+                    Ok(RespondOutcome::Won {
+                        hitl_id: current.hitl_id,
+                    })
+                }
+                HitlStatus::Resolved | HitlStatus::Expired => {
+                    Ok(RespondOutcome::AlreadyHandled(stored_resolution(&current)?))
+                }
+            }
+        })
+    }
+
+    /// One request by id, or `None`.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn hitl_request(&self, hitl_id: &HitlId) -> Result<Option<HitlRequest>, BeltError> {
+        let conn = self.lock_conn()?;
+        find_hitl(&conn, &HitlTarget::Id(hitl_id.clone()))
+    }
+
+    /// Requests that are confirmed (resolved or expired) and not yet
+    /// post-processed, oldest confirmation first. The daemon works through
+    /// these; each one holds its item in Hitl as "processing".
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored request.
+    pub fn pending_post_processing(&self) -> Result<Vec<HitlRequest>, BeltError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {HITL_COLUMNS} FROM hitl_requests
+                 WHERE status IN ('resolved', 'expired') AND post_processed_at IS NULL
+                 ORDER BY resolved_at, rowid"
+            ))
+            .map_err(sql_err)?;
+        let mut rows = stmt.query([]).map_err(sql_err)?;
+        let mut pending = Vec::new();
+        while let Some(row) = rows.next().map_err(sql_err)? {
+            pending.push(row_to_hitl_request(row)?);
+        }
+        Ok(pending)
+    }
+
+    /// Apply the post-processing result transition and mark the request
+    /// processed, in one transaction (crash-safe: both or neither).
+    ///
+    /// `result.work_id` must be the request's item. If the transition is
+    /// refused the request stays pending.
+    ///
+    /// # Errors
+    /// `BeltError::ItemNotFound` for an unknown `hitl_id`; `BeltError::Database`
+    /// when `result` names another item, or on I/O failure.
+    pub fn complete_post_processing(
+        &self,
+        hitl_id: &HitlId,
+        result: &TransitionRequest,
+    ) -> Result<CompleteOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let Some(request) = find_hitl(tx, &HitlTarget::Id(hitl_id.clone()))? else {
+                return Err(BeltError::ItemNotFound(hitl_id.to_string()));
+            };
+            if request.work_id != result.work_id {
+                return Err(BeltError::Database(format!(
+                    "post-processing result for {} does not belong to HITL request {hitl_id} of {}",
+                    result.work_id, request.work_id
+                )));
+            }
+            if request.status == HitlStatus::Open || request.post_processed_at.is_some() {
+                return Ok(CompleteOutcome::NotPending);
+            }
+            let (_, step) = transition_in_tx(tx, result)?;
+            let seq = match step {
+                Step::Applied { seq } => seq,
+                Step::Rejected(outcome) => return Ok(CompleteOutcome::Rejected(outcome)),
+                Step::HitlResponse => {
+                    return Ok(CompleteOutcome::Rejected(
+                        TransitionOutcome::InvalidAction {
+                            current: QueuePhase::Hitl,
+                        },
+                    ));
+                }
+            };
+            let changed = tx
+                .execute(
+                    "UPDATE hitl_requests SET post_processed_at = ?1
+                     WHERE hitl_id = ?2 AND post_processed_at IS NULL",
+                    params![Utc::now().to_rfc3339(), hitl_id.as_str()],
+                )
+                .map_err(sql_err)?;
+            if changed != 1 {
+                return Err(BeltError::Database(format!(
+                    "post-processing mark on {hitl_id} changed {changed} rows under an immediate transaction"
+                )));
+            }
+            Ok(CompleteOutcome::Completed { seq })
+        })
+    }
+
+    /// Count one more failed post-processing attempt and return the total.
+    ///
+    /// # Errors
+    /// `BeltError::Database` when the request does not exist or is not
+    /// awaiting post-processing (open, or already processed), or on I/O failure.
+    pub fn record_post_processing_failure(&self, hitl_id: &HitlId) -> Result<u32, BeltError> {
+        self.write_tx(|tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE hitl_requests
+                     SET post_processing_failures = post_processing_failures + 1
+                     WHERE hitl_id = ?1 AND status IN ('resolved', 'expired')
+                       AND post_processed_at IS NULL",
+                    params![hitl_id.as_str()],
+                )
+                .map_err(sql_err)?;
+            if changed != 1 {
+                return Err(BeltError::Database(format!(
+                    "HITL request {hitl_id} is not awaiting post-processing"
+                )));
+            }
+            tx.query_row(
+                "SELECT post_processing_failures FROM hitl_requests WHERE hitl_id = ?1",
+                params![hitl_id.as_str()],
+                |r| r.get(0),
+            )
+            .map_err(sql_err)
+        })
+    }
+}
+
+/// Decide a response against the target request inside the caller's transaction.
+fn confirm_in_tx(
+    tx: &Transaction<'_>,
+    target: &HitlTarget,
+    resolution: &HitlResolution,
+    notes: Option<&str>,
+) -> Result<RespondOutcome, BeltError> {
+    let Some(current) = find_hitl(tx, target)? else {
+        return Ok(RespondOutcome::NotFound);
+    };
+    match current.status {
+        HitlStatus::Open => {
+            confirm_open(
+                tx,
+                &current.hitl_id,
+                HitlStatus::Resolved,
+                resolution,
+                notes,
+            )?;
+            Ok(RespondOutcome::Won {
+                hitl_id: current.hitl_id,
+            })
+        }
+        HitlStatus::Resolved | HitlStatus::Expired => {
+            Ok(RespondOutcome::AlreadyHandled(stored_resolution(&current)?))
+        }
+    }
+}
+
+/// Open -> `status` compare-and-set recording the winning resolution.
+fn confirm_open(
+    tx: &Transaction<'_>,
+    hitl_id: &HitlId,
+    status: HitlStatus,
+    resolution: &HitlResolution,
+    notes: Option<&str>,
+) -> Result<(), BeltError> {
+    let status = match status {
+        HitlStatus::Resolved => "resolved",
+        HitlStatus::Expired => "expired",
+        HitlStatus::Open => {
+            return Err(BeltError::Database(
+                "a request cannot be confirmed into the open status".to_string(),
+            ));
+        }
+    };
+    let path = match resolution.path {
+        ConfirmPath::Direct => "direct",
+        ConfirmPath::NaturalLanguage => "natural_language",
+    };
+    let changed = tx
+        .execute(
+            "UPDATE hitl_requests
+             SET status = ?1, action = ?2, respondent = ?3, via = ?4, confirm_path = ?5,
+                 resolved_at = ?6, resolution_notes = ?7
+             WHERE hitl_id = ?8 AND status = 'open'",
+            params![
+                status,
+                resolution.action.to_string(),
+                resolution.by,
+                resolution.via,
+                path,
+                resolution.at,
+                notes,
+                hitl_id.as_str(),
+            ],
+        )
+        .map_err(sql_err)?;
+    if changed != 1 {
+        return Err(BeltError::Database(format!(
+            "open-state compare-and-set on {hitl_id} changed {changed} rows under an immediate transaction"
+        )));
+    }
+    Ok(())
+}
+
+fn find_hitl(conn: &Connection, target: &HitlTarget) -> Result<Option<HitlRequest>, BeltError> {
+    let (filter, key) = match target {
+        HitlTarget::Id(id) => ("hitl_id = ?1", id.as_str()),
+        HitlTarget::Item(work_id) => ("work_id = ?1", work_id.as_str()),
+    };
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {HITL_COLUMNS} FROM hitl_requests WHERE {filter}
+             ORDER BY (status = 'open') DESC, rowid DESC LIMIT 1"
+        ))
+        .map_err(sql_err)?;
+    let mut rows = stmt.query(params![key]).map_err(sql_err)?;
+    rows.next()
+        .map_err(sql_err)?
+        .map(row_to_hitl_request)
+        .transpose()
+}
+
+/// The recorded winner of a confirmed request.
+fn stored_resolution(request: &HitlRequest) -> Result<HitlResolution, BeltError> {
+    request.resolution.clone().ok_or_else(|| {
+        BeltError::Database(format!(
+            "HITL request {} is {:?} but has no recorded resolution",
+            request.hitl_id, request.status
+        ))
+    })
+}
+
+fn row_to_hitl_request(row: &rusqlite::Row<'_>) -> Result<HitlRequest, BeltError> {
+    let hitl_id = HitlId::new(col::<String>(row, 0)?);
+    let status = match col::<String>(row, 2)?.as_str() {
+        "open" => HitlStatus::Open,
+        "resolved" => HitlStatus::Resolved,
+        "expired" => HitlStatus::Expired,
+        other => {
+            return Err(BeltError::Database(format!(
+                "unknown hitl status of {hitl_id}: {other}"
+            )));
+        }
+    };
+    let action: Option<String> = col(row, 8)?;
+    let resolution = match status {
+        HitlStatus::Open => None,
+        HitlStatus::Resolved | HitlStatus::Expired => {
+            let missing = |field: &str| {
+                BeltError::Database(format!("confirmed HITL request {hitl_id} has no {field}"))
+            };
+            let action = action.ok_or_else(|| missing("action"))?;
+            let path = col::<Option<String>>(row, 11)?.ok_or_else(|| missing("confirm_path"))?;
+            Some(HitlResolution {
+                action: action
+                    .parse::<HitlRespondAction>()
+                    .map(HitlAction::from)
+                    .map_err(BeltError::Database)?,
+                by: col::<Option<String>>(row, 9)?.ok_or_else(|| missing("respondent"))?,
+                via: col::<Option<String>>(row, 10)?.ok_or_else(|| missing("via"))?,
+                at: col::<Option<String>>(row, 12)?.ok_or_else(|| missing("resolved_at"))?,
+                path: match path.as_str() {
+                    "direct" => ConfirmPath::Direct,
+                    "natural_language" => ConfirmPath::NaturalLanguage,
+                    other => {
+                        return Err(BeltError::Database(format!(
+                            "unknown confirm_path of {hitl_id}: {other}"
+                        )));
+                    }
+                },
+            })
+        }
+    };
+    Ok(HitlRequest {
+        work_id: col(row, 1)?,
+        status,
+        reason: col::<Option<String>>(row, 3)?
+            .as_deref()
+            .map(parse_hitl_reason)
+            .transpose()?,
+        notes: col(row, 4)?,
+        opened_at: col(row, 5)?,
+        timeout_at: col(row, 6)?,
+        terminal_action: col::<Option<String>>(row, 7)?
+            .as_deref()
+            .map(|s| s.parse::<EscalationAction>().map_err(BeltError::Database))
+            .transpose()?,
+        resolution,
+        resolution_notes: col(row, 13)?,
+        post_processed_at: col(row, 14)?,
+        post_processing_failures: col(row, 15)?,
+        hitl_id,
+    })
 }
 
 fn sql_err(e: rusqlite::Error) -> BeltError {
@@ -2557,6 +3047,20 @@ fn parse_datetime(s: &str) -> Result<DateTime<Utc>, BeltError> {
         .map_err(|_| BeltError::Database(format!("invalid datetime: {s}")))
 }
 
+fn parse_hitl_reason(s: &str) -> Result<HitlReason, BeltError> {
+    match s {
+        "evaluate_failure" => Ok(HitlReason::EvaluateFailure),
+        "retry_max_exceeded" => Ok(HitlReason::RetryMaxExceeded),
+        "timeout" => Ok(HitlReason::Timeout),
+        "manual_escalation" => Ok(HitlReason::ManualEscalation),
+        "spec_conflict" => Ok(HitlReason::SpecConflict),
+        "spec_completion_review" => Ok(HitlReason::SpecCompletionReview),
+        "spec_modification_proposed" => Ok(HitlReason::SpecModificationProposed),
+        "stagnation_detected" => Ok(HitlReason::StagnationDetected),
+        other => Err(BeltError::Database(format!("unknown hitl_reason: {other}"))),
+    }
+}
+
 /// Extract a `QueueItem` from a rusqlite `Row`.
 ///
 /// Column order must match [`QUEUE_ITEM_COLUMNS`].
@@ -2565,19 +3069,7 @@ fn row_to_queue_item(row: &rusqlite::Row<'_>) -> Result<QueueItem, BeltError> {
     let hitl_reason_str: Option<String> = col(row, 11)?;
     let hitl_reason = hitl_reason_str
         .as_deref()
-        .map(|s| match s {
-            "evaluate_failure" => Ok(belt_core::queue::HitlReason::EvaluateFailure),
-            "retry_max_exceeded" => Ok(belt_core::queue::HitlReason::RetryMaxExceeded),
-            "timeout" => Ok(belt_core::queue::HitlReason::Timeout),
-            "manual_escalation" => Ok(belt_core::queue::HitlReason::ManualEscalation),
-            "spec_conflict" => Ok(belt_core::queue::HitlReason::SpecConflict),
-            "spec_completion_review" => Ok(belt_core::queue::HitlReason::SpecCompletionReview),
-            "spec_modification_proposed" => {
-                Ok(belt_core::queue::HitlReason::SpecModificationProposed)
-            }
-            "stagnation_detected" => Ok(belt_core::queue::HitlReason::StagnationDetected),
-            other => Err(BeltError::Database(format!("unknown hitl_reason: {other}"))),
-        })
+        .map(parse_hitl_reason)
         .transpose()?;
 
     let mut item = QueueItem::new(col(row, 0)?, col(row, 1)?, col(row, 2)?, col(row, 3)?);
@@ -4978,5 +5470,676 @@ mod tests {
             db.latest_in_lineage("missing"),
             Err(BeltError::ItemNotFound(_))
         ));
+    }
+
+    // ---- HITL request store --------------------------------------------------
+
+    use belt_core::hitl::{
+        ConfirmPath, HitlAction, HitlId, HitlResolution, HitlStatus, RespondOutcome,
+    };
+    use belt_core::queue::HitlReason;
+
+    fn open_req(work_id: &str) -> OpenHitlRequest {
+        OpenHitlRequest {
+            work_id: work_id.to_string(),
+            expected_from: QueuePhase::Running,
+            reason: HitlReason::EvaluateFailure,
+            notes: Some("needs review".to_string()),
+            actor: Actor::Daemon,
+            transition_reason: TransitionReason::Escalation(EscalationAction::Hitl),
+            timeout_at: Some("2099-01-01T00:00:00Z".to_string()),
+            terminal_action: Some(EscalationAction::Skip),
+        }
+    }
+
+    fn running_item(db: &Database, source: &str) -> String {
+        let id = inserted_id(collect(db, source, "analyze"));
+        run_to_running(db, &id);
+        id
+    }
+
+    fn opened(db: &Database, work_id: &str) -> HitlId {
+        match db.open_hitl(&open_req(work_id)).unwrap() {
+            OpenHitlOutcome::Opened { hitl_id, .. } => hitl_id,
+            other => panic!("expected Opened, got {other:?}"),
+        }
+    }
+
+    fn resolution(action: HitlAction, by: &str, via: &str) -> HitlResolution {
+        HitlResolution {
+            action,
+            by: by.to_string(),
+            via: via.to_string(),
+            at: Utc::now().to_rfc3339(),
+            path: ConfirmPath::Direct,
+        }
+    }
+
+    fn post_processing(work_id: &str, to: QueuePhase, action: HitlAction) -> TransitionRequest {
+        TransitionRequest {
+            work_id: work_id.to_string(),
+            expected_from: QueuePhase::Hitl,
+            to,
+            actor: Actor::Daemon,
+            reason: TransitionReason::PostProcessing(action),
+            detail: None,
+        }
+    }
+
+    fn hitl_rows(db: &Database, work_id: &str) -> i64 {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM hitl_requests WHERE work_id = ?1",
+            params![work_id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn open_hitl_enters_hitl_and_creates_open_request_together() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+
+        let OpenHitlOutcome::Opened { hitl_id, seq } = db.open_hitl(&open_req(&id)).unwrap() else {
+            panic!("expected Opened");
+        };
+
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+        let stored = db.hitl_request(&hitl_id).unwrap().expect("request row");
+        assert_eq!(stored.work_id, id);
+        assert_eq!(stored.status, HitlStatus::Open);
+        assert_eq!(stored.reason, Some(HitlReason::EvaluateFailure));
+        assert_eq!(stored.notes.as_deref(), Some("needs review"));
+        assert_eq!(stored.terminal_action, Some(EscalationAction::Skip));
+        assert_eq!(stored.timeout_at.as_deref(), Some("2099-01-01T00:00:00Z"));
+        assert_eq!(stored.resolution, None);
+        assert_eq!(stored.post_processed_at, None);
+        assert_eq!(stored.post_processing_failures, 0);
+
+        let log = db.transitions_of(&id).unwrap();
+        let last = log.last().unwrap();
+        assert_eq!(last.seq, seq);
+        assert_eq!(last.kind, transition_kind::PHASE_ENTER);
+        assert_eq!(last.to_phase.as_deref(), Some("hitl"));
+        assert_eq!(last.reason.as_deref(), Some("escalation:hitl"));
+    }
+
+    #[test]
+    fn hitl_id_is_unique_and_disjoint_from_legacy_ids() {
+        let db = test_db();
+        let a = running_item(&db, "s1");
+        let b = running_item(&db, "s2");
+        let first = opened(&db, &a);
+        let second = opened(&db, &b);
+
+        assert_ne!(first, second);
+        for id in [&first, &second] {
+            assert!(id.as_str().starts_with("hitl-"));
+            assert!(!id.as_str().starts_with("hitl-legacy-"));
+        }
+    }
+
+    #[test]
+    fn open_hitl_failing_request_insert_rolls_back_the_phase_change() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO hitl_requests (hitl_id, work_id, status, opened_at)
+                 VALUES ('stray', ?1, 'open', 't')",
+                params![id],
+            )
+            .unwrap();
+        }
+
+        assert!(db.open_hitl(&open_req(&id)).is_err());
+
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Running);
+        assert_eq!(hitl_rows(&db, &id), 1);
+        assert!(
+            db.transitions_of(&id)
+                .unwrap()
+                .iter()
+                .all(|e| e.to_phase.as_deref() != Some("hitl"))
+        );
+    }
+
+    #[test]
+    fn second_open_hitl_on_an_open_item_is_rejected() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        opened(&db, &id);
+
+        for from in [QueuePhase::Running, QueuePhase::Hitl] {
+            let mut again = open_req(&id);
+            again.expected_from = from;
+            assert_eq!(
+                db.open_hitl(&again).unwrap(),
+                OpenHitlOutcome::Rejected(TransitionOutcome::InvalidAction {
+                    current: QueuePhase::Hitl
+                })
+            );
+        }
+        assert_eq!(hitl_rows(&db, &id), 1);
+    }
+
+    #[test]
+    fn open_hitl_by_non_owner_on_running_item_is_busy_and_creates_no_request() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let mut req = open_req(&id);
+        req.actor = Actor::Cli;
+
+        assert_eq!(
+            db.open_hitl(&req).unwrap(),
+            OpenHitlOutcome::Rejected(TransitionOutcome::Busy {
+                processing: Processing::Handler
+            })
+        );
+        assert_eq!(hitl_rows(&db, &id), 0);
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Running);
+    }
+
+    #[test]
+    fn open_hitl_unknown_item_is_item_not_found() {
+        let db = test_db();
+        assert!(matches!(
+            db.open_hitl(&open_req("nope")),
+            Err(BeltError::ItemNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_hitl_first_response_wins_and_second_sees_the_winner() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        let winner = resolution(HitlAction::Retry, "irene", "cli");
+        assert_eq!(
+            db.resolve_hitl(&HitlTarget::Id(hitl_id.clone()), &winner, Some("again"))
+                .unwrap(),
+            RespondOutcome::Won {
+                hitl_id: hitl_id.clone()
+            }
+        );
+
+        let late = resolution(HitlAction::Skip, "bob", "github");
+        assert_eq!(
+            db.resolve_hitl(&HitlTarget::Item(id.clone()), &late, None)
+                .unwrap(),
+            RespondOutcome::AlreadyHandled(winner.clone())
+        );
+        assert_eq!(
+            db.resolve_hitl(&HitlTarget::Id(hitl_id.clone()), &late, None)
+                .unwrap(),
+            RespondOutcome::AlreadyHandled(winner.clone())
+        );
+
+        let stored = db.hitl_request(&hitl_id).unwrap().unwrap();
+        assert_eq!(stored.status, HitlStatus::Resolved);
+        assert_eq!(stored.resolution, Some(winner));
+        assert_eq!(stored.resolution_notes.as_deref(), Some("again"));
+        // The phase changes only through post-processing.
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+    }
+
+    #[test]
+    fn resolve_hitl_unknown_target_is_not_found() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let any = resolution(HitlAction::Done, "irene", "cli");
+
+        assert_eq!(
+            db.resolve_hitl(&HitlTarget::Id(HitlId::new("missing")), &any, None)
+                .unwrap(),
+            RespondOutcome::NotFound
+        );
+        assert_eq!(
+            db.resolve_hitl(&HitlTarget::Item(id), &any, None).unwrap(),
+            RespondOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn resolve_hitl_by_item_targets_the_current_request_not_an_old_one() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let first = opened(&db, &id);
+        let old = resolution(HitlAction::Retry, "irene", "cli");
+        db.resolve_hitl(&HitlTarget::Id(first.clone()), &old, None)
+            .unwrap();
+        db.complete_post_processing(
+            &first,
+            &post_processing(&id, QueuePhase::Pending, HitlAction::Retry),
+        )
+        .unwrap();
+        run_to_running(&db, &id);
+        let second = opened(&db, &id);
+        assert_ne!(first, second);
+
+        let fresh = resolution(HitlAction::Done, "bob", "tui");
+        assert_eq!(
+            db.resolve_hitl(&HitlTarget::Item(id.clone()), &fresh, None)
+                .unwrap(),
+            RespondOutcome::Won { hitl_id: second }
+        );
+        // A late answer addressed to the old request does not touch the new one.
+        assert_eq!(
+            db.resolve_hitl(&HitlTarget::Id(first), &fresh, None)
+                .unwrap(),
+            RespondOutcome::AlreadyHandled(old)
+        );
+    }
+
+    #[test]
+    fn concurrent_resolve_hitl_has_one_winner_and_the_loser_sees_it() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        let path = path.to_str().unwrap().to_string();
+        let setup = Database::open(&path).unwrap();
+
+        for round in 0..10 {
+            let id = running_item(&setup, &format!("s{round}"));
+            let hitl_id = opened(&setup, &id);
+            let barrier = Arc::new(Barrier::new(2));
+            let handles: Vec<_> = [("cli", HitlAction::Done), ("github", HitlAction::Skip)]
+                .into_iter()
+                .map(|(via, action)| {
+                    let path = path.clone();
+                    let hitl_id = hitl_id.clone();
+                    let barrier = Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        let db = Database::open(&path).unwrap();
+                        let r = resolution(action, via, via);
+                        barrier.wait();
+                        (
+                            r.clone(),
+                            db.resolve_hitl(&HitlTarget::Id(hitl_id), &r, None),
+                        )
+                    })
+                })
+                .collect();
+            let results: Vec<_> = handles
+                .into_iter()
+                .map(|h| {
+                    let (r, outcome) = h.join().unwrap();
+                    (r, outcome.expect("no database error under contention"))
+                })
+                .collect();
+
+            let winners: Vec<_> = results
+                .iter()
+                .filter(|(_, o)| matches!(o, RespondOutcome::Won { .. }))
+                .collect();
+            assert_eq!(winners.len(), 1, "round {round}: {results:?}");
+            let winning = &winners[0].0;
+            let loser = results
+                .iter()
+                .find(|(_, o)| matches!(o, RespondOutcome::AlreadyHandled(_)))
+                .unwrap_or_else(|| panic!("round {round}: no loser in {results:?}"));
+            assert_eq!(loser.1, RespondOutcome::AlreadyHandled(winning.clone()));
+        }
+    }
+
+    #[test]
+    fn expire_hitl_then_resolve_reports_the_expiry_as_already_handled() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        assert_eq!(
+            db.expire_hitl(&hitl_id, EscalationAction::Skip).unwrap(),
+            RespondOutcome::Won {
+                hitl_id: hitl_id.clone()
+            }
+        );
+
+        let late = resolution(HitlAction::Done, "irene", "cli");
+        let RespondOutcome::AlreadyHandled(winner) = db
+            .resolve_hitl(&HitlTarget::Id(hitl_id.clone()), &late, None)
+            .unwrap()
+        else {
+            panic!("expected AlreadyHandled");
+        };
+        assert_eq!(winner.action, HitlAction::Skip);
+        assert_eq!(winner.via, "timeout");
+        assert_eq!(
+            db.hitl_request(&hitl_id).unwrap().unwrap().status,
+            HitlStatus::Expired
+        );
+    }
+
+    #[test]
+    fn resolve_then_expire_keeps_the_response() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        let human = resolution(HitlAction::Retry, "irene", "cli");
+        db.resolve_hitl(&HitlTarget::Id(hitl_id.clone()), &human, None)
+            .unwrap();
+
+        assert_eq!(
+            db.expire_hitl(&hitl_id, EscalationAction::Replan).unwrap(),
+            RespondOutcome::AlreadyHandled(human.clone())
+        );
+        let stored = db.hitl_request(&hitl_id).unwrap().unwrap();
+        assert_eq!(stored.status, HitlStatus::Resolved);
+        assert_eq!(stored.resolution, Some(human));
+    }
+
+    #[test]
+    fn expire_hitl_rejects_non_terminal_actions_and_unknown_requests() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        for action in [
+            EscalationAction::Retry,
+            EscalationAction::RetryWithComment,
+            EscalationAction::Hitl,
+        ] {
+            assert_eq!(
+                db.expire_hitl(&hitl_id, action).unwrap(),
+                RespondOutcome::InvalidAction
+            );
+        }
+        assert_eq!(
+            db.hitl_request(&hitl_id).unwrap().unwrap().status,
+            HitlStatus::Open
+        );
+        assert_eq!(
+            db.expire_hitl(&HitlId::new("missing"), EscalationAction::Skip)
+                .unwrap(),
+            RespondOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn concurrent_expire_and_resolve_let_exactly_one_win() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        let path = path.to_str().unwrap().to_string();
+        let setup = Database::open(&path).unwrap();
+
+        for round in 0..10 {
+            let id = running_item(&setup, &format!("s{round}"));
+            let hitl_id = opened(&setup, &id);
+            let barrier = Arc::new(Barrier::new(2));
+
+            let expirer = {
+                let (path, hitl_id, barrier) =
+                    (path.clone(), hitl_id.clone(), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    let db = Database::open(&path).unwrap();
+                    barrier.wait();
+                    db.expire_hitl(&hitl_id, EscalationAction::Skip)
+                })
+            };
+            let responder = {
+                let (path, hitl_id, barrier) =
+                    (path.clone(), hitl_id.clone(), Arc::clone(&barrier));
+                std::thread::spawn(move || {
+                    let db = Database::open(&path).unwrap();
+                    barrier.wait();
+                    db.resolve_hitl(
+                        &HitlTarget::Id(hitl_id),
+                        &resolution(HitlAction::Done, "irene", "cli"),
+                        None,
+                    )
+                })
+            };
+            let expired = expirer.join().unwrap().expect("no database error");
+            let resolved = responder.join().unwrap().expect("no database error");
+
+            let stored = setup.hitl_request(&hitl_id).unwrap().unwrap();
+            match stored.status {
+                HitlStatus::Expired => {
+                    assert!(
+                        matches!(expired, RespondOutcome::Won { .. }),
+                        "round {round}"
+                    );
+                    assert!(matches!(resolved, RespondOutcome::AlreadyHandled(_)));
+                }
+                HitlStatus::Resolved => {
+                    assert!(
+                        matches!(resolved, RespondOutcome::Won { .. }),
+                        "round {round}"
+                    );
+                    assert!(matches!(expired, RespondOutcome::AlreadyHandled(_)));
+                }
+                HitlStatus::Open => panic!("round {round}: nobody won"),
+            }
+        }
+    }
+
+    #[test]
+    fn confirmed_request_makes_the_item_busy_for_non_owners() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        // Open: a CLI skip maps to a HITL response, not to busy.
+        assert_eq!(
+            db.transition(&request(
+                &id,
+                QueuePhase::Hitl,
+                QueuePhase::Skipped,
+                Actor::Cli
+            ))
+            .unwrap(),
+            TransitionOutcome::InvalidAction {
+                current: QueuePhase::Hitl
+            }
+        );
+
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id),
+            &resolution(HitlAction::Skip, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.transition(&request(
+                &id,
+                QueuePhase::Hitl,
+                QueuePhase::Skipped,
+                Actor::Cli
+            ))
+            .unwrap(),
+            TransitionOutcome::Busy {
+                processing: Processing::PostProcessing
+            }
+        );
+    }
+
+    #[test]
+    fn expired_request_also_makes_the_item_busy() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        db.expire_hitl(&hitl_id, EscalationAction::Replan).unwrap();
+
+        assert_eq!(
+            db.transition(&request(
+                &id,
+                QueuePhase::Hitl,
+                QueuePhase::Skipped,
+                Actor::Tui
+            ))
+            .unwrap(),
+            TransitionOutcome::Busy {
+                processing: Processing::PostProcessing
+            }
+        );
+    }
+
+    #[test]
+    fn pending_post_processing_lists_only_confirmed_unprocessed_requests() {
+        let db = test_db();
+        let open_item = running_item(&db, "s-open");
+        let resolved_item = running_item(&db, "s-resolved");
+        let expired_item = running_item(&db, "s-expired");
+        let _open = opened(&db, &open_item);
+        let resolved = opened(&db, &resolved_item);
+        let expired = opened(&db, &expired_item);
+        db.resolve_hitl(
+            &HitlTarget::Id(resolved.clone()),
+            &resolution(HitlAction::Done, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+        db.expire_hitl(&expired, EscalationAction::Skip).unwrap();
+
+        let pending = db.pending_post_processing().unwrap();
+
+        let ids: Vec<_> = pending.iter().map(|r| r.hitl_id.clone()).collect();
+        assert_eq!(ids, vec![resolved, expired]);
+        assert_eq!(pending[0].status, HitlStatus::Resolved);
+        assert_eq!(pending[1].status, HitlStatus::Expired);
+    }
+
+    #[test]
+    fn complete_post_processing_applies_result_transition_and_marks_done_together() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id.clone()),
+            &resolution(HitlAction::Done, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+
+        let outcome = db
+            .complete_post_processing(
+                &hitl_id,
+                &post_processing(&id, QueuePhase::Done, HitlAction::Done),
+            )
+            .unwrap();
+
+        assert!(
+            matches!(outcome, CompleteOutcome::Completed { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Done);
+        assert!(db.pending_post_processing().unwrap().is_empty());
+        let stored = db.hitl_request(&hitl_id).unwrap().unwrap();
+        assert!(stored.post_processed_at.is_some());
+        assert_eq!(
+            db.complete_post_processing(
+                &hitl_id,
+                &post_processing(&id, QueuePhase::Done, HitlAction::Done),
+            )
+            .unwrap(),
+            CompleteOutcome::NotPending
+        );
+    }
+
+    #[test]
+    fn complete_post_processing_before_confirmation_is_not_pending() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        assert_eq!(
+            db.complete_post_processing(
+                &hitl_id,
+                &post_processing(&id, QueuePhase::Done, HitlAction::Done),
+            )
+            .unwrap(),
+            CompleteOutcome::NotPending
+        );
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+    }
+
+    #[test]
+    fn rejected_result_transition_leaves_the_request_pending() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        db.expire_hitl(&hitl_id, EscalationAction::Skip).unwrap();
+
+        // Not a daemon post-processing transition: the guard refuses.
+        let mut by_cli = post_processing(&id, QueuePhase::Skipped, HitlAction::Skip);
+        by_cli.actor = Actor::Cli;
+        assert_eq!(
+            db.complete_post_processing(&hitl_id, &by_cli).unwrap(),
+            CompleteOutcome::Rejected(TransitionOutcome::Busy {
+                processing: Processing::PostProcessing
+            })
+        );
+        // A transition outside the state machine is refused as well.
+        let invalid = post_processing(&id, QueuePhase::Hitl, HitlAction::Skip);
+        assert!(matches!(
+            db.complete_post_processing(&hitl_id, &invalid).unwrap(),
+            CompleteOutcome::Rejected(TransitionOutcome::InvalidAction { .. })
+        ));
+
+        assert_eq!(db.get_item(&id).unwrap().phase(), QueuePhase::Hitl);
+        assert_eq!(db.pending_post_processing().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn complete_post_processing_for_another_item_is_an_error() {
+        let db = test_db();
+        let a = running_item(&db, "s1");
+        let b = running_item(&db, "s2");
+        let hitl_a = opened(&db, &a);
+        opened(&db, &b);
+        db.expire_hitl(&hitl_a, EscalationAction::Skip).unwrap();
+
+        assert!(
+            db.complete_post_processing(
+                &hitl_a,
+                &post_processing(&b, QueuePhase::Skipped, HitlAction::Skip),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn post_processing_failures_accumulate_until_completion() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        db.expire_hitl(&hitl_id, EscalationAction::Skip).unwrap();
+
+        assert_eq!(db.record_post_processing_failure(&hitl_id).unwrap(), 1);
+        assert_eq!(db.record_post_processing_failure(&hitl_id).unwrap(), 2);
+        assert_eq!(
+            db.hitl_request(&hitl_id)
+                .unwrap()
+                .unwrap()
+                .post_processing_failures,
+            2
+        );
+
+        db.complete_post_processing(
+            &hitl_id,
+            &post_processing(&id, QueuePhase::Skipped, HitlAction::Skip),
+        )
+        .unwrap();
+        assert!(db.record_post_processing_failure(&hitl_id).is_err());
+    }
+
+    #[test]
+    fn post_processing_failure_on_open_or_unknown_request_is_an_error() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        assert!(db.record_post_processing_failure(&hitl_id).is_err());
+        assert!(
+            db.record_post_processing_failure(&HitlId::new("missing"))
+                .is_err()
+        );
     }
 }
