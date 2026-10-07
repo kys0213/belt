@@ -213,6 +213,9 @@ pub struct PollTarget {
     pub message_ref: Option<MessageRef>,
     /// 요청이 열린 시각(RFC 3339). 이 이후의 응답만 대상이다.
     pub since: String,
+    /// 아직 열린 요청인지. 확정된 요청(늦은 응답 창)은 명시 `hitl_id` 응답에
+    /// `already_handled`를 회신하려고만 남으므로, id 없는 응답의 상관 후보가 아니다.
+    pub open: bool,
 }
 
 /// 한 번의 발송 결과. 발송 실패는 `Err`로 따로 돌려준다.

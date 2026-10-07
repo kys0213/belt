@@ -950,6 +950,7 @@ impl Notifier {
                 work_id: request.work_id.clone(),
                 message_ref,
                 since: request.opened_at.clone(),
+                open: request.status == HitlStatus::Open,
             });
         }
         Ok(targets)

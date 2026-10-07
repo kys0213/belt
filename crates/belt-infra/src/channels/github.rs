@@ -12,8 +12,10 @@
 //! - A message tied to a HITL request carries a hidden `hitl_id` token line.
 //! - Explicit responses: `/belt <done|retry|skip|replan> [hitl_id]` and
 //!   `/belt confirm [hitl_id]`. Any other comment is natural language.
-//! - A comment without a `hitl_id` belongs to the single HITL request polled
-//!   for that issue; with several candidates it has no correlation clue.
+//! - A comment without a `hitl_id` belongs to the single *open* HITL request
+//!   polled for that issue or pull request; with none or several it has no
+//!   correlation clue. Confirmed requests (late-response window) match only
+//!   an explicit `hitl_id`, so its sender gets an `already_handled` reply.
 //! - `external_id` and [`MessageRef`] are the comment URL, stable across polls.
 //! - `gh` command lines hold checked tokens only (issue number, `owner/name`,
 //!   a fixed file name); comment bodies travel in a file (`--body-file`).
@@ -285,6 +287,16 @@ fn parse_time(s: &str) -> Result<DateTime<FixedOffset>> {
     DateTime::parse_from_rfc3339(s).with_context(|| format!("invalid RFC 3339 timestamp: {s}"))
 }
 
+/// The request a response without `hitl_id` belongs to: the open candidate
+/// when there is exactly one. Confirmed requests only answer explicit ids.
+fn only_open<'a>(candidates: &[&'a PollTarget]) -> Option<&'a PollTarget> {
+    let mut open = candidates.iter().filter(|t| t.open);
+    match (open.next(), open.next()) {
+        (Some(target), None) => Some(*target),
+        _ => None,
+    }
+}
+
 type OriginTargets<'a> = Vec<(&'a PollTarget, DateTime<FixedOffset>)>;
 
 #[async_trait]
@@ -336,10 +348,7 @@ impl ResponseInbox for GitHubOriginChannel {
                         .iter()
                         .any(|t| t.hitl_id == id)
                         .then_some(HitlRef::Token(id)),
-                    None if candidates.len() == 1 => {
-                        Some(HitlRef::Token(candidates[0].hitl_id.clone()))
-                    }
-                    None => None,
+                    None => only_open(&candidates).map(|t| HitlRef::Token(t.hitl_id.clone())),
                 };
                 responses.push(InboundResponse {
                     external_id: comment.url,
@@ -439,6 +448,15 @@ mod tests {
             work_id: work_id.to_string(),
             message_ref: None,
             since: since.to_string(),
+            open: true,
+        }
+    }
+
+    /// A request already confirmed, still polled for the late-response window.
+    fn confirmed_target(hitl: &str, work_id: &str, since: &str) -> PollTarget {
+        PollTarget {
+            open: false,
+            ..target(hitl, work_id, since)
         }
     }
 
@@ -698,6 +716,44 @@ mod tests {
         assert_eq!(rs[0].hitl_ref, None);
         assert_eq!(rs[1].hitl_ref, Some(HitlRef::Token(HitlId::new("h-2"))));
         assert_eq!(rs[2].hitl_ref, None);
+    }
+
+    #[tokio::test]
+    async fn poll_links_a_response_without_id_to_the_only_open_request() {
+        // h-1 was confirmed (late-response window); h-2 reopened on the same issue.
+        let json = comments_json(&[
+            ("1", "alice", "/belt done", "2026-10-07T01:00:00Z"),
+            ("2", "alice", "please skip this one", "2026-10-07T01:00:00Z"),
+            ("3", "alice", "/belt retry h-1", "2026-10-07T01:00:00Z"),
+        ]);
+        let shell = RecordingShell::ok(&json);
+        let rs = channel(&shell)
+            .poll(&[
+                confirmed_target("h-1", WID, SINCE),
+                target("h-2", WID, SINCE),
+            ])
+            .await
+            .unwrap();
+        let h2 = Some(HitlRef::Token(HitlId::new("h-2")));
+        assert_eq!(rs[0].hitl_ref, h2);
+        assert_eq!(rs[1].hitl_ref, h2);
+        // An explicit id still reaches the confirmed request (already_handled reply).
+        assert_eq!(rs[2].hitl_ref, Some(HitlRef::Token(HitlId::new("h-1"))));
+    }
+
+    #[tokio::test]
+    async fn poll_does_not_link_a_response_without_id_to_a_confirmed_request() {
+        let json = comments_json(&[
+            ("1", "alice", "/belt done", "2026-10-07T01:00:00Z"),
+            ("2", "alice", "/belt done h-1", "2026-10-07T01:00:00Z"),
+        ]);
+        let shell = RecordingShell::ok(&json);
+        let rs = channel(&shell)
+            .poll(&[confirmed_target("h-1", WID, SINCE)])
+            .await
+            .unwrap();
+        assert_eq!(rs[0].hitl_ref, None);
+        assert_eq!(rs[1].hitl_ref, Some(HitlRef::Token(HitlId::new("h-1"))));
     }
 
     #[tokio::test]
