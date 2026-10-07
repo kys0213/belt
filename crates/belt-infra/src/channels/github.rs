@@ -20,10 +20,10 @@
 //! - `gh` command lines hold checked tokens only (issue number, `owner/name`,
 //!   a fixed file name); comment bodies travel in a file (`--body-file`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -60,16 +60,35 @@ impl GitHubChannelConfig {
     }
 }
 
-/// Origin channel for GitHub issues, built on the `gh` CLI.
+/// Origin channel for GitHub issues and pull requests, built on the `gh` CLI.
 pub struct GitHubOriginChannel {
     config: GitHubChannelConfig,
     shell: Arc<dyn ShellExecutor>,
+    /// Comments already warned about as unusable, so a re-read of the same
+    /// conversation every tick warns once per comment.
+    warned: Mutex<HashSet<String>>,
 }
 
 impl GitHubOriginChannel {
     /// Create the channel; `shell` runs the `gh` commands.
     pub fn new(config: GitHubChannelConfig, shell: Arc<dyn ShellExecutor>) -> Self {
-        Self { config, shell }
+        Self {
+            config,
+            shell,
+            warned: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// Warn that the comment at `url` is not taken as a response, once per comment.
+    fn warn_skipped(&self, url: &str, why: &str) {
+        let first = self
+            .warned
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(url.to_string());
+        if first {
+            tracing::warn!(comment = %url, "{why}");
+        }
     }
 
     /// Issue or pull request of a `github:owner/repo#N[:state...]` (issue) or
@@ -255,6 +274,9 @@ struct Comment {
     #[serde(rename = "createdAt")]
     created_at: String,
     author: Option<Author>,
+    /// GitHub `Comment.includesCreatedEdit`: the comment was edited.
+    #[serde(rename = "includesCreatedEdit")]
+    edited: bool,
 }
 
 #[derive(Deserialize)]
@@ -336,6 +358,15 @@ impl ResponseInbox for GitHubOriginChannel {
                     .collect();
                 let text = comment.body.trim();
                 if candidates.is_empty() || text.is_empty() {
+                    continue;
+                }
+                if comment.edited {
+                    // The shown author is the original one, but anyone with
+                    // write access may have changed the text: not a response.
+                    self.warn_skipped(
+                        &comment.url,
+                        "ignoring an edited comment: its author may not have written the current text",
+                    );
                     continue;
                 }
                 let (body, explicit) = match parse_command(text) {
@@ -460,20 +491,62 @@ mod tests {
         }
     }
 
-    fn comments_json(comments: &[(&str, &str, &str, &str)]) -> String {
-        let items: Vec<serde_json::Value> = comments
-            .iter()
-            .map(|(n, login, body, at)| {
-                serde_json::json!({
-                    "id": format!("IC_{n}"),
-                    "url": format!("https://github.com/org/repo/issues/42#issuecomment-{n}"),
-                    "author": {"login": login},
-                    "body": body,
-                    "createdAt": at,
-                })
-            })
-            .collect();
+    /// One unedited comment in the shape of `gh ... view --json comments`.
+    fn comment_json(n: &str, login: &str, body: &str, at: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": format!("IC_{n}"),
+            "url": format!("https://github.com/org/repo/issues/42#issuecomment-{n}"),
+            "author": {"login": login},
+            "body": body,
+            "createdAt": at,
+            "includesCreatedEdit": false,
+        })
+    }
+
+    fn json_of(items: Vec<serde_json::Value>) -> String {
         serde_json::json!({ "comments": items }).to_string()
+    }
+
+    fn comments_json(comments: &[(&str, &str, &str, &str)]) -> String {
+        json_of(
+            comments
+                .iter()
+                .map(|(n, login, body, at)| comment_json(n, login, body, at))
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn poll_ignores_edited_comments() {
+        // Someone with write access can edit an allowlisted user's comment;
+        // the author shown would still be the allowlisted user.
+        let mut edited = comment_json("1", "alice", "/belt done", "2026-10-07T01:00:00Z");
+        edited["includesCreatedEdit"] = serde_json::json!(true);
+        let json = json_of(vec![
+            edited,
+            comment_json("2", "alice", "/belt skip", "2026-10-07T02:00:00Z"),
+        ]);
+        let shell = RecordingShell::ok(&json);
+        let rs = channel(&shell)
+            .poll(&[target("h-1", WID, SINCE)])
+            .await
+            .unwrap();
+        assert_eq!(rs.len(), 1);
+        assert!(rs[0].external_id.ends_with("issuecomment-2"));
+        assert_eq!(rs[0].body, InboundBody::Action(HitlAction::Skip));
+    }
+
+    #[tokio::test]
+    async fn poll_rejects_output_without_the_edit_flag() {
+        let mut item = comment_json("1", "alice", "/belt done", "2026-10-07T01:00:00Z");
+        item.as_object_mut().unwrap().remove("includesCreatedEdit");
+        let shell = RecordingShell::ok(&json_of(vec![item]));
+        assert!(
+            channel(&shell)
+                .poll(&[target("h-1", WID, SINCE)])
+                .await
+                .is_err()
+        );
     }
 
     const WID: &str = "github:org/repo#42:implement";
