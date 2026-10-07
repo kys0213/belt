@@ -53,6 +53,10 @@ const CONFIRM_HELP: &str = "/belt confirm";
 /// `reason` of a `notification_failed` event for a reply.
 const REPLY_LABEL: &str = "reply";
 
+/// Longest model-written text (summary, reason, error) echoed into a reply.
+/// Replies are public comments, so the text is cut to one short line.
+pub const MAX_ECHOED_TEXT_CHARS: usize = 200;
+
 // ---- result values ---------------------------------------------------------
 
 /// Result of one send to one channel.
@@ -185,6 +189,10 @@ pub enum Interpretation {
 
 /// Turns a natural-language response into a proposed action with the
 /// workspace's default AgentRuntime.
+///
+/// The prompt contains text written by outsiders (issue notes, comments), so
+/// the runtime must not run where it could read the daemon's files: give it an
+/// empty directory.
 pub struct NlInterpreter {
     runtime: Arc<dyn AgentRuntime>,
     working_dir: PathBuf,
@@ -192,7 +200,7 @@ pub struct NlInterpreter {
 
 impl NlInterpreter {
     /// `working_dir` is where the runtime process runs; the interpretation
-    /// reads no files.
+    /// reads no files, so it should be an empty directory.
     pub fn new(runtime: Arc<dyn AgentRuntime>, working_dir: PathBuf) -> Self {
         Self {
             runtime,
@@ -221,7 +229,7 @@ impl NlInterpreter {
                 error: format!(
                     "runtime exited with {}: {}",
                     response.exit_code,
-                    response.stderr.trim()
+                    one_line(&response.stderr, MAX_ECHOED_TEXT_CHARS)
                 ),
             };
         }
@@ -274,7 +282,8 @@ fn parse_interpretation(stdout: &str) -> Interpretation {
     let summary = value
         .get("summary")
         .and_then(|s| s.as_str())
-        .map(str::to_string);
+        .map(|s| one_line(s, MAX_ECHOED_TEXT_CHARS))
+        .filter(|s| !s.is_empty());
     let Some(action) = value.get("action").and_then(|a| a.as_str()) else {
         return Interpretation::Failed {
             error: "output has no string `action`".to_string(),
@@ -289,6 +298,22 @@ fn parse_interpretation(stdout: &str) -> Interpretation {
         Ok(action) => Interpretation::Proposal { action, summary },
         Err(e) => Interpretation::NoAction { reason: e },
     }
+}
+
+/// The first non-empty line of `text`, cut to `max_chars` characters (`…`
+/// marks a cut).
+fn one_line(text: &str, max_chars: usize) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    if line.chars().count() <= max_chars {
+        return line.to_string();
+    }
+    let mut cut: String = line.chars().take(max_chars.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
 }
 
 /// The body of a fenced ```` ```json ```` block, or `text` itself.
