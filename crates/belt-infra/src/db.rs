@@ -2731,6 +2731,7 @@ fn confirm_open(
             "open-state compare-and-set on {hitl_id} changed {changed} rows under an immediate transaction"
         )));
     }
+    close_proposals_in_tx(tx, hitl_id)?;
     Ok(())
 }
 
@@ -3790,6 +3791,446 @@ fn log_cancel_event(
         },
     )?;
     Ok(())
+}
+
+// ---- Delivery, external responses and natural-language proposals ----------
+
+/// How many failed attempts a delivery tolerates before it becomes `failed`.
+pub const DELIVERY_MAX_ATTEMPTS: u32 = 5;
+
+/// Delivery state of one HITL request on one channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryStatus {
+    Pending,
+    Sent,
+    Failed,
+}
+
+impl DeliveryStatus {
+    fn parse(value: &str) -> Result<Self, BeltError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "sent" => Ok(Self::Sent),
+            "failed" => Ok(Self::Failed),
+            other => Err(BeltError::Database(format!(
+                "unknown delivery status '{other}'"
+            ))),
+        }
+    }
+}
+
+/// One row of `hitl_deliveries`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Delivery {
+    pub hitl_id: HitlId,
+    pub channel: String,
+    pub status: DeliveryStatus,
+    /// Failed attempts so far.
+    pub attempts: u32,
+    /// Reference of the delivered message, set once `sent`.
+    pub message_ref: Option<String>,
+    pub last_error: Option<String>,
+    /// RFC 3339.
+    pub updated_at: String,
+}
+
+/// Result of one delivery attempt, as reported to [`Database::mark_delivery`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeliveryAttempt {
+    Sent { message_ref: Option<String> },
+    Failed { error: String },
+}
+
+/// Result of [`Database::record_external_response`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalResponseOutcome {
+    /// First time this `(channel, external_id)` is seen.
+    Recorded,
+    /// Already processed; the caller skips it.
+    Duplicate,
+}
+
+/// Lifecycle state of a natural-language proposal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposalStatus {
+    Pending,
+    Confirmed,
+    Superseded,
+}
+
+impl ProposalStatus {
+    fn parse(value: &str) -> Result<Self, BeltError> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "confirmed" => Ok(Self::Confirmed),
+            "superseded" => Ok(Self::Superseded),
+            other => Err(BeltError::Database(format!(
+                "unknown proposal status '{other}'"
+            ))),
+        }
+    }
+}
+
+/// One row of `nl_proposals`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NlProposal {
+    pub id: i64,
+    pub hitl_id: HitlId,
+    pub respondent: String,
+    /// Channel the proposal was sent to and the confirmation comes from.
+    pub channel: String,
+    pub action: HitlAction,
+    pub summary: Option<String>,
+    pub status: ProposalStatus,
+    /// RFC 3339.
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A proposal to record via [`Database::upsert_proposal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewProposal {
+    pub hitl_id: HitlId,
+    pub respondent: String,
+    pub channel: String,
+    pub action: HitlAction,
+    pub summary: Option<String>,
+}
+
+/// Result of [`Database::upsert_proposal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpsertProposalOutcome {
+    Recorded(NlProposal),
+    /// The request was already confirmed; the caller answers `already_handled`
+    /// from the request's resolution.
+    HitlConfirmed(HitlRequest),
+    NotFound,
+}
+
+/// Result of [`Database::confirm_proposal`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmProposalOutcome {
+    /// The proposal was pending and is now confirmed; the caller attempts the
+    /// HITL resolution with its action.
+    Confirmed(NlProposal),
+    /// The proposal was superseded or confirmed before. When the request is
+    /// confirmed too, the caller answers `already_handled` from its resolution.
+    NotPending(NlProposal),
+}
+
+impl Database {
+    /// Register `channel` as a delivery target of `hitl_id` (pending, no
+    /// attempts). Idempotent: an existing row is left untouched.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn ensure_delivery(&self, hitl_id: &HitlId, channel: &str) -> Result<(), BeltError> {
+        self.write_tx(|tx| {
+            tx.execute(
+                "INSERT OR IGNORE INTO hitl_deliveries (hitl_id, channel, status, attempts, updated_at)
+                 VALUES (?1, ?2, 'pending', 0, ?3)",
+                params![hitl_id.as_str(), channel, Utc::now().to_rfc3339()],
+            )
+            .map_err(sql_err)?;
+            Ok(())
+        })
+    }
+
+    /// Deliveries still to be sent: `pending` rows of open requests, oldest
+    /// request first. Confirmed requests are no longer worth delivering.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored row.
+    pub fn deliveries_due(&self) -> Result<Vec<Delivery>, BeltError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT d.hitl_id, d.channel, d.status, d.attempts, d.message_ref, d.last_error, d.updated_at
+                 FROM hitl_deliveries d
+                 JOIN hitl_requests r ON r.hitl_id = d.hitl_id
+                 WHERE d.status = 'pending' AND r.status = 'open'
+                 ORDER BY r.opened_at, d.hitl_id, d.channel",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map([], |row| Ok(delivery_columns(row)))
+            .map_err(sql_err)?;
+        rows.map(|r| r.map_err(sql_err)?).collect()
+    }
+
+    /// One delivery, or `None` when the channel was never registered.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored row.
+    pub fn delivery(&self, hitl_id: &HitlId, channel: &str) -> Result<Option<Delivery>, BeltError> {
+        let conn = self.lock_conn()?;
+        read_delivery(&conn, hitl_id, channel)
+    }
+
+    /// Every delivery of `hitl_id`, ordered by channel.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored row.
+    pub fn deliveries_of(&self, hitl_id: &HitlId) -> Result<Vec<Delivery>, BeltError> {
+        let conn = self.lock_conn()?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT hitl_id, channel, status, attempts, message_ref, last_error, updated_at
+                 FROM hitl_deliveries WHERE hitl_id = ?1 ORDER BY channel",
+            )
+            .map_err(sql_err)?;
+        let rows = stmt
+            .query_map(params![hitl_id.as_str()], |row| Ok(delivery_columns(row)))
+            .map_err(sql_err)?;
+        rows.map(|r| r.map_err(sql_err)?).collect()
+    }
+
+    /// Record the outcome of one delivery attempt on a `pending` delivery and
+    /// return the stored row.
+    ///
+    /// `Sent` stores the message reference. `Failed` counts the attempt and
+    /// keeps the row `pending` for the next tick until
+    /// [`DELIVERY_MAX_ATTEMPTS`] failures, then marks it `failed`. A delivery
+    /// that is already `sent` or `failed` is returned unchanged. `None` when
+    /// the channel was never registered.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored row.
+    pub fn mark_delivery(
+        &self,
+        hitl_id: &HitlId,
+        channel: &str,
+        attempt: &DeliveryAttempt,
+    ) -> Result<Option<Delivery>, BeltError> {
+        self.write_tx(|tx| {
+            let now = Utc::now().to_rfc3339();
+            match attempt {
+                DeliveryAttempt::Sent { message_ref } => {
+                    tx.execute(
+                        "UPDATE hitl_deliveries
+                         SET status = 'sent', message_ref = ?1, last_error = NULL, updated_at = ?2
+                         WHERE hitl_id = ?3 AND channel = ?4 AND status = 'pending'",
+                        params![message_ref, now, hitl_id.as_str(), channel],
+                    )
+                    .map_err(sql_err)?;
+                }
+                DeliveryAttempt::Failed { error } => {
+                    tx.execute(
+                        "UPDATE hitl_deliveries
+                         SET attempts = attempts + 1,
+                             status = CASE WHEN attempts + 1 >= ?1 THEN 'failed' ELSE 'pending' END,
+                             last_error = ?2, updated_at = ?3
+                         WHERE hitl_id = ?4 AND channel = ?5 AND status = 'pending'",
+                        params![DELIVERY_MAX_ATTEMPTS, error, now, hitl_id.as_str(), channel],
+                    )
+                    .map_err(sql_err)?;
+                }
+            }
+            read_delivery(tx, hitl_id, channel)
+        })
+    }
+
+    /// Record that the external response `external_id` of `channel` was
+    /// processed. The second record of the same pair is `Duplicate`, also
+    /// across restarts. `hitl_id` and `respondent` are what the response was
+    /// correlated to, when known.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn record_external_response(
+        &self,
+        channel: &str,
+        external_id: &str,
+        hitl_id: Option<&HitlId>,
+        respondent: Option<&str>,
+    ) -> Result<ExternalResponseOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let inserted = tx
+                .execute(
+                    "INSERT OR IGNORE INTO external_responses (channel, external_id, hitl_id, respondent, received_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        channel,
+                        external_id,
+                        hitl_id.map(HitlId::as_str),
+                        respondent,
+                        Utc::now().to_rfc3339()
+                    ],
+                )
+                .map_err(sql_err)?;
+            Ok(if inserted == 1 {
+                ExternalResponseOutcome::Recorded
+            } else {
+                ExternalResponseOutcome::Duplicate
+            })
+        })
+    }
+
+    /// Record a pending proposal. The respondent's previous pending proposal
+    /// on the same request is superseded in the same transaction, so there is
+    /// at most one. A request that is already confirmed takes no proposal.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored row.
+    pub fn upsert_proposal(
+        &self,
+        proposal: &NewProposal,
+    ) -> Result<UpsertProposalOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let Some(request) = find_hitl(tx, &HitlTarget::Id(proposal.hitl_id.clone()))? else {
+                return Ok(UpsertProposalOutcome::NotFound);
+            };
+            if request.status != HitlStatus::Open {
+                return Ok(UpsertProposalOutcome::HitlConfirmed(request));
+            }
+            let now = Utc::now().to_rfc3339();
+            tx.execute(
+                "UPDATE nl_proposals SET status = 'superseded', updated_at = ?1
+                 WHERE hitl_id = ?2 AND respondent = ?3 AND status = 'pending'",
+                params![now, proposal.hitl_id.as_str(), proposal.respondent],
+            )
+            .map_err(sql_err)?;
+            tx.execute(
+                "INSERT INTO nl_proposals (hitl_id, respondent, channel, action, summary, status, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?6)",
+                params![
+                    proposal.hitl_id.as_str(),
+                    proposal.respondent,
+                    proposal.channel,
+                    proposal.action.to_string(),
+                    proposal.summary,
+                    now
+                ],
+            )
+            .map_err(sql_err)?;
+            let id = tx.last_insert_rowid();
+            Ok(UpsertProposalOutcome::Recorded(read_proposal(tx, id)?))
+        })
+    }
+
+    /// The respondent's most recent proposal on `hitl_id` in any status, or
+    /// `None`. A confirmation checks the status: only `pending` is
+    /// actionable; otherwise the caller consults the request for
+    /// `already_handled`.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure or an inconsistent stored row.
+    pub fn latest_proposal(
+        &self,
+        hitl_id: &HitlId,
+        respondent: &str,
+    ) -> Result<Option<NlProposal>, BeltError> {
+        let conn = self.lock_conn()?;
+        conn.query_row(
+            "SELECT id, hitl_id, respondent, channel, action, summary, status, created_at, updated_at
+             FROM nl_proposals WHERE hitl_id = ?1 AND respondent = ?2
+             ORDER BY id DESC LIMIT 1",
+            params![hitl_id.as_str(), respondent],
+            |row| Ok(proposal_columns(row)),
+        )
+        .optional()
+        .map_err(sql_err)?
+        .transpose()
+    }
+
+    /// Mark a pending proposal confirmed. This precedes the HITL resolution
+    /// attempt, whether or not that attempt wins.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure, an inconsistent stored row, or an
+    /// unknown proposal id.
+    pub fn confirm_proposal(&self, id: i64) -> Result<ConfirmProposalOutcome, BeltError> {
+        self.write_tx(|tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE nl_proposals SET status = 'confirmed', updated_at = ?1
+                     WHERE id = ?2 AND status = 'pending'",
+                    params![Utc::now().to_rfc3339(), id],
+                )
+                .map_err(sql_err)?;
+            let stored = read_proposal(tx, id)?;
+            Ok(if changed == 1 {
+                ConfirmProposalOutcome::Confirmed(stored)
+            } else {
+                ConfirmProposalOutcome::NotPending(stored)
+            })
+        })
+    }
+
+    /// Close every pending proposal of `hitl_id` as superseded; returns how
+    /// many were closed. [`Database::resolve_hitl`] and
+    /// [`Database::expire_hitl`] already do this in their own transaction.
+    ///
+    /// # Errors
+    /// `BeltError::Database` on I/O failure.
+    pub fn close_proposals(&self, hitl_id: &HitlId) -> Result<usize, BeltError> {
+        self.write_tx(|tx| close_proposals_in_tx(tx, hitl_id))
+    }
+}
+
+fn close_proposals_in_tx(tx: &Transaction<'_>, hitl_id: &HitlId) -> Result<usize, BeltError> {
+    tx.execute(
+        "UPDATE nl_proposals SET status = 'superseded', updated_at = ?1
+         WHERE hitl_id = ?2 AND status = 'pending'",
+        params![Utc::now().to_rfc3339(), hitl_id.as_str()],
+    )
+    .map_err(sql_err)
+}
+
+fn delivery_columns(row: &rusqlite::Row<'_>) -> Result<Delivery, BeltError> {
+    Ok(Delivery {
+        hitl_id: HitlId::new(row.get::<_, String>(0).map_err(sql_err)?),
+        channel: row.get(1).map_err(sql_err)?,
+        status: DeliveryStatus::parse(&row.get::<_, String>(2).map_err(sql_err)?)?,
+        attempts: row.get(3).map_err(sql_err)?,
+        message_ref: row.get(4).map_err(sql_err)?,
+        last_error: row.get(5).map_err(sql_err)?,
+        updated_at: row.get(6).map_err(sql_err)?,
+    })
+}
+
+fn read_delivery(
+    conn: &Connection,
+    hitl_id: &HitlId,
+    channel: &str,
+) -> Result<Option<Delivery>, BeltError> {
+    conn.query_row(
+        "SELECT hitl_id, channel, status, attempts, message_ref, last_error, updated_at
+         FROM hitl_deliveries WHERE hitl_id = ?1 AND channel = ?2",
+        params![hitl_id.as_str(), channel],
+        |row| Ok(delivery_columns(row)),
+    )
+    .optional()
+    .map_err(sql_err)?
+    .transpose()
+}
+
+fn proposal_columns(row: &rusqlite::Row<'_>) -> Result<NlProposal, BeltError> {
+    Ok(NlProposal {
+        id: row.get(0).map_err(sql_err)?,
+        hitl_id: HitlId::new(row.get::<_, String>(1).map_err(sql_err)?),
+        respondent: row.get(2).map_err(sql_err)?,
+        channel: row.get(3).map_err(sql_err)?,
+        action: row
+            .get::<_, String>(4)
+            .map_err(sql_err)?
+            .parse::<HitlAction>()
+            .map_err(BeltError::Database)?,
+        summary: row.get(5).map_err(sql_err)?,
+        status: ProposalStatus::parse(&row.get::<_, String>(6).map_err(sql_err)?)?,
+        created_at: row.get(7).map_err(sql_err)?,
+        updated_at: row.get(8).map_err(sql_err)?,
+    })
+}
+
+fn read_proposal(conn: &Connection, id: i64) -> Result<NlProposal, BeltError> {
+    conn.query_row(
+        "SELECT id, hitl_id, respondent, channel, action, summary, status, created_at, updated_at
+         FROM nl_proposals WHERE id = ?1",
+        params![id],
+        |row| Ok(proposal_columns(row)),
+    )
+    .map_err(sql_err)?
 }
 
 #[cfg(test)]
@@ -7449,5 +7890,289 @@ mod tests {
             db.running_handler("nope"),
             Err(BeltError::ItemNotFound(_))
         ));
+    }
+
+    // ---- Delivery, external responses, proposals ----------------------------
+
+    fn failed(error: &str) -> DeliveryAttempt {
+        DeliveryAttempt::Failed {
+            error: error.to_string(),
+        }
+    }
+
+    fn new_proposal(hitl_id: &HitlId, respondent: &str, action: HitlAction) -> NewProposal {
+        NewProposal {
+            hitl_id: hitl_id.clone(),
+            respondent: respondent.to_string(),
+            channel: "origin".to_string(),
+            action,
+            summary: Some("because".to_string()),
+        }
+    }
+
+    fn recorded(outcome: UpsertProposalOutcome) -> NlProposal {
+        match outcome {
+            UpsertProposalOutcome::Recorded(p) => p,
+            other => panic!("expected Recorded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delivery_is_due_until_sent_and_keeps_the_message_ref() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "d1"));
+        db.ensure_delivery(&hitl_id, "origin").unwrap();
+        db.ensure_delivery(&hitl_id, "origin").unwrap();
+
+        let due = db.deliveries_due().unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].status, DeliveryStatus::Pending);
+        assert_eq!(due[0].attempts, 0);
+
+        let sent = db
+            .mark_delivery(
+                &hitl_id,
+                "origin",
+                &DeliveryAttempt::Sent {
+                    message_ref: Some("comment-9".to_string()),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(sent.status, DeliveryStatus::Sent);
+        assert_eq!(sent.message_ref.as_deref(), Some("comment-9"));
+        assert!(db.deliveries_due().unwrap().is_empty());
+
+        // A sent delivery does not move again.
+        let again = db
+            .mark_delivery(&hitl_id, "origin", &failed("late"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, sent);
+    }
+
+    #[test]
+    fn delivery_fails_after_the_attempt_cap_and_leaves_the_due_list() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "d2"));
+        db.ensure_delivery(&hitl_id, "origin").unwrap();
+
+        for n in 1..DELIVERY_MAX_ATTEMPTS {
+            let row = db
+                .mark_delivery(&hitl_id, "origin", &failed("boom"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.status, DeliveryStatus::Pending);
+            assert_eq!(row.attempts, n);
+            assert_eq!(db.deliveries_due().unwrap().len(), 1);
+        }
+        let last = db
+            .mark_delivery(&hitl_id, "origin", &failed("boom"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.status, DeliveryStatus::Failed);
+        assert_eq!(last.attempts, DELIVERY_MAX_ATTEMPTS);
+        assert_eq!(last.last_error.as_deref(), Some("boom"));
+        assert!(db.deliveries_due().unwrap().is_empty());
+        assert_eq!(db.deliveries_of(&hitl_id).unwrap(), vec![last]);
+    }
+
+    #[test]
+    fn deliveries_of_a_confirmed_request_are_not_due() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "d3"));
+        db.ensure_delivery(&hitl_id, "origin").unwrap();
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id.clone()),
+            &resolution(HitlAction::Skip, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+        assert!(db.deliveries_due().unwrap().is_empty());
+    }
+
+    #[test]
+    fn mark_delivery_of_an_unregistered_channel_is_none() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "d4"));
+        assert_eq!(
+            db.mark_delivery(&hitl_id, "origin", &failed("x")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn external_response_second_record_is_duplicate() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "e1"));
+        assert_eq!(
+            db.record_external_response("origin", "c-1", Some(&hitl_id), Some("bob"))
+                .unwrap(),
+            ExternalResponseOutcome::Recorded
+        );
+        assert_eq!(
+            db.record_external_response("origin", "c-1", None, None)
+                .unwrap(),
+            ExternalResponseOutcome::Duplicate
+        );
+        // The key is the pair: another channel or another id is new.
+        assert_eq!(
+            db.record_external_response("other", "c-1", None, None)
+                .unwrap(),
+            ExternalResponseOutcome::Recorded
+        );
+        assert_eq!(
+            db.record_external_response("origin", "c-2", None, None)
+                .unwrap(),
+            ExternalResponseOutcome::Recorded
+        );
+    }
+
+    #[test]
+    fn new_proposal_of_the_same_respondent_supersedes_the_pending_one() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "p1"));
+        let first = recorded(
+            db.upsert_proposal(&new_proposal(&hitl_id, "bob", HitlAction::Skip))
+                .unwrap(),
+        );
+        let other = recorded(
+            db.upsert_proposal(&new_proposal(&hitl_id, "carol", HitlAction::Done))
+                .unwrap(),
+        );
+        let second = recorded(
+            db.upsert_proposal(&new_proposal(&hitl_id, "bob", HitlAction::Retry))
+                .unwrap(),
+        );
+        assert_ne!(first.id, second.id);
+
+        let latest = db.latest_proposal(&hitl_id, "bob").unwrap().unwrap();
+        assert_eq!(latest.id, second.id);
+        assert_eq!(latest.status, ProposalStatus::Pending);
+        assert_eq!(latest.action, HitlAction::Retry);
+        // Confirming the replaced proposal is refused.
+        match db.confirm_proposal(first.id).unwrap() {
+            ConfirmProposalOutcome::NotPending(p) => {
+                assert_eq!(p.status, ProposalStatus::Superseded);
+            }
+            other => panic!("expected NotPending, got {other:?}"),
+        }
+        // Another respondent's proposal is untouched.
+        assert_eq!(
+            db.latest_proposal(&hitl_id, "carol").unwrap().unwrap(),
+            other
+        );
+        assert_eq!(db.latest_proposal(&hitl_id, "dave").unwrap(), None);
+    }
+
+    #[test]
+    fn confirmation_after_the_request_is_confirmed_is_not_pending() {
+        for expire in [false, true] {
+            let db = test_db();
+            let hitl_id = opened(&db, &running_item(&db, "p2"));
+            let proposal = recorded(
+                db.upsert_proposal(&new_proposal(&hitl_id, "bob", HitlAction::Skip))
+                    .unwrap(),
+            );
+            if expire {
+                db.expire_hitl(&hitl_id, EscalationAction::Skip).unwrap();
+            } else {
+                db.resolve_hitl(
+                    &HitlTarget::Id(hitl_id.clone()),
+                    &resolution(HitlAction::Retry, "irene", "cli"),
+                    None,
+                )
+                .unwrap();
+            }
+
+            // The confirmation sees a closed proposal and the winner's resolution.
+            let seen = db.latest_proposal(&hitl_id, "bob").unwrap().unwrap();
+            assert_eq!(seen.status, ProposalStatus::Superseded);
+            assert!(matches!(
+                db.confirm_proposal(proposal.id).unwrap(),
+                ConfirmProposalOutcome::NotPending(_)
+            ));
+            let request = db.hitl_request(&hitl_id).unwrap().unwrap();
+            assert!(request.resolution.is_some());
+        }
+    }
+
+    #[test]
+    fn upsert_proposal_on_a_confirmed_or_unknown_request_records_nothing() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "p3"));
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id.clone()),
+            &resolution(HitlAction::Done, "irene", "cli"),
+            None,
+        )
+        .unwrap();
+        match db
+            .upsert_proposal(&new_proposal(&hitl_id, "bob", HitlAction::Skip))
+            .unwrap()
+        {
+            UpsertProposalOutcome::HitlConfirmed(request) => {
+                assert_eq!(request.hitl_id, hitl_id);
+            }
+            other => panic!("expected HitlConfirmed, got {other:?}"),
+        }
+        assert_eq!(db.latest_proposal(&hitl_id, "bob").unwrap(), None);
+
+        let unknown = HitlId::new("nope");
+        assert_eq!(
+            db.upsert_proposal(&new_proposal(&unknown, "bob", HitlAction::Skip))
+                .unwrap(),
+            UpsertProposalOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn confirmed_proposal_keeps_its_status_when_the_request_is_confirmed() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "p4"));
+        let proposal = recorded(
+            db.upsert_proposal(&new_proposal(&hitl_id, "bob", HitlAction::Skip))
+                .unwrap(),
+        );
+        assert!(matches!(
+            db.confirm_proposal(proposal.id).unwrap(),
+            ConfirmProposalOutcome::Confirmed(_)
+        ));
+        db.resolve_hitl(
+            &HitlTarget::Id(hitl_id.clone()),
+            &resolution(HitlAction::Skip, "bob", "origin"),
+            None,
+        )
+        .unwrap();
+        let stored = db.latest_proposal(&hitl_id, "bob").unwrap().unwrap();
+        assert_eq!(stored.status, ProposalStatus::Confirmed);
+    }
+
+    #[test]
+    fn close_proposals_supersedes_only_pending_ones() {
+        let db = test_db();
+        let hitl_id = opened(&db, &running_item(&db, "p5"));
+        let bob = recorded(
+            db.upsert_proposal(&new_proposal(&hitl_id, "bob", HitlAction::Skip))
+                .unwrap(),
+        );
+        recorded(
+            db.upsert_proposal(&new_proposal(&hitl_id, "carol", HitlAction::Done))
+                .unwrap(),
+        );
+        db.confirm_proposal(bob.id).unwrap();
+        assert_eq!(db.close_proposals(&hitl_id).unwrap(), 1);
+        assert_eq!(db.close_proposals(&hitl_id).unwrap(), 0);
+        assert_eq!(
+            db.latest_proposal(&hitl_id, "bob").unwrap().unwrap().status,
+            ProposalStatus::Confirmed
+        );
+        assert_eq!(
+            db.latest_proposal(&hitl_id, "carol")
+                .unwrap()
+                .unwrap()
+                .status,
+            ProposalStatus::Superseded
+        );
     }
 }
