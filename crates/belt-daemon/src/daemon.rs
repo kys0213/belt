@@ -220,7 +220,7 @@ impl Daemon {
             cron.register(job);
         }
 
-        // Seed per-workspace cron jobs for all registered workspaces (CR-13).
+        // Seed per-workspace cron jobs for all registered workspaces.
         // This ensures that workspace-scoped cron handlers are active when the
         // daemon starts, not only when `workspace add` is run.
         if let Ok(workspaces) = db.list_workspaces() {

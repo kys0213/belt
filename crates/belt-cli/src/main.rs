@@ -1808,7 +1808,7 @@ fn signal_daemon() -> anyhow::Result<()> {
 /// Determine a recommended action based on the HITL reason.
 ///
 /// Returns a tuple of `(action, explanation)` where `action` is the
-/// suggested `HitlRespondAction` string and `explanation` describes why.
+/// suggested `HitlAction` string and `explanation` describes why.
 fn recommended_action(
     reason: Option<&belt_core::queue::HitlReason>,
 ) -> (&'static str, &'static str) {
@@ -1829,18 +1829,6 @@ fn recommended_action(
         Some(HitlReason::ManualEscalation) => (
             "done",
             "Manually escalated; review the item and mark done if the issue is resolved.",
-        ),
-        Some(HitlReason::SpecConflict) => (
-            "replan",
-            "Spec conflict detected; replan to resolve overlapping specifications.",
-        ),
-        Some(HitlReason::SpecCompletionReview) => (
-            "done",
-            "Spec completion review; approve to mark as done if the spec is satisfactory.",
-        ),
-        Some(HitlReason::SpecModificationProposed) => (
-            "done",
-            "Spec modification proposed; review changes and approve or skip.",
         ),
         Some(HitlReason::StagnationDetected) => (
             "replan",
@@ -1935,7 +1923,7 @@ fn cmd_hitl_respond(
         }
     };
 
-    let action: belt_core::queue::HitlRespondAction = match action.parse() {
+    let action: belt_core::hitl::HitlAction = match action.parse() {
         Ok(action) => action,
         Err(e) => {
             return emit_refusal(
@@ -1945,7 +1933,6 @@ fn cmd_hitl_respond(
             );
         }
     };
-    let action = belt_core::hitl::HitlAction::from(action);
     let by = respondent.unwrap_or_else(cli_respondent);
     let outcome = respond_as_cli(&hitl, target, action, by.clone(), notes)?;
     emit_manual_outcome(
@@ -2110,7 +2097,7 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
 
     // Use the recommended action as default when the user presses Enter.
     let chosen = if input.is_empty() { rec_action } else { input };
-    let action: belt_core::queue::HitlRespondAction =
+    let action: belt_core::hitl::HitlAction =
         chosen.parse().map_err(|e: String| anyhow::anyhow!(e))?;
 
     print!("Notes (optional): ");
@@ -2120,7 +2107,6 @@ fn cmd_hitl_show(item_id: &str, format: &str, interactive: bool) -> anyhow::Resu
     let notes = notes_input.trim();
     let notes = (!notes.is_empty()).then(|| notes.to_string());
 
-    let action = belt_core::hitl::HitlAction::from(action);
     let by = cli_respondent();
     let outcome = respond_as_cli(
         &hitl,
@@ -3095,27 +3081,6 @@ mod tests {
     fn recommended_action_manual_escalation() {
         use belt_core::queue::HitlReason;
         let (action, _) = recommended_action(Some(&HitlReason::ManualEscalation));
-        assert_eq!(action, "done");
-    }
-
-    #[test]
-    fn recommended_action_spec_conflict() {
-        use belt_core::queue::HitlReason;
-        let (action, _) = recommended_action(Some(&HitlReason::SpecConflict));
-        assert_eq!(action, "replan");
-    }
-
-    #[test]
-    fn recommended_action_spec_completion_review() {
-        use belt_core::queue::HitlReason;
-        let (action, _) = recommended_action(Some(&HitlReason::SpecCompletionReview));
-        assert_eq!(action, "done");
-    }
-
-    #[test]
-    fn recommended_action_spec_modification_proposed() {
-        use belt_core::queue::HitlReason;
-        let (action, _) = recommended_action(Some(&HitlReason::SpecModificationProposed));
         assert_eq!(action, "done");
     }
 

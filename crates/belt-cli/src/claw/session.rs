@@ -188,8 +188,8 @@ fn collect_status_from_db(db: &belt_infra::db::Database) -> Option<StatusSummary
 
 /// Collect workspace-level statistics from the Belt database.
 ///
-/// Opens the default `~/.belt/belt.db` database and gathers spec counts by
-/// status and queue item counts by phase for the given workspace.
+/// Opens the default `~/.belt/belt.db` database and gathers queue item counts by
+/// phase and recent HITL events for the given workspace.
 /// Returns `None` if the database is unavailable or the workspace name is absent.
 pub fn collect_workspace_stats(workspace: Option<&str>) -> Option<WorkspaceStats> {
     let ws_name = workspace?;
@@ -290,16 +290,16 @@ fn write_status_banner<W: Write>(output: &mut W, summary: &StatusSummary) -> io:
 /// priority.
 fn reason_priority(reason: &str) -> u32 {
     match reason {
-        "evaluate_failure" => 0,               // spec-conflict equivalent
+        "evaluate_failure" => 0, // evaluation result needs a judgment call
         "retry_max_exceeded" | "timeout" => 1, // failure category
-        _ => 2,                                // other (manual_escalation, unknown)
+        _ => 2,                  // other (manual_escalation, unknown)
     }
 }
 
 /// Display label for an escalation reason group.
 fn reason_display_label(reason: &str) -> &str {
     match reason {
-        "evaluate_failure" => "Spec Conflict (evaluate_failure)",
+        "evaluate_failure" => "Evaluate Failure (evaluate_failure)",
         "retry_max_exceeded" => "Failure (retry_max_exceeded)",
         "timeout" => "Failure (timeout)",
         "manual_escalation" => "Other (manual_escalation)",
@@ -997,7 +997,7 @@ mod tests {
                     work_id: "w1:impl".to_string(),
                     workspace: "ws-a".to_string(),
                     reason: "evaluate_failure".to_string(),
-                    title: Some("Spec conflict item".to_string()),
+                    title: Some("Evaluate failure item".to_string()),
                 },
                 HitlItemSummary {
                     work_id: "w2:impl".to_string(),
@@ -1023,7 +1023,7 @@ mod tests {
         // Verify HITL list is displayed.
         assert!(out.contains("HITL Items (3 awaiting review)"));
         // Verify grouping labels appear.
-        assert!(out.contains("Spec Conflict (evaluate_failure)"));
+        assert!(out.contains("Evaluate Failure (evaluate_failure)"));
         assert!(out.contains("Failure (retry_max_exceeded)"));
         assert!(out.contains("Other"));
         // Verify items are listed.
@@ -1320,7 +1320,7 @@ mod tests {
     fn reason_display_labels_are_correct() {
         assert_eq!(
             reason_display_label("evaluate_failure"),
-            "Spec Conflict (evaluate_failure)"
+            "Evaluate Failure (evaluate_failure)"
         );
         assert_eq!(
             reason_display_label("retry_max_exceeded"),
@@ -1350,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn hitl_list_priority_order_spec_conflict_first() {
+    fn hitl_list_priority_order_evaluate_failure_first() {
         let items = vec![
             HitlItemSummary {
                 work_id: "other-item".to_string(),
@@ -1375,13 +1375,13 @@ mod tests {
         write_hitl_list(&mut output, &items).unwrap();
         let out = String::from_utf8(output).unwrap();
 
-        // Spec Conflict should appear before Failure, which should appear before Other.
-        let spec_pos = out.find("Spec Conflict").unwrap();
+        // Evaluate Failure should appear before Failure, which should appear before Other.
+        let spec_pos = out.find("Evaluate Failure").unwrap();
         let failure_pos = out.find("Failure (timeout)").unwrap();
         let other_pos = out.find("Other").unwrap();
         assert!(
             spec_pos < failure_pos,
-            "spec-conflict should appear before failure"
+            "evaluate failure should appear before failure"
         );
         assert!(
             failure_pos < other_pos,

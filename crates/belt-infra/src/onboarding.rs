@@ -3,7 +3,7 @@
 //! Orchestrates the full workspace registration process:
 //! 1. Parse workspace.yml
 //! 2. Save workspace to DB
-//! 3. Seed per-workspace cron jobs (CR-13)
+//! 3. Seed per-workspace cron jobs
 //! 4. Create per-workspace Claw directory (R-052)
 
 use std::path::{Path, PathBuf};
@@ -30,7 +30,7 @@ pub struct OnboardingResult {
     pub claw_dir: PathBuf,
 }
 
-/// Per-workspace cron seed definitions (CR-13).
+/// Per-workspace cron seed definitions.
 ///
 /// Each tuple is `(job_name_suffix, schedule_expression)`.
 const WORKSPACE_CRON_SEEDS: &[(&str, &str)] = &[
@@ -81,7 +81,7 @@ pub fn onboard_workspace(
         Err(e) => return Err(e.into()),
     };
 
-    // Step 3: Seed per-workspace cron jobs (CR-13)
+    // Step 3: Seed per-workspace cron jobs
     let cron_jobs_seeded = seed_workspace_cron_jobs(db, &config.name)?;
 
     // Step 4: Create per-workspace Claw directory (R-052)

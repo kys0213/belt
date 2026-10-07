@@ -18,7 +18,7 @@ use belt_core::hitl::{
 };
 use belt_core::lineage::{AttemptStatus, CollectDecision, collect_decision, count_since_reset};
 use belt_core::phase::QueuePhase;
-use belt_core::queue::{HitlReason, HitlRespondAction, QueueItem};
+use belt_core::queue::{HitlReason, QueueItem};
 use belt_core::runtime::TokenUsage;
 use belt_core::transition::{
     Actor, GuardDecision, ItemSnapshot, Processing, TransitionOutcome, TransitionReason,
@@ -2939,10 +2939,7 @@ fn row_to_hitl_request(row: &rusqlite::Row<'_>) -> Result<HitlRequest, BeltError
             let action = action.ok_or_else(|| missing("action"))?;
             let path = col::<Option<String>>(row, 11)?.ok_or_else(|| missing("confirm_path"))?;
             Some(HitlResolution {
-                action: action
-                    .parse::<HitlRespondAction>()
-                    .map(HitlAction::from)
-                    .map_err(BeltError::Database)?,
+                action: action.parse::<HitlAction>().map_err(BeltError::Database)?,
                 by: col::<Option<String>>(row, 9)?.ok_or_else(|| missing("respondent"))?,
                 via: col::<Option<String>>(row, 10)?.ok_or_else(|| missing("via"))?,
                 at: col::<Option<String>>(row, 12)?.ok_or_else(|| missing("resolved_at"))?,
@@ -3340,9 +3337,6 @@ fn parse_hitl_reason(s: &str) -> Result<HitlReason, BeltError> {
         "retry_max_exceeded" => Ok(HitlReason::RetryMaxExceeded),
         "timeout" => Ok(HitlReason::Timeout),
         "manual_escalation" => Ok(HitlReason::ManualEscalation),
-        "spec_conflict" => Ok(HitlReason::SpecConflict),
-        "spec_completion_review" => Ok(HitlReason::SpecCompletionReview),
-        "spec_modification_proposed" => Ok(HitlReason::SpecModificationProposed),
         "stagnation_detected" => Ok(HitlReason::StagnationDetected),
         other => Err(BeltError::Database(format!("unknown hitl_reason: {other}"))),
     }

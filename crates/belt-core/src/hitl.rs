@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::escalation::EscalationAction;
 use crate::phase::QueuePhase;
-use crate::queue::HitlRespondAction;
 
 /// HITL 요청 인스턴스 식별자. 전역에서 고유하다.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -28,7 +27,7 @@ impl fmt::Display for HitlId {
     }
 }
 
-/// HITL 응답 액션. [`HitlRespondAction`]을 대체할 타입이며 그 전까지 `From`으로 공존한다.
+/// HITL 응답 액션 — 사용자가 HITL 요청에 대해 취할 수 있는 행동.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HitlAction {
@@ -38,24 +37,18 @@ pub enum HitlAction {
     Replan,
 }
 
-impl From<HitlRespondAction> for HitlAction {
-    fn from(action: HitlRespondAction) -> Self {
-        match action {
-            HitlRespondAction::Done => HitlAction::Done,
-            HitlRespondAction::Retry => HitlAction::Retry,
-            HitlRespondAction::Skip => HitlAction::Skip,
-            HitlRespondAction::Replan => HitlAction::Replan,
-        }
-    }
-}
+impl std::str::FromStr for HitlAction {
+    type Err = String;
 
-impl From<HitlAction> for HitlRespondAction {
-    fn from(action: HitlAction) -> Self {
-        match action {
-            HitlAction::Done => HitlRespondAction::Done,
-            HitlAction::Retry => HitlRespondAction::Retry,
-            HitlAction::Skip => HitlRespondAction::Skip,
-            HitlAction::Replan => HitlRespondAction::Replan,
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "done" => Ok(HitlAction::Done),
+            "retry" => Ok(HitlAction::Retry),
+            "skip" => Ok(HitlAction::Skip),
+            "replan" => Ok(HitlAction::Replan),
+            _ => Err(format!(
+                "invalid HITL respond action: {s} (expected: done, retry, skip, replan)"
+            )),
         }
     }
 }
@@ -142,17 +135,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn action_converts_both_ways_without_loss() {
-        for legacy in [
-            HitlRespondAction::Done,
-            HitlRespondAction::Retry,
-            HitlRespondAction::Skip,
-            HitlRespondAction::Replan,
-        ] {
-            let action = HitlAction::from(legacy);
-            assert_eq!(action.to_string(), legacy.to_string());
-            assert_eq!(HitlRespondAction::from(action), legacy);
+    fn action_string_roundtrip() {
+        for name in ["done", "retry", "skip", "replan"] {
+            let action: HitlAction = name.parse().unwrap();
+            assert_eq!(action.to_string(), name);
         }
+        assert!("invalid".parse::<HitlAction>().is_err());
     }
 
     #[test]

@@ -19,14 +19,8 @@ pub enum HitlReason {
     Timeout,
     /// 수동 escalation (사용자 요청).
     ManualEscalation,
-    /// Spec 충돌 감지 — 파일 수준 overlap으로 사람의 판단 필요.
-    SpecConflict,
     /// 정체 감지 — 에이전트가 반복/진동/무진전 등의 stagnation 패턴을 보임.
     StagnationDetected,
-    /// spec Completing 단계 최종 확인 (gap-detection 통과 후 HITL 승인 대기).
-    SpecCompletionReview,
-    /// Claw 에이전트가 제안한 스펙 수정.
-    SpecModificationProposed,
 }
 
 impl fmt::Display for HitlReason {
@@ -36,51 +30,7 @@ impl fmt::Display for HitlReason {
             HitlReason::RetryMaxExceeded => f.write_str("retry_max_exceeded"),
             HitlReason::Timeout => f.write_str("timeout"),
             HitlReason::ManualEscalation => f.write_str("manual_escalation"),
-            HitlReason::SpecConflict => f.write_str("spec_conflict"),
             HitlReason::StagnationDetected => f.write_str("stagnation_detected"),
-            HitlReason::SpecCompletionReview => f.write_str("spec_completion_review"),
-            HitlReason::SpecModificationProposed => f.write_str("spec_modification_proposed"),
-        }
-    }
-}
-
-/// HITL 응답 액션 — 사용자가 HITL 아이템에 대해 취할 수 있는 행동.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HitlRespondAction {
-    /// 완료 처리 (HITL → Done).
-    Done,
-    /// 재시도 (HITL → Pending).
-    Retry,
-    /// 건너뛰기 (HITL → Skipped).
-    Skip,
-    /// 재계획 (HITL → Failed, replan 트리거).
-    Replan,
-}
-
-impl std::str::FromStr for HitlRespondAction {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "done" => Ok(HitlRespondAction::Done),
-            "retry" => Ok(HitlRespondAction::Retry),
-            "skip" => Ok(HitlRespondAction::Skip),
-            "replan" => Ok(HitlRespondAction::Replan),
-            _ => Err(format!(
-                "invalid HITL respond action: {s} (expected: done, retry, skip, replan)"
-            )),
-        }
-    }
-}
-
-impl fmt::Display for HitlRespondAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            HitlRespondAction::Done => f.write_str("done"),
-            HitlRespondAction::Retry => f.write_str("retry"),
-            HitlRespondAction::Skip => f.write_str("skip"),
-            HitlRespondAction::Replan => f.write_str("replan"),
         }
     }
 }
@@ -299,9 +249,6 @@ impl QueueItem {
                 "retry_max_exceeded" => Ok(HitlReason::RetryMaxExceeded),
                 "timeout" => Ok(HitlReason::Timeout),
                 "manual_escalation" => Ok(HitlReason::ManualEscalation),
-                "spec_conflict" => Ok(HitlReason::SpecConflict),
-                "spec_completion_review" => Ok(HitlReason::SpecCompletionReview),
-                "spec_modification_proposed" => Ok(HitlReason::SpecModificationProposed),
                 "stagnation_detected" => Ok(HitlReason::StagnationDetected),
                 other => Err(format!("invalid hitl_reason: {other}")),
             })
@@ -450,17 +397,25 @@ mod tests {
     }
 
     #[test]
-    fn hitl_respond_action_roundtrip() {
-        let actions = ["done", "retry", "skip", "replan"];
-        for s in actions {
-            let action: HitlRespondAction = s.parse().unwrap();
-            assert_eq!(action.to_string(), s);
+    fn hitl_reason_vocabulary_matches_spec() {
+        let reasons = [
+            (HitlReason::EvaluateFailure, "evaluate_failure"),
+            (HitlReason::RetryMaxExceeded, "retry_max_exceeded"),
+            (HitlReason::Timeout, "timeout"),
+            (HitlReason::ManualEscalation, "manual_escalation"),
+            (HitlReason::StagnationDetected, "stagnation_detected"),
+        ];
+        for (reason, name) in reasons {
+            assert_eq!(reason.to_string(), name);
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{name}\"")
+            );
+            let mut item = test_item("s1", "analyze");
+            item.hitl_reason = Some(reason);
+            let restored = QueueItem::from_row(&item.to_row()).unwrap();
+            assert_eq!(restored.hitl_reason, Some(reason));
         }
-    }
-
-    #[test]
-    fn hitl_respond_action_invalid() {
-        assert!("invalid".parse::<HitlRespondAction>().is_err());
     }
 
     #[test]
@@ -475,10 +430,9 @@ mod tests {
             HitlReason::ManualEscalation.to_string(),
             "manual_escalation"
         );
-        assert_eq!(HitlReason::SpecConflict.to_string(), "spec_conflict");
         assert_eq!(
-            HitlReason::SpecModificationProposed.to_string(),
-            "spec_modification_proposed"
+            HitlReason::StagnationDetected.to_string(),
+            "stagnation_detected"
         );
     }
 
@@ -642,21 +596,5 @@ mod tests {
         let restored = QueueItem::from_row(&row).unwrap();
         assert_eq!(restored.derived_from.as_deref(), Some("s1:analyze"));
         assert_eq!(restored.lineage_root, "s1:analyze");
-    }
-
-    #[test]
-    fn spec_modification_proposed_reason_roundtrip() {
-        let mut item = test_item("s1", "analyze");
-        item.hitl_reason = Some(HitlReason::SpecModificationProposed);
-        let row = item.to_row();
-        assert_eq!(
-            row.hitl_reason.as_deref(),
-            Some("spec_modification_proposed")
-        );
-        let restored = QueueItem::from_row(&row).unwrap();
-        assert_eq!(
-            restored.hitl_reason,
-            Some(HitlReason::SpecModificationProposed)
-        );
     }
 }
