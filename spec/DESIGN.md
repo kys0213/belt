@@ -197,10 +197,11 @@ flowchart TD
     F -- "hitl" --> H["Hitl 전이 commit 후 on_escalation과 on_fail 실행, HITL 요청"]
     C --> E{"Evaluator 판정"}
     E -- "완료" --> OD["on_done 실행"]
-    E -- "사람 필요" --> H
+    E -- "사람 필요" --> EH["Hitl 전이, HITL 요청 생성"]
     OD -- "성공" --> D["Done"]
     OD -- "실패" --> FL["Failed"]
     H --> HR["사람 응답 또는 timeout, 이후 daemon 후처리"]
+    EH --> HR
     HR --> D
     HR --> SK["Skipped"]
     HR --> PE["Pending (retry)"]

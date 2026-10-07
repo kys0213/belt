@@ -86,10 +86,11 @@ flowchart TD
     F -- "3 hitl" --> H["on_fail 실행, lateral 이력 첨부, HITL 요청 생성, worktree 보존"]
     C --> E{"evaluate per-item"}
     E -- "완료 판정" --> D["on_done 실행"]
-    E -- "사람 필요" --> H
+    E -- "사람 필요" --> EH["Hitl 전이, HITL 요청 생성"]
     D -- "성공" --> Done["Done, worktree 정리"]
     D -- "실패" --> Failed["Failed, worktree 보존"]
     H --> P["사람 응답 후 daemon 후처리"]
+    EH --> P
     P -- "done" --> Done
     P -- "skip" --> Sk["Skipped, worktree 정리"]
     P -- "retry" --> Pe["같은 아이템 Pending, failure_count 리셋"]
@@ -385,10 +386,13 @@ Completed는 **안전한 대기 상태**. evaluate가 실패하든 CLI가 실패
 
 | 실패 유형 | 동작 | 상태 |
 |-----------|------|------|
-| evaluate LLM 오류/timeout | Completed 유지, 다음 Daemon tick에서 재시도 | Completed |
-| evaluate 반복 실패 (3회) | HITL로 에스컬레이션 | → Hitl |
+| evaluate LLM 오류/timeout | 아이템별 evaluate 실패 횟수에 1을 더하고, Completed 유지, 다음 Daemon tick에서 재시도 | Completed |
+| evaluator의 Retry 결과 (Mechanical 단계 실패 등) | evaluate 오류와 같은 아이템별 evaluate 실패 횟수에 1을 더하고, Completed 유지, handler는 다시 실행하지 않음 | Completed |
+| evaluate 실패 횟수가 상한(3회)에 도달 | HITL로 에스컬레이션 | → Hitl |
 | CLI 호출 실패 (`belt queue done/hitl`) | Completed 유지 + 에러 로그, 다음 tick 재시도 | Completed |
 | on_done script 실패 | Failed 상태 (on_fail은 실행하지 않음 — handler 실패가 아니므로) | → Failed |
+
+> evaluate 실패 횟수는 아이템별로 세고, Retry 결과와 evaluate 오류를 합산한다. evaluate가 완료로 판정되면 횟수는 0으로 돌아간다.
 
 ---
 
