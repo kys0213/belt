@@ -4,6 +4,7 @@ use async_trait::async_trait;
 
 use crate::context::ItemContext;
 use crate::escalation::EscalationAction;
+use crate::hitl::HitlAction;
 use crate::queue::QueueItem;
 
 /// Context passed to lifecycle hook methods.
@@ -40,6 +41,8 @@ pub struct HookContext {
 /// | `on_done`        | transition to Failed                    |
 /// | `on_fail`        | log only, do not interrupt flow         |
 /// | `on_escalation`  | log only, escalation proceeds           |
+/// | `on_hitl_opened` | log only, no retry                      |
+/// | `on_hitl_resolved` | log only, post-processing proceeds    |
 #[async_trait]
 pub trait LifecycleHook: Send + Sync {
     /// Called after entering Running, before handler execution.
@@ -67,6 +70,28 @@ pub trait LifecycleHook: Send + Sync {
         ctx: &HookContext,
         action: EscalationAction,
     ) -> anyhow::Result<()>;
+
+    /// Called once per open HITL request when the daemon observes it,
+    /// whichever path opened it. Requests already confirmed are skipped.
+    ///
+    /// A failure is logged and never retried; the request stays open.
+    async fn on_hitl_opened(&self, _ctx: &HookContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Called by HITL post-processing after the verdict is confirmed, before
+    /// the result transition. `action` is the confirmed verdict.
+    ///
+    /// Post-processing is at-least-once, so this can run twice for one
+    /// request: implementations must be idempotent. A failure is logged and
+    /// post-processing proceeds.
+    async fn on_hitl_resolved(
+        &self,
+        _ctx: &HookContext,
+        _action: HitlAction,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 /// A no-op lifecycle hook that does nothing.
@@ -157,6 +182,8 @@ mod tests {
         hook.on_escalation(&ctx, EscalationAction::Hitl)
             .await
             .unwrap();
+        hook.on_hitl_opened(&ctx).await.unwrap();
+        hook.on_hitl_resolved(&ctx, HitlAction::Done).await.unwrap();
     }
 
     #[test]
