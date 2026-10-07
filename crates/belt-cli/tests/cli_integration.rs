@@ -421,10 +421,42 @@ fn spec_subcommand_does_not_exist() {
 // status: no spec section in any output format
 // ---------------------------------------------------------------------------
 
-/// Run `belt status --format <format>` against a seeded database and return stdout.
+/// Seed rows an older Belt left behind: a `<ws>:evaluate` cron job and a
+/// `specs` table with one row (the current schema no longer creates it).
+fn seed_legacy_spec_and_evaluate(tmp: &TempDir, db: &Database) {
+    db.add_cron_job("ws-test:evaluate", "0 */6 * * *", "", Some("ws-test"))
+        .expect("add legacy evaluate cron job");
+
+    let conn = rusqlite::Connection::open(tmp.path().join("belt.db")).expect("open raw db");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS specs (
+            id                TEXT PRIMARY KEY,
+            workspace_id      TEXT NOT NULL,
+            name              TEXT NOT NULL,
+            status            TEXT NOT NULL,
+            content           TEXT NOT NULL,
+            priority          INTEGER,
+            labels            TEXT,
+            depends_on        TEXT,
+            entry_point       TEXT,
+            decomposed_issues TEXT,
+            test_commands     TEXT,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL
+        );
+        INSERT INTO specs (id, workspace_id, name, status, content, created_at, updated_at)
+        VALUES ('legacy-spec-1', 'ws-test', 'legacy', 'active', 'legacy content',
+                '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+    )
+    .expect("seed legacy specs table");
+}
+
+/// Run `belt status --format <format>` against a database seeded with a HITL
+/// item plus legacy spec/evaluate rows, and return stdout.
 fn status_stdout(format: &str) -> String {
     let (tmp, db) = setup_belt_home();
     insert_hitl_item(&db, "work-status-1");
+    seed_legacy_spec_and_evaluate(&tmp, &db);
     drop(db);
 
     let output = run_belt(tmp.path(), &["status", "--format", format]);
@@ -434,6 +466,22 @@ fn status_stdout(format: &str) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+/// Assert that status printed the seeded HITL item. The text format only
+/// renders counts, so it is matched on those instead of names.
+fn assert_status_shows_seed(stdout: &str, format: &str) {
+    let needles: &[&str] = if format == "text" {
+        &["Total items: 1", "HITL: 1"]
+    } else {
+        &["ws-test", "work-status-1"]
+    };
+    for needle in needles {
+        assert!(
+            stdout.contains(needle),
+            "`belt status --format {format}` should mention {needle:?}:\n{stdout}"
+        );
+    }
 }
 
 /// Assert that the rendered status carries no spec-related key or label.
@@ -453,15 +501,20 @@ fn status_json_has_no_spec_section() {
     let value: serde_json::Value =
         serde_json::from_str(&stdout).expect("status json output should parse");
     assert!(value.is_object(), "status json should be an object");
+    assert_status_shows_seed(&stdout, "json");
     assert_no_spec_section(&stdout, "json");
 }
 
 #[test]
 fn status_text_has_no_spec_section() {
-    assert_no_spec_section(&status_stdout("text"), "text");
+    let stdout = status_stdout("text");
+    assert_status_shows_seed(&stdout, "text");
+    assert_no_spec_section(&stdout, "text");
 }
 
 #[test]
 fn status_rich_has_no_spec_section() {
-    assert_no_spec_section(&status_stdout("rich"), "rich");
+    let stdout = status_stdout("rich");
+    assert_status_shows_seed(&stdout, "rich");
+    assert_no_spec_section(&stdout, "rich");
 }

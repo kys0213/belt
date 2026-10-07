@@ -29,4 +29,5 @@ crossterm = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 tempfile = "3"
+rusqlite = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
