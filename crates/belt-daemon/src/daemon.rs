@@ -349,6 +349,17 @@ impl Daemon {
         Ok(outcome)
     }
 
+    /// Whether a commit lost to a writer that finished the row (Done or
+    /// Skipped): the in-memory copy has nothing left to process.
+    fn lost_to_finished_row(outcome: &TransitionOutcome) -> bool {
+        matches!(
+            outcome,
+            TransitionOutcome::Conflict {
+                current: QueuePhase::Done | QueuePhase::Skipped
+            }
+        )
+    }
+
     /// Turn a refused transition into the error public `mark_*` methods return.
     fn require_applied(
         outcome: TransitionOutcome,
@@ -475,7 +486,10 @@ impl Daemon {
     ///    only see changes made after the restore.
     /// 3. This workspace's non-terminal items are loaded, oldest first.
     ///
-    /// Assumes one daemon per database: every Running row belongs to a dead daemon.
+    /// One daemon owns one `belt_home` and therefore one database, so every
+    /// Running row belongs to a dead daemon whatever its workspace: step 1
+    /// rolls back all workspaces. Only this workspace's items are loaded into
+    /// memory (step 3); other workspaces' daemons restore their own.
     pub fn restore_from_store(&mut self) -> Result<usize> {
         for item in self.db.list_items(Some(QueuePhase::Running), None)? {
             let outcome = self.db.transition(&TransitionRequest {
@@ -1205,6 +1219,9 @@ impl Daemon {
             TransitionReason::Advance,
             None,
         )?;
+        if Self::lost_to_finished_row(&outcome) {
+            self.queue.retain(|it| it.work_id != work_id);
+        }
         Self::require_applied(outcome, from, QueuePhase::Completed)
     }
 
@@ -1226,7 +1243,13 @@ impl Daemon {
             TransitionReason::Advance,
             None,
         )?;
-        Self::require_applied(outcome, from, QueuePhase::Done)?;
+        let finished = Self::lost_to_finished_row(&outcome);
+        if let Err(e) = Self::require_applied(outcome, from, QueuePhase::Done) {
+            if finished {
+                self.queue.retain(|it| it.work_id != work_id);
+            }
+            return Err(e);
+        }
 
         // Lifecycle hook: on_done — fire and forget, log only on failure.
         let worktree_path = self.worktree_mgr.path(&item.work_id);
@@ -1478,7 +1501,13 @@ impl Daemon {
             TransitionReason::Advance,
             Some(error.clone()),
         )?;
-        Self::require_applied(outcome, from, QueuePhase::Failed)?;
+        let finished = Self::lost_to_finished_row(&outcome);
+        if let Err(e) = Self::require_applied(outcome, from, QueuePhase::Failed) {
+            if finished {
+                self.queue.retain(|it| it.work_id != work_id);
+            }
+            return Err(e);
+        }
         item.mark_worktree_preserved();
 
         // Register preserved worktree by source_id for potential reuse.
@@ -2209,6 +2238,7 @@ impl Daemon {
     /// 재사용할 수 있게 한다.
     pub fn rollback_running_to_pending(&mut self) {
         let ws_name = self.config.name.clone();
+        let mut finished_by_others = Vec::new();
         for item in self.queue.iter_mut() {
             if item.phase() == QueuePhase::Running {
                 // Register preserved worktree before rollback so it can be reused.
@@ -2244,6 +2274,9 @@ impl Daemon {
                             current = ?current,
                             "rollback conflicted; following stored phase"
                         );
+                        if matches!(current, QueuePhase::Done | QueuePhase::Skipped) {
+                            finished_by_others.push(item.work_id.clone());
+                        }
                         self.tracker.release(&ws_name);
                         continue;
                     }
@@ -2282,6 +2315,8 @@ impl Daemon {
                 );
             }
         }
+        self.queue
+            .retain(|item| !finished_by_others.contains(&item.work_id));
     }
 
     /// Shutdown이 요청되었는지 확인.
@@ -2735,6 +2770,10 @@ impl Daemon {
     /// A new Pending item is created through the collection contract, so the
     /// store must issue the same `work_id` the item carries. An item at any
     /// other phase has no collection path; its row is written as given.
+    ///
+    /// # Panics
+    /// When the store rejects the row or cannot be read.
+    #[doc(hidden)]
     pub fn push_item(&mut self, item: QueueItem) {
         Self::ensure_row(&self.db, &item);
         self.queue.push_back(item);

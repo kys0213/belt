@@ -43,6 +43,9 @@ pub struct Advancer<'a> {
     db: &'a Option<Arc<Database>>,
     ws_name: &'a str,
     ws_concurrency: u32,
+    /// Items whose claim lost to a writer that finished them (Done or
+    /// Skipped). They leave the queue once the loop that holds indices ends.
+    finished_by_others: Vec<String>,
 }
 
 impl<'a> Advancer<'a> {
@@ -60,7 +63,17 @@ impl<'a> Advancer<'a> {
             db,
             ws_name,
             ws_concurrency,
+            finished_by_others: Vec::new(),
         }
+    }
+
+    /// Remove the copies whose claim found a finished row.
+    ///
+    /// Deferred to the end of a run because the loops address the queue by
+    /// index.
+    fn drop_finished_by_others(&mut self) {
+        let finished = std::mem::take(&mut self.finished_by_others);
+        self.queue.retain(|item| !finished.contains(&item.work_id));
     }
 
     /// Auto-transition Pending -> Ready -> Running (respecting concurrency).
@@ -124,6 +137,7 @@ impl<'a> Advancer<'a> {
             }
         }
 
+        self.drop_finished_by_others();
         advanced
     }
 
@@ -144,6 +158,7 @@ impl<'a> Advancer<'a> {
         for idx in pending_indices {
             self.claim(idx, QueuePhase::Ready);
         }
+        self.drop_finished_by_others();
     }
 
     fn require_db(&self) -> &Database {
@@ -192,6 +207,9 @@ impl<'a> Advancer<'a> {
                     "claim lost to another writer; following stored phase"
                 );
                 self.queue[idx].set_phase_unchecked(current);
+                if matches!(current, QueuePhase::Done | QueuePhase::Skipped) {
+                    self.finished_by_others.push(request.work_id.clone());
+                }
                 false
             }
             Ok(
@@ -248,6 +266,7 @@ impl<'a> Advancer<'a> {
                 self.tracker.track(&ws);
             }
         }
+        self.drop_finished_by_others();
     }
 
     /// Check whether a queue item's queue_dependencies are all Done.

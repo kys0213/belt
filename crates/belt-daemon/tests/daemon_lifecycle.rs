@@ -679,6 +679,10 @@ mod claim {
 
         assert!(outcomes.is_empty(), "no handler may run: {outcomes:?}");
         assert_eq!(daemon.items_in_phase(QueuePhase::Running).len(), 0);
+        assert!(
+            daemon.get_item(&work_id).is_none(),
+            "a copy whose row is Skipped leaves the queue"
+        );
         assert_eq!(hook.on_enter.load(Ordering::SeqCst), 0);
         let log = other.transitions_of(&work_id).unwrap();
         assert!(
@@ -1176,6 +1180,68 @@ mod store_owned {
 
         daemon.tick().await.unwrap();
         assert_eq!(daemon.get_item(id).unwrap().phase(), QueuePhase::Ready);
+    }
+
+    #[tokio::test]
+    async fn commit_conflict_on_a_finished_row_drops_the_copy() {
+        let tmp = TempDir::new().unwrap();
+        let path = db_path(&tmp);
+        let source = SharedSource::default();
+        let mut daemon = daemon_over(&tmp, source.clone(), Database::open(&path).unwrap());
+        let id = "github:org/repo#1:analyze";
+
+        source.offer("github:org/repo#1", "analyze");
+        daemon.collect().await.unwrap();
+        let db = Arc::clone(daemon.database());
+        for (from, to) in [
+            (QueuePhase::Pending, QueuePhase::Ready),
+            (QueuePhase::Ready, QueuePhase::Running),
+            (QueuePhase::Running, QueuePhase::Completed),
+        ] {
+            move_item(&db, id, from, to, Actor::Daemon);
+        }
+        daemon.restore_from_store().unwrap();
+        assert_eq!(daemon.get_item(id).unwrap().phase(), QueuePhase::Completed);
+
+        let cli = Database::open(&path).unwrap();
+        move_item(
+            &cli,
+            id,
+            QueuePhase::Completed,
+            QueuePhase::Done,
+            Actor::Cli,
+        );
+
+        assert!(daemon.mark_done(id).is_err());
+        assert!(daemon.get_item(id).is_none(), "finished row: no copy kept");
+        assert_eq!(cli.get_item(id).unwrap().phase(), QueuePhase::Done);
+    }
+
+    #[tokio::test]
+    async fn rollback_conflict_on_a_finished_row_drops_the_copy() {
+        let tmp = TempDir::new().unwrap();
+        let path = db_path(&tmp);
+        let source = SharedSource::default();
+        let mut daemon = daemon_over(&tmp, source.clone(), Database::open(&path).unwrap());
+        let id = "github:org/repo#1:analyze";
+
+        source.offer("github:org/repo#1", "analyze");
+        daemon.collect().await.unwrap();
+        daemon.advance();
+        assert_eq!(daemon.get_item(id).unwrap().phase(), QueuePhase::Running);
+
+        let other = Database::open(&path).unwrap();
+        move_item(
+            &other,
+            id,
+            QueuePhase::Running,
+            QueuePhase::Skipped,
+            Actor::Daemon,
+        );
+
+        daemon.rollback_running_to_pending();
+        assert!(daemon.get_item(id).is_none(), "finished row: no copy kept");
+        assert_eq!(other.get_item(id).unwrap().phase(), QueuePhase::Skipped);
     }
 
     #[tokio::test]
