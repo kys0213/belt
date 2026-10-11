@@ -1435,6 +1435,11 @@ sources:
           label: "belt:short"
         handlers:
           - script: "sleep 1"
+      short_fail:
+        trigger:
+          label: "belt:short_fail"
+        handlers:
+          - script: "sleep 1; exit 1"
       fast:
         trigger:
           label: "belt:fast"
@@ -2000,6 +2005,61 @@ sources:
         assert!(h.daemon.get_item(work_id).is_none());
         assert_eq!(h.daemon.running_count(), 0);
         assert_eq!(h.daemon.handlers_in_flight(), 0);
+    }
+
+    /// A direct cancel records the run's one `skipped` attempt; the handler
+    /// that keeps running and then ends on its own (success or failure)
+    /// adds no attempt and no reaction for the same execution.
+    async fn a_handler_ending_after_a_direct_cancel_adds_no_attempt(state: &str) {
+        let mut h = harness(
+            &[("github:org/repo#1", state)],
+            2,
+            Database::open_in_memory().unwrap(),
+        );
+        let work_id = format!("github:org/repo#1:{state}");
+        tick_quickly(&mut h.daemon).await;
+        reported_pid(&h.daemon, &work_id).await;
+
+        let other = Arc::clone(h.daemon.database());
+        let request_id = request(&other, &work_id);
+        let outcome = cancel_directly(&other, &NoKill, request_id, &Actor::Cli).unwrap();
+        assert!(matches!(outcome, DirectCancelOutcome::Canceled { .. }));
+
+        // No tick in between: the handler ends by itself and its result
+        // meets the Skipped row.
+        let outcomes = tokio::time::timeout(Duration::from_secs(5), h.daemon.join_handlers())
+            .await
+            .expect("the handler ends by itself");
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [ItemOutcome::Conflicted {
+                    current: QueuePhase::Skipped,
+                    ..
+                }]
+            ),
+            "got {outcomes:?}"
+        );
+        tick_quickly(&mut h.daemon).await;
+
+        assert_eq!(phase(&h.daemon, &work_id), QueuePhase::Skipped);
+        assert_eq!(
+            history_statuses(h.daemon.db(), "github:org/repo#1"),
+            vec!["skipped".to_string()]
+        );
+        assert_eq!(h.hook.on_fail.load(Ordering::SeqCst), 0);
+        assert_eq!(h.hook.on_escalation.load(Ordering::SeqCst), 0);
+        assert_eq!(h.daemon.db().failure_count(&work_id).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_handler_succeeding_after_a_direct_cancel_adds_no_attempt() {
+        a_handler_ending_after_a_direct_cancel_adds_no_attempt("short").await;
+    }
+
+    #[tokio::test]
+    async fn a_handler_failing_after_a_direct_cancel_adds_no_attempt() {
+        a_handler_ending_after_a_direct_cancel_adds_no_attempt("short_fail").await;
     }
 
     /// A handler task that panics is a failed attempt: its slot is returned
