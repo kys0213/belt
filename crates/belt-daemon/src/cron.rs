@@ -1027,28 +1027,6 @@ struct MergedPrInfo {
     review_bodies: Vec<String>,
 }
 
-/// Extract `owner/repo` from a GitHub URL.
-///
-/// Handles HTTPS and SSH formats: `https://github.com/owner/repo`,
-/// `https://github.com/owner/repo.git`, `git@github.com:owner/repo.git`.
-fn extract_repo_name(url: &str) -> Option<String> {
-    let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
-    // SSH format: git@github.com:owner/repo
-    if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
-        return Some(rest.to_string());
-    }
-    // HTTPS format
-    let parts: Vec<&str> = trimmed.split('/').collect();
-    if parts.len() >= 2 {
-        let owner = parts[parts.len() - 2];
-        let repo = parts[parts.len() - 1];
-        if !owner.is_empty() && !repo.is_empty() {
-            return Some(format!("{owner}/{repo}"));
-        }
-    }
-    None
-}
-
 /// Fetch recently merged PRs for a repo using the `gh` CLI.
 ///
 /// Returns an empty Vec on failure (non-fatal).
@@ -1480,7 +1458,9 @@ impl KnowledgeExtractionJob {
                 None => continue,
             };
 
-            let repo = match extract_repo_name(source_url) {
+            let repo = match belt_infra::sources::github::GitHubDataSource::extract_repo_name(
+                source_url,
+            ) {
                 Some(r) => r,
                 None => {
                     tracing::warn!(
@@ -3072,42 +3052,6 @@ mod tests {
         let names: Vec<&str> = engine.jobs.iter().map(|j| j.name.as_str()).collect();
         assert!(names.contains(&"my_backup"));
         assert!(names.contains(&"my_sync"));
-    }
-
-    // -- Merged PR knowledge extraction helper tests --
-
-    #[test]
-    fn extract_repo_name_https() {
-        assert_eq!(
-            extract_repo_name("https://github.com/org/repo"),
-            Some("org/repo".to_string())
-        );
-        assert_eq!(
-            extract_repo_name("https://github.com/org/repo.git"),
-            Some("org/repo".to_string())
-        );
-        assert_eq!(
-            extract_repo_name("https://github.com/org/repo/"),
-            Some("org/repo".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_repo_name_ssh() {
-        assert_eq!(
-            extract_repo_name("git@github.com:org/repo.git"),
-            Some("org/repo".to_string())
-        );
-        assert_eq!(
-            extract_repo_name("git@github.com:owner/project"),
-            Some("owner/project".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_repo_name_invalid() {
-        assert_eq!(extract_repo_name("not-a-url"), None);
-        assert_eq!(extract_repo_name(""), None);
     }
 
     #[test]
