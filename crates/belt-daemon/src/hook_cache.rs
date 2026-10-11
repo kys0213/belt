@@ -25,7 +25,6 @@ use belt_core::platform::ShellExecutor;
 use belt_core::workspace::WorkspaceConfig;
 use belt_infra::db::Database;
 use belt_infra::hooks;
-use belt_infra::script_hook::ScriptLifecycleHook;
 use belt_infra::workspace_loader::load_workspace_config;
 
 /// Cached hook entry: the hook impl plus the `updated_at` timestamp
@@ -168,10 +167,12 @@ impl DynamicHookLoader {
 
 /// Create the best-fit lifecycle hook for a workspace configuration.
 ///
-/// Priority chain:
-/// - DataSource-specific hook (e.g. `GitHubLifecycleHook`) via `hooks::resolve_hook`
-/// - `ScriptLifecycleHook` if yaml has `on_done`/`on_fail`/`on_enter` scripts
-/// - `NoopLifecycleHook` if nothing is configured
+/// The DataSource-specific hook (e.g. `GitHubLifecycleHook`) via
+/// `hooks::resolve_hook`, otherwise `NoopLifecycleHook`.
+///
+/// The yaml `on_enter`/`on_done`/`on_fail` scripts are never wrapped in a
+/// hook: the daemon runs them itself at each event, so a hook running them
+/// too would run every script twice.
 pub fn hook_for_workspace(
     config: &WorkspaceConfig,
     shell: Arc<dyn ShellExecutor>,
@@ -187,28 +188,9 @@ pub fn hook_for_workspace(
         }
     }
 
-    let has_lifecycle_scripts = config.sources.values().any(|source| {
-        source.states.values().any(|state| {
-            !state.on_enter.is_empty() || !state.on_done.is_empty() || !state.on_fail.is_empty()
-        })
-    });
-    if has_lifecycle_scripts {
-        tracing::debug!(
-            workspace = %config.name,
-            "hook loader: resolved ScriptLifecycleHook from yaml scripts"
-        );
-        let mut state_configs = std::collections::HashMap::new();
-        for source in config.sources.values() {
-            for (state_name, state_config) in &source.states {
-                state_configs.insert(state_name.clone(), state_config.clone());
-            }
-        }
-        return Arc::new(ScriptLifecycleHook::new(state_configs, shell));
-    }
-
     tracing::debug!(
         workspace = %config.name,
-        "hook loader: no hook configuration found, using NoopLifecycleHook"
+        "hook loader: no DataSource-specific hook, using NoopLifecycleHook"
     );
     Arc::new(belt_core::lifecycle::NoopLifecycleHook)
 }
@@ -442,10 +424,10 @@ sources:
     }
 
     #[test]
-    fn resolve_script_hook_when_scripts_defined() {
+    fn yaml_scripts_of_a_source_without_its_own_hook_are_not_run_by_the_hook() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Arc::new(test_db());
-        let shell: Arc<dyn ShellExecutor> = Arc::new(StubShell);
+        let shell = Arc::new(RecordingShell::default());
 
         let yaml = r#"
 name: script-ws
@@ -461,20 +443,27 @@ sources:
       implement:
         trigger: {}
         handlers: []
+        on_enter:
+          - script: "echo enter"
         on_done:
           - script: "echo done"
+        on_fail:
+          - script: "echo fail"
 "#;
         let yaml_path = write_workspace_yaml(&tmp, "script-ws", yaml);
         register_workspace(&db, "script-ws", yaml_path.to_str().unwrap());
 
-        let loader = DynamicHookLoader::new(db, shell, 4);
+        let loader = DynamicHookLoader::new(db, shell.clone(), 4);
         let hook = loader.resolve("script-ws");
 
         let ctx = make_hook_context();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            assert!(hook.on_done(&ctx).await.is_ok());
+            hook.on_enter(&ctx).await.unwrap();
+            hook.on_done(&ctx).await.unwrap();
+            hook.on_fail(&ctx).await.unwrap();
         });
+        assert!(shell.commands.lock().unwrap().is_empty());
     }
 
     #[test]

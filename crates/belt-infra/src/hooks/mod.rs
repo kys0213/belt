@@ -61,7 +61,7 @@ impl HookParams {
 /// | `"github"`  | `GitHubLifecycleHook`      |
 ///
 /// Unknown source types return an error. Callers should fall back to
-/// `ScriptLifecycleHook` or `NoopLifecycleHook` when appropriate.
+/// `NoopLifecycleHook`.
 ///
 /// # Examples
 ///
@@ -85,7 +85,7 @@ pub fn create_hook(
         other => {
             bail!(
                 "unsupported DataSource type for lifecycle hook: '{other}'. \
-                 Use ScriptLifecycleHook or NoopLifecycleHook as fallback."
+                 Use NoopLifecycleHook as fallback."
             )
         }
     }
@@ -95,7 +95,7 @@ pub fn create_hook(
 ///
 /// Inspects the source key name and URL to determine the DataSource type,
 /// then delegates to [`create_hook`]. If the source type is not recognized,
-/// returns `None` so the caller can fall back to `ScriptLifecycleHook`.
+/// returns `None` so the caller can fall back to `NoopLifecycleHook`.
 pub fn resolve_hook(
     source_key: &str,
     source_url: &str,

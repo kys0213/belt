@@ -95,10 +95,10 @@ flowchart TD
     A["hook 트리거 시점"] --> B["workspace 설정 조회 (변경 시 다음 트리거에 반영)"]
     B --> C{"DataSource 유형에<br/>전용 hook 있음?"}
     C -- "있음 (github)" --> D[GitHubLifecycleHook]
-    C -- "없음" --> E{"yaml에 on_enter / on_done / on_fail script 있음?"}
-    E -- 있음 --> F[ScriptLifecycleHook]
-    E -- 없음 --> G[NoopLifecycleHook]
+    C -- "없음" --> G[NoopLifecycleHook]
 ```
+
+> yaml `on_enter`/`on_done`/`on_fail` script는 hook 선택과 무관하게 daemon이 각 시점에 직접 한 번 실행한다. 이 script를 실행하는 hook은 없다 — hook이 실행하면 같은 script가 두 번 돈다.
 
 - Daemon 재시작 없이 `belt workspace add`로 등록한 workspace는 다음 tick부터 동작한다.
 - yaml을 수정하면 다음 hook 트리거에서 최신 설정이 반영된다.
@@ -108,14 +108,13 @@ flowchart TD
 | hook | 동작 |
 |------|------|
 | GitHubLifecycleHook | `on_hitl_opened` 시 이슈에 라벨(기본 `belt:needs-human`) 추가. `on_hitl_resolved` 시 그 라벨 제거. 그 밖의 callback은 사람 대상 메시지를 보내지 않는다 |
-| ScriptLifecycleHook | yaml `on_enter`/`on_done`/`on_fail` script를 실행하는 어댑터. 전용 hook이 없는 DataSource에 쓰인다. `on_escalation`·`on_hitl_opened`·`on_hitl_resolved`는 무동작이다 |
 | NoopLifecycleHook | 아무 것도 하지 않는다 |
 
 > GitHub 이슈 코멘트(시작·실패·escalation·HITL 요청)는 hook이 아니라 GitHub origin channel이 작성한다. 라벨 추가·제거는 hook에 남는다.
 
 > github source에는 `GitHubLifecycleHook`이 항상 우선 적용된다. 이 hook은 PR 생성이나 라벨 전환(`belt:implement` → `belt:review`)을 하지 않는다. 이 작업은 workspace yaml의 `on_done` script에서 구현한다. daemon은 evaluate 성공 후 hook과 무관하게 해당 state의 `on_done` script를 실행한다.
 
-`jira` 등 다른 source는 전용 hook이 없어 `ScriptLifecycleHook` 또는 `NoopLifecycleHook`으로 동작한다. 새 DataSource 유형은 hook 구현을 추가하는 것으로 연결하며 코어를 바꾸지 않는다.
+`jira` 등 다른 source는 전용 hook이 없어 `NoopLifecycleHook`으로 동작한다. yaml script는 이때도 daemon이 실행한다. 새 DataSource 유형은 hook 구현을 추가하는 것으로 연결하며 코어를 바꾸지 않는다.
 
 ---
 
@@ -137,7 +136,7 @@ flowchart TD
   - 모든 hook 실패는 전이 이력에 hook 오류로 기록
 ```
 
-> GitHub 시작 코멘트는 channel `started` 이벤트가 작성한다. 코멘트 작성 실패는 handler 실행을 막지 않고 dashboard에 표시된다. `on_enter` 실패가 handler를 건너뛰게 하는 것은 hook이 상태 반영에 실패한 경우(ScriptLifecycleHook의 사용자 script 등)에 한정된다.
+> GitHub 시작 코멘트는 channel `started` 이벤트가 작성한다. 코멘트 작성 실패는 handler 실행을 막지 않고 dashboard에 표시된다. handler를 건너뛰게 하는 것은 `on_enter` hook이 상태 반영에 실패한 경우와 yaml `on_enter` script가 실패한 경우에 한정된다.
 
 ### on_hitl_opened
 
@@ -226,7 +225,15 @@ flowchart TD
 
 ## 기존 yaml on_done/on_fail/on_enter와의 호환
 
-`ScriptLifecycleHook`은 기존 workspace yaml의 `on_enter`/`on_done`/`on_fail` script를 그대로 실행한다. `handlers`만 필수이고 이 세 필드는 비워도 된다. 전용 hook이 있는 DataSource에서도 daemon은 evaluate 성공 후 state의 `on_done` script를 실행한다. PR 생성 같은 출처 작업은 이 script가 맡는다.
+daemon은 기존 workspace yaml의 `on_enter`/`on_done`/`on_fail` script를 hook 유형과 무관하게 직접 실행한다. `handlers`만 필수이고 이 세 필드는 비워도 된다.
+
+| script | daemon이 실행하는 시점 | 실패 시 |
+|--------|----------------------|---------|
+| `on_enter` | Running 진입 후 `on_enter` hook 다음, handler 실행 전 | handler 건너뛰고 escalation 경로 |
+| `on_done` | evaluate Done 판정 후, HITL done 후처리 | Failed (HITL done 후처리에서는 Hitl→Failed) |
+| `on_fail` | escalation 결과 전이가 applied로 commit된 뒤 (retry 제외), `on_fail` hook 전 | 이력 기록, 상태 전이에 영향 없음 |
+
+> 각 script는 이벤트마다 한 번만 실행된다. 전용 hook이 있는 DataSource에서도 같다. PR 생성 같은 출처 작업은 이 script가 맡는다.
 
 GitHub 이슈 코멘트 여부는 [workspace.yaml 스키마](./workspace-schema.md)의 `notifications` 이벤트 선택으로 정한다.
 
@@ -237,7 +244,7 @@ GitHub 이슈 코멘트 여부는 [workspace.yaml 스키마](./workspace-schema.
 - [ ] Daemon Executor는 상태 전이 시 hook callback을 트리거한다
 - [ ] hook callback의 구체적 동작은 DataSource 유형별 구현이 결정한다
 - [ ] LifecycleHook은 workspace별로 인스턴스가 생성된다
-- [ ] `ScriptLifecycleHook`이 기존 yaml script와 호환을 유지한다
+- [ ] yaml `on_enter`/`on_done`/`on_fail` script는 hook 유형과 무관하게 daemon이 이벤트마다 한 번 실행한다
 - [ ] on_escalation·on_fail은 escalation 결과 전이가 applied로 commit된 뒤 호출되고, on_escalation → on_fail 순서다. on_fail은 retry를 제외하고 호출된다
 - [ ] 결과 전이가 conflict면 hook을 호출하지 않는다
 - [ ] on_enter/on_done 실패 시 상태 전이에 영향을 준다 (escalation / Failed)
@@ -246,7 +253,7 @@ GitHub 이슈 코멘트 여부는 [workspace.yaml 스키마](./workspace-schema.
 - [ ] HITL done 후처리에서 on_done이 실패하면 Hitl→Failed로 전이하고, 이때도 `on_hitl_resolved`가 호출된다
 - [ ] `on_hitl_resolved`는 daemon 후처리에서 모든 해결 결과(done 성공, done의 on_done 실패, skip, retry, replan 상한 이내, replan 상한 초과, 만료)마다 결과 전이 직전에 호출되고, 실패해도 후처리가 결과 전이까지 진행한다
 - [ ] GitHub는 HITL 해결 후 `belt:needs-human` 라벨을 제거한다 (GitHub 코멘트, CLI, TUI, timeout 어느 경로든 같다)
-- [ ] 내장 hook 구현(GitHubLifecycleHook, NoopLifecycleHook)은 사람 대상 메시지를 보내지 않는다. 사람 대상 메시지는 channel이 보낸다 (사용자 정의 script를 실행하는 ScriptLifecycleHook은 제외)
+- [ ] 내장 hook 구현(GitHubLifecycleHook, NoopLifecycleHook)은 사람 대상 메시지를 보내지 않는다. 사람 대상 메시지는 channel이 보낸다 (사용자 정의 yaml script가 보내는 것은 제외)
 - [ ] 시작 코멘트 작성 실패가 handler 실행을 막지 않는다
 - [ ] 모든 hook 실패는 전이 이력에 기록된다
 - [ ] 새 DataSource 유형 추가 시 코어 변경 없이 hook 구현만 추가하면 된다

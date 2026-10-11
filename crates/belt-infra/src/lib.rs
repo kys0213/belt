@@ -7,7 +7,6 @@ pub mod ipc;
 pub mod onboarding;
 pub mod platform;
 pub mod runtimes;
-pub mod script_hook;
 pub mod sources;
 pub mod workspace_loader;
 pub mod worktree;

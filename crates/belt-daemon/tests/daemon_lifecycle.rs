@@ -2435,3 +2435,89 @@ sources:
         assert!(!wait_exit(&mut handler).await.success());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Lifecycle scripts of a workspace with no DataSource-specific hook
+// ---------------------------------------------------------------------------
+
+mod lifecycle_scripts {
+    use belt_core::platform::ShellExecutor;
+    use belt_daemon::hook_cache::hook_for_workspace;
+
+    use super::*;
+
+    /// A non-github source whose on_enter/on_fail scripts append one line
+    /// per run to `<dir>/enter.log` and `<dir>/fail.log`.
+    fn script_workspace(dir: &std::path::Path) -> WorkspaceConfig {
+        let yaml = format!(
+            r#"
+name: script-ws
+concurrency: 1
+sources:
+  jira:
+    url: https://jira.example.com/PROJ
+    states:
+      analyze:
+        trigger:
+          label: "belt:analyze"
+        on_enter:
+          - script: "echo enter >> {dir}/enter.log"
+        handlers:
+          - script: "exit 1"
+        on_fail:
+          - script: "echo fail >> {dir}/fail.log"
+    escalation:
+      1: hitl
+      terminal: skip
+"#,
+            dir = dir.display()
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    fn runs(path: std::path::PathBuf) -> usize {
+        std::fs::read_to_string(path)
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// The daemon runs the yaml lifecycle scripts itself, so the hook the
+    /// binary resolves for such a workspace must not run them again.
+    /// (spec: lifecycle-hook.md, "hook 선택" and "기존 yaml on_done/on_fail/on_enter와의 호환")
+    #[tokio::test]
+    async fn each_lifecycle_script_runs_once_per_event() {
+        let tmp = TempDir::new().unwrap();
+        let logs = tmp.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let config = script_workspace(&logs);
+        let shell: Arc<dyn ShellExecutor> =
+            Arc::from(belt_infra::platform::default_shell_executor());
+        let hook = hook_for_workspace(&config, shell);
+
+        let mut source = MockDataSource::new("jira");
+        source.add_item(test_item("jira:PROJ-1", "analyze"));
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(MockRuntime::new("mock", vec![0])));
+        let mut daemon = Daemon::new(
+            config,
+            vec![Box::new(source)],
+            Arc::new(registry),
+            Box::new(MockWorktreeManager::new(tmp.path().join("wt"))),
+            4,
+            Database::open_in_memory().unwrap(),
+        )
+        .with_hook(hook)
+        .with_belt_home(tmp.path().to_path_buf());
+
+        daemon.tick().await.unwrap();
+        daemon.join_handlers().await;
+
+        let work_id = "jira:PROJ-1:analyze";
+        assert_eq!(
+            daemon.db().get_item(work_id).unwrap().phase(),
+            QueuePhase::Hitl
+        );
+        assert_eq!(runs(logs.join("enter.log")), 1, "on_enter runs");
+        assert_eq!(runs(logs.join("fail.log")), 1, "on_fail runs");
+    }
+}
