@@ -116,19 +116,20 @@ pub fn resolve_hook(
 
 /// Extract `owner/repo` from a GitHub URL.
 ///
-/// Supports `https://github.com/owner/repo` and `git@github.com:owner/repo.git`.
+/// Supports `https://github.com/owner/repo`, `ssh://git@github.com/owner/repo`
+/// and the scp-like `git@github.com:owner/repo`, each with an optional
+/// trailing `.git` and `/`.
 fn extract_repo_from_url(url: &str) -> Option<String> {
     let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
-    let parts: Vec<&str> = trimmed.split('/').collect();
-    if parts.len() >= 2 {
-        Some(format!(
-            "{}/{}",
-            parts[parts.len() - 2],
-            parts[parts.len() - 1]
-        ))
-    } else {
-        None
-    }
+    // scp-like syntax separates host and path with `:` and has no scheme.
+    let path = match trimmed.split_once("://") {
+        Some((_, rest)) => rest,
+        None => trimmed.rsplit_once(':').map_or(trimmed, |(_, path)| path),
+    };
+    let mut segments = path.rsplit('/').filter(|s| !s.is_empty());
+    let repo = segments.next()?;
+    let owner = segments.next()?;
+    Some(format!("{owner}/{repo}"))
 }
 
 #[cfg(test)]
@@ -268,6 +269,29 @@ mod tests {
             extract_repo_from_url("https://github.com/org/repo.git"),
             Some("org/repo".to_string())
         );
+    }
+
+    #[test]
+    fn extract_repo_from_ssh_urls() {
+        for url in [
+            "git@github.com:org/repo.git",
+            "git@github.com:org/repo",
+            "git@github.com:org/repo.git/",
+            "ssh://git@github.com/org/repo.git",
+            "ssh://git@github.com/org/repo/",
+        ] {
+            assert_eq!(
+                extract_repo_from_url(url),
+                Some("org/repo".to_string()),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_repo_rejects_url_without_owner_and_repo() {
+        assert_eq!(extract_repo_from_url("git@github.com:repo.git"), None);
+        assert_eq!(extract_repo_from_url("repo"), None);
     }
 
     #[test]
