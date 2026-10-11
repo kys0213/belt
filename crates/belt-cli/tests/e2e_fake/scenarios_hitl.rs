@@ -7,9 +7,14 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::harness::{DaemonGuard, E2eEnv, wait_until};
-use crate::support::{TRIGGER, Workspace, first_work_id, on_fail_runs, progress_comments, rows_of};
+use crate::support::{
+    TRIGGER, Workspace, first_work_id, on_fail_runs, progress_comments, remove_label_script,
+    rows_of,
+};
 
 const RESPONDER: &str = "octo";
+/// A GitHub user outside `respond.allow`.
+const OUTSIDER: &str = "mallory";
 const NEEDS_HUMAN: &str = "belt:needs-human";
 
 /// A daemon whose only item failed into Hitl, with its open request id.
@@ -25,6 +30,11 @@ struct HitlSetup {
 }
 
 fn open_hitl() -> HitlSetup {
+    open_hitl_with(|_, _| {})
+}
+
+/// [`open_hitl`] with the workspace adjusted by `tweak` before install.
+fn open_hitl_with(tweak: impl FnOnce(&E2eEnv, &mut Workspace)) -> HitlSetup {
     let env = E2eEnv::new();
     let issue = env.gh.seed_issue("Analyze", "body", &[TRIGGER]);
     let work_id = first_work_id(issue);
@@ -33,6 +43,7 @@ fn open_hitl() -> HitlSetup {
     ws.escalation = "1: hitl";
     ws.respond_allow = vec![RESPONDER];
     ws.on_fail_log = Some(on_fail_log.clone());
+    tweak(&env, &mut ws);
     let config = ws.install(&env);
 
     let mut daemon = env.start_daemon(&config, 1);
@@ -229,4 +240,160 @@ pub fn hitl_resolution_is_logged_as_hitl_resolved_transition() {
     assert_eq!(resolved.len(), 1, "no hitl_resolved row: {log:#?}");
     assert_eq!(resolved[0]["actor"], "origin", "{}", resolved[0]);
     assert_eq!(resolved[0]["reason"], "done", "{}", resolved[0]);
+}
+
+/// Comments the origin channel itself posted on `issue`.
+fn origin_comments(env: &E2eEnv, issue: u64) -> usize {
+    env.gh
+        .issue_comments(issue)
+        .iter()
+        .filter(|c| c.body.lines().next() == Some("<!-- belt:origin -->"))
+        .count()
+}
+
+/// `(status, post_processed_at)` of the request; readable while it is open.
+fn request_progress(env: &E2eEnv, hitl_id: &str) -> (String, Option<String>) {
+    env.db()
+        .query_row(
+            "SELECT status, post_processed_at FROM hitl_requests WHERE hitl_id = ?1",
+            [hitl_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("hitl request row")
+}
+
+/// Times the origin channel polled `issue` for responses.
+fn comment_polls(env: &E2eEnv, issue: u64) -> usize {
+    let prefix = format!("gh issue view {issue} ");
+    env.gh
+        .calls()
+        .iter()
+        .map(|c| c.line())
+        .filter(|l| l.starts_with(&prefix) && l.contains("comments"))
+        .count()
+}
+
+/// `hitl_response_rejected` rows of `work_id` as `(actor, reason)`.
+fn rejections(env: &E2eEnv, work_id: &str) -> Vec<(String, String)> {
+    rows_of(&env.transitions(work_id), "hitl_response_rejected")
+        .iter()
+        .map(|r| {
+            (
+                r["actor"].as_str().unwrap_or_default().to_string(),
+                r["reason"].as_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// Scenario 3 edges: an answer from outside the allowlist is rejected once
+/// (re-polling the same comment adds nothing) and gets no reply; the
+/// allowed answer wins once; `belt hitl respond <work_id>` sees the
+/// confirmed request as `already_handled` until it is post-processed and
+/// `not_found` after.
+pub fn hitl_unauthorized_answer_is_rejected_once_and_work_id_answer_follows_post_processing() {
+    const RELEASE: &str = "release_on_done";
+    let mut s = open_hitl_with(|env, ws| {
+        // on_done holds post-processing until the test releases it, so the
+        // "confirmed, not yet post-processed" window is as long as needed.
+        ws.on_done = format!(
+            r#"while [ ! -f "{}" ]; do sleep 0.1; done; {}"#,
+            env.tmp_dir.join(RELEASE).display(),
+            remove_label_script()
+        );
+    });
+    let release = s.env.tmp_dir.join(RELEASE);
+    wait_hitl_comment(&mut s);
+    let (env, issue, work_id) = (&s.env, s.issue, s.work_id.clone());
+    wait_until(
+        Duration::from_secs(10),
+        "failed progress comment",
+        &mut s.daemon,
+        || (progress_comments(env, issue, &work_id, "failed") == 1).then_some(()),
+    );
+    let posted = origin_comments(env, issue);
+
+    // 1. An outsider's `/belt done` is rejected `unauthorized`, once.
+    s.env.gh.add_issue_comment(s.issue, OUTSIDER, "/belt done");
+    let (env, work_id) = (&s.env, s.work_id.as_str());
+    wait_until(
+        Duration::from_secs(15),
+        "unauthorized rejection of the outsider's answer",
+        &mut s.daemon,
+        || (!rejections(env, work_id).is_empty()).then_some(()),
+    );
+    let polled = comment_polls(env, issue);
+    wait_until(
+        Duration::from_secs(15),
+        "two more polls that see the outsider's comment again",
+        &mut s.daemon,
+        || (comment_polls(env, issue) >= polled + 2).then_some(()),
+    );
+    assert_eq!(
+        rejections(&s.env, &s.work_id),
+        [("origin".to_string(), "unauthorized".to_string())]
+    );
+    let request = open_request_of(&s.env, &s.work_id).expect("request no longer open");
+    assert_eq!(request["status"], "open", "{request}");
+    assert_eq!(s.env.phase_of(&s.work_id).as_deref(), Some("hitl"));
+    assert_eq!(
+        origin_comments(&s.env, s.issue),
+        posted,
+        "a reply was posted"
+    );
+
+    // 2. The allowed answer wins; post-processing waits on on_done.
+    s.env.gh.add_issue_comment(s.issue, RESPONDER, "/belt done");
+    let (env, hitl_id) = (&s.env, s.hitl_id.as_str());
+    wait_until(
+        Duration::from_secs(15),
+        "the allowed answer to resolve the request",
+        &mut s.daemon,
+        || (request_progress(env, hitl_id).0 == "resolved").then_some(()),
+    );
+    let (_, post_processed) = request_progress(&s.env, &s.hitl_id);
+    assert!(
+        post_processed.is_none(),
+        "post-processed before on_done ran"
+    );
+
+    // 3. Confirmed but not post-processed: the item still names it.
+    let (code, answer) = s
+        .env
+        .belt_answer(&["hitl", "respond", &s.work_id, "--action", "skip", "--json"]);
+    assert_eq!(code, 1, "{answer}");
+    assert_eq!(answer["reason"], "already_handled", "{answer}");
+    assert_eq!(answer["by"], RESPONDER, "{answer}");
+    assert_eq!(answer["via"], "origin", "{answer}");
+    assert_eq!(answer["action"], "done", "{answer}");
+
+    // 4. Post-processed: the request is the item's past, not found.
+    std::fs::write(&release, "").unwrap();
+    let (env, work_id, hitl_id) = (&s.env, s.work_id.as_str(), s.hitl_id.as_str());
+    wait_until(
+        Duration::from_secs(15),
+        "item done and request post-processed",
+        &mut s.daemon,
+        || {
+            (env.phase_of(work_id).as_deref() == Some("done")
+                && request_progress(env, hitl_id).1.is_some())
+            .then_some(())
+        },
+    );
+    let (code, answer) = s
+        .env
+        .belt_answer(&["hitl", "respond", &s.work_id, "--action", "skip", "--json"]);
+    assert_eq!(code, 1, "{answer}");
+    assert_eq!(answer["reason"], "not_found", "{answer}");
+
+    // The winning comment was settled once: the only origin rejection is
+    // the outsider's; the CLI's late answer added its own.
+    assert_eq!(
+        rejections(&s.env, &s.work_id),
+        [
+            ("origin".to_string(), "unauthorized".to_string()),
+            ("cli".to_string(), "already_handled".to_string()),
+        ]
+    );
+    assert_eq!(s.env.phase_of(&s.work_id).as_deref(), Some("done"));
 }

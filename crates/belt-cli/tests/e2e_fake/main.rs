@@ -113,6 +113,36 @@ const CASES: &[Case] = &[
         ignore: None,
         run: scenarios_migration::v1_database_with_unknown_phase_is_refused_without_backup,
     },
+    Case {
+        name: "hitl_unauthorized_answer_is_rejected_once_and_work_id_answer_follows_post_processing",
+        ignore: None,
+        run: scenarios_hitl::hitl_unauthorized_answer_is_rejected_once_and_work_id_answer_follows_post_processing,
+    },
+    Case {
+        name: "cancel_skip_after_handler_finished_is_too_late",
+        ignore: None,
+        run: scenarios_cancel::skip_after_handler_finished_is_too_late,
+    },
+    Case {
+        name: "cancel_skip_of_queued_item_is_applied",
+        ignore: None,
+        run: scenarios_cancel::skip_of_queued_item_is_applied,
+    },
+    Case {
+        name: "cancel_skip_with_unresponsive_daemon_cancels_directly_and_late_result_conflicts",
+        ignore: None,
+        run: scenarios_cancel::skip_with_unresponsive_daemon_cancels_directly_and_late_result_conflicts,
+    },
+    Case {
+        name: "lineage_second_failure_retries_with_comment_and_runs_on_fail",
+        ignore: None,
+        run: scenarios_lineage::second_failure_retries_with_comment_and_runs_on_fail,
+    },
+    Case {
+        name: "migration_v1_backup_with_taken_name_goes_to_next_free_name",
+        ignore: None,
+        run: scenarios_migration::v1_backup_with_taken_name_goes_to_next_free_name,
+    },
 ];
 
 #[cfg(unix)]

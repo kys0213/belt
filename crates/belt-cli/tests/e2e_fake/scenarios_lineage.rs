@@ -98,6 +98,74 @@ pub fn handler_failure_retry_derives_item_that_inherits_worktree() {
     assert_eq!(progress_comments_any(&env, issue, "skipped"), 0);
 }
 
+/// Scenario 2 edge: the lineage's second failure reaches escalation level 2
+/// (`retry_with_comment`): `:2` is skipped as `derived` into `:3`, on_fail
+/// runs for `:2` and one `failed` comment is posted. `:3` succeeds.
+pub fn second_failure_retries_with_comment_and_runs_on_fail() {
+    let env = E2eEnv::new();
+    let issue = env.gh.seed_issue("Analyze", "body", &[TRIGGER]);
+    let original = first_work_id(issue);
+    let second = format!("{original}:2");
+    let third = format!("{original}:3");
+    let on_fail_log = env.tmp_dir.join("on_fail.log");
+    // Counts its runs in the (inherited) worktree; fails the first two.
+    let handler = r#"n=$(cat "$WORKTREE/.attempts" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "$WORKTREE/.attempts"; [ "$n" -ge 3 ]"#;
+    let mut ws = Workspace::new(handler);
+    ws.on_fail_log = Some(on_fail_log.clone());
+    // Levels: 1 retry, 2 retry_with_comment, 3 hitl (the default).
+    assert_eq!(ws.escalation, "1: retry\n2: retry_with_comment\n3: hitl");
+    let config = ws.install(&env);
+
+    let mut daemon = env.start_daemon(&config, 1);
+    wait_until(
+        Duration::from_secs(25),
+        "third item to reach done",
+        &mut daemon,
+        || (env.phase_of(&third).as_deref() == Some("done")).then_some(()),
+    );
+    wait_until(
+        Duration::from_secs(10),
+        "on_fail run and failed comment for the second item",
+        &mut daemon,
+        || {
+            (!on_fail_runs(&on_fail_log).is_empty()
+                && progress_comments(&env, issue, &second, "failed") == 1)
+                .then_some(())
+        },
+    );
+
+    let last_enter = |work_id: &str| {
+        let log = env.transitions(work_id);
+        (*phase_enters(&log).last().unwrap()).clone()
+    };
+    let first_end = last_enter(&original);
+    assert_eq!(first_end["reason"], "derived", "{first_end}");
+    assert_eq!(first_end["detail"], "escalation: retry", "{first_end}");
+    let second_end = last_enter(&second);
+    assert_eq!(second_end["from_phase"], "running", "{second_end}");
+    assert_eq!(second_end["to_phase"], "skipped", "{second_end}");
+    assert_eq!(second_end["reason"], "derived", "{second_end}");
+    assert_eq!(
+        second_end["detail"], "escalation: retry_with_comment",
+        "{second_end}"
+    );
+
+    let item = env.item(&third).expect("third item missing");
+    assert_eq!(item["derived_from"], second.as_str(), "{item}");
+    assert_eq!(item["lineage_root"], original.as_str(), "{item}");
+    let third_log = env.transitions(&third);
+    let created = rows_of(&third_log, "item_created");
+    assert_eq!(created.len(), 1, "{third_log:#?}");
+    assert_eq!(created[0]["reason"], "derived");
+    assert_eq!(created[0]["detail"], second.as_str());
+    assert_eq!(env.queue_items().len(), 3, "{:#?}", env.queue_items());
+
+    // Only the retry_with_comment level runs on_fail and announces failure.
+    assert_eq!(on_fail_runs(&on_fail_log), [second.as_str()]);
+    assert_eq!(progress_comments_any(&env, issue, "failed"), 1);
+    assert_eq!(progress_comments_any(&env, issue, "skipped"), 0);
+}
+
 /// Scenario 7: a Failed item of `(source_id, state)` keeps the still
 /// labeled issue from being collected again, across scans and a daemon
 /// restart. Skipping it reopens the lineage as `…:2`.
@@ -169,6 +237,14 @@ pub fn failed_item_blocks_recollection_across_scans_and_restart() {
         || (collect_calls() >= base + 2).then_some(()),
     );
     assert_eq!(count_items(), 1, "{:#?}", env.queue_items());
+    assert_eq!(env.phase_of(&work_id).as_deref(), Some("failed"));
+
+    // `queue done` is not an action of a Failed item.
+    let (code, answer) = env.belt_answer(&["queue", "done", &work_id, "--json"]);
+    assert_eq!(code, 1, "{answer}");
+    assert_eq!(answer["success"], false, "{answer}");
+    assert_eq!(answer["reason"], "invalid_action", "{answer}");
+    assert_eq!(answer["current"], "failed", "{answer}");
     assert_eq!(env.phase_of(&work_id).as_deref(), Some("failed"));
 
     // Skipping the Failed item ends the lineage; the next scan starts `:2`.

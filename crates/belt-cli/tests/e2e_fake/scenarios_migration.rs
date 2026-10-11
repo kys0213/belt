@@ -349,3 +349,28 @@ pub fn v1_database_with_unknown_phase_is_refused_without_backup() {
     assert_eq!(pragma(&conn, "user_version"), 0);
     assert!(!table_exists(&conn, "transition_log"));
 }
+
+/// An existing `.bak-v1` is never overwritten: the backup goes to the next
+/// free name, `.bak-v1.2`.
+pub fn v1_backup_with_taken_name_goes_to_next_free_name() {
+    let env = E2eEnv::new();
+    let db_path = env.belt_home.join("belt.db");
+    let taken = env.belt_home.join("belt.db.bak-v1");
+    let next = env.belt_home.join("belt.db.bak-v1.2");
+    const EARLIER_BACKUP: &str = "an earlier backup, not a database";
+    std::fs::write(&taken, EARLIER_BACKUP).unwrap();
+    write_v1_db(&db_path, "");
+
+    // Any command that opens the database migrates it.
+    let items = env.queue_items();
+    assert_eq!(items.len(), 5, "{items:#?}");
+
+    assert_eq!(std::fs::read_to_string(&taken).unwrap(), EARLIER_BACKUP);
+    assert!(next.exists(), "no .bak-v1.2 next to the taken .bak-v1");
+    let bak = rusqlite::Connection::open(&next).unwrap();
+    assert_eq!(pragma(&bak, "user_version"), 0);
+    assert!(!table_exists(&bak, "transition_log"));
+    assert!(table_exists(&bak, "transition_events"));
+    assert!(!env.belt_home.join("belt.db.bak-v1.3").exists());
+    assert_eq!(pragma(&env.db(), "user_version"), 2);
+}

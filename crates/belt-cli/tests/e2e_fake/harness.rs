@@ -29,6 +29,10 @@ pub const FAKE_DIR_ENV: &str = "BELT_E2E_FAKE_DIR";
 /// Repository every scenario's GitHub source points at.
 pub const REPO: &str = "acme/widgets";
 
+/// `$USER` inside the sandbox: the CLI records it as the requester of a
+/// cancel and the respondent of a HITL answer.
+pub const OS_USER: &str = "e2e-operator";
+
 const DAEMON_LOG: &str = "daemon.log";
 
 pub struct E2eEnv {
@@ -127,6 +131,7 @@ impl E2eEnv {
             .env("HOME", &self.home)
             .env("BELT_HOME", &self.belt_home)
             .env("TMPDIR", &self.tmp_dir)
+            .env("USER", OS_USER)
             .env(FAKE_DIR_ENV, &self.fake_dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -243,15 +248,18 @@ impl E2eEnv {
             .expect("spawn belt daemon");
         DaemonGuard {
             child: Some(child),
+            paused: false,
             log_path,
             belt_home: self.belt_home.clone(),
             handler_pid_dir: self.handler_pid_dir(),
+            sandbox: self.root.clone(),
         }
     }
 
-    /// Directory where scenario handlers register their pid (one file per
-    /// pid, any name). [`DaemonGuard`] kills those process groups on drop,
-    /// so a handler that outlives its daemon never leaks.
+    /// Directory where scenario handlers register their process group leader
+    /// pid (`$$`; one file per pid, any name). Register leaders only: on drop
+    /// [`DaemonGuard`] kills each registered group that still runs inside
+    /// this sandbox, so a handler that outlives its daemon never leaks.
     pub fn handler_pid_dir(&self) -> PathBuf {
         let dir = self.fake_dir.join("handler_pids");
         std::fs::create_dir_all(&dir).unwrap();
@@ -327,9 +335,13 @@ pub fn read_pid(path: &Path) -> u32 {
 /// SIGKILL after a grace period), so a failing test leaves no process.
 pub struct DaemonGuard {
     child: Option<Child>,
+    /// SIGSTOPped by [`DaemonGuard::pause`] and not resumed yet.
+    paused: bool,
     log_path: PathBuf,
     belt_home: PathBuf,
     handler_pid_dir: PathBuf,
+    /// Sandbox root: only process groups running inside it are killed.
+    sandbox: PathBuf,
 }
 
 impl DaemonGuard {
@@ -349,13 +361,32 @@ impl DaemonGuard {
     /// Graceful stop: SIGINT — the signal the daemon drains on — then wait
     /// up to `grace` and SIGKILL. Returns whether it exited within `grace`.
     pub fn stop(&mut self, grace: Duration) -> bool {
+        self.signal("-INT");
+        self.wait_exit(grace)
+    }
+
+    /// Simulate an unresponsive daemon: SIGSTOP it. Its pid stays alive
+    /// (`kill -0` succeeds) but it handles nothing until
+    /// [`DaemonGuard::resume`]; dropping the guard resumes it first, so a
+    /// panic never leaves it stopped.
+    pub fn pause(&mut self) {
+        self.signal("-STOP");
+        self.paused = true;
+    }
+
+    /// SIGCONT a daemon stopped by [`DaemonGuard::pause`].
+    pub fn resume(&mut self) {
+        self.signal("-CONT");
+        self.paused = false;
+    }
+
+    fn signal(&self, sig: &str) {
         if let Some(child) = &self.child {
             let _ = Command::new("kill")
-                .args(["-INT", &child.id().to_string()])
+                .args([sig, &child.id().to_string()])
                 .stderr(Stdio::null())
                 .status();
         }
-        self.wait_exit(grace)
     }
 
     /// Simulate a crash: SIGKILL the daemon with no drain. Its handler
@@ -413,18 +444,17 @@ impl DaemonGuard {
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
+        if self.paused {
+            self.resume();
+        }
         // Snapshot before the stop: a drain rolls Running items back and
         // clears their recorded pid while the handler may live on.
         let handlers = self.handler_pids();
         self.stop(Duration::from_secs(5));
         // Handlers lead their own process group (pgid == pid), so the
         // daemon's death does not reach them; kill each group explicitly.
-        // A group with no member left makes `kill` fail, which is fine.
-        for pid in handlers.into_iter().filter(|p| *p > 1) {
-            let _ = Command::new("kill")
-                .args(["-KILL", "--", &format!("-{pid}")])
-                .stderr(Stdio::null())
-                .status();
+        for pgid in handlers {
+            kill_group_in_sandbox(pgid, &self.sandbox);
         }
         if std::thread::panicking() {
             eprintln!("---- daemon log ----\n{}\n--------------------", self.log());
@@ -432,8 +462,9 @@ impl Drop for DaemonGuard {
     }
 }
 
-/// [`wait_until`] for phases without a running daemon (it crashed, was
-/// stopped, or never started).
+/// Poll `probe` every 100ms until it yields a value; panic after `timeout`
+/// with `what`. For phases without a running daemon (it crashed, was
+/// stopped, or never started); [`wait_until`] while one runs.
 pub fn wait_for<T>(timeout: Duration, what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
     let deadline = Instant::now() + timeout;
     loop {
@@ -448,24 +479,81 @@ pub fn wait_for<T>(timeout: Duration, what: &str, mut probe: impl FnMut() -> Opt
     }
 }
 
-/// Poll `probe` every 100ms until it yields a value; panic after `timeout`
-/// with `what` and the last probe description.
+/// [`wait_for`] that also fails fast, with the daemon log, once the daemon
+/// has exited.
 pub fn wait_until<T>(
     timeout: Duration,
     what: &str,
     daemon: &mut DaemonGuard,
     mut probe: impl FnMut() -> Option<T>,
 ) -> T {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(v) = probe() {
-            return v;
+    wait_for(timeout, what, || {
+        let found = probe();
+        if found.is_none() {
+            daemon.assert_alive();
         }
-        daemon.assert_alive();
-        assert!(
-            Instant::now() < deadline,
-            "timed out after {timeout:?} waiting for {what}"
-        );
-        std::thread::sleep(Duration::from_millis(100));
+        found
+    })
+}
+
+/// SIGKILL the process group `pgid`, but only when one of its live members
+/// has its working directory inside `sandbox`.
+///
+/// A recorded pid may name an unrelated process by now (pid reuse). A
+/// group id is not handed out again while any member of the group lives,
+/// so a member running inside this sandbox (handlers run in their worktree
+/// under BELT_HOME) proves the group is ours. A group that cannot be
+/// verified is left alone: a leaked test process beats killing someone
+/// else's.
+fn kill_group_in_sandbox(pgid: u32, sandbox: &Path) {
+    if pgid <= 1 {
+        return;
     }
+    let ours = group_members(pgid)
+        .into_iter()
+        .any(|pid| process_cwd(pid).is_some_and(|cwd| cwd.starts_with(sandbox)));
+    if ours {
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{pgid}")])
+            .stderr(Stdio::null())
+            .status();
+    }
+}
+
+/// Live pids whose process group is `pgid`.
+fn group_members(pgid: u32) -> Vec<u32> {
+    let Ok(out) = Command::new("ps").args(["-A", "-o", "pid=,pgid="]).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut cols = line.split_whitespace().map(|c| c.parse::<u32>().ok());
+            match (cols.next().flatten(), cols.next().flatten()) {
+                (Some(pid), Some(group)) if group == pgid => Some(pid),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Working directory of `pid`, if it can be read.
+#[cfg(target_os = "linux")]
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// Working directory of `pid`, if it can be read (`lsof -Fn` prints it on
+/// the line starting with `n`).
+#[cfg(not(target_os = "linux"))]
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    let out = Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| l.strip_prefix('n'))
+        .map(PathBuf::from)
 }
