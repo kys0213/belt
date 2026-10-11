@@ -296,10 +296,13 @@ pub fn hitl_unauthorized_answer_is_rejected_once_and_work_id_answer_follows_post
     let mut s = open_hitl_with(|env, ws| {
         // on_done holds post-processing until the test releases it, so the
         // "confirmed, not yet post-processed" window is as long as needed.
+        // The wait registers itself for the guard's cleanup and gives up
+        // after ~120s, so a failing test leaks no endless loop.
         ws.on_done = format!(
-            r#"while [ ! -f "{}" ]; do sleep 0.1; done; {}"#,
-            env.tmp_dir.join(RELEASE).display(),
-            remove_label_script()
+            r#"echo $$ > "{pids}/on_done"; i=0; while [ ! -f "{release}" ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done; {remove}"#,
+            pids = env.handler_pid_dir().display(),
+            release = env.tmp_dir.join(RELEASE).display(),
+            remove = remove_label_script()
         );
     });
     let release = s.env.tmp_dir.join(RELEASE);

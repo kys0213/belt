@@ -400,9 +400,10 @@ pub fn skip_after_handler_finished_is_too_late() {
     ws.on_fail_log = Some(on_fail_log.clone());
     let config = ws.install(&env);
 
-    // A 60s tick: after the first tick only the handler's own end moves the
-    // item (Completed is evaluated on a tick, a minute away).
-    let mut daemon = env.start_daemon(&config, 60);
+    // A 120s tick: after the first tick only the handler's own end moves the
+    // item (Completed is evaluated on a tick, two minutes away, leaving a
+    // wide margin on a slow CI runner).
+    let mut daemon = env.start_daemon(&config, 120);
     wait_until(
         Duration::from_secs(20),
         "handler to be running",
@@ -531,6 +532,8 @@ pub fn skip_with_unresponsive_daemon_cancels_directly_and_late_result_conflicts(
     assert_eq!(closed[0]["reason"], "canceled_directly");
 
     r.daemon.resume();
+    // The log line only marks when the late result has been handled; the
+    // assertions below check the outcome through the store and the CLI.
     let discarded = format!("discarded: {} (stored phase is skipped)", r.work_id);
     let env = &r.env;
     wait_until(
