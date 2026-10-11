@@ -244,8 +244,83 @@ impl E2eEnv {
         DaemonGuard {
             child: Some(child),
             log_path,
+            belt_home: self.belt_home.clone(),
+            handler_pid_dir: self.handler_pid_dir(),
         }
     }
+
+    /// Directory where scenario handlers register their pid (one file per
+    /// pid, any name). [`DaemonGuard`] kills those process groups on drop,
+    /// so a handler that outlives its daemon never leaks.
+    pub fn handler_pid_dir(&self) -> PathBuf {
+        let dir = self.fake_dir.join("handler_pids");
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// `belt queue show <work_id> --json`.
+    pub fn queue_show(&self, work_id: &str) -> Value {
+        self.belt_json(&["queue", "show", work_id, "--json"])
+    }
+
+    /// Transition rows of `work_id`, oldest first.
+    pub fn transitions(&self, work_id: &str) -> Vec<Value> {
+        match &self.queue_show(work_id)["transitions"] {
+            Value::Array(rows) => rows.clone(),
+            other => panic!("queue show transitions is not an array: {other}"),
+        }
+    }
+
+    /// The queue item `work_id` per `belt queue list`, if it exists.
+    pub fn item(&self, work_id: &str) -> Option<Value> {
+        self.queue_items()
+            .into_iter()
+            .find(|i| i["work_id"] == work_id)
+    }
+
+    /// Run a `belt` CLI command whose JSON answer is read regardless of the
+    /// exit code (refusals exit non-zero). Returns `(exit code, JSON)`.
+    pub fn belt_answer(&self, args: &[&str]) -> (i32, Value) {
+        let out = self.belt(args);
+        let json = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "belt {args:?} printed non-JSON ({e}): stdout={} stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        (out.status.code().unwrap_or(-1), json)
+    }
+
+    /// Read-only connection to `$BELT_HOME/belt.db`, for state no CLI shows.
+    pub fn db(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open_with_flags(
+            self.belt_home.join("belt.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("open belt.db")
+    }
+}
+
+/// Whether `pid` no longer names a live process. A zombie counts as gone:
+/// it has exited and only waits for its parent to reap it.
+pub fn process_gone(pid: u32) -> bool {
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .expect("run ps");
+    let stat = String::from_utf8_lossy(&out.stdout);
+    let stat = stat.trim();
+    stat.is_empty() || stat.starts_with('Z')
+}
+
+/// The pid a handler wrote to `path`.
+pub fn read_pid(path: &Path) -> u32 {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("pid file {} unreadable: {e}", path.display()));
+    text.trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("pid file {} holds {text:?}: {e}", path.display()))
 }
 
 /// Owns a running daemon. Dropping it stops the daemon (SIGINT, then
@@ -253,6 +328,8 @@ impl E2eEnv {
 pub struct DaemonGuard {
     child: Option<Child>,
     log_path: PathBuf,
+    belt_home: PathBuf,
+    handler_pid_dir: PathBuf,
 }
 
 impl DaemonGuard {
@@ -275,9 +352,44 @@ impl DaemonGuard {
         if let Some(child) = &self.child {
             let _ = Command::new("kill")
                 .args(["-INT", &child.id().to_string()])
+                .stderr(Stdio::null())
                 .status();
         }
         self.wait_exit(grace)
+    }
+
+    /// Simulate a crash: SIGKILL the daemon with no drain. Its handler
+    /// process groups and `daemon.pid` survive, as after a real crash.
+    pub fn kill_hard(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Pids of every handler that may still run: the ones the store records
+    /// for Running items and the ones scenario handlers registered.
+    fn handler_pids(&self) -> Vec<u32> {
+        let mut pids = Vec::new();
+        if let Ok(conn) = rusqlite::Connection::open_with_flags(
+            self.belt_home.join("belt.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ) && let Ok(mut stmt) =
+            conn.prepare("SELECT handler_pid FROM queue_items WHERE handler_pid IS NOT NULL")
+            && let Ok(rows) = stmt.query_map([], |r| r.get::<_, i64>(0))
+        {
+            pids.extend(rows.flatten().filter_map(|p| u32::try_from(p).ok()));
+        }
+        if let Ok(rd) = std::fs::read_dir(&self.handler_pid_dir) {
+            pids.extend(rd.flatten().filter_map(|entry| {
+                std::fs::read_to_string(entry.path())
+                    .ok()
+                    .and_then(|t| t.trim().parse::<u32>().ok())
+            }));
+        }
+        pids.sort_unstable();
+        pids.dedup();
+        pids
     }
 
     /// Wait up to `timeout` for the daemon to exit on its own (e.g. after
@@ -301,10 +413,38 @@ impl DaemonGuard {
 
 impl Drop for DaemonGuard {
     fn drop(&mut self) {
+        // Snapshot before the stop: a drain rolls Running items back and
+        // clears their recorded pid while the handler may live on.
+        let handlers = self.handler_pids();
         self.stop(Duration::from_secs(5));
+        // Handlers lead their own process group (pgid == pid), so the
+        // daemon's death does not reach them; kill each group explicitly.
+        // A group with no member left makes `kill` fail, which is fine.
+        for pid in handlers.into_iter().filter(|p| *p > 1) {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &format!("-{pid}")])
+                .stderr(Stdio::null())
+                .status();
+        }
         if std::thread::panicking() {
             eprintln!("---- daemon log ----\n{}\n--------------------", self.log());
         }
+    }
+}
+
+/// [`wait_until`] for phases without a running daemon (it crashed, was
+/// stopped, or never started).
+pub fn wait_for<T>(timeout: Duration, what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(v) = probe() {
+            return v;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out after {timeout:?} waiting for {what}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
