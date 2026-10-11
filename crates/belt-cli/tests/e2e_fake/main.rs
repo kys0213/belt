@@ -24,6 +24,8 @@ mod scenarios;
 #[cfg(unix)]
 mod scenarios_cancel;
 #[cfg(unix)]
+mod scenarios_fixes;
+#[cfg(unix)]
 mod scenarios_hitl;
 #[cfg(unix)]
 mod scenarios_lineage;
@@ -142,6 +144,16 @@ const CASES: &[Case] = &[
         name: "migration_v1_backup_with_taken_name_goes_to_next_free_name",
         ignore: None,
         run: scenarios_migration::v1_backup_with_taken_name_goes_to_next_free_name,
+    },
+    Case {
+        name: "fixes_sigint_during_a_tick_shuts_the_daemon_down",
+        ignore: None,
+        run: scenarios_fixes::sigint_during_a_tick_shuts_the_daemon_down,
+    },
+    Case {
+        name: "fixes_sigterm_drains_a_running_handler",
+        ignore: None,
+        run: scenarios_fixes::sigterm_drains_a_running_handler,
     },
 ];
 
