@@ -1,11 +1,15 @@
 //! Regression cases for reviewed fixes: shutdown signals observed during a
-//! tick and draining a Running handler on SIGTERM.
+//! tick and draining a Running handler on SIGTERM, and owner-key worktree
+//! cleanup on `belt queue skip` / `belt queue done` of a derived item.
 
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::harness::{E2eEnv, process_gone, read_pid, wait_for, wait_until};
-use crate::support::{TRIGGER, Workspace, first_work_id, remove_label_script};
+use crate::support::{
+    TRIGGER, Workspace, first_work_id, register_workspace, remove_label_script, worktree_name,
+};
+
 /// Send `kill -<signal>` to the daemon recorded in `daemon.pid`.
 fn signal_daemon(env: &E2eEnv, signal: &str) {
     let pid_file = env.belt_home.join("daemon.pid");
@@ -100,4 +104,144 @@ pub fn sigterm_drains_a_running_handler() {
     let log = env.daemon_log();
     assert!(log.contains("received SIGTERM"), "{log}");
     assert!(log.contains("all running handlers drained"), "{log}");
+}
+
+/// Fails until `.attempt` exists in its worktree, so the item derived by
+/// escalation retry succeeds only in the worktree it inherited.
+const FAIL_ONCE_HANDLER: &str =
+    r#"if [ -f "$WORKTREE/.attempt" ]; then exit 0; fi; touch "$WORKTREE/.attempt"; exit 1"#;
+
+/// `belt queue skip <derived>` succeeds and removes the worktree the derived
+/// item inherited from `original` (its owner key), directory and git
+/// registration. (spec: queue-state-machine.md:111, 324)
+fn skip_cleans_inherited_worktree(env: &E2eEnv, derived: &str, original: &str) {
+    let inherited = worktree_name(original);
+    assert!(
+        env.worktree_dirs().contains(&inherited),
+        "inherited worktree {inherited} missing before the skip: {:?}",
+        env.worktree_dirs()
+    );
+    let (code, answer) = env.belt_answer(&["queue", "skip", derived, "--json"]);
+    assert_eq!((code, &answer["success"]), (0, &true.into()), "{answer}");
+    assert_eq!(env.phase_of(derived).as_deref(), Some("skipped"));
+    assert!(
+        !env.worktree_dirs().contains(&inherited),
+        "inherited worktree {inherited} left behind: {:?}",
+        env.worktree_dirs()
+    );
+    assert_eq!(
+        env.git_worktrees(),
+        vec![env.repo_dir.display().to_string()]
+    );
+}
+
+/// D5: skipping a Pending derived item cleans the worktree it inherited.
+pub fn skip_of_pending_derived_item_cleans_inherited_worktree() {
+    let env = E2eEnv::new();
+    let issue = env.gh.seed_issue("Analyze", "body", &[TRIGGER]);
+    let original = first_work_id(issue);
+    let derived = format!("{original}:2");
+    let mut ws = Workspace::new(FAIL_ONCE_HANDLER);
+    ws.escalation = "1: retry\n2: hitl";
+    let config = ws.install(&env);
+
+    // Only the first tick runs (at start): the derived item stays Pending.
+    let mut daemon = env.start_daemon(&config, 3600);
+    wait_until(
+        Duration::from_secs(20),
+        "derived item to be pending",
+        &mut daemon,
+        || (env.phase_of(&derived).as_deref() == Some("pending")).then_some(()),
+    );
+    assert!(daemon.stop(Duration::from_secs(10)), "daemon did not stop");
+
+    skip_cleans_inherited_worktree(&env, &derived, &original);
+}
+
+/// D5: skipping a Failed derived item (its on_done failed) cleans the
+/// worktree it inherited; Failed alone preserves it.
+pub fn skip_of_failed_derived_item_cleans_inherited_worktree() {
+    let env = E2eEnv::new();
+    let issue = env.gh.seed_issue("Analyze", "body", &[TRIGGER]);
+    let original = first_work_id(issue);
+    let derived = format!("{original}:2");
+    let mut ws = Workspace::new(FAIL_ONCE_HANDLER);
+    ws.escalation = "1: retry\n2: hitl";
+    ws.on_done = "exit 1".to_string();
+    let config = ws.install(&env);
+
+    let mut daemon = env.start_daemon(&config, 1);
+    wait_until(
+        Duration::from_secs(30),
+        "derived item to fail on its on_done",
+        &mut daemon,
+        || (env.phase_of(&derived).as_deref() == Some("failed")).then_some(()),
+    );
+    assert!(daemon.stop(Duration::from_secs(10)), "daemon did not stop");
+
+    skip_cleans_inherited_worktree(&env, &derived, &original);
+}
+
+/// D5: `belt queue done` on a Completed derived item runs on_done in the
+/// worktree it inherited (the owner key) and cleans that worktree on Done.
+/// (spec: queue-state-machine.md:111, 324)
+pub fn done_of_completed_derived_item_uses_and_cleans_inherited_worktree() {
+    let env = E2eEnv::new();
+    let issue = env.gh.seed_issue("Analyze", "body", &[TRIGGER]);
+    let original = first_work_id(issue);
+    let derived = format!("{original}:2");
+    let on_done_log = env.tmp_dir.join("on_done.log");
+    let mut ws = Workspace::new(FAIL_ONCE_HANDLER);
+    ws.escalation = "1: retry\n2: hitl";
+    ws.on_done = format!(
+        r#"echo "$WORK_ID $WORKTREE" >> "{}""#,
+        on_done_log.display()
+    );
+    let config = ws.install(&env);
+
+    // Ticks run only at start and on SIGUSR1, so the derived item is
+    // claimed by the second tick and its success is never evaluated.
+    let mut daemon = env.start_daemon(&config, 3600);
+    wait_until(
+        Duration::from_secs(20),
+        "derived item to be pending",
+        &mut daemon,
+        || (env.phase_of(&derived).as_deref() == Some("pending")).then_some(()),
+    );
+    signal_daemon(&env, "USR1");
+    wait_until(
+        Duration::from_secs(20),
+        "derived item to be completed",
+        &mut daemon,
+        || (env.phase_of(&derived).as_deref() == Some("completed")).then_some(()),
+    );
+    assert!(daemon.stop(Duration::from_secs(10)), "daemon did not stop");
+    assert!(
+        !on_done_log.exists(),
+        "the daemon evaluated the derived item"
+    );
+
+    let inherited = worktree_name(&original);
+    let inherited_path = env.belt_home.join("worktrees").join(&inherited);
+    assert!(inherited_path.exists(), "{:?}", env.worktree_dirs());
+    register_workspace(&env, &config);
+    let (code, answer) = env.belt_answer(&["queue", "done", &derived, "--json"]);
+    assert_eq!((code, &answer["success"]), (0, &true.into()), "{answer}");
+    assert_eq!(env.phase_of(&derived).as_deref(), Some("done"));
+
+    let runs = std::fs::read_to_string(&on_done_log).unwrap();
+    assert_eq!(
+        runs.lines().collect::<Vec<_>>(),
+        [format!("{derived} {}", inherited_path.display())],
+        "on_done must run once, in the inherited worktree"
+    );
+    assert!(
+        !env.worktree_dirs().contains(&inherited),
+        "inherited worktree {inherited} left behind: {:?}",
+        env.worktree_dirs()
+    );
+    assert_eq!(
+        env.git_worktrees(),
+        vec![env.repo_dir.display().to_string()]
+    );
 }

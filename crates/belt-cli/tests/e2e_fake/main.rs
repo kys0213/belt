@@ -155,6 +155,21 @@ const CASES: &[Case] = &[
         ignore: None,
         run: scenarios_fixes::sigterm_drains_a_running_handler,
     },
+    Case {
+        name: "fixes_skip_of_pending_derived_item_cleans_inherited_worktree",
+        ignore: None,
+        run: scenarios_fixes::skip_of_pending_derived_item_cleans_inherited_worktree,
+    },
+    Case {
+        name: "fixes_skip_of_failed_derived_item_cleans_inherited_worktree",
+        ignore: None,
+        run: scenarios_fixes::skip_of_failed_derived_item_cleans_inherited_worktree,
+    },
+    Case {
+        name: "fixes_done_of_completed_derived_item_uses_and_cleans_inherited_worktree",
+        ignore: None,
+        run: scenarios_fixes::done_of_completed_derived_item_uses_and_cleans_inherited_worktree,
+    },
 ];
 
 #[cfg(unix)]
