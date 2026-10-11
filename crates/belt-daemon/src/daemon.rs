@@ -199,15 +199,33 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Resolve on the next SIGINT or SIGTERM and return the signal's name.
+/// The signals that stop the daemon: SIGINT and SIGTERM (`belt stop`).
 ///
-/// `sigterm` is registered by the caller once, outside its loop, so a
-/// SIGTERM delivered between two polls is not lost.
+/// Registered once, before the loop that waits on them: a signal stream
+/// keeps a signal delivered while the loop is busy (e.g. in a tick), where
+/// a fresh `ctrl_c()` future per iteration would miss it.
 #[cfg(unix)]
-async fn shutdown_signal(sigterm: &mut tokio::signal::unix::Signal) -> &'static str {
-    tokio::select! {
-        () = sigint() => "SIGINT",
-        _ = sigterm.recv() => "SIGTERM",
+struct ShutdownSignals {
+    sigint: tokio::signal::unix::Signal,
+    sigterm: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn register() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            sigint: signal(SignalKind::interrupt())?,
+            sigterm: signal(SignalKind::terminate())?,
+        })
+    }
+
+    /// Resolve on the next SIGINT or SIGTERM and return the signal's name.
+    async fn recv(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.sigint.recv() => "SIGINT",
+            _ = self.sigterm.recv() => "SIGTERM",
+        }
     }
 }
 
@@ -2600,10 +2618,8 @@ impl Daemon {
 
         // Also start the IPC listener so that the TCP-based notification
         // path works on Unix too (useful for testing and uniformity).
-        // `belt stop` sends SIGTERM: it must drain like SIGINT instead of
-        // killing the process with its default disposition.
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to register SIGTERM handler");
+        let mut shutdown =
+            ShutdownSignals::register().expect("failed to register SIGINT/SIGTERM handlers");
 
         let (_ipc_task, mut wakes) = self.start_ipc_wakes().await;
 
@@ -2624,7 +2640,7 @@ impl Daemon {
                 Some(signal) = wakes.recv() => {
                     self.handle_ipc_signal(signal).await;
                 }
-                name = shutdown_signal(&mut sigterm) => {
+                name = shutdown.recv() => {
                     tracing::info!("received {name}, initiating graceful shutdown...");
                     self.shutdown_requested = true;
                     break;
@@ -2676,17 +2692,16 @@ impl Daemon {
     pub async fn drain_with_timeout(&mut self, timeout: std::time::Duration) {
         #[cfg(unix)]
         {
-            let mut sigterm =
-                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
-                    Ok(sigterm) => sigterm,
-                    Err(e) => {
-                        tracing::error!("SIGTERM not observable during the drain: {e}");
-                        self.drain_until_interrupted(timeout, sigint()).await;
-                        return;
-                    }
-                };
+            let mut shutdown = match ShutdownSignals::register() {
+                Ok(shutdown) => shutdown,
+                Err(e) => {
+                    tracing::error!("SIGTERM not observable during the drain: {e}");
+                    self.drain_until_interrupted(timeout, sigint()).await;
+                    return;
+                }
+            };
             self.drain_until_interrupted(timeout, async {
-                let name = shutdown_signal(&mut sigterm).await;
+                let name = shutdown.recv().await;
                 tracing::warn!("received {name} during the drain");
             })
             .await;
