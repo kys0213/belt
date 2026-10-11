@@ -227,4 +227,6 @@ pub fn hitl_resolution_is_logged_as_hitl_resolved_transition() {
     let log = s.env.transitions(&s.work_id);
     let resolved = rows_of(&log, "hitl_resolved");
     assert_eq!(resolved.len(), 1, "no hitl_resolved row: {log:#?}");
+    assert_eq!(resolved[0]["actor"], "origin", "{}", resolved[0]);
+    assert_eq!(resolved[0]["reason"], "done", "{}", resolved[0]);
 }

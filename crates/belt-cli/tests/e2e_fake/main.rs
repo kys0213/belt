@@ -65,9 +65,7 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "finding_daemon_survives_a_registered_workspace",
-        ignore: Some(
-            "finding: PrReviewScanJob block_on inside the daemon runtime panics once a workspace is registered",
-        ),
+        ignore: None,
         run: scenarios_lineage::finding_daemon_survives_a_registered_workspace,
     },
     Case {
@@ -77,12 +75,12 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "hitl_needs_human_label_added_on_open_and_removed_on_resolve",
-        ignore: Some("finding: D1 lifecycle hook is not wired into the daemon binary"),
+        ignore: None,
         run: scenarios_hitl::hitl_needs_human_label_added_on_open_and_removed_on_resolve,
     },
     Case {
         name: "hitl_resolution_is_logged_as_hitl_resolved_transition",
-        ignore: Some("finding: D2 HITL confirmation appends no hitl_resolved transition row"),
+        ignore: None,
         run: scenarios_hitl::hitl_resolution_is_logged_as_hitl_resolved_transition,
     },
     Case {
@@ -97,12 +95,12 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "cancel_direct_cancel_records_skipped_attempt",
-        ignore: Some("finding: D6 CLI direct cancel records no skipped attempt"),
+        ignore: None,
         run: scenarios_cancel::direct_cancel_records_skipped_attempt,
     },
     Case {
         name: "cancel_direct_cancel_of_derived_item_cleans_inherited_worktree",
-        ignore: Some("finding: D5 CLI cleans the worktree by its own work_id, not the owner key"),
+        ignore: None,
         run: scenarios_cancel::direct_cancel_of_derived_item_cleans_inherited_worktree,
     },
     Case {

@@ -102,11 +102,10 @@ runtime:
     }
 }
 
-/// `belt workspace add --config <config>`. Only the CLI's `queue done`,
-/// `queue hitl` and `context` need it. Registering also makes the daemon's
-/// `pr_review_scan` cron scan it, which currently crashes the daemon (see
-/// `scenarios_lineage::finding_daemon_survives_a_registered_workspace`), so
-/// scenarios that need no registration leave it out.
+/// `belt workspace add --config <config>`. Only the CLI's `queue done` and
+/// `queue hitl` need it (`context` falls back to the item's stored fields),
+/// so scenarios that need neither leave it out. Registering also makes the
+/// daemon's `pr_review_scan` cron scan the workspace.
 pub fn register_workspace(env: &E2eEnv, config: &std::path::Path) {
     let out = env.belt(&["workspace", "add", "--config", config.to_str().unwrap()]);
     assert!(

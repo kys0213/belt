@@ -79,17 +79,17 @@ fn wait_processes_gone(pids: &[u32]) {
     );
 }
 
-/// Statuses the attempt history records for `work_id`. Read from the store:
-/// `belt context` shows them too but needs `belt workspace add`, which
-/// currently crashes the daemon (see `support::register_workspace`).
+/// Statuses `belt context --json` reports in the attempt history of
+/// `work_id`. The history spans the whole source, so other items' rows are
+/// filtered out.
 fn history_statuses(env: &E2eEnv, work_id: &str) -> Vec<String> {
-    let db = env.db();
-    let mut stmt = db
-        .prepare("SELECT status FROM history WHERE work_id = ?1 ORDER BY id")
-        .unwrap();
-    stmt.query_map([work_id], |r| r.get(0))
-        .unwrap()
-        .map(Result::unwrap)
+    let context = env.belt_json(&["context", work_id, "--json"]);
+    context["history"]
+        .as_array()
+        .unwrap_or_else(|| panic!("context has no history array: {context:#}"))
+        .iter()
+        .filter(|h| h["work_id"] == work_id)
+        .map(|h| h["status"].as_str().unwrap().to_string())
         .collect()
 }
 
@@ -314,4 +314,10 @@ pub fn direct_cancel_of_derived_item_cleans_inherited_worktree() {
         "inherited worktree {inherited} left behind: {:?}",
         env.worktree_dirs()
     );
+    // The git worktree registration goes too, not only the directory.
+    assert_eq!(
+        env.git_worktrees(),
+        vec![env.repo_dir.display().to_string()]
+    );
+    assert_eq!(history_statuses(&env, &derived), ["skipped"]);
 }

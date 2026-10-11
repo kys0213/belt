@@ -201,15 +201,8 @@ pub fn failed_item_blocks_recollection_across_scans_and_restart() {
     assert_eq!(created[0]["reason"], "collected", "{created:?}");
 }
 
-// E2E-FINDING: once a workspace with a GitHub source is registered
-// (`belt workspace add`), the daemon panics on its first tick and exits:
-// `PrReviewScanJob` bridges `collect_review_items` with
-// `std::thread::scope(|_| { Runtime::new()...block_on(..) })`
-// (belt-daemon/src/cron.rs:1715-1722). `thread::scope` runs the closure on
-// the calling thread — no thread is spawned — and that thread already drives
-// the daemon's tokio runtime, so `block_on` panics with "Cannot start a
-// runtime from within a runtime" (cron.rs:1721).
-/// A registered workspace must not take the daemon down.
+/// A registered workspace must not take the daemon down: its
+/// `pr_review_scan` cron job runs on the daemon's ticks next to the item.
 pub fn finding_daemon_survives_a_registered_workspace() {
     let env = E2eEnv::new();
     let issue = env.gh.seed_issue("Analyze", "body", &[TRIGGER]);
