@@ -237,7 +237,7 @@ handler와 lifecycle hook은 서로 다른 설정을 사용한다.
 | 구분 | 설정 | 실행 |
 |------|------|------|
 | handler | `prompt` 또는 `script` | Daemon이 직접 실행. prompt는 LLM(worktree 안), script는 bash |
-| lifecycle 반응 | `on_enter` / `on_done` / `on_fail` script | script 어댑터가 LifecycleHook으로 감싸 실행 |
+| lifecycle 반응 | `on_enter` / `on_done` / `on_fail` script | Daemon이 직접 실행. 각 시점에 이벤트당 한 번이며 LifecycleHook과 무관 ([LifecycleHook](./lifecycle-hook.md)) |
 
 ```yaml
 handlers:

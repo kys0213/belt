@@ -99,6 +99,8 @@ flowchart TD
 ```
 
 > yaml `on_enter`/`on_done`/`on_fail` script는 hook 선택과 무관하게 daemon이 각 시점에 직접 한 번 실행한다. 이 script를 실행하는 hook은 없다 — hook이 실행하면 같은 script가 두 번 돈다.
+>
+> yaml `on_fail` script가 비정상 종료하거나 실행 오류가 나도 경고 로그만 남는다. 이력에 기록하지 않고 상태 전이도 바꾸지 않는다. hook의 `on_fail` 실패도 같다. `on_fail` script는 worktree가 있을 때만 실행한다.
 
 - Daemon 재시작 없이 `belt workspace add`로 등록한 workspace는 다음 tick부터 동작한다.
 - yaml을 수정하면 다음 hook 트리거에서 최신 설정이 반영된다.
@@ -124,7 +126,7 @@ flowchart TD
 |----------|----------|---------|------|
 | `on_enter` | Running 진입 후, handler 실행 전 | handler 건너뛰고 escalation 경로 | 전제 조건 미충족 — handler 실행 의미 없음 |
 | `on_done` | evaluate가 Done 판정 후. HITL done 후처리에서도 호출 | Failed 상태로 전이 (HITL done 후처리에서는 Hitl→Failed) | 외부 반영 실패 — 수동 확인 필요 |
-| `on_fail` | handler 또는 on_enter 실패의 escalation 결과 전이가 applied로 commit된 뒤 (retry 제외) | 이력 기록, 상태 전이에 영향 없음 | 이미 실패 경로 — 2차 실패로 흐름 중단하지 않음 |
+| `on_fail` | handler 또는 on_enter 실패의 escalation 결과 전이가 applied로 commit된 뒤 (retry 제외) | 경고 로그만 남김, 상태 전이에 영향 없음 | 이미 실패 경로 — 2차 실패로 흐름 중단하지 않음 |
 | `on_escalation` | escalation 결과 전이가 applied로 commit된 뒤 (모든 액션) | 이력 기록, escalation 진행 | 알림 실패가 escalation 자체를 막으면 안 됨 |
 | `on_hitl_opened` | HITL 요청이 열린 뒤 daemon이 관찰할 때 한 번. 이미 확정된 요청은 건너뜀 | 이력 기록, 재시도 없음 (비치명) | 라벨 반영 실패가 HITL을 막으면 안 됨 |
 | `on_hitl_resolved` | daemon의 HITL 해결 후처리에서, 결과 전이 전 | 이력 기록, 후처리 진행 (비치명) | 해결 사실의 외부 반영 실패가 해결 자체를 되돌리면 안 됨 |
