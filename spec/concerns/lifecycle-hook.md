@@ -100,7 +100,7 @@ flowchart TD
 
 > yaml `on_enter`/`on_done`/`on_fail` script는 hook 선택과 무관하게 daemon이 각 시점에 직접 한 번 실행한다. 이 script를 실행하는 hook은 없다 — hook이 실행하면 같은 script가 두 번 돈다.
 >
-> yaml `on_fail` script가 비정상 종료하거나 실행 오류가 나도 경고 로그만 남는다. 이력에 기록하지 않고 상태 전이도 바꾸지 않는다. hook의 `on_fail` 실패도 같다. `on_fail` script는 worktree가 있을 때만 실행한다.
+> yaml `on_fail` script가 비정상 종료하거나 실행 오류가 나도 경고 로그만 남는다. 이력에 기록하지 않고 상태 전이도 바꾸지 않는다. `on_fail` script는 worktree가 있을 때만 실행한다.
 
 - Daemon 재시작 없이 `belt workspace add`로 등록한 workspace는 다음 tick부터 동작한다.
 - yaml을 수정하면 다음 hook 트리거에서 최신 설정이 반영된다.
