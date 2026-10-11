@@ -21,6 +21,7 @@ use anyhow::{Result, bail};
 use belt_core::lifecycle::LifecycleHook;
 use belt_core::platform::ShellExecutor;
 
+use crate::sources::github::GitHubDataSource;
 use github::{GitHubHookConfig, GitHubLifecycleHook};
 
 /// Parameters for creating a lifecycle hook instance.
@@ -108,28 +109,11 @@ pub fn resolve_hook(
     };
 
     // Extract repo identifier from URL.
-    let repo = extract_repo_from_url(source_url).unwrap_or_else(|| source_url.to_string());
+    let repo =
+        GitHubDataSource::extract_repo_name(source_url).unwrap_or_else(|| source_url.to_string());
 
     let params = HookParams::new(source_type, &repo);
     create_hook(&params, shell).ok()
-}
-
-/// Extract `owner/repo` from a GitHub URL.
-///
-/// Supports `https://github.com/owner/repo`, `ssh://git@github.com/owner/repo`
-/// and the scp-like `git@github.com:owner/repo`, each with an optional
-/// trailing `.git` and `/`.
-fn extract_repo_from_url(url: &str) -> Option<String> {
-    let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
-    // scp-like syntax separates host and path with `:` and has no scheme.
-    let path = match trimmed.split_once("://") {
-        Some((_, rest)) => rest,
-        None => trimmed.rsplit_once(':').map_or(trimmed, |(_, path)| path),
-    };
-    let mut segments = path.rsplit('/').filter(|s| !s.is_empty());
-    let repo = segments.next()?;
-    let owner = segments.next()?;
-    Some(format!("{owner}/{repo}"))
 }
 
 #[cfg(test)]
@@ -253,45 +237,6 @@ mod tests {
         let shell: Arc<dyn ShellExecutor> = Arc::new(StubShell);
         let hook = resolve_hook("jira", "https://jira.example.com", shell);
         assert!(hook.is_none());
-    }
-
-    #[test]
-    fn extract_repo_from_github_url() {
-        assert_eq!(
-            extract_repo_from_url("https://github.com/org/repo"),
-            Some("org/repo".to_string())
-        );
-        assert_eq!(
-            extract_repo_from_url("https://github.com/org/repo/"),
-            Some("org/repo".to_string())
-        );
-        assert_eq!(
-            extract_repo_from_url("https://github.com/org/repo.git"),
-            Some("org/repo".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_repo_from_ssh_urls() {
-        for url in [
-            "git@github.com:org/repo.git",
-            "git@github.com:org/repo",
-            "git@github.com:org/repo.git/",
-            "ssh://git@github.com/org/repo.git",
-            "ssh://git@github.com/org/repo/",
-        ] {
-            assert_eq!(
-                extract_repo_from_url(url),
-                Some("org/repo".to_string()),
-                "{url}"
-            );
-        }
-    }
-
-    #[test]
-    fn extract_repo_rejects_url_without_owner_and_repo() {
-        assert_eq!(extract_repo_from_url("git@github.com:repo.git"), None);
-        assert_eq!(extract_repo_from_url("repo"), None);
     }
 
     #[test]
