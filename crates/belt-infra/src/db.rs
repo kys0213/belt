@@ -3663,11 +3663,12 @@ impl Database {
             .next() else {
                 return Ok(DirectCancelOutcome::NotOpen);
             };
-            let (pid, updated_at): (Option<i64>, String) = tx
+            let (pid, updated_at, source_id, state): (Option<i64>, String, String, String) = tx
                 .query_row(
-                    "SELECT handler_pid, updated_at FROM queue_items WHERE work_id = ?1",
+                    "SELECT handler_pid, updated_at, source_id, state FROM queue_items
+                     WHERE work_id = ?1",
                     params![request.work_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
                 .map_err(sql_err)?
@@ -3684,11 +3685,14 @@ impl Database {
                 },
             )?;
             let outcome = match step {
-                Step::Applied { .. } => DirectCancelOutcome::Canceled {
-                    handler: pid
-                        .map(|pid| handler_process_of(pid, &updated_at))
-                        .transpose()?,
-                },
+                Step::Applied { .. } => {
+                    record_skipped_attempt(tx, &request.work_id, &source_id, &state)?;
+                    DirectCancelOutcome::Canceled {
+                        handler: pid
+                            .map(|pid| handler_process_of(pid, &updated_at))
+                            .transpose()?,
+                    }
+                }
                 Step::Rejected(TransitionOutcome::Conflict { current })
                 | Step::Rejected(TransitionOutcome::InvalidAction { current }) => {
                     DirectCancelOutcome::TooLate { current }
@@ -3726,6 +3730,32 @@ impl Database {
             Ok(outcome)
         })
     }
+}
+
+/// Append the `skipped` attempt of a canceled execution to the history.
+///
+/// The attempt number follows the daemon's: one past the failed attempts of
+/// the same source and state. A skipped attempt does not count as a failure.
+fn record_skipped_attempt(
+    tx: &Transaction<'_>,
+    work_id: &str,
+    source_id: &str,
+    state: &str,
+) -> Result<(), BeltError> {
+    let failed: i32 = tx
+        .query_row(
+            "SELECT COUNT(*) FROM history WHERE source_id = ?1 AND state = ?2 AND status = 'failed'",
+            params![source_id, state],
+            |row| row.get(0),
+        )
+        .map_err(sql_err)?;
+    tx.execute(
+        "INSERT INTO history (work_id, source_id, state, status, attempt, summary, error, created_at)
+             VALUES (?1, ?2, ?3, 'skipped', ?4, NULL, NULL, ?5)",
+        params![work_id, source_id, state, failed + 1, Utc::now().to_rfc3339()],
+    )
+    .map_err(sql_err)?;
+    Ok(())
 }
 
 fn handler_process_of(pid: i64, running_since: &str) -> Result<HandlerProcess, BeltError> {
@@ -7876,6 +7906,45 @@ mod tests {
             .unwrap();
         assert_eq!(enter.reason.as_deref(), Some("canceled"));
         assert_eq!(enter.actor, "cli");
+    }
+
+    #[test]
+    fn cancel_directly_records_the_canceled_execution_as_a_skipped_attempt() {
+        let db = test_db();
+        let source_id = "gh:org/repo#955";
+        let id = running_item(&db, source_id);
+        let cancel_id = open_request(&db, &id);
+
+        db.cancel_directly(cancel_id, &Actor::Cli).unwrap();
+
+        let history = db.get_history(source_id).unwrap();
+        assert_eq!(history.len(), 1, "history: {history:?}");
+        assert_eq!(history[0].work_id, id);
+        assert_eq!(history[0].state, "analyze");
+        assert_eq!(history[0].status, "skipped");
+        assert_eq!(history[0].attempt, 1);
+    }
+
+    #[test]
+    fn cancel_directly_too_late_records_no_attempt() {
+        let db = test_db();
+        let source_id = "gh:org/repo#956";
+        let id = running_item(&db, source_id);
+        let cancel_id = open_request(&db, &id);
+        db.transition(&TransitionRequest {
+            reason: TransitionReason::Advance,
+            ..request(
+                &id,
+                QueuePhase::Running,
+                QueuePhase::Completed,
+                Actor::Daemon,
+            )
+        })
+        .unwrap();
+
+        db.cancel_directly(cancel_id, &Actor::Cli).unwrap();
+
+        assert!(db.get_history(source_id).unwrap().is_empty());
     }
 
     #[test]
