@@ -1634,6 +1634,11 @@ pub mod transition_kind {
     pub const TRANSITION_REJECTED: &str = "transition_rejected";
     /// A transition found a phase other than the expected one.
     pub const TRANSITION_CONFLICT: &str = "transition_conflict";
+    /// A HITL request was confirmed, by a winning response or by expiry;
+    /// `actor` is the path (`via`), `reason` the action, `detail` the request
+    /// id, respondent and status. The phase columns are empty: the phase
+    /// changes later, in post-processing.
+    pub const HITL_RESOLVED: &str = "hitl_resolved";
     /// A HITL response was refused; `reason` is `already_handled` or
     /// `unauthorized`. The phase columns are empty: no transition happened.
     pub const HITL_RESPONSE_REJECTED: &str = "hitl_response_rejected";
@@ -2493,7 +2498,7 @@ impl Database {
             };
             match current.status {
                 HitlStatus::Open => {
-                    confirm_open(tx, &current.hitl_id, HitlStatus::Expired, &expiry, None)?;
+                    confirm_open(tx, &current, HitlStatus::Expired, &expiry, None)?;
                     Ok(RespondOutcome::Won {
                         hitl_id: current.hitl_id,
                     })
@@ -2664,13 +2669,7 @@ fn confirm_in_tx(
     };
     match current.status {
         HitlStatus::Open => {
-            confirm_open(
-                tx,
-                &current.hitl_id,
-                HitlStatus::Resolved,
-                resolution,
-                notes,
-            )?;
+            confirm_open(tx, &current, HitlStatus::Resolved, resolution, notes)?;
             Ok(RespondOutcome::Won {
                 hitl_id: current.hitl_id,
             })
@@ -2737,10 +2736,11 @@ fn append_rejection(
     Ok(())
 }
 
-/// Open -> `status` compare-and-set recording the winning resolution.
+/// Open -> `status` compare-and-set recording the winning resolution, logged
+/// as `hitl_resolved` in the same transaction.
 fn confirm_open(
     tx: &Transaction<'_>,
-    hitl_id: &HitlId,
+    request: &HitlRequest,
     status: HitlStatus,
     resolution: &HitlResolution,
     notes: Option<&str>,
@@ -2758,6 +2758,7 @@ fn confirm_open(
         ConfirmPath::Direct => "direct",
         ConfirmPath::NaturalLanguage => "natural_language",
     };
+    let hitl_id = &request.hitl_id;
     let changed = tx
         .execute(
             "UPDATE hitl_requests
@@ -2782,6 +2783,37 @@ fn confirm_open(
         )));
     }
     close_proposals_in_tx(tx, hitl_id)?;
+
+    let source_id: String = tx
+        .query_row(
+            "SELECT source_id FROM queue_items WHERE work_id = ?1",
+            params![request.work_id],
+            |r| r.get(0),
+        )
+        .map_err(sql_err)?;
+    let action = resolution.action.to_string();
+    let detail = serde_json::json!({
+        "hitl_id": hitl_id.as_str(),
+        "by": resolution.by,
+        "via": resolution.via,
+        "action": action,
+        "status": status,
+        "confirm_path": path,
+    })
+    .to_string();
+    append_log(
+        tx,
+        &LogRecord {
+            work_id: &request.work_id,
+            source_id: &source_id,
+            kind: transition_kind::HITL_RESOLVED,
+            from_phase: None,
+            to_phase: None,
+            actor: &resolution.via,
+            reason: Some(&action),
+            detail: Some(&detail),
+        },
+    )?;
     Ok(())
 }
 
@@ -7078,6 +7110,58 @@ mod tests {
             db.hitl_request(&hitl_id).unwrap().unwrap().status,
             HitlStatus::Expired
         );
+    }
+
+    fn hitl_resolved_rows(db: &Database, work_id: &str) -> Vec<TransitionLogEntry> {
+        db.transitions_of(work_id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == transition_kind::HITL_RESOLVED)
+            .collect()
+    }
+
+    #[test]
+    fn a_winning_response_logs_hitl_resolved_once() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+        let human = resolution(HitlAction::Retry, "irene", "cli");
+
+        db.resolve_hitl(&HitlTarget::Id(hitl_id.clone()), &human, None)
+            .unwrap();
+        // A losing response is logged as a rejection, not as a resolution.
+        let late = resolution(HitlAction::Done, "jack", "tui");
+        db.resolve_hitl(&HitlTarget::Id(hitl_id.clone()), &late, None)
+            .unwrap();
+
+        let rows = hitl_resolved_rows(&db, &id);
+        assert_eq!(rows.len(), 1, "rows: {rows:?}");
+        assert_eq!(rows[0].actor, "cli");
+        assert_eq!(rows[0].reason.as_deref(), Some("retry"));
+        assert_eq!(rows[0].from_phase, None);
+        assert_eq!(rows[0].to_phase, None);
+        let detail: serde_json::Value =
+            serde_json::from_str(rows[0].detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["hitl_id"], hitl_id.as_str());
+        assert_eq!(detail["by"], "irene");
+        assert_eq!(detail["status"], "resolved");
+    }
+
+    #[test]
+    fn an_expiry_logs_hitl_resolved() {
+        let db = test_db();
+        let id = running_item(&db, "s1");
+        let hitl_id = opened(&db, &id);
+
+        db.expire_hitl(&hitl_id, EscalationAction::Skip).unwrap();
+
+        let rows = hitl_resolved_rows(&db, &id);
+        assert_eq!(rows.len(), 1, "rows: {rows:?}");
+        assert_eq!(rows[0].actor, "timeout");
+        assert_eq!(rows[0].reason.as_deref(), Some("skip"));
+        let detail: serde_json::Value =
+            serde_json::from_str(rows[0].detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["status"], "expired");
     }
 
     #[test]
