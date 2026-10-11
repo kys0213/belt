@@ -24,7 +24,7 @@ use belt_core::lifecycle::LifecycleHook;
 use belt_core::platform::ShellExecutor;
 use belt_core::workspace::WorkspaceConfig;
 use belt_infra::db::Database;
-use belt_infra::hooks::{self, HookParams};
+use belt_infra::hooks;
 use belt_infra::script_hook::ScriptLifecycleHook;
 use belt_infra::workspace_loader::load_workspace_config;
 
@@ -69,21 +69,27 @@ impl DynamicHookLoader {
     /// 2. Check LRU cache — return cached hook if `updated_at` matches.
     /// 3. On miss or stale entry: parse yaml, create hook, cache it.
     ///
-    /// Falls back through this priority chain:
-    /// - DataSource-specific hook (e.g. `GitHubLifecycleHook`) via `hooks::create_hook`
-    /// - `ScriptLifecycleHook` if yaml has `on_done`/`on_fail`/`on_enter` scripts
-    /// - `NoopLifecycleHook` if nothing is configured
+    /// The hook is chosen by [`hook_for_workspace`]; a workspace that cannot
+    /// be looked up gets `NoopLifecycleHook`.
     pub fn resolve(&self, workspace_name: &str) -> Arc<dyn LifecycleHook> {
+        self.try_resolve(workspace_name)
+            .unwrap_or_else(|| Arc::new(belt_core::lifecycle::NoopLifecycleHook))
+    }
+
+    /// [`DynamicHookLoader::resolve`], but `None` when the workspace cannot
+    /// be looked up in the DB (e.g. not registered), so the caller can
+    /// choose its own fallback.
+    pub fn try_resolve(&self, workspace_name: &str) -> Option<Arc<dyn LifecycleHook>> {
         // Step 1: DB lookup.
         let (config_path, updated_at) = match self.db.get_workspace_with_updated_at(workspace_name)
         {
             Ok((_name, cp, ua)) => (cp, ua),
             Err(e) => {
-                tracing::warn!(
+                tracing::debug!(
                     workspace = workspace_name,
-                    "hook loader: DB workspace lookup failed, using NoopLifecycleHook: {e}"
+                    "hook loader: DB workspace lookup failed: {e}"
                 );
-                return Arc::new(belt_core::lifecycle::NoopLifecycleHook);
+                return None;
             }
         };
 
@@ -93,7 +99,7 @@ impl DynamicHookLoader {
             if let Some(entry) = cache.get(workspace_name)
                 && entry.updated_at == updated_at
             {
-                return Arc::clone(&entry.hook);
+                return Some(Arc::clone(&entry.hook));
             }
             // Stale or missing — will be (re)populated below.
         }
@@ -113,7 +119,7 @@ impl DynamicHookLoader {
             );
         }
 
-        hook
+        Some(hook)
     }
 
     /// Parse workspace yaml and create the best-fit hook implementation.
@@ -134,61 +140,7 @@ impl DynamicHookLoader {
             }
         };
 
-        // Try DataSource-specific hook first (e.g. GitHubLifecycleHook).
-        if let Some(hook) = self.try_datasource_hook(&config) {
-            tracing::debug!(
-                workspace = workspace_name,
-                "hook loader: resolved DataSource-specific hook"
-            );
-            return hook;
-        }
-
-        // Fall back to ScriptLifecycleHook if on_done/on_fail/on_enter scripts exist.
-        if Self::has_lifecycle_scripts(&config) {
-            tracing::debug!(
-                workspace = workspace_name,
-                "hook loader: resolved ScriptLifecycleHook from yaml scripts"
-            );
-            return Arc::new(self.build_script_hook(&config));
-        }
-
-        // Nothing configured — noop.
-        tracing::debug!(
-            workspace = workspace_name,
-            "hook loader: no hook configuration found, using NoopLifecycleHook"
-        );
-        Arc::new(belt_core::lifecycle::NoopLifecycleHook)
-    }
-
-    /// Attempt to create a DataSource-specific hook from the workspace sources.
-    fn try_datasource_hook(&self, config: &WorkspaceConfig) -> Option<Arc<dyn LifecycleHook>> {
-        for (source_key, source_config) in &config.sources {
-            let params = HookParams::new(source_key, &source_config.url);
-            if let Ok(hook) = hooks::create_hook(&params, Arc::clone(&self.shell)) {
-                return Some(Arc::from(hook));
-            }
-        }
-        None
-    }
-
-    /// Check if any state in any source has lifecycle scripts defined.
-    fn has_lifecycle_scripts(config: &WorkspaceConfig) -> bool {
-        config.sources.values().any(|source| {
-            source.states.values().any(|state| {
-                !state.on_enter.is_empty() || !state.on_done.is_empty() || !state.on_fail.is_empty()
-            })
-        })
-    }
-
-    /// Build a `ScriptLifecycleHook` from all state configs across all sources.
-    fn build_script_hook(&self, config: &WorkspaceConfig) -> ScriptLifecycleHook {
-        let mut state_configs = std::collections::HashMap::new();
-        for source in config.sources.values() {
-            for (state_name, state_config) in &source.states {
-                state_configs.insert(state_name.clone(), state_config.clone());
-            }
-        }
-        ScriptLifecycleHook::new(state_configs, Arc::clone(&self.shell))
+        hook_for_workspace(&config, Arc::clone(&self.shell))
     }
 
     /// Invalidate a specific workspace's cached hook.
@@ -212,6 +164,53 @@ impl DynamicHookLoader {
         let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.len()
     }
+}
+
+/// Create the best-fit lifecycle hook for a workspace configuration.
+///
+/// Priority chain:
+/// - DataSource-specific hook (e.g. `GitHubLifecycleHook`) via `hooks::resolve_hook`
+/// - `ScriptLifecycleHook` if yaml has `on_done`/`on_fail`/`on_enter` scripts
+/// - `NoopLifecycleHook` if nothing is configured
+pub fn hook_for_workspace(
+    config: &WorkspaceConfig,
+    shell: Arc<dyn ShellExecutor>,
+) -> Arc<dyn LifecycleHook> {
+    for (source_key, source_config) in &config.sources {
+        if let Some(hook) = hooks::resolve_hook(source_key, &source_config.url, Arc::clone(&shell))
+        {
+            tracing::debug!(
+                workspace = %config.name,
+                "hook loader: resolved DataSource-specific hook"
+            );
+            return Arc::from(hook);
+        }
+    }
+
+    let has_lifecycle_scripts = config.sources.values().any(|source| {
+        source.states.values().any(|state| {
+            !state.on_enter.is_empty() || !state.on_done.is_empty() || !state.on_fail.is_empty()
+        })
+    });
+    if has_lifecycle_scripts {
+        tracing::debug!(
+            workspace = %config.name,
+            "hook loader: resolved ScriptLifecycleHook from yaml scripts"
+        );
+        let mut state_configs = std::collections::HashMap::new();
+        for source in config.sources.values() {
+            for (state_name, state_config) in &source.states {
+                state_configs.insert(state_name.clone(), state_config.clone());
+            }
+        }
+        return Arc::new(ScriptLifecycleHook::new(state_configs, shell));
+    }
+
+    tracing::debug!(
+        workspace = %config.name,
+        "hook loader: no hook configuration found, using NoopLifecycleHook"
+    );
+    Arc::new(belt_core::lifecycle::NoopLifecycleHook)
 }
 
 impl std::fmt::Debug for DynamicHookLoader {
@@ -350,6 +349,50 @@ sources:
             assert!(hook.on_enter(&ctx).await.is_ok());
             assert!(hook.on_done(&ctx).await.is_ok());
         });
+    }
+
+    /// Records every command it is asked to run.
+    #[derive(Default)]
+    struct RecordingShell {
+        commands: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ShellExecutor for RecordingShell {
+        async fn execute(
+            &self,
+            command: &str,
+            _working_dir: &Path,
+            _env_vars: &HashMap<String, String>,
+        ) -> Result<ShellOutput, BeltError> {
+            self.commands.lock().unwrap().push(command.to_string());
+            Ok(ShellOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn github_hook_names_the_repository_as_owner_slash_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(test_db());
+        let shell = Arc::new(RecordingShell::default());
+        let yaml = "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n";
+        let yaml_path = write_workspace_yaml(&tmp, "test-ws", yaml);
+        register_workspace(&db, "test-ws", yaml_path.to_str().unwrap());
+
+        let loader = DynamicHookLoader::new(db, shell.clone(), 4);
+        let hook = loader.resolve("test-ws");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(hook.on_hitl_opened(&make_hook_context()))
+            .unwrap();
+
+        assert_eq!(
+            *shell.commands.lock().unwrap(),
+            vec!["gh issue edit 42 --repo org/repo --add-label belt:needs-human".to_string()]
+        );
     }
 
     #[test]

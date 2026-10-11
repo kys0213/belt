@@ -396,14 +396,11 @@ impl Daemon {
 
     /// Resolve the lifecycle hook for a workspace.
     ///
-    /// If a [`DynamicHookLoader`] is configured, delegates to it.
+    /// If a [`DynamicHookLoader`] is configured, delegates to it; the static
+    /// hook serves workspaces the loader cannot look up (not registered).
     /// Otherwise returns the static hook.
     fn resolve_hook(&self, workspace_name: &str) -> Arc<dyn LifecycleHook> {
-        if let Some(loader) = &self.hook_loader {
-            loader.resolve(workspace_name)
-        } else {
-            Arc::clone(&self.hook)
-        }
+        Self::resolve_hook_static(&self.hook, &self.hook_loader, workspace_name)
     }
 
     /// Resolve the lifecycle hook for a workspace (static version for parallel execution).
@@ -414,11 +411,10 @@ impl Daemon {
         hook_loader: &Option<Arc<DynamicHookLoader>>,
         workspace_name: &str,
     ) -> Arc<dyn LifecycleHook> {
-        if let Some(loader) = hook_loader {
-            loader.resolve(workspace_name)
-        } else {
-            Arc::clone(hook)
-        }
+        hook_loader
+            .as_ref()
+            .and_then(|loader| loader.try_resolve(workspace_name))
+            .unwrap_or_else(|| Arc::clone(hook))
     }
 
     // ---------------------------------------------------------------

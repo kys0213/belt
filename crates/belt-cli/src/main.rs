@@ -575,7 +575,22 @@ async fn start_daemon(
         default_runtime,
         nl_sandbox.path(),
     )?;
-    let mut daemon = daemon.with_notifier(notifier);
+    // Registered workspaces resolve their hook from the DB at trigger time;
+    // the hook of the started config serves a workspace that is not
+    // registered.
+    let hook_shell: Arc<dyn belt_core::platform::ShellExecutor> =
+        Arc::from(belt_infra::platform::default_shell_executor());
+    let hook =
+        belt_daemon::hook_cache::hook_for_workspace(&config_for_notifier, Arc::clone(&hook_shell));
+    let hook_loader = belt_daemon::hook_cache::DynamicHookLoader::new(
+        Arc::clone(daemon.database()),
+        hook_shell,
+        16,
+    );
+    let mut daemon = daemon
+        .with_notifier(notifier)
+        .with_hook(hook)
+        .with_hook_loader(Arc::new(hook_loader));
 
     // Write PID file so `belt stop` can find the daemon process.
     std::fs::write(&pid_path, std::process::id().to_string())

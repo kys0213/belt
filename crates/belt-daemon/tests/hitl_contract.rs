@@ -445,6 +445,28 @@ async fn on_hitl_opened_runs_once_per_open_request() {
 }
 
 #[tokio::test]
+async fn the_static_hook_serves_a_workspace_the_hook_loader_cannot_look_up() {
+    let tmp = TempDir::new().unwrap();
+    let hook = OpenedHook::new(false);
+    let daemon = daemon(&tmp, MockDataSource::new("github"), vec![]);
+    let loader = belt_daemon::hook_cache::DynamicHookLoader::new(
+        Arc::clone(daemon.database()),
+        Arc::from(belt_infra::platform::default_shell_executor()),
+        4,
+    );
+    let mut daemon = daemon
+        .with_hook(hook.clone())
+        .with_hook_loader(Arc::new(loader));
+    let service = HitlService::new(Arc::clone(daemon.database()));
+
+    let work_id = running_item(daemon.db(), "1");
+    open(&service, &work_id);
+
+    assert_eq!(daemon.observe_hitl_opened().await.unwrap(), 1);
+    assert_eq!(hook.opened(), vec![work_id]);
+}
+
+#[tokio::test]
 async fn on_hitl_opened_skips_requests_confirmed_before_observation() {
     let tmp = TempDir::new().unwrap();
     let hook = OpenedHook::new(false);
