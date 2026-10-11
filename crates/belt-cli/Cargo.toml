@@ -27,6 +27,13 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 tempfile = { workspace = true }
 
+# Fake-environment E2E: the test binary doubles as the fake `gh` / `claude`
+# (dispatched on argv[0] through symlinks), so it needs its own `main`.
+[[test]]
+name = "e2e_fake"
+path = "tests/e2e_fake/main.rs"
+harness = false
+
 [dev-dependencies]
 async-trait = { workspace = true }
 rusqlite = { workspace = true }
