@@ -1322,9 +1322,19 @@ fn worktree_manager() -> anyhow::Result<GitWorktreeManager> {
 }
 
 /// Cleanup after a terminal transition (matches daemon pattern: warn on failure, don't abort).
-fn cleanup_worktree(mgr: &GitWorktreeManager, work_id: &str, command: &str) {
-    if let Err(e) = mgr.cleanup(work_id) {
-        tracing::warn!(work_id, error = %e, "worktree cleanup failed on {command}, continuing");
+///
+/// The worktree is keyed by its owner ([`Database::worktree_key`]): a
+/// derived item cleans the worktree it was handed.
+fn cleanup_worktree(db: &Database, mgr: &GitWorktreeManager, work_id: &str, command: &str) {
+    let key = match db.worktree_key(work_id) {
+        Ok(key) => key,
+        Err(e) => {
+            tracing::warn!(work_id, error = %e, "worktree owner lookup failed on {command}, not cleaned");
+            return;
+        }
+    };
+    if let Err(e) = mgr.cleanup(&key) {
+        tracing::warn!(work_id, worktree = %key, error = %e, "worktree cleanup failed on {command}, continuing");
     }
 }
 
@@ -1363,7 +1373,7 @@ async fn cmd_queue_done(work_id: &str, json: bool) -> anyhow::Result<i32> {
             .unwrap_or_default();
 
         if !on_done_actions.is_empty() {
-            let worktree_path = worktree_mgr.create_or_reuse(work_id)?;
+            let worktree_path = worktree_mgr.create_or_reuse(&db.worktree_key(work_id)?)?;
             let env = belt_daemon::executor::ActionEnv::new(work_id, &worktree_path);
 
             // Build a minimal runtime registry for script execution.
@@ -1396,7 +1406,7 @@ async fn cmd_queue_done(work_id: &str, json: bool) -> anyhow::Result<i32> {
 
     let outcome = request_manual_transition(&hitl, &item, target, detail)?;
     if matches!(outcome, ManualOutcome::Applied) && target == QueuePhase::Done {
-        cleanup_worktree(&worktree_mgr, work_id, "queue done");
+        cleanup_worktree(&db, &worktree_mgr, work_id, "queue done");
     }
     let mut fields = serde_json::json!({ "scripts_run": scripts_run });
     if let Some(code) = script_exit {
@@ -1497,7 +1507,7 @@ fn cmd_queue_skip(work_id: &str, json: bool) -> anyhow::Result<i32> {
         return cancel_running_item(&db, work_id, json);
     }
     if matches!(outcome, ManualOutcome::Applied) {
-        cleanup_worktree(&worktree_manager()?, work_id, "queue skip");
+        cleanup_worktree(&db, &worktree_manager()?, work_id, "queue skip");
     }
     emit_manual_outcome(
         work_id,
@@ -1536,7 +1546,7 @@ fn cancel_running_item(db: &Database, work_id: &str, json: bool) -> anyhow::Resu
             format!("Canceled {work_id}."),
         ),
         CancelOutcome::CanceledDirectly => {
-            cleanup_worktree(&worktree_manager()?, work_id, "queue skip");
+            cleanup_worktree(db, &worktree_manager()?, work_id, "queue skip");
             emit_success(
                 work_id,
                 json,
