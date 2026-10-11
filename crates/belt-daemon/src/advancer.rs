@@ -10,13 +10,11 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use chrono::Utc;
-
-use belt_core::dependency::{DependencyGuard, SpecDependencyGuard};
 use belt_core::phase::QueuePhase;
-use belt_core::queue::{HitlReason, QueueItem};
+use belt_core::queue::QueueItem;
 use belt_core::state_machine;
-use belt_infra::db::{Database, TransitionEvent};
+use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
+use belt_infra::db::Database;
 
 use crate::concurrency::ConcurrencyTracker;
 
@@ -32,57 +30,22 @@ fn transit(
     item.transit(to)
 }
 
-/// Record a phase transition event to the database.
-///
-/// Silently logs a warning on failure — transition recording must not
-/// block the state machine.
-fn record_transition(
-    db: &Option<Arc<Database>>,
-    work_id: &str,
-    source_id: &str,
-    from: QueuePhase,
-    to: QueuePhase,
-    event_type: &str,
-    detail: Option<String>,
-) {
-    let Some(db) = db.as_ref() else {
-        return;
-    };
-    let now = Utc::now();
-    let event = TransitionEvent {
-        id: format!("te-{}-{}", work_id, now.timestamp_millis()),
-        work_id: work_id.to_string(),
-        source_id: source_id.to_string(),
-        event_type: event_type.to_string(),
-        phase: Some(to.as_str().to_string()),
-        from_phase: Some(from.as_str().to_string()),
-        detail,
-        created_at: now.to_rfc3339(),
-    };
-    if let Err(e) = db.insert_transition_event(&event) {
-        tracing::warn!(
-            work_id = %work_id,
-            error = %e,
-            "failed to record transition event"
-        );
-    }
-}
-
 /// Drives queue items through the advance phase of the daemon lifecycle.
 ///
 /// Responsibilities:
-/// 1. Filter items for advance eligibility (dependency gate, conflict detection)
+/// 1. Filter items for advance eligibility (queue dependency gate)
 /// 2. Update `QueueItem.phase` via `transit` / state_machine
 /// 3. Emit transition events to the database
-/// 4. Handle escalation decisions (HITL entry on spec conflicts)
-/// 5. Return updated count for the daemon to log
+/// 4. Return updated count for the daemon to log
 pub struct Advancer<'a> {
     queue: &'a mut VecDeque<QueueItem>,
     tracker: &'a mut ConcurrencyTracker,
     db: &'a Option<Arc<Database>>,
     ws_name: &'a str,
     ws_concurrency: u32,
-    dependency_guard: &'a SpecDependencyGuard,
+    /// Items whose claim lost to a writer that finished them (Done or
+    /// Skipped). They leave the queue once the loop that holds indices ends.
+    finished_by_others: Vec<String>,
 }
 
 impl<'a> Advancer<'a> {
@@ -93,7 +56,6 @@ impl<'a> Advancer<'a> {
         db: &'a Option<Arc<Database>>,
         ws_name: &'a str,
         ws_concurrency: u32,
-        dependency_guard: &'a SpecDependencyGuard,
     ) -> Self {
         Self {
             queue,
@@ -101,17 +63,34 @@ impl<'a> Advancer<'a> {
             db,
             ws_name,
             ws_concurrency,
-            dependency_guard,
+            finished_by_others: Vec::new(),
         }
+    }
+
+    /// Remove the copies whose claim found a finished row.
+    ///
+    /// Deferred to the end of a run because the loops address the queue by
+    /// index.
+    fn drop_finished_by_others(&mut self) {
+        let finished = std::mem::take(&mut self.finished_by_others);
+        self.queue.retain(|item| !finished.contains(&item.work_id));
     }
 
     /// Auto-transition Pending -> Ready -> Running (respecting concurrency).
     ///
+    /// Every transition goes through [`Database::transition`]. An item whose
+    /// stored phase differs (another process moved it) is not advanced and
+    /// its in-memory phase follows the stored one.
+    ///
     /// Returns the number of items that were successfully transitioned.
+    ///
+    /// # Panics
+    /// When no database is configured. `Daemon::tick` rejects that case with
+    /// an error before reaching here.
     pub fn run(&mut self) -> usize {
+        self.require_db();
         let mut advanced = 0;
 
-        // Pending -> Ready (uses safe transit + dependency gate + conflict detection)
         let pending_indices: Vec<usize> = self
             .queue
             .iter()
@@ -121,55 +100,8 @@ impl<'a> Advancer<'a> {
             .collect();
 
         for idx in pending_indices {
-            if state_machine::transit(QueuePhase::Pending, QueuePhase::Ready).is_err() {
-                continue;
-            }
-
-            // Dependency gate: check if the spec's depends_on specs are all completed.
-            if !self.check_dependency_gate(&self.queue[idx].source_id.clone()) {
-                tracing::debug!(
-                    "dependency gate blocked: {} (source={})",
-                    self.queue[idx].work_id,
-                    self.queue[idx].source_id
-                );
-                continue;
-            }
-
-            if transit(&mut self.queue[idx], QueuePhase::Ready).is_ok() {
+            if self.claim(idx, QueuePhase::Ready) {
                 advanced += 1;
-                record_transition(
-                    self.db,
-                    &self.queue[idx].work_id,
-                    &self.queue[idx].source_id,
-                    QueuePhase::Pending,
-                    QueuePhase::Ready,
-                    "phase_enter",
-                    None,
-                );
-
-                // Conflict detection: after transitioning to Ready, check if spec
-                // entry_points overlap with other active specs. If so, escalate to HITL.
-                let conflict = self.check_conflict_gate(&self.queue[idx].source_id.clone());
-                if let Some(notes) = conflict {
-                    tracing::warn!(
-                        work_id = %self.queue[idx].work_id,
-                        "spec conflict detected, escalating to HITL: {notes}"
-                    );
-                    let now = Utc::now().to_rfc3339();
-                    let _ = transit(&mut self.queue[idx], QueuePhase::Hitl);
-                    record_transition(
-                        self.db,
-                        &self.queue[idx].work_id,
-                        &self.queue[idx].source_id,
-                        QueuePhase::Ready,
-                        QueuePhase::Hitl,
-                        "phase_enter",
-                        Some(notes.clone()),
-                    );
-                    self.queue[idx].hitl_created_at = Some(now);
-                    self.queue[idx].hitl_reason = Some(HitlReason::SpecConflict);
-                    self.queue[idx].hitl_notes = Some(notes);
-                }
             }
         }
 
@@ -199,29 +131,103 @@ impl<'a> Advancer<'a> {
                 continue;
             }
 
-            if transit(&mut self.queue[idx], QueuePhase::Running).is_ok() {
-                record_transition(
-                    self.db,
-                    &self.queue[idx].work_id,
-                    &self.queue[idx].source_id,
-                    QueuePhase::Ready,
-                    QueuePhase::Running,
-                    "phase_enter",
-                    None,
-                );
+            if self.claim(idx, QueuePhase::Running) {
                 self.tracker.track(self.ws_name);
                 advanced += 1;
             }
         }
 
+        self.drop_finished_by_others();
         advanced
     }
 
     /// Advance Pending items to Ready.
+    ///
+    /// # Panics
+    /// When no database is configured.
     pub fn advance_pending_to_ready(&mut self) {
-        for item in self.queue.iter_mut() {
-            if item.phase() == QueuePhase::Pending {
-                let _ = transit(item, QueuePhase::Ready);
+        self.require_db();
+        let pending_indices: Vec<usize> = self
+            .queue
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.phase() == QueuePhase::Pending)
+            .map(|(i, _)| i)
+            .collect();
+
+        for idx in pending_indices {
+            self.claim(idx, QueuePhase::Ready);
+        }
+        self.drop_finished_by_others();
+    }
+
+    fn require_db(&self) -> &Database {
+        self.db
+            .as_deref()
+            .expect("Advancer requires a database: queue state is owned by SQLite")
+    }
+
+    /// Move the item at `idx` to `to` through the store and mirror the result.
+    ///
+    /// Returns `true` only when the store applied the transition. On a
+    /// conflict the stored phase wins: the in-memory phase follows it and the
+    /// caller must not start any work for the item.
+    fn claim(&mut self, idx: usize, to: QueuePhase) -> bool {
+        let db = self.require_db();
+        let item = &self.queue[idx];
+        let from = item.phase();
+        if state_machine::transit(from, to).is_err() {
+            tracing::error!(work_id = %item.work_id, ?from, ?to, "undefined transition skipped");
+            return false;
+        }
+        let request = TransitionRequest {
+            work_id: item.work_id.clone(),
+            expected_from: from,
+            to,
+            actor: Actor::Daemon,
+            reason: TransitionReason::Advance,
+            detail: None,
+        };
+        match db.transition(&request) {
+            Ok(TransitionOutcome::Applied { .. }) => {
+                if let Err(e) = transit(&mut self.queue[idx], to) {
+                    tracing::error!(
+                        work_id = %request.work_id,
+                        "in-memory transit after applied claim failed: {e}"
+                    );
+                    return false;
+                }
+                true
+            }
+            // An `InvalidAction` naming another phase means the row moved on
+            // (a Hitl row refuses every claim this way): follow it like a conflict.
+            Ok(TransitionOutcome::Conflict { current })
+            | Ok(TransitionOutcome::InvalidAction { current })
+                if current != from =>
+            {
+                tracing::info!(
+                    work_id = %request.work_id,
+                    expected = ?from,
+                    current = ?current,
+                    "claim lost to another writer; following stored phase"
+                );
+                self.queue[idx].set_phase_unchecked(current);
+                if matches!(current, QueuePhase::Done | QueuePhase::Skipped) {
+                    self.finished_by_others.push(request.work_id.clone());
+                }
+                false
+            }
+            Ok(
+                outcome @ (TransitionOutcome::Conflict { .. }
+                | TransitionOutcome::Busy { .. }
+                | TransitionOutcome::InvalidAction { .. }),
+            ) => {
+                tracing::error!(work_id = %request.work_id, ?outcome, "claim transition rejected");
+                false
+            }
+            Err(e) => {
+                tracing::error!(work_id = %request.work_id, "claim transition failed: {e}");
+                false
             }
         }
     }
@@ -230,11 +236,15 @@ impl<'a> Advancer<'a> {
     ///
     /// `ws_concurrency_limits` maps workspace IDs to their concurrency limits.
     /// Workspaces not present in the map use `default_concurrency` (falls back to 1).
+    ///
+    /// # Panics
+    /// When no database is configured.
     pub fn advance_ready_to_running(
         &mut self,
         ws_concurrency_limits: &HashMap<String, u32>,
         default_concurrency: u32,
     ) {
+        self.require_db();
         let ready_indices: Vec<usize> = self
             .queue
             .iter()
@@ -258,33 +268,11 @@ impl<'a> Advancer<'a> {
                 continue;
             }
 
-            if transit(&mut self.queue[idx], QueuePhase::Running).is_ok() {
+            if self.claim(idx, QueuePhase::Running) {
                 self.tracker.track(&ws);
             }
         }
-    }
-
-    /// Check whether a queue item's associated spec has all dependencies completed.
-    fn check_dependency_gate(&self, source_id: &str) -> bool {
-        let db = match self.db {
-            Some(db) => db,
-            None => return true,
-        };
-
-        let spec = match db.get_spec(source_id) {
-            Ok(spec) => spec,
-            Err(_) => return true,
-        };
-
-        let result = self
-            .dependency_guard
-            .check_dependencies(&spec, |dep_id| db.get_spec(dep_id).ok());
-
-        if !result.is_ready() {
-            tracing::trace!("spec {} blocked by dependencies: {:?}", spec.id, result);
-        }
-
-        result.is_ready()
+        self.drop_finished_by_others();
     }
 
     /// Check whether a queue item's queue_dependencies are all Done.
@@ -296,7 +284,14 @@ impl<'a> Advancer<'a> {
 
         let dep_work_ids = match db.list_queue_dependencies(work_id) {
             Ok(deps) => deps,
-            Err(_) => return true,
+            Err(err) => {
+                tracing::error!(
+                    work_id = %work_id,
+                    error = %err,
+                    "dependency list lookup failed; keeping gate closed"
+                );
+                return false;
+            }
         };
 
         if dep_work_ids.is_empty() {
@@ -304,88 +299,38 @@ impl<'a> Advancer<'a> {
         }
 
         for dep_id in &dep_work_ids {
-            let dep_phase = self
-                .queue
-                .iter()
-                .find(|item| item.work_id == *dep_id)
-                .map(|item| item.phase());
-
-            match dep_phase {
-                Some(QueuePhase::Done) => {}
-                Some(phase) => {
+            // The dependency may have been derived (escalation retry, replan);
+            // the gate judges the head of its lineage, not the original.
+            match db.latest_in_lineage(dep_id) {
+                Ok(item) if item.phase() == QueuePhase::Done => {}
+                Ok(item) => {
                     tracing::trace!(
                         work_id = %work_id,
                         dependency = %dep_id,
-                        dependency_phase = %phase.as_str(),
+                        lineage_head = %item.work_id,
+                        dependency_phase = %item.phase().as_str(),
                         "queue dependency not done"
                     );
                     return false;
                 }
-                None => {
-                    // Dependency not found in in-memory queue — fall back to DB
-                    // to handle system restart scenarios where the dependency
-                    // was completed in a previous session.
-                    match db.get_item(dep_id) {
-                        Ok(item) if item.phase() == QueuePhase::Done => {}
-                        Ok(item) => {
-                            tracing::trace!(
-                                work_id = %work_id,
-                                dependency = %dep_id,
-                                dependency_phase = %item.phase().as_str(),
-                                "queue dependency not done (DB lookup)"
-                            );
-                            return false;
-                        }
-                        Err(belt_core::error::BeltError::ItemNotFound(_)) => {
-                            // Not in DB either — gate open (original behavior).
-                        }
-                        Err(err) => {
-                            // DB error — gate open for stability (safe default).
-                            tracing::warn!(
-                                work_id = %work_id,
-                                dependency = %dep_id,
-                                error = %err,
-                                "DB lookup failed for dependency; keeping gate open"
-                            );
-                        }
-                    }
+                Err(belt_core::error::BeltError::ItemNotFound(_)) => {
+                    // Not in DB — orphan dependency, gate open.
+                }
+                Err(err) => {
+                    // Store error — the dependency state is unknown, so the gate
+                    // stays closed (fail-closed).
+                    tracing::error!(
+                        work_id = %work_id,
+                        dependency = %dep_id,
+                        error = %err,
+                        "DB lookup failed for dependency; keeping gate closed"
+                    );
+                    return false;
                 }
             }
         }
 
         true
-    }
-
-    /// Check whether a queue item's associated spec has entry_point conflicts.
-    fn check_conflict_gate(&self, source_id: &str) -> Option<String> {
-        let db = match self.db {
-            Some(db) => db,
-            None => return None,
-        };
-
-        let spec = match db.get_spec(source_id) {
-            Ok(spec) => spec,
-            Err(_) => return None,
-        };
-
-        let db_ref = Arc::clone(db);
-        let result = self.dependency_guard.check_conflicts(&spec, || {
-            db_ref
-                .list_specs(None, Some(belt_core::spec::SpecStatus::Active))
-                .unwrap_or_default()
-        });
-
-        match result {
-            belt_core::dependency::ConflictCheckResult::Clear => None,
-            belt_core::dependency::ConflictCheckResult::Conflict {
-                conflicting_specs,
-                overlapping_paths,
-            } => Some(format!(
-                "spec-conflict: entry_point overlap with [{}] on paths [{}]",
-                conflicting_specs.join(", "),
-                overlapping_paths.join(", ")
-            )),
-        }
     }
 }
 
@@ -398,14 +343,22 @@ mod tests {
         items.into_iter().collect()
     }
 
+    /// In-memory store holding a row for every queued item.
+    fn db_with(queue: &VecDeque<QueueItem>) -> Option<Arc<Database>> {
+        let db = Database::open_in_memory().expect("in-memory DB");
+        for item in queue {
+            db.insert_item(item).expect("insert_item");
+        }
+        Some(Arc::new(db))
+    }
+
     #[test]
     fn run_advances_pending_through_ready_to_running() {
         let mut queue = make_queue(vec![test_item("w1", "analyze")]);
         let mut tracker = ConcurrencyTracker::new(4);
-        let db: Option<Arc<Database>> = None;
-        let dep_guard = SpecDependencyGuard;
+        let db = db_with(&queue);
 
-        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2, &dep_guard);
+        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2);
 
         let advanced = advancer.run();
         assert_eq!(advanced, 2); // Pending->Ready + Ready->Running
@@ -421,11 +374,10 @@ mod tests {
         ];
         let mut queue = make_queue(items);
         let mut tracker = ConcurrencyTracker::new(4);
-        let db: Option<Arc<Database>> = None;
-        let dep_guard = SpecDependencyGuard;
+        let db = db_with(&queue);
 
         // ws_concurrency = 1, so only one item should reach Running
-        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 1, &dep_guard);
+        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 1);
 
         let _advanced = advancer.run();
 
@@ -443,10 +395,9 @@ mod tests {
             test_item("w2", "implement"),
         ]);
         let mut tracker = ConcurrencyTracker::new(4);
-        let db: Option<Arc<Database>> = None;
-        let dep_guard = SpecDependencyGuard;
+        let db = db_with(&queue);
 
-        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2, &dep_guard);
+        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2);
 
         advancer.advance_pending_to_ready();
 
@@ -465,14 +416,13 @@ mod tests {
         queue[1].workspace_id = "ws-b".to_string();
 
         let mut tracker = ConcurrencyTracker::new(4);
-        let db: Option<Arc<Database>> = None;
-        let dep_guard = SpecDependencyGuard;
+        let db = db_with(&queue);
 
         let mut limits = HashMap::new();
         limits.insert("ws-a".to_string(), 1);
         limits.insert("ws-b".to_string(), 1);
 
-        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2, &dep_guard);
+        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2);
 
         advancer.advance_ready_to_running(&limits, 1);
 
@@ -483,10 +433,9 @@ mod tests {
     fn run_empty_queue_is_noop() {
         let mut queue: VecDeque<QueueItem> = VecDeque::new();
         let mut tracker = ConcurrencyTracker::new(4);
-        let db: Option<Arc<Database>> = None;
-        let dep_guard = SpecDependencyGuard;
+        let db = db_with(&queue);
 
-        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2, &dep_guard);
+        let mut advancer = Advancer::new(&mut queue, &mut tracker, &db, "test-ws", 2);
 
         let advanced = advancer.run();
         assert_eq!(advanced, 0);
@@ -518,9 +467,8 @@ mod tests {
         let mut queue = make_queue(vec![item]);
         let mut tracker = ConcurrencyTracker::new(4);
         let db_opt: Option<Arc<Database>> = Some(Arc::clone(&db));
-        let dep_guard = SpecDependencyGuard;
 
-        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
+        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
 
         assert!(advancer.check_queue_dependency_gate("my-work-id"));
     }
@@ -549,9 +497,8 @@ mod tests {
         let mut queue = make_queue(vec![item]);
         let mut tracker = ConcurrencyTracker::new(4);
         let db_opt: Option<Arc<Database>> = Some(Arc::clone(&db));
-        let dep_guard = SpecDependencyGuard;
 
-        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
+        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
 
         assert!(!advancer.check_queue_dependency_gate("my-work-id"));
     }
@@ -573,10 +520,44 @@ mod tests {
         let mut queue = make_queue(vec![item]);
         let mut tracker = ConcurrencyTracker::new(4);
         let db_opt: Option<Arc<Database>> = Some(Arc::clone(&db));
-        let dep_guard = SpecDependencyGuard;
 
-        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2, &dep_guard);
+        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
 
         assert!(advancer.check_queue_dependency_gate("my-work-id"));
+    }
+
+    #[test]
+    fn dependency_gate_closes_on_store_error() {
+        // A store failure (not ItemNotFound) leaves the dependency state
+        // unknown, so the gate must stay closed.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        let path = path.to_str().unwrap();
+        let db = Arc::new(Database::open(path).expect("file DB"));
+
+        let mut dep_item = test_item("dep-src", "analyze");
+        dep_item.work_id = "dep-work-id".to_string();
+        db.insert_item(&dep_item).unwrap();
+        db.update_phase("dep-work-id", QueuePhase::Ready).unwrap();
+        db.update_phase("dep-work-id", QueuePhase::Running).unwrap();
+        db.update_phase("dep-work-id", QueuePhase::Done).unwrap();
+
+        let mut item = test_item("my-src", "implement");
+        item.work_id = "my-work-id".to_string();
+        db.insert_item(&item).unwrap();
+        db.add_queue_dependency("my-work-id", "dep-work-id")
+            .unwrap();
+
+        // Break the lineage lookup through a second connection.
+        let other = rusqlite::Connection::open(path).unwrap();
+        other.execute_batch("DROP TABLE transition_log").unwrap();
+
+        let mut queue = make_queue(vec![item]);
+        let mut tracker = ConcurrencyTracker::new(4);
+        let db_opt: Option<Arc<Database>> = Some(Arc::clone(&db));
+
+        let advancer = Advancer::new(&mut queue, &mut tracker, &db_opt, "test-ws", 2);
+
+        assert!(!advancer.check_queue_dependency_gate("my-work-id"));
     }
 }

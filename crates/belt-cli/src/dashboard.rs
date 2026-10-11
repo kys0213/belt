@@ -4,15 +4,14 @@
 //! - `run()`: interactive ratatui-based real-time TUI dashboard with multiple tabs
 //! - `render_runtime_panel()`: text-based runtime statistics panel for non-TUI output
 //!
-//! The dashboard supports six tabs:
+//! The dashboard supports five tabs:
 //! - **Dashboard** (`d`): phase summary + running/recent items
 //! - **PerWorkspace** (`w`): items filtered by a selected workspace
-//! - **Spec** (`s`): spec progress view
 //! - **Board** (`b`): kanban-style board with columns per queue phase
 //! - **DataSource** (`n`): real-time DataSource connection status panel
-//! - **Scripts** (`x`): script execution statistics with success/fail rates
+//! - **Scripts** (`t`): script execution statistics with success/fail rates
 //!
-//! Tab switching: `d/w/s/b/n/x` to jump, or `Tab`/`Shift+Tab` to cycle.
+//! Tab switching: `d/w/b/n/t` to jump, or `Tab`/`Shift+Tab` to cycle.
 //! Item selection with arrow keys and item detail overlay (Enter).
 //! Help overlay (`h`) showing all available key bindings.
 //! Scroll positions are preserved per tab.
@@ -35,10 +34,19 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table};
 
+use belt_core::hitl::HitlId;
+use belt_core::hitl::{ConfirmPath, HitlAction, HitlStatus, RespondOutcome};
 use belt_core::phase::QueuePhase;
 use belt_core::queue::QueueItem;
-use belt_core::spec::{Spec, SpecStatus, extract_acceptance_criteria};
-use belt_infra::db::{Database, HistoryEvent, ScriptExecStats, TransitionEvent};
+use belt_daemon::hitl::{HitlResponse, HitlService};
+
+use crate::cancel::{
+    CANCEL_POLL_INTERVAL, CANCEL_WAIT_LIMIT, CancelFlow, CancelOutcome, LocalDaemon,
+};
+use belt_core::transition::Actor;
+use belt_infra::db::{
+    Database, HistoryEvent, HitlRequest, HitlTarget, ScriptExecStats, TransitionEvent,
+};
 use belt_infra::workspace_loader::load_workspace_config;
 
 /// Connection status of a DataSource (internal dashboard representation).
@@ -198,11 +206,8 @@ enum OverlayMode {
     Hitl {
         /// Selected index in the HITL items list.
         selected: usize,
-    },
-    /// Spec acceptance criteria detail overlay for a given spec index.
-    SpecDetail {
-        /// Index of the spec in the specs list.
-        spec_index: usize,
+        /// Retry instruction being typed (`r`); `None` outside input mode.
+        retry_input: Option<String>,
     },
 }
 
@@ -213,8 +218,6 @@ enum DashboardTab {
     Dashboard,
     /// Per-workspace view showing items grouped by workspace.
     PerWorkspace,
-    /// Spec progress view showing specs and their statuses.
-    Spec,
     /// Kanban board with columns per queue phase.
     Board,
     /// DataSource connection status panel.
@@ -228,8 +231,7 @@ impl DashboardTab {
     fn next(self) -> Self {
         match self {
             DashboardTab::Dashboard => DashboardTab::PerWorkspace,
-            DashboardTab::PerWorkspace => DashboardTab::Spec,
-            DashboardTab::Spec => DashboardTab::Board,
+            DashboardTab::PerWorkspace => DashboardTab::Board,
             DashboardTab::Board => DashboardTab::DataSource,
             DashboardTab::DataSource => DashboardTab::Scripts,
             DashboardTab::Scripts => DashboardTab::Dashboard,
@@ -241,8 +243,7 @@ impl DashboardTab {
         match self {
             DashboardTab::Dashboard => DashboardTab::Scripts,
             DashboardTab::PerWorkspace => DashboardTab::Dashboard,
-            DashboardTab::Spec => DashboardTab::PerWorkspace,
-            DashboardTab::Board => DashboardTab::Spec,
+            DashboardTab::Board => DashboardTab::PerWorkspace,
             DashboardTab::DataSource => DashboardTab::Board,
             DashboardTab::Scripts => DashboardTab::DataSource,
         }
@@ -291,6 +292,11 @@ struct DashboardState {
     per_ws_kanban_row: usize,
     /// Status filter for PerWorkspace tab.
     status_filter: StatusFilter,
+    /// Result of the last HITL response, shown in the HITL overlay.
+    toast: Option<String>,
+    /// Running item whose cancel waits for the next frame, so the "canceling"
+    /// toast is on screen while the flow blocks.
+    pending_cancel: Option<String>,
 }
 
 impl DashboardState {
@@ -307,7 +313,6 @@ impl DashboardState {
         tab_states.insert(2, TabState::default());
         tab_states.insert(3, TabState::default());
         tab_states.insert(4, TabState::default());
-        tab_states.insert(5, TabState::default());
 
         Self {
             active_tab: DashboardTab::Dashboard,
@@ -320,6 +325,8 @@ impl DashboardState {
             per_ws_kanban_col: 0,
             per_ws_kanban_row: 0,
             status_filter: StatusFilter::All,
+            toast: None,
+            pending_cancel: None,
         }
     }
 
@@ -327,10 +334,9 @@ impl DashboardState {
         match self.active_tab {
             DashboardTab::Dashboard => 0,
             DashboardTab::PerWorkspace => 1,
-            DashboardTab::Spec => 2,
-            DashboardTab::Board => 3,
-            DashboardTab::DataSource => 4,
-            DashboardTab::Scripts => 5,
+            DashboardTab::Board => 2,
+            DashboardTab::DataSource => 3,
+            DashboardTab::Scripts => 4,
         }
     }
 
@@ -357,7 +363,8 @@ pub fn run(db: Arc<Database>) -> anyhow::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run_loop(&mut terminal, &db);
+    let service = HitlService::new(db);
+    let result = run_loop(&mut terminal, &service);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -368,9 +375,27 @@ pub fn run(db: Arc<Database>) -> anyhow::Result<()> {
 
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    db: &Database,
+    service: &HitlService,
 ) -> anyhow::Result<()> {
+    let db = service.database();
+    let responder = HitlResponder {
+        service,
+        by: tui_respondent(),
+    };
     let mut state = DashboardState::new();
+    let local_daemon = LocalDaemon {
+        belt_home: crate::belt_home()?,
+    };
+    let killer = belt_infra::platform::default_process_killer();
+    let cancel_flow = CancelFlow {
+        db,
+        daemon: &local_daemon,
+        killer: killer.as_ref(),
+        actor: Actor::Tui,
+        requester: tui_respondent(),
+        wait_limit: CANCEL_WAIT_LIMIT,
+        poll_interval: CANCEL_POLL_INTERVAL,
+    };
 
     loop {
         // Collect data for all tabs.
@@ -382,7 +407,6 @@ fn run_loop(
             .collect();
         let recent_items = collect_recent_items(db);
         let workspaces = db.list_workspaces().unwrap_or_default();
-        let specs = db.list_specs(None, None).unwrap_or_default();
         let datasource_entries = collect_datasource_status(&workspaces, &all_items, Some(db));
 
         // Compute list length for navigation clamping.
@@ -412,7 +436,6 @@ fn run_loop(
                     0
                 }
             }
-            DashboardTab::Spec => specs.len(),
             DashboardTab::Board => 0, // Board uses column/row navigation, not a single list.
             DashboardTab::DataSource => datasource_entries.len(),
             DashboardTab::Scripts => db
@@ -515,6 +538,11 @@ fn run_loop(
             state.per_ws_kanban_row = ws_col_len.saturating_sub(1);
         }
 
+        // The HITL overlay answers exactly the requests it draws, so the data is
+        // loaded once per frame and shared by drawing and key handling.
+        let hitl_view =
+            matches!(state.overlay, OverlayMode::Hitl { .. }).then(|| HitlOverlayView::load(db));
+
         terminal.draw(|frame| {
             // Tab bar at top.
             let outer_chunks = Layout::default()
@@ -522,7 +550,7 @@ fn run_loop(
                 .constraints([Constraint::Length(3), Constraint::Min(5)])
                 .split(frame.area());
 
-            let tab_bar = render_tab_bar(state.active_tab);
+            let tab_bar = render_tab_bar(state.active_tab, state.toast.as_deref());
             frame.render_widget(tab_bar, outer_chunks[0]);
 
             match state.active_tab {
@@ -544,14 +572,6 @@ fn run_loop(
                         &workspaces,
                         &state,
                         &per_ws_kanban_columns,
-                    );
-                }
-                DashboardTab::Spec => {
-                    render_spec_tab(
-                        frame,
-                        outer_chunks[1],
-                        &specs,
-                        state.current_tab_state().selected_index,
                     );
                 }
                 DashboardTab::Board => {
@@ -584,97 +604,67 @@ fn run_loop(
                 OverlayMode::ItemDetail(work_id) => {
                     render_item_detail_overlay(frame, db, work_id);
                 }
-                OverlayMode::Hitl { selected } => {
-                    render_hitl_overlay(frame, db, *selected);
-                }
-                OverlayMode::SpecDetail { spec_index } => {
-                    render_spec_detail_overlay(frame, &specs, *spec_index);
+                OverlayMode::Hitl {
+                    selected,
+                    retry_input,
+                } => {
+                    render_hitl_overlay(
+                        frame,
+                        hitl_view.as_ref().and_then(|v| v.as_ref().ok()),
+                        hitl_view.as_ref().and_then(|v| v.as_ref().err()),
+                        *selected,
+                        retry_input.as_deref(),
+                        state.toast.as_deref(),
+                    );
                 }
             }
         })?;
+
+        finish_pending_cancel(&mut state, &cancel_flow);
 
         // Poll for keyboard events with 1 second timeout.
         if event::poll(Duration::from_secs(1))?
             && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
-            // Handle overlay-specific keys.
-            match &state.overlay {
-                OverlayMode::Help => {
-                    // Help overlay: close on any key.
-                    state.overlay = OverlayMode::None;
-                    continue;
-                }
-                OverlayMode::ItemDetail(_) => {
-                    // Item detail overlay: close on q/Esc.
-                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                        state.overlay = OverlayMode::None;
-                    }
-                    continue;
-                }
-                OverlayMode::Hitl { selected } => {
-                    let hitl_items: Vec<_> = all_items
-                        .iter()
-                        .filter(|i| i.phase() == QueuePhase::Hitl)
-                        .collect();
-                    let count = hitl_items.len();
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            state.overlay = OverlayMode::None;
-                        }
-                        KeyCode::Down | KeyCode::Char('j') if count > 0 => {
-                            state.overlay = OverlayMode::Hitl {
-                                selected: (*selected + 1).min(count.saturating_sub(1)),
-                            };
-                        }
-                        KeyCode::Up | KeyCode::Char('k') if count > 0 => {
-                            state.overlay = OverlayMode::Hitl {
-                                selected: selected.saturating_sub(1),
-                            };
-                        }
-                        KeyCode::Enter => {
-                            // Open the selected HITL item's detail overlay.
-                            if let Some(item) = hitl_items.get(*selected) {
-                                state.overlay = OverlayMode::ItemDetail(item.work_id.clone());
-                            }
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-                OverlayMode::SpecDetail { .. } => {
-                    // Spec detail overlay: close on q/Esc.
-                    if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
-                        state.overlay = OverlayMode::None;
-                    }
-                    continue;
-                }
-                OverlayMode::None => {}
+            // An open overlay owns the keyboard: its keys take precedence over the
+            // global ones below.
+            let hitl_rows = match &hitl_view {
+                Some(Ok(view)) => view.rows(),
+                _ => Vec::new(),
+            };
+            if handle_overlay_key(&mut state, key.code, &hitl_rows, &responder) {
+                continue;
             }
+
+            if switch_tab_key(&mut state, key.code) {
+                continue;
+            }
+
+            // A toast stays until the next key.
+            state.toast = None;
 
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                // Tab switching keys: letter keys for direct jump.
-                KeyCode::Char('d') => {
-                    state.active_tab = DashboardTab::Dashboard;
-                }
-                KeyCode::Char('s') => {
-                    state.active_tab = DashboardTab::Spec;
-                }
-                KeyCode::Char('w') => {
-                    state.active_tab = DashboardTab::PerWorkspace;
-                }
-                KeyCode::Char('b') => {
-                    state.active_tab = DashboardTab::Board;
-                }
-                KeyCode::Char('n') => {
-                    state.active_tab = DashboardTab::DataSource;
-                }
                 KeyCode::Char('x') => {
-                    state.active_tab = DashboardTab::Scripts;
+                    let selected = selected_work_id(
+                        &state,
+                        &running_items,
+                        &recent_items,
+                        &workspaces,
+                        db,
+                        &board_columns,
+                        &per_ws_kanban_columns,
+                    );
+                    handle_cancel_key(&mut state, selected.as_deref(), db);
+                    continue;
                 }
                 KeyCode::Char('h') => {
-                    state.overlay = OverlayMode::Hitl { selected: 0 };
+                    state.toast = None;
+                    state.overlay = OverlayMode::Hitl {
+                        selected: 0,
+                        retry_input: None,
+                    };
                 }
                 KeyCode::Char('?') => {
                     state.overlay = OverlayMode::Help;
@@ -741,6 +731,259 @@ fn run_loop(
             }
         }
     }
+}
+
+/// Path label recorded as `via` for responses given in the dashboard.
+const TUI_VIA: &str = "tui";
+
+/// Respondent recorded as `by`: `$USER`, or `tui` when it is unset or empty.
+fn tui_respondent() -> String {
+    std::env::var("USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| TUI_VIA.to_string())
+}
+
+/// One item of the HITL overlay and the request drawn for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HitlRow {
+    work_id: String,
+    hitl_id: Option<HitlId>,
+}
+
+/// Snapshot of what the HITL overlay draws.
+struct HitlOverlayView {
+    items: Vec<QueueItem>,
+    requests: HashMap<String, HitlRequest>,
+}
+
+impl HitlOverlayView {
+    fn load(db: &Database) -> anyhow::Result<Self> {
+        Ok(Self {
+            items: db.list_items(Some(QueuePhase::Hitl), None)?,
+            requests: current_hitl_requests(db)?,
+        })
+    }
+
+    fn rows(&self) -> Vec<HitlRow> {
+        self.items
+            .iter()
+            .map(|item| HitlRow {
+                work_id: item.work_id.clone(),
+                hitl_id: self
+                    .requests
+                    .get(&item.work_id)
+                    .map(|request| request.hitl_id.clone()),
+            })
+            .collect()
+    }
+}
+
+/// Sends HITL responses given in the overlay through the shared first-wins contract.
+struct HitlResponder<'a> {
+    service: &'a HitlService,
+    by: String,
+}
+
+impl HitlResponder<'_> {
+    /// Respond to the request drawn for `row` and describe the result.
+    ///
+    /// A row with a request is answered by its `hitl_id`, so a request re-opened
+    /// for the same item after the frame was drawn is left untouched.
+    fn respond(&self, row: &HitlRow, action: HitlAction, notes: Option<String>) -> String {
+        let work_id = row.work_id.as_str();
+        let target = match &row.hitl_id {
+            Some(id) => HitlTarget::Id(id.clone()),
+            None => HitlTarget::Item(work_id.to_string()),
+        };
+        let response = HitlResponse {
+            target,
+            action,
+            by: self.by.clone(),
+            via: TUI_VIA.to_string(),
+            path: ConfirmPath::Direct,
+            notes,
+        };
+        match self.service.respond(&response) {
+            Ok(outcome) => describe_respond_outcome(work_id, action, &outcome),
+            Err(e) => format!("error: {work_id}: {e}"),
+        }
+    }
+}
+
+/// One-line toast text for a response attempt.
+fn describe_respond_outcome(work_id: &str, action: HitlAction, outcome: &RespondOutcome) -> String {
+    match outcome {
+        RespondOutcome::Won { .. } => format!("{work_id}: {action} 응답 확정 - 해결됨 · 처리 중"),
+        RespondOutcome::AlreadyHandled(winner) => format!(
+            "already_handled: {work_id} 는 이미 {} 가 {} 로 {} 응답함 ({})",
+            winner.by,
+            winner.via,
+            winner.action,
+            format_transition_time(&winner.at),
+        ),
+        RespondOutcome::NotFound => format!("not_found: {work_id} 에 응답할 HITL 요청이 없음"),
+        RespondOutcome::InvalidAction => {
+            format!("invalid_action: {work_id} 에 {action} 응답을 적용할 수 없음")
+        }
+        RespondOutcome::Unauthorized => format!("unauthorized: {work_id} 에 응답할 권한이 없음"),
+    }
+}
+
+/// Handle a key while an overlay is open. Returns `true` when an overlay
+/// consumed the key; the global keys must then be skipped.
+///
+/// `hitl_rows` lists the items in the HITL phase in overlay order.
+fn handle_overlay_key(
+    state: &mut DashboardState,
+    code: KeyCode,
+    hitl_rows: &[HitlRow],
+    responder: &HitlResponder<'_>,
+) -> bool {
+    match state.overlay.clone() {
+        OverlayMode::None => false,
+        OverlayMode::Help => {
+            state.overlay = OverlayMode::None;
+            true
+        }
+        OverlayMode::ItemDetail(_) => {
+            if matches!(code, KeyCode::Char('q') | KeyCode::Esc) {
+                state.overlay = OverlayMode::None;
+            }
+            true
+        }
+        OverlayMode::Hitl {
+            selected,
+            retry_input,
+        } => {
+            handle_hitl_overlay_key(state, code, selected, retry_input, hitl_rows, responder);
+            true
+        }
+    }
+}
+
+fn handle_hitl_overlay_key(
+    state: &mut DashboardState,
+    code: KeyCode,
+    selected: usize,
+    retry_input: Option<String>,
+    hitl_rows: &[HitlRow],
+    responder: &HitlResponder<'_>,
+) {
+    let count = hitl_rows.len();
+    let selected_row = hitl_rows.get(selected);
+
+    if let Some(mut input) = retry_input {
+        match code {
+            KeyCode::Esc => {
+                state.overlay = OverlayMode::Hitl {
+                    selected,
+                    retry_input: None,
+                };
+            }
+            KeyCode::Enter => {
+                if let Some(row) = selected_row {
+                    let notes = (!input.trim().is_empty()).then(|| input.trim().to_string());
+                    state.toast = Some(responder.respond(row, HitlAction::Retry, notes));
+                }
+                state.overlay = OverlayMode::Hitl {
+                    selected,
+                    retry_input: None,
+                };
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                state.overlay = OverlayMode::Hitl {
+                    selected,
+                    retry_input: Some(input),
+                };
+            }
+            KeyCode::Char(c) => {
+                input.push(c);
+                state.overlay = OverlayMode::Hitl {
+                    selected,
+                    retry_input: Some(input),
+                };
+            }
+            _ => {
+                state.overlay = OverlayMode::Hitl {
+                    selected,
+                    retry_input: Some(input),
+                };
+            }
+        }
+        return;
+    }
+
+    match code {
+        KeyCode::Char('q') | KeyCode::Esc => {
+            state.toast = None;
+            state.overlay = OverlayMode::None;
+        }
+        KeyCode::Down | KeyCode::Char('j') if count > 0 => {
+            state.overlay = OverlayMode::Hitl {
+                selected: (selected + 1).min(count - 1),
+                retry_input: None,
+            };
+        }
+        KeyCode::Up | KeyCode::Char('k') if count > 0 => {
+            state.overlay = OverlayMode::Hitl {
+                selected: selected.saturating_sub(1),
+                retry_input: None,
+            };
+        }
+        KeyCode::Enter => {
+            if let Some(row) = selected_row {
+                state.overlay = OverlayMode::ItemDetail(row.work_id.clone());
+            }
+        }
+        KeyCode::Char('r') if selected_row.is_some() => {
+            state.overlay = OverlayMode::Hitl {
+                selected,
+                retry_input: Some(String::new()),
+            };
+        }
+        KeyCode::Char(c @ ('d' | 's' | 'p')) => {
+            let action = match c {
+                'd' => HitlAction::Done,
+                's' => HitlAction::Skip,
+                _ => HitlAction::Replan,
+            };
+            if let Some(row) = selected_row {
+                state.toast = Some(responder.respond(row, action, None));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Jump to a tab by its letter key. Returns `true` when the key was a tab key.
+///
+/// `x` is reserved for cancelling a running item and switches nothing.
+fn switch_tab_key(state: &mut DashboardState, code: KeyCode) -> bool {
+    let tab = match code {
+        KeyCode::Char('d') => DashboardTab::Dashboard,
+        KeyCode::Char('w') => DashboardTab::PerWorkspace,
+        KeyCode::Char('b') => DashboardTab::Board,
+        KeyCode::Char('n') => DashboardTab::DataSource,
+        KeyCode::Char('t') => DashboardTab::Scripts,
+        _ => return false,
+    };
+    state.active_tab = tab;
+    true
+}
+
+/// Requests that currently decide what an item in Hitl shows: the open one,
+/// else the confirmed one still waiting for post-processing.
+fn current_hitl_requests(db: &Database) -> anyhow::Result<HashMap<String, HitlRequest>> {
+    let mut by_work_id = HashMap::new();
+    for request in db.pending_post_processing()? {
+        by_work_id.insert(request.work_id.clone(), request);
+    }
+    for request in db.open_hitl_requests()? {
+        by_work_id.insert(request.work_id.clone(), request);
+    }
+    Ok(by_work_id)
 }
 
 /// Handle Up/k navigation.
@@ -816,7 +1059,7 @@ fn handle_nav_left(state: &mut DashboardState, workspaces: &[(String, String, St
             state.board_selected_col = state.board_selected_col.saturating_sub(1);
             state.board_selected_row = 0;
         }
-        DashboardTab::Spec | DashboardTab::DataSource | DashboardTab::Scripts => {}
+        DashboardTab::DataSource | DashboardTab::Scripts => {}
     }
     let _ = workspaces;
 }
@@ -850,7 +1093,7 @@ fn handle_nav_right(
                 state.board_selected_row = 0;
             }
         }
-        DashboardTab::Spec | DashboardTab::DataSource | DashboardTab::Scripts => {}
+        DashboardTab::DataSource | DashboardTab::Scripts => {}
     }
 }
 
@@ -866,6 +1109,30 @@ fn handle_enter(
     board_columns: &[Vec<&QueueItem>],
     per_ws_kanban_columns: &[Vec<&QueueItem>],
 ) {
+    if let Some(work_id) = selected_work_id(
+        state,
+        running_items,
+        recent_items,
+        workspaces,
+        db,
+        board_columns,
+        per_ws_kanban_columns,
+    ) {
+        state.overlay = OverlayMode::ItemDetail(work_id);
+    }
+    let _ = all_items;
+}
+
+/// The item under the selection of the active tab, if any.
+fn selected_work_id(
+    state: &DashboardState,
+    running_items: &[QueueItem],
+    recent_items: &[QueueItem],
+    workspaces: &[(String, String, String)],
+    db: &Database,
+    board_columns: &[Vec<&QueueItem>],
+    per_ws_kanban_columns: &[Vec<&QueueItem>],
+) -> Option<String> {
     match state.active_tab {
         DashboardTab::Dashboard => {
             let panel = state
@@ -877,47 +1144,100 @@ fn handle_enter(
                 ActivePanel::Running => running_items,
                 ActivePanel::Recent => recent_items,
             };
-            if let Some(item) = items.get(idx) {
-                state.overlay = OverlayMode::ItemDetail(item.work_id.clone());
-            }
+            items.get(idx).map(|item| item.work_id.clone())
         }
         DashboardTab::PerWorkspace => {
             if state.per_ws_view == PerWorkspaceView::Kanban {
-                if let Some(col) = per_ws_kanban_columns.get(state.per_ws_kanban_col)
-                    && let Some(item) = col.get(state.per_ws_kanban_row)
-                {
-                    state.overlay = OverlayMode::ItemDetail(item.work_id.clone());
-                }
-            } else if let Some(ws) = workspaces.get(state.selected_workspace) {
-                let ws_items: Vec<_> = db
-                    .list_items(None, Some(&ws.0))
+                per_ws_kanban_columns
+                    .get(state.per_ws_kanban_col)
+                    .and_then(|col| col.get(state.per_ws_kanban_row))
+                    .map(|item| item.work_id.clone())
+            } else {
+                let ws = workspaces.get(state.selected_workspace)?;
+                let idx = state.current_tab_state().selected_index;
+                db.list_items(None, Some(&ws.0))
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|i| state.status_filter.matches(&i.phase()))
-                    .collect();
-                let idx = state.current_tab_state().selected_index;
-                if let Some(item) = ws_items.get(idx) {
-                    state.overlay = OverlayMode::ItemDetail(item.work_id.clone());
-                }
+                    .nth(idx)
+                    .map(|item| item.work_id)
             }
         }
-        DashboardTab::Spec => {
-            // Open spec acceptance criteria detail overlay.
-            let idx = state.current_tab_state().selected_index;
-            state.overlay = OverlayMode::SpecDetail { spec_index: idx };
+        DashboardTab::DataSource | DashboardTab::Scripts => None,
+        DashboardTab::Board => board_columns
+            .get(state.board_selected_col)
+            .and_then(|col| col.get(state.board_selected_row))
+            .map(|item| item.work_id.clone()),
+    }
+}
+
+/// Toast text of a cancel attempt on `work_id`.
+fn describe_cancel(work_id: &str, outcome: &CancelOutcome) -> String {
+    match outcome {
+        CancelOutcome::Canceled => format!("canceled: {work_id}"),
+        CancelOutcome::CanceledDirectly => {
+            format!("canceled_directly: {work_id} (no daemon answered)")
         }
-        DashboardTab::DataSource | DashboardTab::Scripts => {
-            // No overlay on Enter for DataSource/Scripts tabs.
+        CancelOutcome::Accepted => {
+            format!("accepted: the daemon is canceling {work_id}; see `belt queue show`")
         }
-        DashboardTab::Board => {
-            if let Some(col) = board_columns.get(state.board_selected_col)
-                && let Some(item) = col.get(state.board_selected_row)
-            {
-                state.overlay = OverlayMode::ItemDetail(item.work_id.clone());
-            }
+        CancelOutcome::TooLate { current } => {
+            format!("too_late: {work_id} already left Running (now {current})")
         }
     }
-    let _ = all_items;
+}
+
+/// Handle the cancel key: cancel the selected item when it is Running.
+///
+/// A Running item gets the "canceling" toast and is queued in
+/// `pending_cancel`; [`finish_pending_cancel`] carries it out once the toast
+/// has been drawn. An item in Hitl whose confirmed response awaits
+/// post-processing is refused as `busy`; any other phase has nothing running
+/// to cancel.
+fn handle_cancel_key(state: &mut DashboardState, selected: Option<&str>, db: &Database) {
+    let Some(work_id) = selected else {
+        return;
+    };
+    match refuse_or_accept_cancel(work_id, db) {
+        Ok(None) => {
+            state.toast = Some(format!("canceling: {work_id}..."));
+            state.pending_cancel = Some(work_id.to_string());
+        }
+        Ok(Some(text)) => state.toast = Some(text),
+        Err(e) => state.toast = Some(format!("error: {work_id}: {e}")),
+    }
+}
+
+/// Carry out the queued cancel and replace the "canceling" toast with its
+/// result.
+fn finish_pending_cancel(state: &mut DashboardState, flow: &CancelFlow<'_>) {
+    let Some(work_id) = state.pending_cancel.take() else {
+        return;
+    };
+    state.toast = Some(match flow.cancel(&work_id) {
+        Ok(outcome) => describe_cancel(&work_id, &outcome),
+        Err(e) => format!("error: {work_id}: {e}"),
+    });
+}
+
+/// `None` when `work_id` is Running and can be canceled; otherwise the toast
+/// that says why not.
+fn refuse_or_accept_cancel(work_id: &str, db: &Database) -> anyhow::Result<Option<String>> {
+    let item = db.get_item(work_id)?;
+    match item.phase() {
+        QueuePhase::Running => Ok(None),
+        QueuePhase::Hitl
+            if db
+                .pending_post_processing()?
+                .iter()
+                .any(|r| r.work_id == work_id) =>
+        {
+            Ok(Some(format!(
+                "busy: {work_id} is being processed (post_processing)"
+            )))
+        }
+        phase => Ok(Some(format!("not running: {work_id} is {phase}"))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -925,14 +1245,15 @@ fn handle_enter(
 // ---------------------------------------------------------------------------
 
 /// Render the tab bar showing available tabs with the active one highlighted.
-fn render_tab_bar(active: DashboardTab) -> Paragraph<'static> {
+///
+/// A toast, when present, is shown in the title.
+fn render_tab_bar(active: DashboardTab, toast: Option<&str>) -> Paragraph<'static> {
     let tabs = [
         ("d", "Dashboard", DashboardTab::Dashboard),
         ("w", "Workspace", DashboardTab::PerWorkspace),
-        ("s", "Spec", DashboardTab::Spec),
         ("b", "Board", DashboardTab::Board),
         ("n", "DataSource", DashboardTab::DataSource),
-        ("x", "Scripts", DashboardTab::Scripts),
+        ("t", "Scripts", DashboardTab::Scripts),
     ];
 
     let mut spans: Vec<Span<'static>> = Vec::new();
@@ -957,9 +1278,13 @@ fn render_tab_bar(active: DashboardTab) -> Paragraph<'static> {
         Style::default().fg(Color::DarkGray),
     ));
 
+    let title = match toast {
+        Some(toast) => format!(" Belt TUI | {toast} "),
+        None => " Belt TUI ".to_string(),
+    };
     Paragraph::new(Line::from(spans)).block(
         Block::default()
-            .title(" Belt TUI ")
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan)),
     )
@@ -1527,6 +1852,7 @@ fn render_dashboard_tab(
             Constraint::Min(8),
             Constraint::Length(10),
             Constraint::Length(10),
+            Constraint::Length(5),
         ])
         .split(area);
 
@@ -1552,6 +1878,87 @@ fn render_dashboard_tab(
 
     let runtime_widget = render_runtime_panel_tui(db);
     frame.render_widget(runtime_widget, chunks[3]);
+
+    frame.render_widget(render_notification_panel(db), chunks[4]);
+}
+
+/// How far back `notification_failed` events count for the alerts panel.
+const NOTIFICATION_ALERT_WINDOW_HOURS: i64 = 1;
+/// How many of the newest log rows are scanned for `notification_failed`.
+const NOTIFICATION_ALERT_SCAN_ROWS: u64 = 500;
+
+/// Warning lines of the notification panel: HITL request deliveries of open
+/// requests that ended `failed`, per channel, and the progress/reply
+/// notification failures of the last hour.
+fn notification_alert_lines(db: &Database, now: chrono::DateTime<chrono::Utc>) -> Vec<String> {
+    use belt_infra::db::{DeliveryStatus, transition_kind};
+
+    let mut lines = Vec::new();
+    match db.open_hitl_requests() {
+        Ok(requests) => {
+            for request in requests {
+                match db.deliveries_of(&request.hitl_id) {
+                    Ok(deliveries) => {
+                        for d in deliveries
+                            .iter()
+                            .filter(|d| d.status == DeliveryStatus::Failed)
+                        {
+                            lines.push(format!(
+                                "⚠ HITL 요청 전달 실패: {} · {} · 시도 {}회 · failed",
+                                request.work_id, d.channel, d.attempts
+                            ));
+                        }
+                    }
+                    Err(e) => lines.push(format!("⚠ 전달 상태 조회 실패: {e}")),
+                }
+            }
+        }
+        Err(e) => lines.push(format!("⚠ HITL 요청 조회 실패: {e}")),
+    }
+
+    let since = db
+        .latest_transition_seq()
+        .map(|head| head.saturating_sub(NOTIFICATION_ALERT_SCAN_ROWS))
+        .and_then(|cursor| db.transitions_since(cursor));
+    match since {
+        Ok(rows) => {
+            let window = chrono::Duration::hours(NOTIFICATION_ALERT_WINDOW_HOURS);
+            let failed = rows
+                .iter()
+                .filter(|e| e.kind == transition_kind::NOTIFICATION_FAILED)
+                .filter(|e| {
+                    chrono::DateTime::parse_from_rfc3339(&e.created_at)
+                        .is_ok_and(|at| now.signed_duration_since(at) <= window)
+                })
+                .count();
+            if failed > 0 {
+                lines.push(format!(
+                    "⚠ 알림 실패 {failed}건 ({NOTIFICATION_ALERT_WINDOW_HOURS}h)"
+                ));
+            }
+        }
+        Err(e) => lines.push(format!("⚠ 알림 이력 조회 실패: {e}")),
+    }
+    lines
+}
+
+/// The notification panel: delivery and notification failures.
+fn render_notification_panel(db: &Database) -> Paragraph<'static> {
+    let lines = notification_alert_lines(db, chrono::Utc::now());
+    let body: Vec<Line<'static>> = if lines.is_empty() {
+        vec![Line::from("경고 없음")]
+    } else {
+        lines
+            .into_iter()
+            .map(|l| Line::from(Span::styled(l, Style::default().fg(Color::Yellow))))
+            .collect()
+    };
+    Paragraph::new(body).block(
+        Block::default()
+            .title(" 알림 ")
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan)),
+    )
 }
 
 /// Render the per-workspace tab showing items filtered by the selected workspace.
@@ -1564,7 +1971,7 @@ fn render_dashboard_tab(
 ///
 /// Layout:
 /// - Workspace selector bar + view/filter indicators (top)
-/// - Workspace phase summary + spec progress side by side (middle)
+/// - Workspace phase summary (middle)
 /// - Items view: table or kanban (bottom)
 fn render_per_workspace_tab(
     frame: &mut ratatui::Frame,
@@ -1648,14 +2055,7 @@ fn render_per_workspace_tab(
     let selected_ws = &workspaces[state.selected_workspace].0;
     let ws_items = db.list_items(None, Some(selected_ws)).unwrap_or_default();
 
-    // Workspace summary: phase counts + spec progress side by side.
-    let summary_cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(chunks[1]);
-
-    render_workspace_phase_summary(frame, summary_cols[0], &ws_items);
-    render_workspace_spec_progress(frame, db, summary_cols[1], selected_ws);
+    render_workspace_phase_summary(frame, chunks[1], &ws_items);
 
     // Render either table or kanban view.
     match state.per_ws_view {
@@ -1882,199 +2282,6 @@ fn render_workspace_phase_summary(frame: &mut ratatui::Frame, area: Rect, ws_ite
     frame.render_widget(summary, area);
 }
 
-/// Render spec progress for a single workspace.
-fn render_workspace_spec_progress(
-    frame: &mut ratatui::Frame,
-    db: &Database,
-    area: Rect,
-    workspace_id: &str,
-) {
-    let specs = db.list_specs(Some(workspace_id), None).unwrap_or_default();
-    let total = specs.len();
-    let completed = specs
-        .iter()
-        .filter(|s| s.status == SpecStatus::Completed)
-        .count();
-    let active = specs
-        .iter()
-        .filter(|s| s.status == SpecStatus::Active)
-        .count();
-    let progress_pct = if total > 0 {
-        (completed as f64 / total as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let bar_width = 15usize;
-    let filled = (completed * bar_width).checked_div(total).unwrap_or(0);
-    let empty = bar_width.saturating_sub(filled);
-
-    let line = Line::from(vec![
-        Span::styled(
-            format!("{total} specs"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(format!("active:{active}"), Style::default().fg(Color::Blue)),
-        Span::raw(" "),
-        Span::styled(
-            format!("done:{completed}"),
-            Style::default().fg(Color::Green),
-        ),
-        Span::raw("  ["),
-        Span::styled("#".repeat(filled), Style::default().fg(Color::Green)),
-        Span::styled("-".repeat(empty), Style::default().fg(Color::DarkGray)),
-        Span::raw("]"),
-        Span::styled(
-            format!(" {progress_pct:.0}%"),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-
-    let paragraph = Paragraph::new(line).block(
-        Block::default()
-            .title(" Spec Progress ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
-    );
-    frame.render_widget(paragraph, area);
-}
-
-/// Render the spec progress tab showing all specs with status and progress.
-fn render_spec_tab(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    specs: &[belt_core::spec::Spec],
-    selected: usize,
-) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(5), Constraint::Min(5)])
-        .split(area);
-
-    // Spec status summary (progress overview).
-    let status_counts = count_spec_statuses(specs);
-    let total = specs.len();
-    let completed = status_counts.completed;
-    let progress_pct = if total > 0 {
-        (completed as f64 / total as f64) * 100.0
-    } else {
-        0.0
-    };
-
-    let summary_spans = vec![
-        Span::styled(
-            format!("Total: {total}"),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("draft: {}", status_counts.draft),
-            Style::default().fg(Color::Gray),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("active: {}", status_counts.active),
-            Style::default().fg(Color::Blue),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("paused: {}", status_counts.paused),
-            Style::default().fg(Color::Yellow),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("completing: {}", status_counts.completing),
-            Style::default().fg(Color::Cyan),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("completed: {completed}"),
-            Style::default().fg(Color::Green),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("Progress: {progress_pct:.0}%"),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-
-    // Build a progress bar line.
-    let bar_width = 30usize;
-    let filled = (completed * bar_width).checked_div(total).unwrap_or(0);
-    let empty = bar_width.saturating_sub(filled);
-    let bar_line = Line::from(vec![
-        Span::raw("  ["),
-        Span::styled("#".repeat(filled), Style::default().fg(Color::Green)),
-        Span::styled("-".repeat(empty), Style::default().fg(Color::DarkGray)),
-        Span::raw("]"),
-    ]);
-
-    let summary = Paragraph::new(vec![Line::from(summary_spans), Line::from(""), bar_line]).block(
-        Block::default()
-            .title(" Spec Progress ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
-    );
-    frame.render_widget(summary, chunks[0]);
-
-    // Spec list table.
-    let rows: Vec<Row<'static>> = specs
-        .iter()
-        .enumerate()
-        .map(|(i, spec)| {
-            let status_str = spec.status.as_str().to_string();
-            let color = spec_status_color(&status_str);
-            let ws = spec.workspace_id.clone();
-            let row = Row::new(vec![
-                Cell::from(spec.name.clone()),
-                Cell::from(ws),
-                Cell::from(status_str).style(Style::default().fg(color)),
-                Cell::from(spec.updated_at.clone()),
-            ]);
-            if i == selected {
-                row.style(
-                    Style::default()
-                        .bg(Color::DarkGray)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                row
-            }
-        })
-        .collect();
-
-    let header = Row::new(vec!["Name", "Workspace", "Status", "Updated"])
-        .style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-        .bottom_margin(1);
-
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Percentage(30),
-            Constraint::Percentage(20),
-            Constraint::Percentage(15),
-            Constraint::Percentage(35),
-        ],
-    )
-    .header(header)
-    .block(
-        Block::default()
-            .title(" Specs ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
-    );
-    frame.render_widget(table, chunks[1]);
-}
-
 /// Render the scripts execution statistics tab.
 ///
 /// Layout:
@@ -2282,49 +2489,6 @@ fn render_recent_executions(frame: &mut ratatui::Frame, area: Rect, events: &[Hi
     frame.render_widget(table, area);
 }
 
-/// Aggregate counts of spec statuses.
-struct SpecStatusCounts {
-    draft: usize,
-    active: usize,
-    paused: usize,
-    completing: usize,
-    completed: usize,
-}
-
-fn count_spec_statuses(specs: &[belt_core::spec::Spec]) -> SpecStatusCounts {
-    let mut counts = SpecStatusCounts {
-        draft: 0,
-        active: 0,
-        paused: 0,
-        completing: 0,
-        completed: 0,
-    };
-    for spec in specs {
-        match spec.status {
-            SpecStatus::Draft => counts.draft += 1,
-            SpecStatus::Active => counts.active += 1,
-            SpecStatus::Paused => counts.paused += 1,
-            SpecStatus::Completing => counts.completing += 1,
-            SpecStatus::Completed => counts.completed += 1,
-            SpecStatus::Archived => {} // excluded from list by default
-        }
-    }
-    counts
-}
-
-/// Map spec status strings to colors.
-fn spec_status_color(status: &str) -> Color {
-    match status {
-        "draft" => Color::Gray,
-        "active" => Color::Blue,
-        "paused" => Color::Yellow,
-        "completing" => Color::Cyan,
-        "completed" => Color::Green,
-        "archived" => Color::DarkGray,
-        _ => Color::White,
-    }
-}
-
 /// Render the help overlay showing all key bindings.
 fn render_help_overlay(frame: &mut ratatui::Frame) {
     let area = centered_rect(50, 60, frame.area());
@@ -2347,10 +2511,6 @@ fn render_help_overlay(frame: &mut ratatui::Frame) {
             Span::raw("Switch to Per-Workspace tab"),
         ]),
         Line::from(vec![
-            Span::styled("  s       ", Style::default().fg(Color::Yellow)),
-            Span::raw("Switch to Spec progress tab"),
-        ]),
-        Line::from(vec![
             Span::styled("  b       ", Style::default().fg(Color::Yellow)),
             Span::raw("Switch to Board (kanban) tab"),
         ]),
@@ -2359,7 +2519,7 @@ fn render_help_overlay(frame: &mut ratatui::Frame) {
             Span::raw("Switch to DataSource status tab"),
         ]),
         Line::from(vec![
-            Span::styled("  x       ", Style::default().fg(Color::Yellow)),
+            Span::styled("  t       ", Style::default().fg(Color::Yellow)),
             Span::raw("Switch to Scripts statistics tab"),
         ]),
         Line::from(vec![
@@ -2397,7 +2557,11 @@ fn render_help_overlay(frame: &mut ratatui::Frame) {
         ]),
         Line::from(vec![
             Span::styled("  Enter   ", Style::default().fg(Color::Cyan)),
-            Span::raw("Open item/spec detail overlay"),
+            Span::raw("Open item detail overlay"),
+        ]),
+        Line::from(vec![
+            Span::styled("  x       ", Style::default().fg(Color::Cyan)),
+            Span::raw("Cancel the selected running item"),
         ]),
         Line::from(""),
         Line::from(vec![
@@ -2446,8 +2610,20 @@ fn render_item_detail_overlay(frame: &mut ratatui::Frame, db: &Database, work_id
         .and_then(|sid| db.get_history(sid).ok())
         .unwrap_or_default();
 
-    let lines =
-        build_detail_lines_with_history(work_id, item.ok().as_ref(), &transitions, &history);
+    let hitl = current_hitl_requests(db);
+    let mut lines = build_detail_lines_with_history(
+        work_id,
+        item.ok().as_ref(),
+        &transitions,
+        &history,
+        hitl.as_ref()
+            .ok()
+            .and_then(|requests| requests.get(work_id)),
+    );
+    if let Err(e) = &hitl {
+        lines.push(Line::from(""));
+        lines.push(hitl_error_line(e));
+    }
 
     let paragraph = Paragraph::new(lines).block(
         Block::default()
@@ -2469,7 +2645,7 @@ fn build_detail_lines<'a>(
     item: Option<&QueueItem>,
     transitions: &[TransitionEvent],
 ) -> Vec<Line<'a>> {
-    build_detail_lines_with_history(work_id, item, transitions, &[])
+    build_detail_lines_with_history(work_id, item, transitions, &[], None)
 }
 
 /// Build the text lines for the item detail overlay with judgment history.
@@ -2481,6 +2657,7 @@ fn build_detail_lines_with_history<'a>(
     item: Option<&QueueItem>,
     transitions: &[TransitionEvent],
     history: &[HistoryEvent],
+    hitl: Option<&HitlRequest>,
 ) -> Vec<Line<'a>> {
     let mut lines: Vec<Line<'a>> = Vec::new();
 
@@ -2526,11 +2703,7 @@ fn build_detail_lines_with_history<'a>(
                 Span::raw(item.updated_at.clone()),
             ]));
 
-            // HITL details (if present).
-            if item.hitl_created_at.is_some()
-                || item.hitl_reason.is_some()
-                || item.hitl_notes.is_some()
-            {
+            if let Some(request) = hitl {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "HITL Details:",
@@ -2538,37 +2711,53 @@ fn build_detail_lines_with_history<'a>(
                         .add_modifier(Modifier::BOLD)
                         .fg(Color::Yellow),
                 )));
-                if let Some(ref hitl_at) = item.hitl_created_at {
+                let label = |text: &'static str| {
+                    Span::styled(text, Style::default().add_modifier(Modifier::BOLD))
+                };
+                lines.push(Line::from(vec![
+                    label("  Status: "),
+                    Span::raw(hitl_status_label(request)),
+                ]));
+                lines.push(Line::from(vec![
+                    label("  Entered: "),
+                    Span::raw(request.opened_at.clone()),
+                ]));
+                if let Some(ref reason) = request.reason {
                     lines.push(Line::from(vec![
-                        Span::styled("  Entered: ", Style::default().add_modifier(Modifier::BOLD)),
-                        Span::raw(hitl_at.clone()),
-                    ]));
-                }
-                if let Some(ref reason) = item.hitl_reason {
-                    lines.push(Line::from(vec![
-                        Span::styled("  Reason: ", Style::default().add_modifier(Modifier::BOLD)),
+                        label("  Reason: "),
                         Span::raw(reason.to_string()),
                     ]));
                 }
-                if let Some(ref respondent) = item.hitl_respondent {
+                if let Some(ref notes) = request.notes {
                     lines.push(Line::from(vec![
-                        Span::styled(
-                            "  Respondent: ",
-                            Style::default().add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw(respondent.clone()),
-                    ]));
-                }
-                if let Some(ref notes) = item.hitl_notes {
-                    lines.push(Line::from(vec![
-                        Span::styled("  Notes: ", Style::default().add_modifier(Modifier::BOLD)),
+                        label("  Notes: "),
                         Span::raw(notes.clone()),
                     ]));
                 }
-                if let Some(ref timeout) = item.hitl_timeout_at {
+                if let Some(ref timeout) = request.timeout_at {
                     lines.push(Line::from(vec![
-                        Span::styled("  Timeout: ", Style::default().add_modifier(Modifier::BOLD)),
+                        label("  Timeout: "),
                         Span::raw(timeout.clone()),
+                    ]));
+                }
+                if let Some(ref resolution) = request.resolution {
+                    lines.push(Line::from(vec![
+                        label("  Respondent: "),
+                        Span::raw(format!("{} via {}", resolution.by, resolution.via)),
+                    ]));
+                    lines.push(Line::from(vec![
+                        label("  Action: "),
+                        Span::raw(resolution.action.to_string()),
+                    ]));
+                    lines.push(Line::from(vec![
+                        label("  Resolved: "),
+                        Span::raw(resolution.at.clone()),
+                    ]));
+                }
+                if let Some(ref notes) = request.resolution_notes {
+                    lines.push(Line::from(vec![
+                        label("  Response notes: "),
+                        Span::raw(notes.clone()),
                     ]));
                 }
             }
@@ -2701,15 +2890,24 @@ fn build_detail_lines_with_history<'a>(
 /// Displays a centered popup with a list of HITL items showing their
 /// work ID, title, reason, and entry time. Users can navigate the list
 /// with j/k and press Enter to view item details.
-fn render_hitl_overlay(frame: &mut ratatui::Frame, db: &Database, selected: usize) {
+fn render_hitl_overlay(
+    frame: &mut ratatui::Frame,
+    view: Option<&HitlOverlayView>,
+    error: Option<&anyhow::Error>,
+    selected: usize,
+    retry_input: Option<&str>,
+    toast: Option<&str>,
+) {
     let area = centered_rect(70, 75, frame.area());
     frame.render_widget(Clear, area);
 
-    let hitl_items: Vec<QueueItem> = db
-        .list_items(Some(QueuePhase::Hitl), None)
-        .unwrap_or_default();
-
-    let lines = build_hitl_overlay_lines(&hitl_items, selected);
+    let lines = match (view, error) {
+        (Some(view), _) => {
+            build_hitl_overlay_lines(&view.items, &view.requests, selected, retry_input, toast)
+        }
+        (None, Some(e)) => vec![hitl_error_line(e)],
+        (None, None) => Vec::new(),
+    };
 
     let paragraph = Paragraph::new(lines).block(
         Block::default()
@@ -2721,8 +2919,25 @@ fn render_hitl_overlay(frame: &mut ratatui::Frame, db: &Database, selected: usiz
     frame.render_widget(paragraph, area);
 }
 
+/// Banner line shown when the HITL state could not be read from the store.
+fn hitl_error_line(error: &anyhow::Error) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("error: HITL 상태를 읽지 못함: {error}"),
+        Style::default().fg(Color::Red),
+    ))
+}
+
 /// Build the text lines for the HITL overlay.
-fn build_hitl_overlay_lines(hitl_items: &[QueueItem], selected: usize) -> Vec<Line<'static>> {
+///
+/// Each item shows its `hitl_requests` row; a confirmed request shows
+/// `해결됨 · 처리 중` until the daemon finishes post-processing.
+fn build_hitl_overlay_lines(
+    hitl_items: &[QueueItem],
+    requests: &HashMap<String, HitlRequest>,
+    selected: usize,
+    retry_input: Option<&str>,
+    toast: Option<&str>,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     lines.push(Line::from(Span::styled(
@@ -2765,52 +2980,106 @@ fn build_hitl_overlay_lines(hitl_items: &[QueueItem], selected: usize) -> Vec<Li
 
             // Indented detail lines.
             let detail_indent = "    ";
-            if let Some(ref reason) = item.hitl_reason {
+            let request = requests.get(&item.work_id);
+            if let Some(request) = request {
                 lines.push(Line::from(vec![
                     Span::raw(detail_indent.to_string()),
-                    Span::styled("Reason: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled(reason.to_string(), Style::default().fg(Color::Red)),
+                    Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        hitl_status_label(request),
+                        Style::default().fg(Color::Magenta),
+                    ),
                 ]));
-            }
-            if let Some(ref hitl_at) = item.hitl_created_at {
-                let time_display = format_transition_time(hitl_at);
+                if let Some(ref reason) = request.reason {
+                    lines.push(Line::from(vec![
+                        Span::raw(detail_indent.to_string()),
+                        Span::styled("Reason: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::styled(reason.to_string(), Style::default().fg(Color::Red)),
+                    ]));
+                }
                 lines.push(Line::from(vec![
                     Span::raw(detail_indent.to_string()),
                     Span::styled("Entered: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled(time_display, Style::default().fg(Color::DarkGray)),
-                ]));
-            }
-            if let Some(ref notes) = item.hitl_notes {
-                lines.push(Line::from(vec![
-                    Span::raw(detail_indent.to_string()),
-                    Span::styled("Notes: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(notes.clone()),
-                ]));
-            }
-            if let Some(ref timeout) = item.hitl_timeout_at {
-                let time_display = format_transition_time(timeout);
-                lines.push(Line::from(vec![
-                    Span::raw(detail_indent.to_string()),
-                    Span::styled("Timeout: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled(time_display, Style::default().fg(Color::DarkGray)),
-                ]));
-            }
-
-            if is_selected {
-                lines.push(Line::from(vec![
-                    Span::raw(detail_indent.to_string()),
-                    Span::styled("Actions: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::styled("[Enter] ", Style::default().fg(Color::Green)),
-                    Span::raw("View details  "),
                     Span::styled(
-                        "Use `belt hitl approve/reject/modify` to respond",
+                        format_transition_time(&request.opened_at),
                         Style::default().fg(Color::DarkGray),
                     ),
                 ]));
+                if let Some(ref notes) = request.notes {
+                    lines.push(Line::from(vec![
+                        Span::raw(detail_indent.to_string()),
+                        Span::styled("Notes: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(notes.clone()),
+                    ]));
+                }
+                if let Some(ref timeout) = request.timeout_at {
+                    lines.push(Line::from(vec![
+                        Span::raw(detail_indent.to_string()),
+                        Span::styled("Timeout: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::styled(
+                            format_transition_time(timeout),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]));
+                }
+                if let Some(ref resolution) = request.resolution {
+                    lines.push(Line::from(vec![
+                        Span::raw(detail_indent.to_string()),
+                        Span::styled("Answered: ", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(format!(
+                            "{} by {} via {}",
+                            resolution.action, resolution.by, resolution.via
+                        )),
+                    ]));
+                }
+            }
+
+            if is_selected {
+                let answerable = request.is_none_or(|r| r.status == HitlStatus::Open);
+                let mut actions = vec![
+                    Span::raw(detail_indent.to_string()),
+                    Span::styled("Actions: ", Style::default().add_modifier(Modifier::BOLD)),
+                ];
+                if answerable {
+                    for (key, label) in [
+                        ("[d] ", "done  "),
+                        ("[r] ", "retry  "),
+                        ("[s] ", "skip  "),
+                        ("[p] ", "replan  "),
+                    ] {
+                        actions.push(Span::styled(key, Style::default().fg(Color::Green)));
+                        actions.push(Span::raw(label));
+                    }
+                }
+                actions.push(Span::styled("[Enter] ", Style::default().fg(Color::Green)));
+                actions.push(Span::raw("View details"));
+                lines.push(Line::from(actions));
             }
 
             lines.push(Line::from(""));
         }
+    }
+
+    if let Some(input) = retry_input {
+        lines.push(Line::from(vec![
+            Span::styled("retry 지시> ", Style::default().fg(Color::Yellow)),
+            Span::raw(input.to_string()),
+            Span::styled("_", Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("[Enter] ", Style::default().fg(Color::Green)),
+            Span::raw("Send  "),
+            Span::styled("[Esc] ", Style::default().fg(Color::Red)),
+            Span::raw("Cancel input"),
+        ]));
+        return lines;
+    }
+    if let Some(toast) = toast {
+        lines.push(Line::from(Span::styled(
+            toast.to_string(),
+            Style::default().fg(Color::Magenta),
+        )));
+        lines.push(Line::from(""));
     }
 
     lines.push(Line::from(vec![
@@ -2825,200 +3094,13 @@ fn build_hitl_overlay_lines(hitl_items: &[QueueItem], selected: usize) -> Vec<Li
     lines
 }
 
-/// Render the spec acceptance criteria detail overlay.
-///
-/// Displays a centered popup showing the spec's metadata, acceptance
-/// criteria extracted from the spec content, and completion progress.
-fn render_spec_detail_overlay(frame: &mut ratatui::Frame, specs: &[Spec], spec_index: usize) {
-    let area = centered_rect(65, 75, frame.area());
-    frame.render_widget(Clear, area);
-
-    let lines = build_spec_detail_lines(specs, spec_index);
-
-    let paragraph = Paragraph::new(lines).block(
-        Block::default()
-            .title(" Spec Details ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
-    );
-
-    frame.render_widget(paragraph, area);
-}
-
-/// Build the text lines for the spec acceptance criteria detail overlay.
-fn build_spec_detail_lines(specs: &[Spec], spec_index: usize) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-
-    let Some(spec) = specs.get(spec_index) else {
-        lines.push(Line::from(Span::styled(
-            "(spec not found)",
-            Style::default().fg(Color::Red),
-        )));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "[q/Esc] Close",
-            Style::default().fg(Color::DarkGray),
-        )));
-        return lines;
-    };
-
-    let status_str = spec.status.as_str().to_string();
-    let status_color = spec_status_color(&status_str);
-
-    // Spec metadata.
-    lines.push(Line::from(vec![
-        Span::styled("Name: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(spec.name.clone()),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("ID: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(spec.id.clone()),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Workspace: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(spec.workspace_id.clone()),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("Status: ", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(status_str, Style::default().fg(status_color)),
-    ]));
-    if let Some(priority) = spec.priority {
-        lines.push(Line::from(vec![
-            Span::styled("Priority: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(priority.to_string()),
-        ]));
+/// Status text of a request: open, or confirmed and waiting for the daemon.
+fn hitl_status_label(request: &HitlRequest) -> &'static str {
+    match request.status {
+        HitlStatus::Open => "대기 중",
+        HitlStatus::Resolved => "해결됨 · 처리 중",
+        HitlStatus::Expired => "만료됨 · 처리 중",
     }
-    if let Some(ref labels) = spec.labels {
-        lines.push(Line::from(vec![
-            Span::styled("Labels: ", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(labels.clone()),
-        ]));
-    }
-    if let Some(ref entry_point) = spec.entry_point {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Entry Points: ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(entry_point.clone()),
-        ]));
-    }
-    if let Some(ref depends) = spec.depends_on {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Depends On: ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(depends.clone()),
-        ]));
-    }
-    if let Some(ref issues) = spec.decomposed_issues {
-        lines.push(Line::from(vec![
-            Span::styled(
-                "Decomposed Issues: ",
-                Style::default().add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(issues.clone()),
-        ]));
-    }
-
-    // Acceptance criteria section.
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Acceptance Criteria:",
-        Style::default()
-            .add_modifier(Modifier::BOLD)
-            .add_modifier(Modifier::UNDERLINED)
-            .fg(Color::Cyan),
-    )));
-
-    let criteria = extract_acceptance_criteria(&spec.content);
-    if criteria.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (no acceptance criteria found in spec content)",
-            Style::default().fg(Color::DarkGray),
-        )));
-    } else {
-        let total = criteria.len();
-        // Build progress bar.
-        let completed_count = match spec.status {
-            SpecStatus::Completed => total,
-            SpecStatus::Completing => total.saturating_sub(1).max(total * 3 / 4),
-            SpecStatus::Active => total / 3,
-            _ => 0,
-        };
-        let progress_pct = if total > 0 {
-            (completed_count as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        };
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                format!("Progress: {completed_count}/{total} ({progress_pct:.0}%)"),
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]));
-
-        let bar_width = 20usize;
-        let filled = (completed_count * bar_width)
-            .checked_div(total)
-            .unwrap_or(0);
-        let empty = bar_width.saturating_sub(filled);
-        lines.push(Line::from(vec![
-            Span::raw("  ["),
-            Span::styled("#".repeat(filled), Style::default().fg(Color::Green)),
-            Span::styled("-".repeat(empty), Style::default().fg(Color::DarkGray)),
-            Span::raw("]"),
-        ]));
-        lines.push(Line::from(""));
-
-        for (i, criterion) in criteria.iter().enumerate() {
-            let idx = i + 1;
-            let is_done = i < completed_count;
-            let marker = if is_done { "[x]" } else { "[ ]" };
-            let marker_color = if is_done { Color::Green } else { Color::Gray };
-            lines.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(
-                    format!("{marker} AC{idx}: "),
-                    Style::default().fg(marker_color),
-                ),
-                Span::raw(criterion.clone()),
-            ]));
-        }
-    }
-
-    // Test commands section.
-    if let Some(ref test_cmds) = spec.test_commands {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "Test Commands:",
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .fg(Color::Blue),
-        )));
-        for cmd in test_cmds
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            lines.push(Line::from(vec![
-                Span::raw("  $ "),
-                Span::styled(cmd.to_string(), Style::default().fg(Color::Cyan)),
-            ]));
-        }
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "[q/Esc] Close",
-        Style::default().fg(Color::DarkGray),
-    )));
-
-    lines
 }
 
 /// Format an RFC 3339 timestamp to a shorter display form.
@@ -3352,6 +3434,7 @@ fn format_number(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use belt_core::hitl::HitlId;
     use belt_infra::db::RuntimeStats;
 
     use super::*;
@@ -3857,8 +3940,7 @@ mod tests {
     #[test]
     fn tab_cycle_forward() {
         assert_eq!(DashboardTab::Dashboard.next(), DashboardTab::PerWorkspace);
-        assert_eq!(DashboardTab::PerWorkspace.next(), DashboardTab::Spec);
-        assert_eq!(DashboardTab::Spec.next(), DashboardTab::Board);
+        assert_eq!(DashboardTab::PerWorkspace.next(), DashboardTab::Board);
         assert_eq!(DashboardTab::Board.next(), DashboardTab::DataSource);
         assert_eq!(DashboardTab::DataSource.next(), DashboardTab::Scripts);
         assert_eq!(DashboardTab::Scripts.next(), DashboardTab::Dashboard);
@@ -3869,8 +3951,7 @@ mod tests {
         assert_eq!(DashboardTab::Dashboard.prev(), DashboardTab::Scripts);
         assert_eq!(DashboardTab::Scripts.prev(), DashboardTab::DataSource);
         assert_eq!(DashboardTab::DataSource.prev(), DashboardTab::Board);
-        assert_eq!(DashboardTab::Board.prev(), DashboardTab::Spec);
-        assert_eq!(DashboardTab::Spec.prev(), DashboardTab::PerWorkspace);
+        assert_eq!(DashboardTab::Board.prev(), DashboardTab::PerWorkspace);
         assert_eq!(DashboardTab::PerWorkspace.prev(), DashboardTab::Dashboard);
     }
 
@@ -3910,72 +3991,13 @@ mod tests {
         assert_eq!(state.current_tab_state().selected_index, 5);
     }
 
-    // ---- spec_status_color ----
-
-    #[test]
-    fn spec_status_color_known_statuses() {
-        assert_eq!(spec_status_color("draft"), Color::Gray);
-        assert_eq!(spec_status_color("active"), Color::Blue);
-        assert_eq!(spec_status_color("paused"), Color::Yellow);
-        assert_eq!(spec_status_color("completing"), Color::Cyan);
-        assert_eq!(spec_status_color("completed"), Color::Green);
-        assert_eq!(spec_status_color("archived"), Color::DarkGray);
-    }
-
-    #[test]
-    fn spec_status_color_unknown_returns_white() {
-        assert_eq!(spec_status_color("unknown"), Color::White);
-        assert_eq!(spec_status_color(""), Color::White);
-    }
-
-    // ---- count_spec_statuses ----
-
-    #[test]
-    fn count_spec_statuses_empty() {
-        let counts = count_spec_statuses(&[]);
-        assert_eq!(counts.draft, 0);
-        assert_eq!(counts.active, 0);
-        assert_eq!(counts.paused, 0);
-        assert_eq!(counts.completing, 0);
-        assert_eq!(counts.completed, 0);
-    }
-
-    #[test]
-    fn count_spec_statuses_mixed() {
-        use belt_core::spec::Spec;
-
-        let mut specs = Vec::new();
-        let mut s1 = Spec::new("s1".into(), "ws".into(), "n1".into(), "c".into());
-        // Draft by default
-        specs.push(s1.clone());
-
-        s1.id = "s2".into();
-        s1.status = SpecStatus::Active;
-        specs.push(s1.clone());
-
-        s1.id = "s3".into();
-        s1.status = SpecStatus::Completed;
-        specs.push(s1.clone());
-
-        s1.id = "s4".into();
-        s1.status = SpecStatus::Completed;
-        specs.push(s1);
-
-        let counts = count_spec_statuses(&specs);
-        assert_eq!(counts.draft, 1);
-        assert_eq!(counts.active, 1);
-        assert_eq!(counts.completed, 2);
-        assert_eq!(counts.paused, 0);
-        assert_eq!(counts.completing, 0);
-    }
-
     // ---- DashboardTab equality ----
 
     #[test]
     fn dashboard_tab_equality() {
         assert_eq!(DashboardTab::Dashboard, DashboardTab::Dashboard);
-        assert_ne!(DashboardTab::Dashboard, DashboardTab::Spec);
-        assert_ne!(DashboardTab::Spec, DashboardTab::PerWorkspace);
+        assert_ne!(DashboardTab::Dashboard, DashboardTab::Board);
+        assert_ne!(DashboardTab::Board, DashboardTab::PerWorkspace);
         assert_ne!(DashboardTab::Board, DashboardTab::Dashboard);
     }
 
@@ -4006,14 +4028,14 @@ mod tests {
     #[test]
     fn tab_next_full_cycle_returns_to_start() {
         let start = DashboardTab::Dashboard;
-        let result = start.next().next().next().next().next().next();
+        let result = start.next().next().next().next().next();
         assert_eq!(result, start);
     }
 
     #[test]
     fn tab_prev_full_cycle_returns_to_start() {
         let start = DashboardTab::Dashboard;
-        let result = start.prev().prev().prev().prev().prev().prev();
+        let result = start.prev().prev().prev().prev().prev();
         assert_eq!(result, start);
     }
 
@@ -4022,12 +4044,11 @@ mod tests {
         for tab in [
             DashboardTab::Dashboard,
             DashboardTab::PerWorkspace,
-            DashboardTab::Spec,
             DashboardTab::Board,
             DashboardTab::DataSource,
             DashboardTab::Scripts,
         ] {
-            assert_eq!(tab.next().next().next().next().next().next(), tab);
+            assert_eq!(tab.next().next().next().next().next(), tab);
         }
     }
 
@@ -4036,12 +4057,11 @@ mod tests {
         for tab in [
             DashboardTab::Dashboard,
             DashboardTab::PerWorkspace,
-            DashboardTab::Spec,
             DashboardTab::Board,
             DashboardTab::DataSource,
             DashboardTab::Scripts,
         ] {
-            assert_eq!(tab.prev().prev().prev().prev().prev().prev(), tab);
+            assert_eq!(tab.prev().prev().prev().prev().prev(), tab);
         }
     }
 
@@ -4050,7 +4070,6 @@ mod tests {
         for tab in [
             DashboardTab::Dashboard,
             DashboardTab::PerWorkspace,
-            DashboardTab::Spec,
             DashboardTab::Board,
             DashboardTab::DataSource,
             DashboardTab::Scripts,
@@ -4064,7 +4083,6 @@ mod tests {
         for tab in [
             DashboardTab::Dashboard,
             DashboardTab::PerWorkspace,
-            DashboardTab::Spec,
             DashboardTab::Board,
             DashboardTab::DataSource,
             DashboardTab::Scripts,
@@ -4085,17 +4103,14 @@ mod tests {
         state.active_tab = DashboardTab::PerWorkspace;
         assert_eq!(state.tab_key(), 1);
 
-        state.active_tab = DashboardTab::Spec;
+        state.active_tab = DashboardTab::Board;
         assert_eq!(state.tab_key(), 2);
 
-        state.active_tab = DashboardTab::Board;
+        state.active_tab = DashboardTab::DataSource;
         assert_eq!(state.tab_key(), 3);
 
-        state.active_tab = DashboardTab::DataSource;
-        assert_eq!(state.tab_key(), 4);
-
         state.active_tab = DashboardTab::Scripts;
-        assert_eq!(state.tab_key(), 5);
+        assert_eq!(state.tab_key(), 4);
     }
 
     // ---- Board view state ----
@@ -4181,15 +4196,15 @@ mod tests {
         state.active_tab = DashboardTab::PerWorkspace;
         state.current_tab_state_mut().selected_index = 10;
 
-        // Modify Spec tab state.
-        state.active_tab = DashboardTab::Spec;
+        // Modify Board tab state.
+        state.active_tab = DashboardTab::Board;
         state.current_tab_state_mut().selected_index = 20;
 
         // Verify each tab has its own state.
         state.active_tab = DashboardTab::PerWorkspace;
         assert_eq!(state.current_tab_state().selected_index, 10);
 
-        state.active_tab = DashboardTab::Spec;
+        state.active_tab = DashboardTab::Board;
         assert_eq!(state.current_tab_state().selected_index, 20);
 
         // Dashboard tab should still be at 0.
@@ -4252,10 +4267,10 @@ mod tests {
     }
 
     #[test]
-    fn datasource_tab_key_is_four() {
+    fn datasource_tab_key_is_three() {
         let mut state = DashboardState::new();
         state.active_tab = DashboardTab::DataSource;
-        assert_eq!(state.tab_key(), 4);
+        assert_eq!(state.tab_key(), 3);
     }
 
     #[test]
@@ -4315,10 +4330,58 @@ mod tests {
     }
 
     #[test]
-    fn scripts_tab_key_is_five() {
+    fn scripts_tab_key_is_four() {
         let mut state = DashboardState::new();
         state.active_tab = DashboardTab::Scripts;
-        assert_eq!(state.tab_key(), 5);
+        assert_eq!(state.tab_key(), 4);
+    }
+
+    #[test]
+    fn notification_alerts_show_failed_deliveries_and_recent_notification_failures() {
+        use belt_core::transition::Actor;
+        use belt_infra::db::{DeliveryAttempt, EventRecord, transition_kind};
+
+        let db = make_db();
+        assert!(notification_alert_lines(&db, chrono::Utc::now()).is_empty());
+
+        let hitl_id = open_hitl_item(&db, "1", None);
+        let work_id = db.hitl_request(&hitl_id).unwrap().unwrap().work_id;
+        db.ensure_delivery(&hitl_id, "team-chat").unwrap();
+        for _ in 0..belt_infra::db::DELIVERY_MAX_ATTEMPTS {
+            db.mark_delivery(
+                &hitl_id,
+                "team-chat",
+                &DeliveryAttempt::Failed {
+                    error: "down".to_string(),
+                },
+            )
+            .unwrap();
+        }
+        db.record_event(&EventRecord {
+            work_id: &work_id,
+            kind: transition_kind::NOTIFICATION_FAILED,
+            actor: Actor::Daemon,
+            reason: Some("failed"),
+            detail: Some("origin: down"),
+        })
+        .unwrap();
+
+        let lines = notification_alert_lines(&db, chrono::Utc::now());
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("team-chat") && l.contains("failed")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("알림 실패 1건")),
+            "{lines:?}"
+        );
+
+        // Two hours later the notification failure no longer counts.
+        let later = chrono::Utc::now() + chrono::Duration::hours(2);
+        let lines = notification_alert_lines(&db, later);
+        assert!(lines.iter().all(|l| !l.contains("알림 실패")), "{lines:?}");
     }
 
     #[test]
@@ -4823,24 +4886,42 @@ mod tests {
     }
 
     #[test]
-    fn build_detail_lines_shows_hitl_details() {
-        let mut item = QueueItem::new(
+    fn build_detail_lines_shows_hitl_details_from_request() {
+        let db = make_db();
+        let hitl_id = open_hitl_item(&db, "src1", Some("needs review"));
+        let request = db.hitl_request(&hitl_id).unwrap().unwrap();
+        let item = QueueItem::new(
+            request.work_id.clone(),
+            "src1".to_string(),
+            "ws1".to_string(),
+            "analyze".to_string(),
+        );
+
+        let lines = build_detail_lines_with_history(
+            &request.work_id,
+            Some(&item),
+            &[],
+            &[],
+            Some(&request),
+        );
+        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
+        assert!(text.contains("HITL Details:"));
+        assert!(text.contains("Entered:"));
+        assert!(text.contains("evaluate_failure"));
+        assert!(text.contains("needs review"));
+    }
+
+    #[test]
+    fn build_detail_lines_hides_hitl_section_without_request() {
+        let item = QueueItem::new(
             "w1".to_string(),
             "src1".to_string(),
             "ws1".to_string(),
             "analyze".to_string(),
         );
-        item.hitl_created_at = Some("2026-03-25T10:00:00Z".to_string());
-        item.hitl_reason = Some(belt_core::queue::HitlReason::RetryMaxExceeded);
-        item.hitl_notes = Some("needs review".to_string());
-
         let lines = build_detail_lines("w1", Some(&item), &[]);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
-        assert!(text.contains("HITL Details:"));
-        assert!(text.contains("Entered:"));
-        assert!(text.contains("Reason:"));
-        assert!(text.contains("Notes:"));
-        assert!(text.contains("needs review"));
+        assert!(!text.contains("HITL Details:"));
     }
 
     #[test]
@@ -4904,22 +4985,14 @@ mod tests {
     #[test]
     fn overlay_mode_hitl_preserves_selected() {
         let mut state = DashboardState::new();
-        state.overlay = OverlayMode::Hitl { selected: 3 };
-        if let OverlayMode::Hitl { selected } = state.overlay {
+        state.overlay = OverlayMode::Hitl {
+            selected: 3,
+            retry_input: None,
+        };
+        if let OverlayMode::Hitl { selected, .. } = state.overlay {
             assert_eq!(selected, 3);
         } else {
             panic!("Expected Hitl overlay");
-        }
-    }
-
-    #[test]
-    fn overlay_mode_spec_detail_preserves_index() {
-        let mut state = DashboardState::new();
-        state.overlay = OverlayMode::SpecDetail { spec_index: 5 };
-        if let OverlayMode::SpecDetail { spec_index } = state.overlay {
-            assert_eq!(spec_index, 5);
-        } else {
-            panic!("Expected SpecDetail overlay");
         }
     }
 
@@ -4927,7 +5000,7 @@ mod tests {
 
     #[test]
     fn build_hitl_overlay_lines_empty() {
-        let lines = build_hitl_overlay_lines(&[], 0);
+        let lines = build_hitl_overlay_lines(&[], &HashMap::new(), 0, None, None);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
         assert!(text.contains("no items in HITL phase"));
         assert!(text.contains("Awaiting Human Review"));
@@ -4943,8 +5016,6 @@ mod tests {
         );
         item1.set_phase_unchecked(QueuePhase::Hitl);
         item1.title = Some("Fix auth bug".to_string());
-        item1.hitl_reason = Some(belt_core::queue::HitlReason::RetryMaxExceeded);
-        item1.hitl_created_at = Some("2026-03-25T10:00:00Z".to_string());
 
         let mut item2 = QueueItem::new(
             "w2".to_string(),
@@ -4954,7 +5025,12 @@ mod tests {
         );
         item2.set_phase_unchecked(QueuePhase::Hitl);
 
-        let lines = build_hitl_overlay_lines(&[item1, item2], 0);
+        let db = make_db();
+        let hitl_id = open_hitl_item(&db, "src1", None);
+        let request = db.hitl_request(&hitl_id).unwrap().unwrap();
+        let requests = HashMap::from([("w1".to_string(), request)]);
+
+        let lines = build_hitl_overlay_lines(&[item1, item2], &requests, 0, None, None);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
         assert!(text.contains("2 item(s) pending review"));
         assert!(text.contains("w1"));
@@ -4975,73 +5051,683 @@ mod tests {
         );
         item.set_phase_unchecked(QueuePhase::Hitl);
 
-        let lines = build_hitl_overlay_lines(&[item], 0);
+        let lines = build_hitl_overlay_lines(&[item], &HashMap::new(), 0, None, None);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
         // Selected item should show actions.
         assert!(text.contains("View details"));
     }
 
-    // ---- build_spec_detail_lines ----
+    // ---- HITL overlay responses ----
 
-    #[test]
-    fn build_spec_detail_lines_not_found() {
-        let lines = build_spec_detail_lines(&[], 0);
-        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
-        assert!(text.contains("spec not found"));
+    /// Collect an item, move it to Running and open a HITL request for it.
+    fn open_hitl_item(db: &Database, source: &str, notes: Option<&str>) -> HitlId {
+        use belt_core::transition::Actor;
+        use belt_infra::db::{CollectOutcome, NewItem};
+
+        let CollectOutcome::Inserted { work_id } = db
+            .insert_collected(&NewItem {
+                source_id: format!("github:org/repo#{source}"),
+                workspace_id: "ws1".to_string(),
+                state: "analyze".to_string(),
+                title: None,
+                actor: Actor::Daemon,
+            })
+            .unwrap()
+        else {
+            panic!("expected a new item");
+        };
+        run_and_open_hitl(db, &work_id, notes)
+    }
+
+    /// Move a Pending item to Running and open a HITL request for it.
+    fn run_and_open_hitl(db: &Database, work_id: &str, notes: Option<&str>) -> HitlId {
+        use belt_core::queue::HitlReason;
+        use belt_core::transition::{
+            Actor, TransitionOutcome, TransitionReason, TransitionRequest,
+        };
+        use belt_infra::db::{OpenHitlOutcome, OpenHitlRequest};
+
+        for (from, to) in [
+            (QueuePhase::Pending, QueuePhase::Ready),
+            (QueuePhase::Ready, QueuePhase::Running),
+        ] {
+            let outcome = db
+                .transition(&TransitionRequest {
+                    work_id: work_id.to_string(),
+                    expected_from: from,
+                    to,
+                    actor: Actor::Daemon,
+                    reason: TransitionReason::Manual,
+                    detail: None,
+                })
+                .unwrap();
+            assert!(matches!(outcome, TransitionOutcome::Applied { .. }));
+        }
+        let OpenHitlOutcome::Opened { hitl_id, .. } = db
+            .open_hitl(&OpenHitlRequest {
+                work_id: work_id.to_string(),
+                expected_from: QueuePhase::Running,
+                reason: HitlReason::EvaluateFailure,
+                notes: notes.map(str::to_string),
+                actor: Actor::Daemon,
+                transition_reason: TransitionReason::Escalation(
+                    belt_core::escalation::EscalationAction::Hitl,
+                ),
+                timeout_at: None,
+                terminal_action: None,
+            })
+            .unwrap()
+        else {
+            panic!("expected the request to open");
+        };
+        hitl_id
+    }
+
+    /// Retry-confirm and post-process `old`, then open a fresh request for the same item.
+    fn reopen_hitl(db: &Database, old: &HitlId, work_id: &str) -> HitlId {
+        use belt_core::transition::{Actor, TransitionReason, TransitionRequest};
+
+        db.complete_post_processing(
+            old,
+            &TransitionRequest {
+                work_id: work_id.to_string(),
+                expected_from: QueuePhase::Hitl,
+                to: QueuePhase::Pending,
+                actor: Actor::Daemon,
+                reason: TransitionReason::PostProcessing(HitlAction::Retry),
+                detail: None,
+            },
+        )
+        .unwrap();
+        run_and_open_hitl(db, work_id, None)
+    }
+
+    fn hitl_state() -> DashboardState {
+        let mut state = DashboardState::new();
+        state.overlay = OverlayMode::Hitl {
+            selected: 0,
+            retry_input: None,
+        };
+        state
+    }
+
+    fn responder_for<'a>(service: &'a HitlService, by: &str) -> HitlResponder<'a> {
+        HitlResponder {
+            service,
+            by: by.to_string(),
+        }
+    }
+
+    fn tui_flow(db: &Database) -> CancelFlow<'_> {
+        use crate::cancel::testing::{NoDaemon, NoKill};
+        CancelFlow {
+            db,
+            daemon: &NoDaemon,
+            killer: &NoKill,
+            actor: Actor::Tui,
+            requester: "alice".to_string(),
+            wait_limit: Duration::from_millis(50),
+            poll_interval: Duration::from_millis(10),
+        }
     }
 
     #[test]
-    fn build_spec_detail_lines_with_acceptance_criteria() {
-        let spec = belt_core::spec::Spec::new(
-            "spec-1".to_string(),
-            "ws1".to_string(),
-            "Auth Feature".to_string(),
-            "## Overview\nSome description.\n## Acceptance Criteria\n- Login works\n- Logout works\n- Token refresh works\n## Tests\ntest commands".to_string(),
-        );
+    fn cancel_key_cancels_the_selected_running_item_and_toasts_the_result() {
+        let db = make_db();
+        let work_id = crate::cancel::testing::running_item(&db);
+        let mut state = DashboardState::new();
 
-        let lines = build_spec_detail_lines(&[spec], 0);
-        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
-        assert!(text.contains("Auth Feature"));
-        assert!(text.contains("spec-1"));
-        assert!(text.contains("Acceptance Criteria:"));
-        assert!(text.contains("AC1:"));
-        assert!(text.contains("Login works"));
-        assert!(text.contains("AC2:"));
-        assert!(text.contains("Logout works"));
-        assert!(text.contains("AC3:"));
-        assert!(text.contains("Token refresh works"));
-        assert!(text.contains("Progress:"));
+        handle_cancel_key(&mut state, Some(&work_id), &db);
+        let toast_before_wait = state.toast.clone().unwrap();
+        assert!(
+            toast_before_wait.contains("canceling"),
+            "{toast_before_wait}"
+        );
+        assert_eq!(
+            db.get_item(&work_id).unwrap().phase(),
+            QueuePhase::Running,
+            "nothing is canceled until the toast has been drawn"
+        );
+        finish_pending_cancel(&mut state, &tui_flow(&db));
+
+        let toast = state.toast.unwrap();
+        assert!(toast.contains("canceled_directly"), "{toast}");
+        assert_eq!(db.get_item(&work_id).unwrap().phase(), QueuePhase::Skipped);
+        let via_tui = db
+            .transitions_of(&work_id)
+            .unwrap()
+            .iter()
+            .any(|e| e.kind == "cancel_requested" && e.actor == "tui");
+        assert!(via_tui, "the request is recorded as coming from the tui");
     }
 
     #[test]
-    fn build_spec_detail_lines_no_acceptance_criteria() {
-        let spec = belt_core::spec::Spec::new(
-            "spec-2".to_string(),
-            "ws1".to_string(),
-            "Simple Spec".to_string(),
-            "## Overview\nNo AC section here.".to_string(),
-        );
+    fn cancel_key_on_an_item_awaiting_post_processing_is_busy() {
+        let db = Arc::new(make_db());
+        open_hitl_item(&db, "1", None);
+        let work_id = db.list_items(Some(QueuePhase::Hitl), None).unwrap()[0]
+            .work_id
+            .clone();
+        let service = HitlService::new(Arc::clone(&db));
+        service
+            .respond(&HitlResponse {
+                target: HitlTarget::Item(work_id.clone()),
+                action: HitlAction::Skip,
+                by: "alice".to_string(),
+                via: "tui".to_string(),
+                path: ConfirmPath::Direct,
+                notes: None,
+            })
+            .unwrap();
+        let mut state = DashboardState::new();
 
-        let lines = build_spec_detail_lines(&[spec], 0);
-        let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
-        assert!(text.contains("no acceptance criteria found"));
+        handle_cancel_key(&mut state, Some(&work_id), &db);
+
+        let toast = state.toast.unwrap();
+        assert!(toast.contains("busy"), "{toast}");
+        assert!(db.open_cancel_request(&work_id).unwrap().is_none());
+        assert_eq!(db.get_item(&work_id).unwrap().phase(), QueuePhase::Hitl);
     }
 
     #[test]
-    fn build_spec_detail_lines_shows_test_commands() {
-        let mut spec = belt_core::spec::Spec::new(
-            "spec-3".to_string(),
-            "ws1".to_string(),
-            "Test Spec".to_string(),
-            "## Overview\nContent.".to_string(),
-        );
-        spec.test_commands = Some("cargo test, cargo clippy".to_string());
+    fn cancel_key_on_a_pending_item_does_nothing_but_say_so() {
+        let db = make_db();
+        let item = make_item_with_phase("w-pending", QueuePhase::Pending, "2026-01-01T00:00:00Z");
+        db.insert_item(&item).unwrap();
+        let mut state = DashboardState::new();
 
-        let lines = build_spec_detail_lines(&[spec], 0);
+        handle_cancel_key(&mut state, Some("w-pending"), &db);
+
+        assert!(state.toast.unwrap().contains("not running"));
+        assert_eq!(
+            db.get_item("w-pending").unwrap().phase(),
+            QueuePhase::Pending
+        );
+    }
+
+    #[test]
+    fn cancel_key_without_a_selection_changes_nothing() {
+        let db = make_db();
+        let mut state = DashboardState::new();
+
+        handle_cancel_key(&mut state, None, &db);
+
+        assert!(state.toast.is_none());
+    }
+
+    #[test]
+    fn an_open_overlay_keeps_the_cancel_key_to_itself() {
+        let db = make_db();
+        let work_id = crate::cancel::testing::running_item(&db);
+        let service = HitlService::new(Arc::new(make_db()));
+        let responder = responder_for(&service, "alice");
+
+        for overlay in [OverlayMode::Help, OverlayMode::ItemDetail(work_id.clone())] {
+            let mut state = DashboardState::new();
+            state.overlay = overlay;
+            assert!(handle_overlay_key(
+                &mut state,
+                KeyCode::Char('x'),
+                &[],
+                &responder
+            ));
+            assert!(state.toast.is_none());
+        }
+        let mut state = hitl_state();
+        assert!(handle_overlay_key(
+            &mut state,
+            KeyCode::Char('x'),
+            &[],
+            &responder
+        ));
+        assert!(state.toast.is_none());
+        assert_eq!(db.get_item(&work_id).unwrap().phase(), QueuePhase::Running);
+    }
+
+    #[test]
+    fn selected_work_id_follows_the_dashboard_selection() {
+        let db = make_db();
+        let state = DashboardState::new();
+        let running = vec![QueueItem::new(
+            "w-run1".to_string(),
+            "s".to_string(),
+            "ws".to_string(),
+            "a".to_string(),
+        )];
+
+        let selected = selected_work_id(&state, &running, &[], &[], &db, &[], &[]);
+
+        assert_eq!(selected.as_deref(), Some("w-run1"));
+    }
+
+    fn press(
+        state: &mut DashboardState,
+        code: KeyCode,
+        ids: &[String],
+        responder: &HitlResponder<'_>,
+    ) -> bool {
+        let requests = current_hitl_requests(responder.service.database()).unwrap();
+        let rows: Vec<HitlRow> = ids
+            .iter()
+            .map(|work_id| HitlRow {
+                work_id: work_id.clone(),
+                hitl_id: requests.get(work_id).map(|r| r.hitl_id.clone()),
+            })
+            .collect();
+        handle_overlay_key(state, code, &rows, responder)
+    }
+
+    #[test]
+    fn overlay_open_d_responds_done_without_switching_tab() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let hitl_id = open_hitl_item(service.database(), "1", None);
+        let work_id = service
+            .database()
+            .hitl_request(&hitl_id)
+            .unwrap()
+            .unwrap()
+            .work_id;
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+        state.active_tab = DashboardTab::Board;
+
+        let consumed = press(&mut state, KeyCode::Char('d'), &[work_id], &responder);
+
+        assert!(consumed);
+        assert_eq!(state.active_tab, DashboardTab::Board);
+        let request = service.database().hitl_request(&hitl_id).unwrap().unwrap();
+        assert_eq!(request.status, HitlStatus::Resolved);
+        let resolution = request.resolution.unwrap();
+        assert_eq!(resolution.action, HitlAction::Done);
+        assert_eq!(resolution.by, "alice");
+        assert_eq!(resolution.via, "tui");
+        assert!(state.toast.as_deref().unwrap().contains("해결됨 · 처리 중"));
+    }
+
+    #[test]
+    fn overlay_closed_d_keeps_global_tab_behavior() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let responder = responder_for(&service, "alice");
+        let mut state = DashboardState::new();
+        state.active_tab = DashboardTab::Board;
+
+        assert!(!press(&mut state, KeyCode::Char('d'), &[], &responder));
+        assert!(switch_tab_key(&mut state, KeyCode::Char('d')));
+        assert_eq!(state.active_tab, DashboardTab::Dashboard);
+    }
+
+    #[test]
+    fn overlay_open_r_starts_retry_input_not_refresh() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let hitl_id = open_hitl_item(service.database(), "1", None);
+        let work_id = service
+            .database()
+            .hitl_request(&hitl_id)
+            .unwrap()
+            .unwrap()
+            .work_id;
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+        let ids = [work_id];
+
+        assert!(press(&mut state, KeyCode::Char('r'), &ids, &responder));
+        assert_eq!(
+            state.overlay,
+            OverlayMode::Hitl {
+                selected: 0,
+                retry_input: Some(String::new())
+            }
+        );
+        // Typing is text, not commands: `d` and `q` must not respond or close.
+        for c in ['f', 'i', 'x', 'd', 'q'] {
+            press(&mut state, KeyCode::Char(c), &ids, &responder);
+        }
+        assert_eq!(
+            service
+                .database()
+                .hitl_request(&hitl_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            HitlStatus::Open
+        );
+        press(&mut state, KeyCode::Enter, &ids, &responder);
+
+        let request = service.database().hitl_request(&hitl_id).unwrap().unwrap();
+        let resolution = request.resolution.clone().unwrap();
+        assert_eq!(resolution.action, HitlAction::Retry);
+        assert_eq!(request.resolution_notes.as_deref(), Some("fixdq"));
+        assert_eq!(
+            state.overlay,
+            OverlayMode::Hitl {
+                selected: 0,
+                retry_input: None
+            }
+        );
+    }
+
+    #[test]
+    fn overlay_retry_input_esc_cancels_without_responding() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let hitl_id = open_hitl_item(service.database(), "1", None);
+        let work_id = service
+            .database()
+            .hitl_request(&hitl_id)
+            .unwrap()
+            .unwrap()
+            .work_id;
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+        let ids = [work_id];
+
+        press(&mut state, KeyCode::Char('r'), &ids, &responder);
+        press(&mut state, KeyCode::Esc, &ids, &responder);
+
+        assert!(matches!(
+            state.overlay,
+            OverlayMode::Hitl {
+                retry_input: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            service
+                .database()
+                .hitl_request(&hitl_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            HitlStatus::Open
+        );
+    }
+
+    #[test]
+    fn overlay_s_and_p_respond_skip_and_replan() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let first = open_hitl_item(service.database(), "1", None);
+        let second = open_hitl_item(service.database(), "2", None);
+        let ids: Vec<String> = [&first, &second]
+            .iter()
+            .map(|id| {
+                service
+                    .database()
+                    .hitl_request(id)
+                    .unwrap()
+                    .unwrap()
+                    .work_id
+            })
+            .collect();
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+
+        press(&mut state, KeyCode::Char('s'), &ids, &responder);
+        press(&mut state, KeyCode::Char('j'), &ids, &responder);
+        press(&mut state, KeyCode::Char('p'), &ids, &responder);
+
+        let action_of = |id: &HitlId| {
+            service
+                .database()
+                .hitl_request(id)
+                .unwrap()
+                .unwrap()
+                .resolution
+                .unwrap()
+                .action
+        };
+        assert_eq!(action_of(&first), HitlAction::Skip);
+        assert_eq!(action_of(&second), HitlAction::Replan);
+    }
+
+    #[test]
+    fn overlay_late_response_shows_already_handled() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let hitl_id = open_hitl_item(service.database(), "1", None);
+        let work_id = service
+            .database()
+            .hitl_request(&hitl_id)
+            .unwrap()
+            .unwrap()
+            .work_id;
+        let ids = [work_id.clone()];
+        let mut state = hitl_state();
+        service
+            .respond(&HitlResponse {
+                target: HitlTarget::Item(work_id),
+                action: HitlAction::Skip,
+                by: "bob".to_string(),
+                via: "cli".to_string(),
+                path: ConfirmPath::Direct,
+                notes: None,
+            })
+            .unwrap();
+
+        press(
+            &mut state,
+            KeyCode::Char('d'),
+            &ids,
+            &responder_for(&service, "alice"),
+        );
+
+        let toast = state.toast.unwrap();
+        assert!(toast.contains("already_handled"), "{toast}");
+        assert!(toast.contains("bob"), "{toast}");
+        assert!(toast.contains("cli"), "{toast}");
+        assert!(toast.contains("skip"), "{toast}");
+        let request = service.database().hitl_request(&hitl_id).unwrap().unwrap();
+        assert_eq!(request.resolution.unwrap().action, HitlAction::Skip);
+    }
+
+    #[test]
+    fn overlay_response_to_item_without_request_shows_not_found() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+
+        press(
+            &mut state,
+            KeyCode::Char('d'),
+            &["missing".to_string()],
+            &responder,
+        );
+
+        assert!(state.toast.unwrap().contains("not_found"));
+    }
+
+    #[test]
+    fn overlay_action_keys_without_items_do_nothing() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+
+        for c in ['d', 'r', 's', 'p'] {
+            assert!(press(&mut state, KeyCode::Char(c), &[], &responder));
+        }
+
+        assert!(state.toast.is_none());
+        assert_eq!(state.overlay, hitl_state().overlay);
+    }
+
+    #[test]
+    fn overlay_esc_closes_and_clears_toast() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+        state.toast = Some("old".to_string());
+
+        assert!(press(&mut state, KeyCode::Esc, &[], &responder));
+
+        assert_eq!(state.overlay, OverlayMode::None);
+        assert!(state.toast.is_none());
+    }
+
+    #[test]
+    fn overlay_lists_resolved_request_as_processing() {
+        let db = make_db();
+        let service = HitlService::new(Arc::new(db));
+        let hitl_id = open_hitl_item(service.database(), "1", Some("check logs"));
+        let work_id = service
+            .database()
+            .hitl_request(&hitl_id)
+            .unwrap()
+            .unwrap()
+            .work_id;
+        press(
+            &mut hitl_state(),
+            KeyCode::Char('d'),
+            std::slice::from_ref(&work_id),
+            &responder_for(&service, "alice"),
+        );
+
+        let items = service
+            .database()
+            .list_items(Some(QueuePhase::Hitl), None)
+            .unwrap();
+        let requests = current_hitl_requests(service.database()).unwrap();
+        let lines = build_hitl_overlay_lines(&items, &requests, 0, None, None);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
-        assert!(text.contains("Test Commands:"));
-        assert!(text.contains("cargo test"));
-        assert!(text.contains("cargo clippy"));
+
+        assert!(text.contains("해결됨 · 처리 중"), "{text}");
+        assert!(text.contains("check logs"), "{text}");
+        assert!(!text.contains("belt hitl approve"));
+    }
+
+    #[test]
+    fn overlay_lines_show_toast_and_retry_prompt() {
+        let toast = build_hitl_overlay_lines(&[], &HashMap::new(), 0, None, Some("hello toast"));
+        let text: String = toast.iter().map(|l| format!("{l}")).collect();
+        assert!(text.contains("hello toast"));
+
+        let prompt = build_hitl_overlay_lines(&[], &HashMap::new(), 0, Some("typed"), None);
+        let text: String = prompt.iter().map(|l| format!("{l}")).collect();
+        assert!(text.contains("typed"));
+    }
+
+    #[test]
+    fn overlay_view_surfaces_store_error_instead_of_empty_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("belt.db");
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("ALTER TABLE hitl_requests RENAME TO hitl_requests_gone;")
+            .unwrap();
+
+        let error = match HitlOverlayView::load(&db) {
+            Ok(_) => panic!("a broken store must not load as an empty overlay"),
+            Err(e) => e,
+        };
+
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        terminal
+            .draw(|frame| render_hitl_overlay(frame, None, Some(&error), 0, None, None))
+            .unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("error: HITL"), "{screen}");
+    }
+
+    #[test]
+    fn overlay_answers_the_drawn_request_not_a_reopened_one() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let old_id = open_hitl_item(service.database(), "1", None);
+        let work_id = service
+            .database()
+            .hitl_request(&old_id)
+            .unwrap()
+            .unwrap()
+            .work_id;
+        let drawn = HitlOverlayView::load(service.database()).unwrap().rows();
+        assert_eq!(drawn[0].hitl_id.as_ref(), Some(&old_id));
+
+        // Another path answers the drawn request, the item leaves Hitl and a new
+        // request is opened for the same work_id.
+        service
+            .respond(&HitlResponse {
+                target: HitlTarget::Id(old_id.clone()),
+                action: HitlAction::Retry,
+                by: "bob".to_string(),
+                via: "cli".to_string(),
+                path: ConfirmPath::Direct,
+                notes: None,
+            })
+            .unwrap();
+        let new_id = reopen_hitl(service.database(), &old_id, &work_id);
+        assert_ne!(new_id, old_id);
+
+        let mut state = hitl_state();
+        handle_overlay_key(
+            &mut state,
+            KeyCode::Char('d'),
+            &drawn,
+            &responder_for(&service, "alice"),
+        );
+
+        let toast = state.toast.unwrap();
+        assert!(toast.contains("already_handled"), "{toast}");
+        let new_request = service.database().hitl_request(&new_id).unwrap().unwrap();
+        assert_eq!(new_request.status, HitlStatus::Open);
+    }
+
+    #[test]
+    fn open_overlay_swallows_t_instead_of_switching_tab() {
+        let service = HitlService::new(Arc::new(make_db()));
+        let responder = responder_for(&service, "alice");
+        let mut state = hitl_state();
+        state.active_tab = DashboardTab::Board;
+
+        // The run loop only reaches `switch_tab_key` when the overlay did not consume the key.
+        assert!(handle_overlay_key(
+            &mut state,
+            KeyCode::Char('t'),
+            &[],
+            &responder
+        ));
+        assert_eq!(state.active_tab, DashboardTab::Board);
+    }
+
+    // ---- tab keys ----
+
+    #[test]
+    fn t_jumps_to_scripts_tab() {
+        let mut state = DashboardState::new();
+        assert!(switch_tab_key(&mut state, KeyCode::Char('t')));
+        assert_eq!(state.active_tab, DashboardTab::Scripts);
+    }
+
+    #[test]
+    fn x_does_not_switch_tab() {
+        let mut state = DashboardState::new();
+        assert!(!switch_tab_key(&mut state, KeyCode::Char('x')));
+        assert_eq!(state.active_tab, DashboardTab::Dashboard);
+    }
+
+    #[test]
+    fn tab_bar_labels_scripts_with_t() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(160, 3)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(render_tab_bar(DashboardTab::Dashboard, None), frame.area())
+            })
+            .unwrap();
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(rendered.contains("[t] Scripts"), "{rendered}");
+        assert!(!rendered.contains("[x]"), "{rendered}");
     }
 
     // ---- build_detail_lines_with_history ----
@@ -5077,7 +5763,7 @@ mod tests {
             },
         ];
 
-        let lines = build_detail_lines_with_history("w1", Some(&item), &[], &history);
+        let lines = build_detail_lines_with_history("w1", Some(&item), &[], &history, None);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
         assert!(text.contains("Judgment History:"));
         assert!(text.contains("[analyze]"));
@@ -5098,7 +5784,7 @@ mod tests {
             "analyze".to_string(),
         );
 
-        let lines = build_detail_lines_with_history("w1", Some(&item), &[], &[]);
+        let lines = build_detail_lines_with_history("w1", Some(&item), &[], &[], None);
         let text: String = lines.iter().map(|l| format!("{l}")).collect::<String>();
         // Should not contain the Judgment History header when empty.
         assert!(!text.contains("Judgment History:"));
@@ -5119,14 +5805,14 @@ mod tests {
             "analyze".to_string(),
         );
         item.set_phase_unchecked(QueuePhase::Hitl);
-        item.hitl_reason = Some(belt_core::queue::HitlReason::RetryMaxExceeded);
         db.insert_item(&item).unwrap();
 
+        let view = HitlOverlayView::load(&db).unwrap();
         let backend = TestBackend::new(80, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_hitl_overlay(frame, &db, 0);
+                render_hitl_overlay(frame, Some(&view), None, 0, None, None);
             })
             .unwrap();
     }
@@ -5137,50 +5823,39 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let db = make_db();
+        let view = HitlOverlayView::load(&db).unwrap();
         let backend = TestBackend::new(80, 40);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_hitl_overlay(frame, &db, 0);
+                render_hitl_overlay(frame, Some(&view), None, 0, None, None);
             })
             .unwrap();
     }
 
-    // ---- render_spec_detail_overlay no-panic ----
+    // ---- tab bar ----
 
     #[test]
-    fn render_spec_detail_overlay_no_panic() {
+    fn tab_bar_has_no_spec_tab() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
-        let spec = belt_core::spec::Spec::new(
-            "spec-1".to_string(),
-            "ws1".to_string(),
-            "Auth Feature".to_string(),
-            "## Overview\nDesc.\n## Acceptance Criteria\n- AC one\n- AC two\n".to_string(),
-        );
-
-        let backend = TestBackend::new(80, 40);
+        let backend = TestBackend::new(160, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                render_spec_detail_overlay(frame, &[spec], 0);
+                frame.render_widget(render_tab_bar(DashboardTab::Dashboard, None), frame.area());
             })
             .unwrap();
-    }
-
-    #[test]
-    fn render_spec_detail_overlay_out_of_bounds_no_panic() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let backend = TestBackend::new(80, 40);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal
-            .draw(|frame| {
-                render_spec_detail_overlay(frame, &[], 5);
-            })
-            .unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Dashboard"));
+        assert!(!text.contains("Spec"), "tab bar still shows Spec: {text}");
     }
 
     // ---- DashboardState::new() comprehensive defaults ----
@@ -5198,8 +5873,8 @@ mod tests {
         assert_eq!(state.per_ws_kanban_col, 0);
         assert_eq!(state.per_ws_kanban_row, 0);
         assert_eq!(state.status_filter, StatusFilter::All);
-        // All 6 tab states should exist (keys 0..=5).
-        for key in 0..=5u8 {
+        // All 5 tab states should exist (keys 0..=4).
+        for key in 0..=4u8 {
             assert!(
                 state.tab_states.contains_key(&key),
                 "tab_states should contain key {key}"
@@ -5490,17 +6165,6 @@ mod tests {
         let workspaces: Vec<(String, String, String)> = Vec::new();
         handle_nav_left(&mut state, &workspaces);
         assert_eq!(state.board_selected_col, 0);
-    }
-
-    #[test]
-    fn handle_nav_left_spec_noop() {
-        let mut state = DashboardState::new();
-        state.active_tab = DashboardTab::Spec;
-        state.current_tab_state_mut().selected_index = 3;
-        let workspaces: Vec<(String, String, String)> = Vec::new();
-        handle_nav_left(&mut state, &workspaces);
-        // Spec tab left arrow should be a no-op.
-        assert_eq!(state.current_tab_state().selected_index, 3);
     }
 
     // ---- handle_nav_right ----
@@ -5822,32 +6486,6 @@ mod tests {
     }
 
     #[test]
-    fn handle_enter_spec_tab_no_overlay() {
-        let mut state = DashboardState::new();
-        state.active_tab = DashboardTab::Spec;
-
-        let running: Vec<QueueItem> = Vec::new();
-        let recent: Vec<QueueItem> = Vec::new();
-        let all: Vec<QueueItem> = Vec::new();
-        let workspaces: Vec<(String, String, String)> = Vec::new();
-        let db = make_db();
-        let board_columns: Vec<Vec<&QueueItem>> = Vec::new();
-        let per_ws_columns: Vec<Vec<&QueueItem>> = Vec::new();
-
-        handle_enter(
-            &mut state,
-            &running,
-            &recent,
-            &all,
-            &workspaces,
-            &db,
-            &board_columns,
-            &per_ws_columns,
-        );
-        assert!(matches!(state.overlay, OverlayMode::SpecDetail { .. }));
-    }
-
-    #[test]
     fn handle_enter_datasource_tab_no_overlay() {
         let mut state = DashboardState::new();
         state.active_tab = DashboardTab::DataSource;
@@ -6141,7 +6779,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| {
-                let bar = render_tab_bar(DashboardTab::Dashboard);
+                let bar = render_tab_bar(DashboardTab::Dashboard, None);
                 frame.render_widget(bar, frame.area());
             })
             .unwrap();

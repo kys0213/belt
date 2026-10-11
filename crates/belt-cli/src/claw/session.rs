@@ -65,18 +65,11 @@ pub struct RecentEvent {
 
 /// Per-workspace statistics displayed alongside the system-wide status banner.
 ///
-/// Provides a breakdown of spec lifecycle counts and queue item counts
-/// scoped to a single workspace.
+/// Provides queue item counts scoped to a single workspace.
 #[derive(Debug, Default)]
 pub struct WorkspaceStats {
     /// Name of the workspace these stats belong to.
     pub workspace_name: String,
-    /// Number of specs in `active` status.
-    pub active_spec_count: u32,
-    /// Number of specs in `completing` status.
-    pub completing_count: u32,
-    /// Number of specs in `completed` status.
-    pub completed_count: u32,
     /// Number of queue items in `pending` phase for this workspace.
     pub pending_items_count: u32,
     /// Number of queue items in `running` phase for this workspace.
@@ -153,11 +146,19 @@ pub fn collect_status() -> Option<StatusSummary> {
     collect_status_from_db(&db)
 }
 
+/// Turn a store error into `None` after logging it, so a failing store does not
+/// silently look like an empty one.
+fn warn_on_error<T, E: std::fmt::Display>(what: &str, result: Result<T, E>) -> Option<T> {
+    result
+        .inspect_err(|e| tracing::warn!("status banner: {what} failed: {e}"))
+        .ok()
+}
+
 /// Collect system status from a given database handle.
 ///
 /// Separated from [`collect_status`] so tests can inject an in-memory DB.
 fn collect_status_from_db(db: &belt_infra::db::Database) -> Option<StatusSummary> {
-    let phase_counts = db.count_items_by_phase().ok()?;
+    let phase_counts = warn_on_error("count_items_by_phase", db.count_items_by_phase())?;
     let total_items: u32 = phase_counts.iter().map(|(_, c)| *c).sum();
     let hitl_pending = phase_counts
         .iter()
@@ -165,24 +166,25 @@ fn collect_status_from_db(db: &belt_infra::db::Database) -> Option<StatusSummary
         .map(|(_, c)| *c)
         .unwrap_or(0);
 
-    let events = db.list_recent_transition_events(5).ok()?;
+    let events = warn_on_error(
+        "list_recent_transition_events",
+        db.list_recent_transition_events(5),
+    )?;
     let recent_events = events.into_iter().map(into_recent_event).collect();
 
-    let hitl_items = db
-        .list_items(Some(belt_core::phase::QueuePhase::Hitl), None)
-        .ok()
-        .unwrap_or_default()
-        .into_iter()
-        .map(|item| HitlItemSummary {
+    let mut hitl_items = Vec::new();
+    for request in warn_on_error("open_hitl_requests", db.open_hitl_requests())? {
+        let item = warn_on_error("get_item", db.get_item(&request.work_id))?;
+        hitl_items.push(HitlItemSummary {
             work_id: item.work_id,
             workspace: item.workspace_id,
-            reason: item
-                .hitl_reason
+            reason: request
+                .reason
                 .map(|r| r.to_string())
                 .unwrap_or_else(|| "other".to_string()),
             title: item.title,
-        })
-        .collect();
+        });
+    }
 
     Some(StatusSummary {
         total_items,
@@ -195,8 +197,8 @@ fn collect_status_from_db(db: &belt_infra::db::Database) -> Option<StatusSummary
 
 /// Collect workspace-level statistics from the Belt database.
 ///
-/// Opens the default `~/.belt/belt.db` database and gathers spec counts by
-/// status and queue item counts by phase for the given workspace.
+/// Opens the default `~/.belt/belt.db` database and gathers queue item counts by
+/// phase and recent HITL events for the given workspace.
 /// Returns `None` if the database is unavailable or the workspace name is absent.
 pub fn collect_workspace_stats(workspace: Option<&str>) -> Option<WorkspaceStats> {
     let ws_name = workspace?;
@@ -211,22 +213,6 @@ fn collect_workspace_stats_from_db(
     db: &belt_infra::db::Database,
     workspace: &str,
 ) -> Option<WorkspaceStats> {
-    use belt_core::spec::SpecStatus;
-
-    // Count specs by status for this workspace.
-    let specs = db.list_specs(Some(workspace), None).ok()?;
-    let mut active_spec_count: u32 = 0;
-    let mut completing_count: u32 = 0;
-    let mut completed_count: u32 = 0;
-    for spec in &specs {
-        match spec.status {
-            SpecStatus::Active => active_spec_count += 1,
-            SpecStatus::Completing => completing_count += 1,
-            SpecStatus::Completed => completed_count += 1,
-            _ => {}
-        }
-    }
-
     // Count queue items by phase for this workspace.
     let items = db.list_items(None, Some(workspace)).ok()?;
     let mut pending_items_count: u32 = 0;
@@ -258,9 +244,6 @@ fn collect_workspace_stats_from_db(
 
     Some(WorkspaceStats {
         workspace_name: workspace.to_string(),
-        active_spec_count,
-        completing_count,
-        completed_count,
         pending_items_count,
         running_items_count,
         recent_hitl_events,
@@ -316,16 +299,16 @@ fn write_status_banner<W: Write>(output: &mut W, summary: &StatusSummary) -> io:
 /// priority.
 fn reason_priority(reason: &str) -> u32 {
     match reason {
-        "evaluate_failure" => 0,               // spec-conflict equivalent
+        "evaluate_failure" => 0, // evaluation result needs a judgment call
         "retry_max_exceeded" | "timeout" => 1, // failure category
-        _ => 2,                                // other (manual_escalation, unknown)
+        _ => 2,                  // other (manual_escalation, unknown)
     }
 }
 
 /// Display label for an escalation reason group.
 fn reason_display_label(reason: &str) -> &str {
     match reason {
-        "evaluate_failure" => "Spec Conflict (evaluate_failure)",
+        "evaluate_failure" => "Evaluate Failure (evaluate_failure)",
         "retry_max_exceeded" => "Failure (retry_max_exceeded)",
         "timeout" => "Failure (timeout)",
         "manual_escalation" => "Other (manual_escalation)",
@@ -376,11 +359,6 @@ fn write_workspace_stats_banner<W: Write>(
     stats: &WorkspaceStats,
 ) -> io::Result<()> {
     writeln!(output, "--- Workspace: {} ---", stats.workspace_name)?;
-    writeln!(
-        output,
-        "Specs: active={}, completing={}, completed={}",
-        stats.active_spec_count, stats.completing_count, stats.completed_count
-    )?;
     writeln!(
         output,
         "Items: pending={}, running={}",
@@ -722,7 +700,7 @@ mod tests {
             .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("/auto"));
-        assert!(out.contains("/spec"));
+        assert!(!out.contains("/spec"));
         assert!(out.contains("/claw"));
     }
 
@@ -965,6 +943,33 @@ mod tests {
         assert!(summary.hitl_items.is_empty());
     }
 
+    /// Opens a HITL request on a Running item.
+    fn open_hitl_request(
+        db: &belt_infra::db::Database,
+        work_id: &str,
+        reason: belt_core::queue::HitlReason,
+    ) {
+        use belt_core::phase::QueuePhase;
+        use belt_core::transition::{Actor, TransitionReason};
+        use belt_infra::db::{OpenHitlOutcome, OpenHitlRequest};
+
+        let outcome = db
+            .open_hitl(&OpenHitlRequest {
+                work_id: work_id.to_string(),
+                expected_from: QueuePhase::Running,
+                reason,
+                notes: None,
+                actor: Actor::Daemon,
+                transition_reason: TransitionReason::Escalation(
+                    belt_core::escalation::EscalationAction::Hitl,
+                ),
+                timeout_at: None,
+                terminal_action: None,
+            })
+            .unwrap();
+        assert!(matches!(outcome, OpenHitlOutcome::Opened { .. }));
+    }
+
     #[test]
     fn collect_status_from_populated_db() {
         use belt_core::phase::QueuePhase;
@@ -987,9 +992,9 @@ mod tests {
             "ws1".to_string(),
             "implement".to_string(),
         );
-        item2.hitl_reason = Some(belt_core::queue::HitlReason::EvaluateFailure);
+        item2.set_phase_unchecked(QueuePhase::Running);
         db.insert_item(&item2).unwrap();
-        db.update_phase("w2", QueuePhase::Hitl).unwrap();
+        open_hitl_request(&db, "w2", belt_core::queue::HitlReason::EvaluateFailure);
 
         let summary = collect_status_from_db(&db).unwrap();
         assert_eq!(summary.total_items, 2);
@@ -1028,7 +1033,7 @@ mod tests {
                     work_id: "w1:impl".to_string(),
                     workspace: "ws-a".to_string(),
                     reason: "evaluate_failure".to_string(),
-                    title: Some("Spec conflict item".to_string()),
+                    title: Some("Evaluate failure item".to_string()),
                 },
                 HitlItemSummary {
                     work_id: "w2:impl".to_string(),
@@ -1054,7 +1059,7 @@ mod tests {
         // Verify HITL list is displayed.
         assert!(out.contains("HITL Items (3 awaiting review)"));
         // Verify grouping labels appear.
-        assert!(out.contains("Spec Conflict (evaluate_failure)"));
+        assert!(out.contains("Evaluate Failure (evaluate_failure)"));
         assert!(out.contains("Failure (retry_max_exceeded)"));
         assert!(out.contains("Other"));
         // Verify items are listed.
@@ -1145,9 +1150,9 @@ mod tests {
             "implement".to_string(),
         );
         item.title = Some("My HITL task".to_string());
-        item.hitl_reason = Some(belt_core::queue::HitlReason::Timeout);
+        item.set_phase_unchecked(QueuePhase::Running);
         db.insert_item(&item).unwrap();
-        db.update_phase("w-hitl", QueuePhase::Hitl).unwrap();
+        open_hitl_request(&db, "w-hitl", belt_core::queue::HitlReason::Timeout);
 
         let summary = collect_status_from_db(&db).unwrap();
         assert_eq!(summary.hitl_items.len(), 1);
@@ -1235,7 +1240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_dispatches_spec_command() {
+    async fn session_rejects_removed_spec_command() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
         let mut input = Cursor::new(b"/spec issue-42\n/quit\n" as &[u8]);
@@ -1244,8 +1249,7 @@ mod tests {
             .await
             .unwrap();
         let out = String::from_utf8(output).unwrap();
-        assert!(out.contains("[spec]"));
-        assert!(out.contains("issue-42"));
+        assert!(out.contains("Unknown command: /spec"));
     }
 
     #[tokio::test]
@@ -1307,7 +1311,7 @@ mod tests {
     async fn session_multiple_commands_in_sequence() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(&tmp);
-        let mut input = Cursor::new(b"/help\n/auto\n/spec\n/quit\n" as &[u8]);
+        let mut input = Cursor::new(b"/help\n/auto\n/quit\n" as &[u8]);
         let mut output = Vec::new();
         run_session(&config, &mut input, &mut output, None, None)
             .await
@@ -1315,7 +1319,6 @@ mod tests {
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("/auto"));
         assert!(out.contains("[auto]"));
-        assert!(out.contains("[spec]"));
         assert!(out.contains("Goodbye."));
     }
 
@@ -1353,7 +1356,7 @@ mod tests {
     fn reason_display_labels_are_correct() {
         assert_eq!(
             reason_display_label("evaluate_failure"),
-            "Spec Conflict (evaluate_failure)"
+            "Evaluate Failure (evaluate_failure)"
         );
         assert_eq!(
             reason_display_label("retry_max_exceeded"),
@@ -1383,7 +1386,7 @@ mod tests {
     }
 
     #[test]
-    fn hitl_list_priority_order_spec_conflict_first() {
+    fn hitl_list_priority_order_evaluate_failure_first() {
         let items = vec![
             HitlItemSummary {
                 work_id: "other-item".to_string(),
@@ -1408,13 +1411,13 @@ mod tests {
         write_hitl_list(&mut output, &items).unwrap();
         let out = String::from_utf8(output).unwrap();
 
-        // Spec Conflict should appear before Failure, which should appear before Other.
-        let spec_pos = out.find("Spec Conflict").unwrap();
+        // Evaluate Failure should appear before Failure, which should appear before Other.
+        let spec_pos = out.find("Evaluate Failure").unwrap();
         let failure_pos = out.find("Failure (timeout)").unwrap();
         let other_pos = out.find("Other").unwrap();
         assert!(
             spec_pos < failure_pos,
-            "spec-conflict should appear before failure"
+            "evaluate failure should appear before failure"
         );
         assert!(
             failure_pos < other_pos,
@@ -1426,9 +1429,6 @@ mod tests {
     fn workspace_stats_banner_displays_counts() {
         let stats = WorkspaceStats {
             workspace_name: "my-project".to_string(),
-            active_spec_count: 3,
-            completing_count: 1,
-            completed_count: 5,
             pending_items_count: 4,
             running_items_count: 2,
             recent_hitl_events: vec![],
@@ -1437,9 +1437,6 @@ mod tests {
         write_workspace_stats_banner(&mut output, &stats).unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("Workspace: my-project"));
-        assert!(out.contains("active=3"));
-        assert!(out.contains("completing=1"));
-        assert!(out.contains("completed=5"));
         assert!(out.contains("pending=4"));
         assert!(out.contains("running=2"));
     }
@@ -1448,9 +1445,6 @@ mod tests {
     fn workspace_stats_banner_shows_hitl_events() {
         let stats = WorkspaceStats {
             workspace_name: "ws".to_string(),
-            active_spec_count: 0,
-            completing_count: 0,
-            completed_count: 0,
             pending_items_count: 0,
             running_items_count: 0,
             recent_hitl_events: vec![RecentEvent {
@@ -1487,9 +1481,6 @@ mod tests {
         let config = make_config(&tmp);
         let stats = WorkspaceStats {
             workspace_name: "test-ws".to_string(),
-            active_spec_count: 2,
-            completing_count: 0,
-            completed_count: 1,
             pending_items_count: 3,
             running_items_count: 1,
             recent_hitl_events: vec![],
@@ -1501,7 +1492,6 @@ mod tests {
             .unwrap();
         let out = String::from_utf8(output).unwrap();
         assert!(out.contains("Workspace: test-ws ---"));
-        assert!(out.contains("active=2"));
         assert!(out.contains("pending=3"));
     }
 
@@ -1524,9 +1514,6 @@ mod tests {
         let db = belt_infra::db::Database::open_in_memory().unwrap();
         let stats = collect_workspace_stats_from_db(&db, "ws1").unwrap();
         assert_eq!(stats.workspace_name, "ws1");
-        assert_eq!(stats.active_spec_count, 0);
-        assert_eq!(stats.completing_count, 0);
-        assert_eq!(stats.completed_count, 0);
         assert_eq!(stats.pending_items_count, 0);
         assert_eq!(stats.running_items_count, 0);
         assert!(stats.recent_hitl_events.is_empty());
@@ -1536,28 +1523,8 @@ mod tests {
     fn collect_workspace_stats_from_populated_db() {
         use belt_core::phase::QueuePhase;
         use belt_core::queue::QueueItem;
-        use belt_core::spec::{Spec, SpecStatus};
 
         let db = belt_infra::db::Database::open_in_memory().unwrap();
-
-        // Insert specs.
-        let mut spec1 = Spec::new(
-            "sp1".to_string(),
-            "ws1".to_string(),
-            "Spec 1".to_string(),
-            "content".to_string(),
-        );
-        spec1.status = SpecStatus::Active;
-        db.insert_spec(&spec1).unwrap();
-
-        let mut spec2 = Spec::new(
-            "sp2".to_string(),
-            "ws1".to_string(),
-            "Spec 2".to_string(),
-            "content".to_string(),
-        );
-        spec2.status = SpecStatus::Completing;
-        db.insert_spec(&spec2).unwrap();
 
         // Insert queue items.
         let item1 = QueueItem::new(
@@ -1578,9 +1545,6 @@ mod tests {
         db.update_phase("w2", QueuePhase::Running).unwrap();
 
         let stats = collect_workspace_stats_from_db(&db, "ws1").unwrap();
-        assert_eq!(stats.active_spec_count, 1);
-        assert_eq!(stats.completing_count, 1);
-        assert_eq!(stats.completed_count, 0);
         assert_eq!(stats.pending_items_count, 1);
         assert_eq!(stats.running_items_count, 1);
     }
@@ -1588,29 +1552,8 @@ mod tests {
     #[test]
     fn collect_workspace_stats_filters_by_workspace() {
         use belt_core::queue::QueueItem;
-        use belt_core::spec::{Spec, SpecStatus};
 
         let db = belt_infra::db::Database::open_in_memory().unwrap();
-
-        // Insert spec in ws1.
-        let mut spec = Spec::new(
-            "sp1".to_string(),
-            "ws1".to_string(),
-            "Spec".to_string(),
-            "content".to_string(),
-        );
-        spec.status = SpecStatus::Active;
-        db.insert_spec(&spec).unwrap();
-
-        // Insert spec in ws2.
-        let mut spec2 = Spec::new(
-            "sp2".to_string(),
-            "ws2".to_string(),
-            "Other".to_string(),
-            "content".to_string(),
-        );
-        spec2.status = SpecStatus::Active;
-        db.insert_spec(&spec2).unwrap();
 
         // Insert item in ws2.
         let item = QueueItem::new(
@@ -1623,12 +1566,10 @@ mod tests {
 
         // Stats for ws1 should not include ws2 data.
         let stats = collect_workspace_stats_from_db(&db, "ws1").unwrap();
-        assert_eq!(stats.active_spec_count, 1);
         assert_eq!(stats.pending_items_count, 0);
 
         // Stats for ws2 should not include ws1 data.
         let stats2 = collect_workspace_stats_from_db(&db, "ws2").unwrap();
-        assert_eq!(stats2.active_spec_count, 1);
         assert_eq!(stats2.pending_items_count, 1);
     }
 

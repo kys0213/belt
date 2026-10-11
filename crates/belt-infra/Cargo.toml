@@ -21,3 +21,7 @@ chrono = { workspace = true }
 libc = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
+
+[features]
+# Raw state setters that bypass the transition contract, for other crates tests only.
+test-support = []

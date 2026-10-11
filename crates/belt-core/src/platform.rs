@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
@@ -44,6 +45,57 @@ pub trait ShellExecutor: Send + Sync {
         working_dir: &Path,
         env_vars: &HashMap<String, String>,
     ) -> Result<ShellOutput, BeltError>;
+
+    /// Same as [`execute`](Self::execute), but reports the pid of the spawned
+    /// process to `sink` right after the spawn, exactly once.
+    ///
+    /// The default delegates to `execute` and never calls `sink`: an
+    /// implementation that spawns a process **must** override this method,
+    /// otherwise its process cannot be identified for cancellation.
+    async fn execute_with_sink(
+        &self,
+        command: &str,
+        working_dir: &Path,
+        env_vars: &HashMap<String, String>,
+        sink: Arc<dyn ProcessSink>,
+    ) -> Result<ShellOutput, BeltError> {
+        let _ = sink;
+        self.execute(command, working_dir, env_vars).await
+    }
+}
+
+/// Receives the pid of a handler process as soon as it is spawned.
+///
+/// The pid identifies the leader of a dedicated process group, so that
+/// [`ProcessKiller::kill_group`] can terminate the process and its children.
+pub trait ProcessSink: Send + Sync {
+    /// Called exactly once per spawned process, right after the spawn.
+    fn spawned(&self, pid: u32);
+
+    /// Called once after the process reported to [`spawned`](Self::spawned)
+    /// was waited for. From then on the pid may name another process, so
+    /// it must not be signaled any more.
+    fn exited(&self, pid: u32) {
+        let _ = pid;
+    }
+}
+
+/// A [`ProcessSink`] that ignores the pid.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopProcessSink;
+
+impl ProcessSink for NoopProcessSink {
+    fn spawned(&self, _pid: u32) {}
+}
+
+/// Terminates a handler process together with its children.
+pub trait ProcessKiller: Send + Sync {
+    /// Terminate the process group led by `pid`.
+    ///
+    /// # Errors
+    /// `BeltError::Runtime` when `pid` is not a valid group leader pid or the
+    /// platform refuses the termination (including a group that no longer exists).
+    fn kill_group(&self, pid: u32) -> Result<(), BeltError>;
 }
 
 /// Platform-agnostic daemon notification mechanism.

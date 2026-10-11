@@ -7,7 +7,8 @@ use belt_core::workspace::WorkspaceConfig;
 /// Load a [`WorkspaceConfig`] from the given YAML file path.
 ///
 /// # Errors
-/// Returns an error if the file cannot be read or parsed.
+/// Returns an error if the file cannot be read or parsed, or when
+/// `notifications.channels` names a type this build cannot create.
 pub fn load_workspace_config(path: &Path) -> anyhow::Result<WorkspaceConfig> {
     let content = std::fs::read_to_string(path).map_err(|e| {
         anyhow::anyhow!("failed to read workspace config '{}': {e}", path.display())
@@ -15,6 +16,10 @@ pub fn load_workspace_config(path: &Path) -> anyhow::Result<WorkspaceConfig> {
     let config: WorkspaceConfig = serde_yaml::from_str(&content).map_err(|e| {
         anyhow::anyhow!("failed to parse workspace config '{}': {e}", path.display())
     })?;
+    config
+        .notifications
+        .validate_channels(crate::channels::SUPPORTED_CHANNEL_TYPES)
+        .map_err(|e| anyhow::anyhow!("invalid workspace config '{}': {e}", path.display()))?;
     Ok(config)
 }
 
@@ -31,6 +36,11 @@ concurrency: 2
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 300
 "#;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
@@ -40,6 +50,17 @@ sources:
         assert_eq!(config.name, "test-project");
         assert_eq!(config.concurrency, 2);
         assert!(config.sources.contains_key("github"));
+    }
+
+    #[test]
+    fn load_rejects_unsupported_channel_type() {
+        let yaml = "name: p\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\nnotifications:\n  channels:\n    - name: team\n      type: slack\n      events: [failed]\n";
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(yaml.as_bytes()).unwrap();
+
+        let err = load_workspace_config(tmp.path()).unwrap_err().to_string();
+        assert!(err.contains("slack"), "{err}");
+        assert!(err.contains("allowed"), "{err}");
     }
 
     #[test]
@@ -72,6 +93,11 @@ concurrency: 2
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -107,8 +133,7 @@ sources:
     #[test]
     fn load_minimal_config_applies_defaults() {
         // Only `name` and one source `url` are required; everything else should default.
-        let yaml =
-            "name: minimal-project\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let yaml = "name: minimal-project\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n";
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
 
@@ -130,12 +155,27 @@ name: multi-source
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 60
   slack:
     url: https://slack.com/workspace
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     scan_interval_secs: 120
   jira:
     url: https://jira.example.com
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(yaml.as_bytes()).unwrap();
@@ -158,6 +198,11 @@ name: runtime-project
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 runtime:
   default: gemini
 "#;

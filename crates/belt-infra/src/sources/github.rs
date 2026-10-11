@@ -34,18 +34,20 @@ impl GitHubDataSource {
     }
 
     /// URL에서 `owner/repo` 형태의 레포 이름을 추출한다.
+    ///
+    /// `https://host/owner/repo`, `ssh://user@host/owner/repo`, scp 형식
+    /// `user@host:owner/repo`와 `owner/repo`를 받으며, 끝의 `.git`과 `/`는 무시한다.
     pub fn extract_repo_name(url: &str) -> Option<String> {
         let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
-        let parts: Vec<&str> = trimmed.split('/').collect();
-        if parts.len() >= 2 {
-            Some(format!(
-                "{}/{}",
-                parts[parts.len() - 2],
-                parts[parts.len() - 1]
-            ))
-        } else {
-            None
-        }
+        // scp 형식은 scheme 없이 `:`로 host와 path를 나눈다.
+        let path = match trimmed.split_once("://") {
+            Some((_, rest)) => rest,
+            None => trimmed.rsplit_once(':').map_or(trimmed, |(_, path)| path),
+        };
+        let mut segments = path.rsplit('/').filter(|s| !s.is_empty());
+        let repo = segments.next()?;
+        let owner = segments.next()?;
+        Some(format!("{owner}/{repo}"))
     }
 
     /// `gh` CLI로 이슈 상세 정보를 조회한다.
@@ -415,6 +417,7 @@ impl GitHubDataSource {
                 phase: item.phase().as_str().to_string(),
                 state: item.state.clone(),
                 source_id: item.source_id.clone(),
+                derived_from: item.derived_from.clone(),
             },
             source: SourceContext {
                 source_type: "github".to_string(),
@@ -579,6 +582,11 @@ name: test-ws
 sources:
   github:
     url: {url}
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     states:
       {state}:
         trigger:
@@ -637,13 +645,29 @@ sources:
     }
 
     #[test]
-    fn extract_repo_name_ssh_url() {
-        // SSH style: git@github.com:org/repo.git
-        // split('/') on this gives ["git@github.com:org", "repo.git"] → "org/repo" after strip
+    fn extract_repo_name_ssh_urls() {
+        for url in [
+            "git@github.com:org/repo.git",
+            "git@github.com:org/repo",
+            "git@github.com:org/repo.git/",
+            "ssh://git@github.com/org/repo.git",
+            "ssh://git@github.com/org/repo/",
+        ] {
+            assert_eq!(
+                GitHubDataSource::extract_repo_name(url),
+                Some("org/repo".to_string()),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_repo_name_rejects_url_without_owner_and_repo() {
         assert_eq!(
-            GitHubDataSource::extract_repo_name("git@github.com:org/repo.git"),
-            Some("git@github.com:org/repo".to_string())
+            GitHubDataSource::extract_repo_name("git@github.com:repo.git"),
+            None
         );
+        assert_eq!(GitHubDataSource::extract_repo_name("repo"), None);
     }
 
     #[test]
@@ -971,6 +995,11 @@ name: test-ws
 sources:
   github:
     url: {url}
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     states:
       {state}:
         trigger:

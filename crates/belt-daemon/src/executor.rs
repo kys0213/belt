@@ -6,7 +6,7 @@ use std::time::Instant;
 use anyhow::{Result, bail};
 
 use belt_core::action::Action;
-use belt_core::platform::ShellExecutor;
+use belt_core::platform::{NoopProcessSink, ProcessSink, ShellExecutor};
 use belt_core::runtime::{RuntimeRegistry, RuntimeRequest, TokenUsage};
 
 /// Action 실행 결과.
@@ -62,12 +62,26 @@ impl ActionExecutor {
         actions: &[Action],
         env: &ActionEnv,
     ) -> Result<Option<ActionResult>> {
+        self.execute_all_with_sink(actions, env, Arc::new(NoopProcessSink))
+            .await
+    }
+
+    /// Same as [`execute_all`](Self::execute_all), but every process an action
+    /// spawns is reported to `sink` (one pid per action).
+    pub async fn execute_all_with_sink(
+        &self,
+        actions: &[Action],
+        env: &ActionEnv,
+        sink: Arc<dyn ProcessSink>,
+    ) -> Result<Option<ActionResult>> {
         let mut total_usage = TokenUsage::default();
         let mut has_usage = false;
         let mut last_result = None;
 
         for action in actions {
-            let result = self.execute_one(action, env).await?;
+            let result = self
+                .execute_one_with_sink(action, env, sink.clone())
+                .await?;
             if let Some(usage) = &result.token_usage {
                 total_usage.input_tokens += usage.input_tokens;
                 total_usage.output_tokens += usage.output_tokens;
@@ -95,16 +109,28 @@ impl ActionExecutor {
     }
 
     pub async fn execute_one(&self, action: &Action, env: &ActionEnv) -> Result<ActionResult> {
+        self.execute_one_with_sink(action, env, Arc::new(NoopProcessSink))
+            .await
+    }
+
+    /// Same as [`execute_one`](Self::execute_one), reporting the spawned
+    /// process to `sink`.
+    pub async fn execute_one_with_sink(
+        &self,
+        action: &Action,
+        env: &ActionEnv,
+        sink: Arc<dyn ProcessSink>,
+    ) -> Result<ActionResult> {
         match action {
             Action::Prompt {
                 text,
                 runtime,
                 model,
             } => {
-                self.execute_prompt(text, runtime.as_deref(), model.clone(), env)
+                self.execute_prompt(text, runtime.as_deref(), model.clone(), env, sink)
                     .await
             }
-            Action::Script { command } => self.execute_script(command, env).await,
+            Action::Script { command } => self.execute_script(command, env, sink).await,
         }
     }
 
@@ -114,6 +140,7 @@ impl ActionExecutor {
         runtime_name: Option<&str>,
         model: Option<String>,
         env: &ActionEnv,
+        sink: Arc<dyn ProcessSink>,
     ) -> Result<ActionResult> {
         let name = runtime_name.unwrap_or(self.registry.default_name());
         let runtime = self
@@ -131,7 +158,7 @@ impl ActionExecutor {
             structured_output: None,
         };
 
-        let response = runtime.invoke(request).await;
+        let response = runtime.invoke_with_sink(request, sink).await;
         Ok(ActionResult {
             exit_code: response.exit_code,
             stdout: response.stdout,
@@ -143,7 +170,12 @@ impl ActionExecutor {
         })
     }
 
-    async fn execute_script(&self, command: &str, env: &ActionEnv) -> Result<ActionResult> {
+    async fn execute_script(
+        &self,
+        command: &str,
+        env: &ActionEnv,
+        sink: Arc<dyn ProcessSink>,
+    ) -> Result<ActionResult> {
         let start = Instant::now();
 
         // Build environment variables map for the ShellExecutor.
@@ -169,7 +201,10 @@ impl ActionExecutor {
             env_vars.insert(k.clone(), v.clone());
         }
 
-        let output = self.shell.execute(command, &env.worktree, &env_vars).await;
+        let output = self
+            .shell
+            .execute_with_sink(command, &env.worktree, &env_vars, sink)
+            .await;
 
         let duration = start.elapsed();
 
@@ -236,6 +271,45 @@ mod tests {
 
     fn test_env() -> ActionEnv {
         ActionEnv::new("test-work-id", Path::new("/tmp"))
+    }
+
+    #[derive(Default)]
+    struct RecordingSink(std::sync::Mutex<Vec<u32>>);
+
+    impl ProcessSink for RecordingSink {
+        fn spawned(&self, pid: u32) {
+            self.0.lock().unwrap().push(pid);
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_all_with_sink_reports_a_pid_per_script_and_prompt_action() {
+        let executor = ActionExecutor::new(setup_registry());
+        let sink = Arc::new(RecordingSink::default());
+        let actions = vec![Action::script("echo one"), Action::prompt("two")];
+
+        let result = executor
+            .execute_all_with_sink(&actions, &test_env(), sink.clone())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(result.success());
+        assert_eq!(sink.0.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn execute_all_without_sink_still_runs_actions() {
+        let executor = ActionExecutor::new(setup_registry());
+        let actions = vec![Action::script("echo one")];
+
+        let result = executor
+            .execute_all(&actions, &test_env())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(result.success());
     }
 
     #[tokio::test]

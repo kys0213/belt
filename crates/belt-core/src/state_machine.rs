@@ -1,17 +1,19 @@
 use crate::phase::QueuePhase;
 
-/// 상태 전이 규칙 (17개 유효 전이).
+/// 상태 전이 규칙 (18개 유효 전이). `spec/concerns/queue-state-machine.md`의 허용 집합과 같다.
 pub fn is_valid_transition(from: QueuePhase, to: QueuePhase) -> bool {
     use QueuePhase::*;
     matches!(
         (from, to),
         (Pending, Ready)
+            | (Pending, Skipped)
             | (Ready, Running)
             | (Ready, Done) // history-aware pre-judgment skip (R-EV-005)
-            | (Ready, Hitl) // spec conflict detection at advance time
+            | (Ready, Skipped)
             | (Running, Completed)
             | (Running, Skipped)
             | (Running, Failed)
+            | (Running, Hitl)
             | (Running, Pending) // graceful shutdown rollback
             | (Completed, Done)
             | (Completed, Hitl)
@@ -20,7 +22,6 @@ pub fn is_valid_transition(from: QueuePhase, to: QueuePhase) -> bool {
             | (Hitl, Skipped)
             | (Hitl, Failed)
             | (Hitl, Pending)
-            | (Failed, Done)
             | (Failed, Skipped)
     )
 }
@@ -70,8 +71,32 @@ mod tests {
     }
 
     #[test]
-    fn ready_hitl_for_conflict_detection() {
-        assert!(transit(Ready, Hitl).is_ok());
+    fn ready_hitl_is_rejected() {
+        assert!(transit(Ready, Hitl).is_err());
+    }
+
+    #[test]
+    fn pending_and_ready_can_be_skipped() {
+        assert!(transit(Pending, Skipped).is_ok());
+        assert!(transit(Ready, Skipped).is_ok());
+    }
+
+    #[test]
+    fn running_can_escalate_to_hitl() {
+        assert!(transit(Running, Hitl).is_ok());
+    }
+
+    #[test]
+    fn failed_exits_only_to_skipped() {
+        let phases = [
+            Pending, Ready, Running, Completed, Done, Hitl, Failed, Skipped,
+        ];
+        let exits: Vec<_> = phases
+            .iter()
+            .copied()
+            .filter(|&to| is_valid_transition(Failed, to))
+            .collect();
+        assert_eq!(exits, vec![Skipped]);
     }
 
     #[test]
@@ -136,6 +161,6 @@ mod tests {
             .flat_map(|&from| phases.iter().map(move |&to| (from, to)))
             .filter(|&(from, to)| is_valid_transition(from, to))
             .count();
-        assert_eq!(valid_count, 17);
+        assert_eq!(valid_count, 18);
     }
 }

@@ -91,6 +91,9 @@ pub struct QueueContext {
     pub phase: String,
     pub state: String,
     pub source_id: String,
+    /// 파생 원본 work_id. 파생 아이템이 아니면 키를 생략한다.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub derived_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,6 +290,7 @@ mod tests {
                 phase: "running".to_string(),
                 state: "implement".to_string(),
                 source_id: "github:org/repo#42".to_string(),
+                derived_from: None,
             },
             source: SourceContext {
                 source_type: "github".to_string(),

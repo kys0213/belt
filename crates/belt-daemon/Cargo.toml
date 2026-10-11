@@ -20,3 +20,5 @@ lru = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+rusqlite = { workspace = true }
+belt-infra = { workspace = true, features = ["test-support"] }

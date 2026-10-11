@@ -40,6 +40,7 @@ sources:
       1: retry
       2: retry_with_comment
       3: hitl
+      terminal: skip
 "#;
     serde_yaml::from_str(yaml).unwrap()
 }
@@ -63,8 +64,16 @@ fn setup_daemon_with_db(
         Arc::new(registry),
         Box::new(worktree_mgr),
         4,
+        db,
     )
-    .with_db(db)
+}
+
+/// A tick starts the handler without waiting for it; once it ends, the next
+/// tick evaluates the Completed item.
+async fn tick_through_evaluation(daemon: &mut Daemon) {
+    daemon.tick().await.unwrap();
+    daemon.join_handlers().await;
+    daemon.tick().await.unwrap();
 }
 
 /// After a full tick (collect -> advance -> execute -> evaluate), the daemon
@@ -100,11 +109,11 @@ async fn run_evaluate_records_token_usage_in_db() {
         ],
     );
 
-    // Run a full tick: collect -> advance -> execute -> evaluate.
-    daemon.tick().await.unwrap();
+    // collect -> advance -> execute -> evaluate.
+    tick_through_evaluation(&mut daemon).await;
 
     // Verify token usage was persisted in the database.
-    let db = daemon.db().expect("daemon should have a database");
+    let db = daemon.db();
     let rows = db
         .get_token_usage_by_work_id("github:org/repo#1:analyze")
         .unwrap();
@@ -296,4 +305,286 @@ async fn build_evaluate_prompt_reflects_workspace_config() {
         !prompt2.contains("production-api"),
         "prompt should not contain a different workspace name"
     );
+}
+
+// ---------------------------------------------------------------------------
+// DB-owned evaluator transitions (Completed -> Done / Hitl)
+// ---------------------------------------------------------------------------
+
+mod store_judgement {
+    use belt_core::hitl::HitlId;
+    use belt_core::hitl::HitlStatus;
+    use belt_core::queue::HitlReason;
+    use belt_core::transition::{Actor, TransitionOutcome, TransitionReason, TransitionRequest};
+    use belt_daemon::daemon::Daemon;
+
+    use super::*;
+
+    fn single_item_daemon(tmp: &TempDir, exit_codes: Vec<i32>) -> Daemon {
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+        setup_daemon_with_db(tmp, source, exit_codes, vec![])
+    }
+
+    /// `(from, to, reason)` of every phase entry, oldest first.
+    fn phase_enters(daemon: &Daemon, work_id: &str) -> Vec<(String, String, String)> {
+        daemon
+            .db()
+            .transitions_of(work_id)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "phase_enter")
+            .map(|e| {
+                (
+                    e.from_phase.unwrap(),
+                    e.to_phase.unwrap(),
+                    e.reason.unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn enter(from: &str, to: &str) -> (String, String, String) {
+        (from.to_string(), to.to_string(), "advance".to_string())
+    }
+
+    #[tokio::test]
+    async fn done_judgement_is_committed_to_the_store() {
+        let tmp = TempDir::new().unwrap();
+        let mut daemon = single_item_daemon(&tmp, vec![0, 0]);
+
+        tick_through_evaluation(&mut daemon).await;
+
+        let work_id = "github:org/repo#1:analyze";
+        assert_eq!(
+            phase_enters(&daemon, work_id),
+            vec![
+                enter("pending", "ready"),
+                enter("ready", "running"),
+                enter("running", "completed"),
+                enter("completed", "done"),
+            ]
+        );
+        assert_eq!(
+            daemon.db().get_item(work_id).unwrap().phase(),
+            QueuePhase::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_evaluate_failure_opens_a_hitl_request_in_the_store() {
+        let tmp = TempDir::new().unwrap();
+        // handler succeeds, the evaluate subprocess fails
+        let mut daemon = single_item_daemon(&tmp, vec![0, 1]).with_max_eval_failures(1);
+
+        tick_through_evaluation(&mut daemon).await;
+
+        let work_id = "github:org/repo#1:analyze";
+        assert_eq!(
+            phase_enters(&daemon, work_id).last(),
+            Some(&enter("completed", "hitl"))
+        );
+        assert_eq!(
+            daemon.db().get_item(work_id).unwrap().phase(),
+            QueuePhase::Hitl
+        );
+        let entering = daemon
+            .db()
+            .transitions_of(work_id)
+            .unwrap()
+            .into_iter()
+            .find(|e| e.to_phase.as_deref() == Some("hitl"))
+            .unwrap();
+        let request = daemon
+            .db()
+            .hitl_request(&HitlId::new(format!("hitl-{}", entering.seq)))
+            .unwrap()
+            .expect("a request is opened together with the phase change");
+        assert_eq!(request.status, HitlStatus::Open);
+        assert_eq!(request.reason, Some(HitlReason::EvaluateFailure));
+        assert_eq!(daemon.items_in_phase(QueuePhase::Hitl).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_judgement_is_applied_when_a_human_moved_the_item_first() {
+        let tmp = TempDir::new().unwrap();
+        let mut daemon = single_item_daemon(&tmp, vec![0, 0]);
+
+        daemon.collect().await.unwrap();
+        daemon.advance();
+        daemon.execute_running().await;
+        let work_id = "github:org/repo#1:analyze";
+        let outcome = daemon
+            .db()
+            .transition(&TransitionRequest {
+                work_id: work_id.to_string(),
+                expected_from: QueuePhase::Completed,
+                to: QueuePhase::Failed,
+                actor: Actor::Cli,
+                reason: TransitionReason::Manual,
+                detail: None,
+            })
+            .unwrap();
+        assert!(
+            matches!(outcome, TransitionOutcome::Applied { .. }),
+            "{outcome:?}"
+        );
+
+        daemon.tick().await.unwrap();
+
+        assert_eq!(
+            daemon.db().get_item(work_id).unwrap().phase(),
+            QueuePhase::Failed,
+            "the stored phase wins"
+        );
+        // The tick observes the human's move first, so no judgement is even
+        // attempted (a mid-tick race would instead log a daemon conflict).
+        assert!(
+            !phase_enters(&daemon, work_id)
+                .iter()
+                .any(|(_, to, _)| to == "done"),
+            "the discarded judgement must not appear as Done"
+        );
+        assert_eq!(daemon.items_in_phase(QueuePhase::Completed).len(), 0);
+        assert_eq!(daemon.items_in_phase(QueuePhase::Failed).len(), 1);
+    }
+
+    /// A runtime whose second invocation (the evaluate step; the first is the
+    /// handler) moves the item through another connection, so the move lands
+    /// after the tick's observation and before the judgement commit.
+    struct RacingRuntime {
+        calls: std::sync::atomic::AtomicUsize,
+        db_path: String,
+        work_id: String,
+        evaluate_exit_code: i32,
+    }
+
+    #[async_trait::async_trait]
+    impl belt_core::runtime::AgentRuntime for RacingRuntime {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn invoke(
+            &self,
+            _request: belt_core::runtime::RuntimeRequest,
+        ) -> belt_core::runtime::RuntimeResponse {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let exit_code = if call == 1 {
+                let other = Database::open(&self.db_path).unwrap();
+                let outcome = other
+                    .transition(&TransitionRequest {
+                        work_id: self.work_id.clone(),
+                        expected_from: QueuePhase::Completed,
+                        to: QueuePhase::Failed,
+                        actor: Actor::Cli,
+                        reason: TransitionReason::Manual,
+                        detail: None,
+                    })
+                    .unwrap();
+                assert!(matches!(outcome, TransitionOutcome::Applied { .. }));
+                self.evaluate_exit_code
+            } else {
+                0
+            };
+            belt_core::runtime::RuntimeResponse {
+                exit_code,
+                stdout: String::new(),
+                stderr: String::new(),
+                duration: std::time::Duration::from_millis(1),
+                token_usage: None,
+                session_id: None,
+            }
+        }
+
+        fn capabilities(&self) -> belt_core::runtime::RuntimeCapabilities {
+            belt_core::runtime::RuntimeCapabilities {
+                supports_tool_use: true,
+                supports_structured_output: false,
+                supports_session: false,
+            }
+        }
+    }
+
+    const RACE_WORK_ID: &str = "github:org/repo#1:analyze";
+
+    fn racing_daemon(tmp: &TempDir, evaluate_exit_code: i32) -> (Daemon, String) {
+        let db_path = tmp.path().join("belt.db").to_str().unwrap().to_string();
+        let mut source = MockDataSource::new("github");
+        source.add_item(test_item("github:org/repo#1", "analyze"));
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(RacingRuntime {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            db_path: db_path.clone(),
+            work_id: RACE_WORK_ID.to_string(),
+            evaluate_exit_code,
+        }));
+        let daemon = Daemon::new(
+            test_workspace_config(),
+            vec![Box::new(source)],
+            Arc::new(registry),
+            Box::new(MockWorktreeManager::new(tmp.path().to_path_buf())),
+            4,
+            Database::open(&db_path).unwrap(),
+        );
+        (daemon, db_path)
+    }
+
+    fn daemon_conflicts(daemon: &Daemon) -> usize {
+        daemon
+            .db()
+            .transitions_of(RACE_WORK_ID)
+            .unwrap()
+            .iter()
+            .filter(|e| e.kind == "transition_conflict" && e.actor == "daemon")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn done_judgement_loses_to_a_move_made_during_evaluation() {
+        let tmp = TempDir::new().unwrap();
+        let (mut daemon, _) = racing_daemon(&tmp, 0);
+
+        tick_through_evaluation(&mut daemon).await;
+
+        assert_eq!(
+            daemon.db().get_item(RACE_WORK_ID).unwrap().phase(),
+            QueuePhase::Failed,
+            "the stored phase wins"
+        );
+        assert!(
+            !phase_enters(&daemon, RACE_WORK_ID)
+                .iter()
+                .any(|(_, to, _)| to == "done"),
+            "the discarded judgement must not appear as Done"
+        );
+        assert_eq!(daemon_conflicts(&daemon), 1);
+    }
+
+    #[tokio::test]
+    async fn hitl_escalation_loses_to_a_move_made_during_evaluation() {
+        let tmp = TempDir::new().unwrap();
+        let (daemon, db_path) = racing_daemon(&tmp, 1);
+        let mut daemon = daemon.with_max_eval_failures(1);
+
+        tick_through_evaluation(&mut daemon).await;
+
+        assert_eq!(
+            daemon.db().get_item(RACE_WORK_ID).unwrap().phase(),
+            QueuePhase::Failed,
+            "the stored phase wins"
+        );
+        assert!(
+            !phase_enters(&daemon, RACE_WORK_ID)
+                .iter()
+                .any(|(_, to, _)| to == "hitl"),
+            "the discarded escalation must not enter Hitl"
+        );
+        let requests: i64 = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM hitl_requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(requests, 0, "no HITL request is created");
+        assert_eq!(daemon_conflicts(&daemon), 1);
+    }
 }

@@ -213,8 +213,8 @@ pub fn setup_real_daemon(tmp: &TempDir) -> Daemon {
         Arc::new(registry),
         Box::new(worktree_mgr),
         1,
+        db,
     )
-    .with_db(db)
     .with_belt_home(tmp.path().to_path_buf())
 }
 
@@ -239,8 +239,8 @@ pub fn setup_mock_runtime_daemon(tmp: &TempDir, exit_codes: Vec<i32>) -> Daemon 
         Arc::new(registry),
         Box::new(worktree_mgr),
         1,
+        db,
     )
-    .with_db(db)
     .with_belt_home(tmp.path().to_path_buf())
 }
 

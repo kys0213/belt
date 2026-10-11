@@ -24,8 +24,7 @@ use belt_core::lifecycle::LifecycleHook;
 use belt_core::platform::ShellExecutor;
 use belt_core::workspace::WorkspaceConfig;
 use belt_infra::db::Database;
-use belt_infra::hooks::{self, HookParams};
-use belt_infra::script_hook::ScriptLifecycleHook;
+use belt_infra::hooks;
 use belt_infra::workspace_loader::load_workspace_config;
 
 /// Cached hook entry: the hook impl plus the `updated_at` timestamp
@@ -69,21 +68,27 @@ impl DynamicHookLoader {
     /// 2. Check LRU cache — return cached hook if `updated_at` matches.
     /// 3. On miss or stale entry: parse yaml, create hook, cache it.
     ///
-    /// Falls back through this priority chain:
-    /// - DataSource-specific hook (e.g. `GitHubLifecycleHook`) via `hooks::create_hook`
-    /// - `ScriptLifecycleHook` if yaml has `on_done`/`on_fail`/`on_enter` scripts
-    /// - `NoopLifecycleHook` if nothing is configured
+    /// The hook is chosen by [`hook_for_workspace`]; a workspace that cannot
+    /// be looked up gets `NoopLifecycleHook`.
     pub fn resolve(&self, workspace_name: &str) -> Arc<dyn LifecycleHook> {
+        self.try_resolve(workspace_name)
+            .unwrap_or_else(|| Arc::new(belt_core::lifecycle::NoopLifecycleHook))
+    }
+
+    /// [`DynamicHookLoader::resolve`], but `None` when the workspace cannot
+    /// be looked up in the DB (e.g. not registered), so the caller can
+    /// choose its own fallback.
+    pub fn try_resolve(&self, workspace_name: &str) -> Option<Arc<dyn LifecycleHook>> {
         // Step 1: DB lookup.
         let (config_path, updated_at) = match self.db.get_workspace_with_updated_at(workspace_name)
         {
             Ok((_name, cp, ua)) => (cp, ua),
             Err(e) => {
-                tracing::warn!(
+                tracing::debug!(
                     workspace = workspace_name,
-                    "hook loader: DB workspace lookup failed, using NoopLifecycleHook: {e}"
+                    "hook loader: DB workspace lookup failed: {e}"
                 );
-                return Arc::new(belt_core::lifecycle::NoopLifecycleHook);
+                return None;
             }
         };
 
@@ -93,7 +98,7 @@ impl DynamicHookLoader {
             if let Some(entry) = cache.get(workspace_name)
                 && entry.updated_at == updated_at
             {
-                return Arc::clone(&entry.hook);
+                return Some(Arc::clone(&entry.hook));
             }
             // Stale or missing — will be (re)populated below.
         }
@@ -113,7 +118,7 @@ impl DynamicHookLoader {
             );
         }
 
-        hook
+        Some(hook)
     }
 
     /// Parse workspace yaml and create the best-fit hook implementation.
@@ -134,61 +139,7 @@ impl DynamicHookLoader {
             }
         };
 
-        // Try DataSource-specific hook first (e.g. GitHubLifecycleHook).
-        if let Some(hook) = self.try_datasource_hook(&config) {
-            tracing::debug!(
-                workspace = workspace_name,
-                "hook loader: resolved DataSource-specific hook"
-            );
-            return hook;
-        }
-
-        // Fall back to ScriptLifecycleHook if on_done/on_fail/on_enter scripts exist.
-        if Self::has_lifecycle_scripts(&config) {
-            tracing::debug!(
-                workspace = workspace_name,
-                "hook loader: resolved ScriptLifecycleHook from yaml scripts"
-            );
-            return Arc::new(self.build_script_hook(&config));
-        }
-
-        // Nothing configured — noop.
-        tracing::debug!(
-            workspace = workspace_name,
-            "hook loader: no hook configuration found, using NoopLifecycleHook"
-        );
-        Arc::new(belt_core::lifecycle::NoopLifecycleHook)
-    }
-
-    /// Attempt to create a DataSource-specific hook from the workspace sources.
-    fn try_datasource_hook(&self, config: &WorkspaceConfig) -> Option<Arc<dyn LifecycleHook>> {
-        for (source_key, source_config) in &config.sources {
-            let params = HookParams::new(source_key, &source_config.url);
-            if let Ok(hook) = hooks::create_hook(&params, Arc::clone(&self.shell)) {
-                return Some(Arc::from(hook));
-            }
-        }
-        None
-    }
-
-    /// Check if any state in any source has lifecycle scripts defined.
-    fn has_lifecycle_scripts(config: &WorkspaceConfig) -> bool {
-        config.sources.values().any(|source| {
-            source.states.values().any(|state| {
-                !state.on_enter.is_empty() || !state.on_done.is_empty() || !state.on_fail.is_empty()
-            })
-        })
-    }
-
-    /// Build a `ScriptLifecycleHook` from all state configs across all sources.
-    fn build_script_hook(&self, config: &WorkspaceConfig) -> ScriptLifecycleHook {
-        let mut state_configs = std::collections::HashMap::new();
-        for source in config.sources.values() {
-            for (state_name, state_config) in &source.states {
-                state_configs.insert(state_name.clone(), state_config.clone());
-            }
-        }
-        ScriptLifecycleHook::new(state_configs, Arc::clone(&self.shell))
+        hook_for_workspace(&config, Arc::clone(&self.shell))
     }
 
     /// Invalidate a specific workspace's cached hook.
@@ -212,6 +163,36 @@ impl DynamicHookLoader {
         let cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         cache.len()
     }
+}
+
+/// Create the best-fit lifecycle hook for a workspace configuration.
+///
+/// The DataSource-specific hook (e.g. `GitHubLifecycleHook`) via
+/// `hooks::resolve_hook`, otherwise `NoopLifecycleHook`.
+///
+/// The yaml `on_enter`/`on_done`/`on_fail` scripts are never wrapped in a
+/// hook: the daemon runs them itself at each event, so a hook running them
+/// too would run every script twice.
+pub fn hook_for_workspace(
+    config: &WorkspaceConfig,
+    shell: Arc<dyn ShellExecutor>,
+) -> Arc<dyn LifecycleHook> {
+    for (source_key, source_config) in &config.sources {
+        if let Some(hook) = hooks::resolve_hook(source_key, &source_config.url, Arc::clone(&shell))
+        {
+            tracing::debug!(
+                workspace = %config.name,
+                "hook loader: resolved DataSource-specific hook"
+            );
+            return Arc::from(hook);
+        }
+    }
+
+    tracing::debug!(
+        workspace = %config.name,
+        "hook loader: no DataSource-specific hook, using NoopLifecycleHook"
+    );
+    Arc::new(belt_core::lifecycle::NoopLifecycleHook)
 }
 
 impl std::fmt::Debug for DynamicHookLoader {
@@ -270,6 +251,7 @@ mod tests {
                     phase: "running".to_string(),
                     state: "implement".to_string(),
                     source_id: "github:org/repo#42".to_string(),
+                    derived_from: None,
                 },
                 source: SourceContext {
                     source_type: "github".to_string(),
@@ -330,6 +312,11 @@ name: test-ws
 sources:
   github:
     url: https://github.com/org/repo
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
 "#;
         let yaml_path = write_workspace_yaml(&tmp, "test-ws", yaml);
         register_workspace(&db, "test-ws", yaml_path.to_str().unwrap());
@@ -346,13 +333,57 @@ sources:
         });
     }
 
+    /// Records every command it is asked to run.
+    #[derive(Default)]
+    struct RecordingShell {
+        commands: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ShellExecutor for RecordingShell {
+        async fn execute(
+            &self,
+            command: &str,
+            _working_dir: &Path,
+            _env_vars: &HashMap<String, String>,
+        ) -> Result<ShellOutput, BeltError> {
+            self.commands.lock().unwrap().push(command.to_string());
+            Ok(ShellOutput {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn github_hook_names_the_repository_as_owner_slash_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = Arc::new(test_db());
+        let shell = Arc::new(RecordingShell::default());
+        let yaml = "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n";
+        let yaml_path = write_workspace_yaml(&tmp, "test-ws", yaml);
+        register_workspace(&db, "test-ws", yaml_path.to_str().unwrap());
+
+        let loader = DynamicHookLoader::new(db, shell.clone(), 4);
+        let hook = loader.resolve("test-ws");
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(hook.on_hitl_opened(&make_hook_context()))
+            .unwrap();
+
+        assert_eq!(
+            *shell.commands.lock().unwrap(),
+            vec!["gh issue edit 42 --repo org/repo --add-label belt:needs-human".to_string()]
+        );
+    }
+
     #[test]
     fn resolve_uses_cache_on_second_call() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Arc::new(test_db());
         let shell: Arc<dyn ShellExecutor> = Arc::new(StubShell);
 
-        let yaml = "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let yaml = "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n";
         let yaml_path = write_workspace_yaml(&tmp, "test-ws", yaml);
         register_workspace(&db, "test-ws", yaml_path.to_str().unwrap());
 
@@ -373,7 +404,7 @@ sources:
         let db = Arc::new(test_db());
         let shell: Arc<dyn ShellExecutor> = Arc::new(StubShell);
 
-        let yaml = "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let yaml = "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n";
         let yaml_path = write_workspace_yaml(&tmp, "test-ws", yaml);
         register_workspace(&db, "test-ws", yaml_path.to_str().unwrap());
 
@@ -393,34 +424,46 @@ sources:
     }
 
     #[test]
-    fn resolve_script_hook_when_scripts_defined() {
+    fn yaml_scripts_of_a_source_without_its_own_hook_are_not_run_by_the_hook() {
         let tmp = tempfile::tempdir().unwrap();
         let db = Arc::new(test_db());
-        let shell: Arc<dyn ShellExecutor> = Arc::new(StubShell);
+        let shell = Arc::new(RecordingShell::default());
 
         let yaml = r#"
 name: script-ws
 sources:
   custom:
     url: https://example.com
+    escalation:
+      1: retry
+      2: retry_with_comment
+      3: hitl
+      terminal: skip
     states:
       implement:
         trigger: {}
         handlers: []
+        on_enter:
+          - script: "echo enter"
         on_done:
           - script: "echo done"
+        on_fail:
+          - script: "echo fail"
 "#;
         let yaml_path = write_workspace_yaml(&tmp, "script-ws", yaml);
         register_workspace(&db, "script-ws", yaml_path.to_str().unwrap());
 
-        let loader = DynamicHookLoader::new(db, shell, 4);
+        let loader = DynamicHookLoader::new(db, shell.clone(), 4);
         let hook = loader.resolve("script-ws");
 
         let ctx = make_hook_context();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            assert!(hook.on_done(&ctx).await.is_ok());
+            hook.on_enter(&ctx).await.unwrap();
+            hook.on_done(&ctx).await.unwrap();
+            hook.on_fail(&ctx).await.unwrap();
         });
+        assert!(shell.commands.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -429,7 +472,7 @@ sources:
         let db = Arc::new(test_db());
         let shell: Arc<dyn ShellExecutor> = Arc::new(StubShell);
 
-        let yaml = "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n";
+        let yaml = "name: test-ws\nsources:\n  github:\n    url: https://github.com/org/repo\n    escalation:\n      1: retry\n      terminal: skip\n";
         let yaml_path = write_workspace_yaml(&tmp, "test-ws", yaml);
         register_workspace(&db, "test-ws", yaml_path.to_str().unwrap());
 
@@ -447,8 +490,8 @@ sources:
         let db = Arc::new(test_db());
         let shell: Arc<dyn ShellExecutor> = Arc::new(StubShell);
 
-        let yaml1 = "name: ws1\nsources:\n  github:\n    url: https://github.com/org/repo1\n";
-        let yaml2 = "name: ws2\nsources:\n  github:\n    url: https://github.com/org/repo2\n";
+        let yaml1 = "name: ws1\nsources:\n  github:\n    url: https://github.com/org/repo1\n    escalation:\n      1: retry\n      terminal: skip\n";
+        let yaml2 = "name: ws2\nsources:\n  github:\n    url: https://github.com/org/repo2\n    escalation:\n      1: retry\n      terminal: skip\n";
         let path1 = write_workspace_yaml(&tmp, "ws1", yaml1);
         let path2 = write_workspace_yaml(&tmp, "ws2", yaml2);
         register_workspace(&db, "ws1", path1.to_str().unwrap());
@@ -473,7 +516,7 @@ sources:
         for i in 1..=3 {
             let name = format!("ws{i}");
             let yaml = format!(
-                "name: {name}\nsources:\n  github:\n    url: https://github.com/org/repo{i}\n"
+                "name: {name}\nsources:\n  github:\n    url: https://github.com/org/repo{i}\n    escalation:\n      1: retry\n      terminal: skip\n"
             );
             let path = write_workspace_yaml(&tmp, &name, &yaml);
             register_workspace(&db, &name, path.to_str().unwrap());

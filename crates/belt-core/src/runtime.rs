@@ -5,11 +5,28 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::platform::ProcessSink;
+
 /// AgentRuntime trait — LLM 실행 추상화.
 #[async_trait]
 pub trait AgentRuntime: Send + Sync {
     fn name(&self) -> &str;
     async fn invoke(&self, request: RuntimeRequest) -> RuntimeResponse;
+
+    /// Same as [`invoke`](Self::invoke), but reports the pid of the spawned
+    /// process to `sink` right after the spawn, exactly once.
+    ///
+    /// The default delegates to `invoke` and never calls `sink`: a runtime
+    /// that spawns a process **must** override this method, otherwise its
+    /// process cannot be identified for cancellation.
+    async fn invoke_with_sink(
+        &self,
+        request: RuntimeRequest,
+        sink: Arc<dyn ProcessSink>,
+    ) -> RuntimeResponse {
+        let _ = sink;
+        self.invoke(request).await
+    }
     fn capabilities(&self) -> RuntimeCapabilities;
 }
 

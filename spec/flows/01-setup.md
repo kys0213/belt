@@ -66,9 +66,8 @@ sources:
       3: hitl
       terminal: skip          # hitl timeout 시 적용 (skip 또는 replan)
 
-    # 주의: github source에는 GitHubLifecycleHook이 항상 우선 적용되고,
-    # 위에서 정의한 on_done script(라벨 전환 등)는 현재 실행되지 않는다.
-    # ScriptLifecycleHook은 전용 Hook이 없는 source_type에만 폴백으로 쓰인다.
+    # github source에는 GitHubLifecycleHook(needs-human 라벨)이 적용되고,
+    # 위에서 정의한 on_done script(PR 생성, 라벨 전환)는 daemon이 evaluate 성공 후 한 번 실행한다.
     # 상세: [LifecycleHook](../concerns/lifecycle-hook.md)
 
 runtime:

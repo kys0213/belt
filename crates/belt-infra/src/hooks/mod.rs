@@ -21,6 +21,7 @@ use anyhow::{Result, bail};
 use belt_core::lifecycle::LifecycleHook;
 use belt_core::platform::ShellExecutor;
 
+use crate::sources::github::GitHubDataSource;
 use github::{GitHubHookConfig, GitHubLifecycleHook};
 
 /// Parameters for creating a lifecycle hook instance.
@@ -35,10 +36,6 @@ pub struct HookParams {
     pub repo: String,
     /// Optional HITL label override.
     pub hitl_label: Option<String>,
-    /// Whether to post comments on successful completion.
-    pub comment_on_done: bool,
-    /// Whether to post comments on failure.
-    pub comment_on_fail: bool,
 }
 
 impl HookParams {
@@ -48,8 +45,6 @@ impl HookParams {
             source_type: source_type.to_string(),
             repo: repo.to_string(),
             hitl_label: None,
-            comment_on_done: false,
-            comment_on_fail: true,
         }
     }
 }
@@ -67,7 +62,7 @@ impl HookParams {
 /// | `"github"`  | `GitHubLifecycleHook`      |
 ///
 /// Unknown source types return an error. Callers should fall back to
-/// `ScriptLifecycleHook` or `NoopLifecycleHook` when appropriate.
+/// `NoopLifecycleHook`.
 ///
 /// # Examples
 ///
@@ -83,8 +78,6 @@ pub fn create_hook(
     match params.source_type.as_str() {
         "github" => {
             let mut config = GitHubHookConfig::new(&params.repo);
-            config.comment_on_done = params.comment_on_done;
-            config.comment_on_fail = params.comment_on_fail;
             if let Some(ref label) = params.hitl_label {
                 config = config.with_hitl_label(label);
             }
@@ -93,7 +86,7 @@ pub fn create_hook(
         other => {
             bail!(
                 "unsupported DataSource type for lifecycle hook: '{other}'. \
-                 Use ScriptLifecycleHook or NoopLifecycleHook as fallback."
+                 Use NoopLifecycleHook as fallback."
             )
         }
     }
@@ -103,7 +96,7 @@ pub fn create_hook(
 ///
 /// Inspects the source key name and URL to determine the DataSource type,
 /// then delegates to [`create_hook`]. If the source type is not recognized,
-/// returns `None` so the caller can fall back to `ScriptLifecycleHook`.
+/// returns `None` so the caller can fall back to `NoopLifecycleHook`.
 pub fn resolve_hook(
     source_key: &str,
     source_url: &str,
@@ -116,27 +109,11 @@ pub fn resolve_hook(
     };
 
     // Extract repo identifier from URL.
-    let repo = extract_repo_from_url(source_url).unwrap_or_else(|| source_url.to_string());
+    let repo =
+        GitHubDataSource::extract_repo_name(source_url).unwrap_or_else(|| source_url.to_string());
 
     let params = HookParams::new(source_type, &repo);
     create_hook(&params, shell).ok()
-}
-
-/// Extract `owner/repo` from a GitHub URL.
-///
-/// Supports `https://github.com/owner/repo` and `git@github.com:owner/repo.git`.
-fn extract_repo_from_url(url: &str) -> Option<String> {
-    let trimmed = url.trim_end_matches('/').trim_end_matches(".git");
-    let parts: Vec<&str> = trimmed.split('/').collect();
-    if parts.len() >= 2 {
-        Some(format!(
-            "{}/{}",
-            parts[parts.len() - 2],
-            parts[parts.len() - 1]
-        ))
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]
@@ -181,6 +158,7 @@ mod tests {
                     phase: "running".to_string(),
                     state: "implement".to_string(),
                     source_id: "github:org/repo#42".to_string(),
+                    derived_from: None,
                 },
                 source: SourceContext {
                     source_type: "github".to_string(),
@@ -262,28 +240,10 @@ mod tests {
     }
 
     #[test]
-    fn extract_repo_from_github_url() {
-        assert_eq!(
-            extract_repo_from_url("https://github.com/org/repo"),
-            Some("org/repo".to_string())
-        );
-        assert_eq!(
-            extract_repo_from_url("https://github.com/org/repo/"),
-            Some("org/repo".to_string())
-        );
-        assert_eq!(
-            extract_repo_from_url("https://github.com/org/repo.git"),
-            Some("org/repo".to_string())
-        );
-    }
-
-    #[test]
     fn hook_params_defaults() {
         let params = HookParams::new("github", "org/repo");
         assert_eq!(params.source_type, "github");
         assert_eq!(params.repo, "org/repo");
         assert!(params.hitl_label.is_none());
-        assert!(!params.comment_on_done);
-        assert!(params.comment_on_fail);
     }
 }
