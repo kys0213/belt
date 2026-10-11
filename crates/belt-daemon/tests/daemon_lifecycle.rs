@@ -2580,4 +2580,70 @@ sources:
         assert_eq!(runs(logs.join("enter.log")), 1, "on_enter runs");
         assert_eq!(runs(logs.join("fail.log")), 1, "on_fail runs");
     }
+
+    /// A non-github source whose on_done script appends one line per run to
+    /// `<dir>/done.log`; the handler succeeds so the item reaches Done.
+    fn on_done_workspace(dir: &std::path::Path) -> WorkspaceConfig {
+        let yaml = format!(
+            r#"
+name: script-ws
+concurrency: 1
+sources:
+  jira:
+    url: https://jira.example.com/PROJ
+    states:
+      analyze:
+        trigger:
+          label: "belt:analyze"
+        handlers:
+          - prompt: "analyze"
+        on_done:
+          - script: "echo done >> {dir}/done.log"
+    escalation:
+      1: hitl
+      terminal: skip
+"#,
+            dir = dir.display()
+        );
+        serde_yaml::from_str(&yaml).unwrap()
+    }
+
+    /// Reaching Done through evaluate runs the on_done script once, not once
+    /// by the daemon and once more by the hook.
+    #[tokio::test]
+    async fn on_done_script_runs_once_when_the_item_reaches_done() {
+        let tmp = TempDir::new().unwrap();
+        let logs = tmp.path().join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let config = on_done_workspace(&logs);
+        let shell: Arc<dyn ShellExecutor> =
+            Arc::from(belt_infra::platform::default_shell_executor());
+        let hook = hook_for_workspace(&config, shell);
+
+        let mut source = MockDataSource::new("jira");
+        source.add_item(test_item("jira:PROJ-1", "analyze"));
+        let mut registry = RuntimeRegistry::new("mock".to_string());
+        registry.register(Arc::new(MockRuntime::new("mock", vec![0, 0])));
+        let mut daemon = Daemon::new(
+            config,
+            vec![Box::new(source)],
+            Arc::new(registry),
+            Box::new(MockWorktreeManager::new(tmp.path().join("wt"))),
+            4,
+            Database::open_in_memory().unwrap(),
+        )
+        .with_hook(hook)
+        .with_belt_home(tmp.path().to_path_buf());
+
+        daemon.tick().await.unwrap();
+        daemon.join_handlers().await;
+        daemon.tick().await.unwrap();
+        daemon.join_handlers().await;
+
+        assert_eq!(
+            daemon.db().get_item("jira:PROJ-1:analyze").unwrap().phase(),
+            QueuePhase::Done
+        );
+        assert_eq!(runs(logs.join("done.log")), 1, "on_done runs once");
+    }
 }
