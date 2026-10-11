@@ -136,14 +136,6 @@ pub fn smoke_labeled_issue_reaches_done_and_worktree_is_cleaned() {
     assert!(clean_exit, "daemon ignored SIGINT:\n{}", daemon.log());
 }
 
-// E2E-FINDING: `belt stop` (and `belt restart`, documented as a "graceful
-// stop") send SIGTERM, but the daemon only installs a SIGINT handler
-// (`tokio::signal::ctrl_c` in `Daemon::run_select_loop`). SIGTERM therefore
-// kills the process outright: no drain of Running items, no
-// "belt daemon stopped", `daemon.pid` left behind, and work in flight is cut
-// mid-step (observed: Done committed but the `belt/...` worktree branch never
-// deleted, because the process died between `git worktree remove` and
-// `git branch -D`).
 /// `belt stop` must shut the daemon down through the graceful path.
 pub fn finding_belt_stop_shuts_daemon_down_gracefully() {
     let env = E2eEnv::new();

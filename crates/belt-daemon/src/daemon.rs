@@ -199,6 +199,26 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Resolve on the next SIGINT or SIGTERM and return the signal's name.
+///
+/// `sigterm` is registered by the caller once, outside its loop, so a
+/// SIGTERM delivered between two polls is not lost.
+#[cfg(unix)]
+async fn shutdown_signal(sigterm: &mut tokio::signal::unix::Signal) -> &'static str {
+    tokio::select! {
+        () = sigint() => "SIGINT",
+        _ = sigterm.recv() => "SIGTERM",
+    }
+}
+
+/// Resolve on the next SIGINT; never resolves when SIGINT cannot be observed.
+async fn sigint() {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        tracing::error!("SIGINT not observable: {e}");
+        std::future::pending::<()>().await;
+    }
+}
+
 /// What a spawned execution needs besides its item.
 struct ExecutionDeps {
     executor: Arc<ActionExecutor>,
@@ -2461,11 +2481,11 @@ impl Daemon {
 
     /// tokio::select! 기반 async event loop with graceful shutdown.
     ///
-    /// SIGINT 수신 시:
+    /// SIGINT 또는 SIGTERM(unix) 수신 시:
     /// 1. `shutdown_requested = true` -- 새 아이템 수집 중단.
     /// 2. Running 아이템 완료를 최대 30초 대기 (`drain_with_timeout`).
     /// 3. timeout 초과 시 Running -> Pending 롤백 (worktree 보존).
-    /// 4. drain 중 두 번째 SIGINT 시 즉시 종료 (Running -> Failed 강제 전이).
+    /// 4. drain 중 두 번째 신호(SIGINT/SIGTERM) 시 즉시 종료 (Running -> Failed 강제 전이).
     ///
     /// # Errors
     /// Returns an error, before the loop starts, when the store cannot be
@@ -2568,7 +2588,7 @@ impl Daemon {
         }
     }
 
-    /// Select loop with SIGUSR1 + IPC support (unix).
+    /// Select loop with SIGUSR1, SIGTERM + IPC support (unix).
     ///
     /// Ended handlers are applied as they end, next to the tick and the
     /// wake signals, so nothing here waits for a running handler.
@@ -2580,6 +2600,11 @@ impl Daemon {
 
         // Also start the IPC listener so that the TCP-based notification
         // path works on Unix too (useful for testing and uniformity).
+        // `belt stop` sends SIGTERM: it must drain like SIGINT instead of
+        // killing the process with its default disposition.
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+
         let (_ipc_task, mut wakes) = self.start_ipc_wakes().await;
 
         loop {
@@ -2599,8 +2624,8 @@ impl Daemon {
                 Some(signal) = wakes.recv() => {
                     self.handle_ipc_signal(signal).await;
                 }
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("received SIGINT, initiating graceful shutdown...");
+                name = shutdown_signal(&mut sigterm) => {
+                    tracing::info!("received {name}, initiating graceful shutdown...");
                     self.shutdown_requested = true;
                     break;
                 }
@@ -2646,16 +2671,28 @@ impl Daemon {
     /// - timeout: the handler groups are killed, then Running → Pending
     ///   (worktree preserved). An execution already canceled by request
     ///   ends Skipped (`canceled`) instead.
-    /// - a second SIGINT: the handler groups are killed, then Running →
-    ///   Failed.
+    /// - a second SIGINT or SIGTERM (unix): the handler groups are killed,
+    ///   then Running → Failed.
     pub async fn drain_with_timeout(&mut self, timeout: std::time::Duration) {
-        self.drain_until_interrupted(timeout, async {
-            if let Err(e) = tokio::signal::ctrl_c().await {
-                tracing::error!("SIGINT not observable during the drain: {e}");
-                std::future::pending::<()>().await;
-            }
-        })
-        .await;
+        #[cfg(unix)]
+        {
+            let mut sigterm =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(sigterm) => sigterm,
+                    Err(e) => {
+                        tracing::error!("SIGTERM not observable during the drain: {e}");
+                        self.drain_until_interrupted(timeout, sigint()).await;
+                        return;
+                    }
+                };
+            self.drain_until_interrupted(timeout, async {
+                let name = shutdown_signal(&mut sigterm).await;
+                tracing::warn!("received {name} during the drain");
+            })
+            .await;
+        }
+        #[cfg(not(unix))]
+        self.drain_until_interrupted(timeout, sigint()).await;
     }
 
     /// [`Daemon::drain_with_timeout`] with the second interrupt given as
@@ -2708,7 +2745,7 @@ impl Daemon {
                     return;
                 }
                 () = &mut interrupt => {
-                    tracing::warn!("received second SIGINT, force-failing running items");
+                    tracing::warn!("received a second shutdown signal, force-failing running items");
                     self.stop_all_handlers().await;
                     self.force_fail_running();
                     return;

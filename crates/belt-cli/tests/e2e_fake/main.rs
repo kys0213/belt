@@ -50,7 +50,7 @@ const CASES: &[Case] = &[
     },
     Case {
         name: "finding_belt_stop_shuts_daemon_down_gracefully",
-        ignore: Some("finding: belt stop sends SIGTERM but the daemon only drains on SIGINT"),
+        ignore: None,
         run: scenarios::finding_belt_stop_shuts_daemon_down_gracefully,
     },
     Case {
