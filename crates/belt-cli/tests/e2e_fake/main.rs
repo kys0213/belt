@@ -170,6 +170,11 @@ const CASES: &[Case] = &[
         ignore: None,
         run: scenarios_fixes::done_of_completed_derived_item_uses_and_cleans_inherited_worktree,
     },
+    Case {
+        name: "fixes_registered_workspace_needs_human_label_added_and_removed",
+        ignore: None,
+        run: scenarios_fixes::registered_workspace_needs_human_label_added_and_removed,
+    },
 ];
 
 #[cfg(unix)]

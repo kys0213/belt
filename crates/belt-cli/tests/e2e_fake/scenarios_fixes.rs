@@ -1,6 +1,7 @@
 //! Regression cases for reviewed fixes: shutdown signals observed during a
-//! tick and draining a Running handler on SIGTERM, and owner-key worktree
-//! cleanup on `belt queue skip` / `belt queue done` of a derived item.
+//! tick and draining a Running handler on SIGTERM, owner-key worktree
+//! cleanup on `belt queue skip` / `belt queue done` of a derived item, and
+//! the needs-human label on a registered workspace.
 
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -243,5 +244,55 @@ pub fn done_of_completed_derived_item_uses_and_cleans_inherited_worktree() {
     assert_eq!(
         env.git_worktrees(),
         vec![env.repo_dir.display().to_string()]
+    );
+}
+
+const NEEDS_HUMAN: &str = "belt:needs-human";
+
+/// The lifecycle hook of a workspace registered with `belt workspace add`
+/// (resolved per trigger from the DB) labels the issue `belt:needs-human`
+/// when a HITL request opens and removes the label once it is resolved.
+/// (spec: lifecycle-hook.md "workspace 바인딩과 hook 선택", "on_hitl_opened")
+pub fn registered_workspace_needs_human_label_added_and_removed() {
+    let env = E2eEnv::new();
+    let issue = env.gh.seed_issue("Analyze", "body", &[TRIGGER]);
+    let work_id = first_work_id(issue);
+    let mut ws = Workspace::new("exit 1");
+    ws.escalation = "1: hitl";
+    let config = ws.install(&env);
+    register_workspace(&env, &config);
+
+    let mut daemon = env.start_daemon(&config, 1);
+    let has_label = || env.gh.issue_labels(issue).iter().any(|l| l == NEEDS_HUMAN);
+    wait_until(
+        Duration::from_secs(20),
+        "belt:needs-human label on the issue",
+        &mut daemon,
+        || has_label().then_some(()),
+    );
+    assert_eq!(env.phase_of(&work_id).as_deref(), Some("hitl"));
+
+    // Without the trigger label the skipped issue is not collected again
+    // (a new item would reopen a HITL and re-add the label).
+    env.gh.update(|s| {
+        s.issues
+            .get_mut(&issue)
+            .unwrap()
+            .labels
+            .retain(|l| l != TRIGGER)
+    });
+    let (code, answer) = env.belt_answer(&["queue", "skip", &work_id, "--json"]);
+    assert_eq!(code, 0, "{answer}");
+    wait_until(
+        Duration::from_secs(20),
+        "belt:needs-human label removed after resolve",
+        &mut daemon,
+        || (!has_label()).then_some(()),
+    );
+    wait_until(
+        Duration::from_secs(10),
+        "item to be skipped by post-processing",
+        &mut daemon,
+        || (env.phase_of(&work_id).as_deref() == Some("skipped")).then_some(()),
     );
 }
