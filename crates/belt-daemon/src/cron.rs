@@ -1712,14 +1712,21 @@ impl CronHandler for PrReviewScanJob {
 
             let gh = belt_infra::sources::github::GitHubDataSource::new(&source_url);
 
-            // Bridge async collect_review_items into this sync handler.
-            let items = std::thread::scope(|_| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| BeltError::Runtime(e.to_string()))?;
-                rt.block_on(gh.collect_review_items(&workspace_config, PR_REVIEW_SCAN_STATE))
-                    .map_err(|e| BeltError::Runtime(e.to_string()))
+            // Bridge async collect_review_items into this sync handler. The
+            // daemon calls handlers from inside its tokio runtime, so the
+            // dedicated runtime must be driven on a separate OS thread;
+            // blocking on the caller's thread panics regardless of flavor.
+            let items = std::thread::scope(|s| {
+                s.spawn(|| {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|e| BeltError::Runtime(e.to_string()))?;
+                    rt.block_on(gh.collect_review_items(&workspace_config, PR_REVIEW_SCAN_STATE))
+                        .map_err(|e| BeltError::Runtime(e.to_string()))
+                })
+                .join()
+                .map_err(|_| BeltError::Runtime("PR review scan thread panicked".into()))?
             })?;
 
             for item in &items {
@@ -2445,6 +2452,28 @@ mod tests {
             .to_string();
         assert!(err.contains("terminal"), "{err}");
         assert!(err.contains("skip, replan"), "{err}");
+    }
+
+    /// The daemon invokes cron handlers synchronously from inside its tokio
+    /// runtime, so the scan must not start a nested runtime on the caller's thread.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pr_review_scan_runs_inside_tokio_runtime_without_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("workspace.yaml");
+        let yaml = "name: scan-ws\nsources:\n  github:\n    url: https://github.com/belt-invalid-owner/belt-invalid-repo\n    escalation:\n      1: retry\n      terminal: skip\n";
+        std::fs::write(&config_path, yaml).unwrap();
+        // The job skips workspaces whose config fails to load, which would
+        // bypass the code path under test.
+        belt_infra::workspace_loader::load_workspace_config(&config_path).unwrap();
+
+        let db = Arc::new(Database::open_in_memory().unwrap());
+        db.add_workspace("scan-ws", config_path.to_str().unwrap())
+            .unwrap();
+
+        let job = PrReviewScanJob {
+            db: Arc::clone(&db),
+        };
+        job.execute(&CronContext { now: Utc::now() }).unwrap();
     }
 
     #[test]
